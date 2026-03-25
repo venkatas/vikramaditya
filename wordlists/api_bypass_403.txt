@@ -1,0 +1,13 @@
+/admin
+/admin/
+/administrator/
+/api/
+/api/v1/
+/console
+/dashboard
+/internal
+/jmx-console/
+/manager/html
+/private
+/server-status
+/wp-admin/
