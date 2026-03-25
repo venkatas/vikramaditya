@@ -1,0 +1,48 @@
+# ── Scan output (client data — never commit) ──────────────────────────────────
+recon/
+findings/
+reports/
+targets/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Agent traces and session files ────────────────────────────────────────────
+*.jsonl
+agent_session.json
+agent_bump.txt
+
+# ── Config with secrets ───────────────────────────────────────────────────────
+config.json
+.env
+*.key
+*.pem
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Python ────────────────────────────────────────────────────────────────────
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+nohup.out
+
+# ── Tool output files ─────────────────────────────────────────────────────────
+*.xml
+*.nmap
+nmap_*
+nuclei_output*
+
+# ── Editor ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo

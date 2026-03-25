@@ -1,0 +1,28 @@
+# ── LLM providers (install at least one) ─────────────────────────────────────
+
+# Ollama — local inference (recommended; no API key needed)
+ollama>=0.2.0
+
+# Claude API (Anthropic) — claude-opus-4-6, claude-sonnet-4-6, etc.
+# Set: export ANTHROPIC_API_KEY=sk-ant-...
+# anthropic>=0.40.0
+
+# OpenAI API — gpt-4o, o1, o3-mini, etc.
+# Set: export OPENAI_API_KEY=sk-...
+# openai>=1.30.0
+
+# Grok API (xAI) — grok-2-latest, grok-3-mini, etc.
+# Set: export XAI_API_KEY=xai-...
+# requests>=2.31.0   # used for Grok (OpenAI-compatible HTTP)
+
+# Optional LangGraph backend for agent.py
+# pip install langgraph langchain-ollama langchain-core
+
+# ── Core dependencies ─────────────────────────────────────────────────────────
+httpx>=0.27.0
+requests>=2.31.0
+python-dateutil>=2.8.2
+
+# ── Report PDF export (optional, system package) ─────────────────────────────
+# macOS:  brew install wkhtmltopdf
+# Linux:  apt install wkhtmltopdf

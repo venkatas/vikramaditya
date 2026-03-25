@@ -1,0 +1,8 @@
+https://example.com
+https://example.org
+https://example.net
+//example.com
+//example.org
+http://127.0.0.1
+http://localhost
+https://attacker.invalid
