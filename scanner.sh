@@ -405,7 +405,7 @@ if ! skip_has saml; then
         fi
     fi
 
-    SAML_FINDINGS=$(wc -l < "$FINDINGS_DIR/saml/findings.txt" 2>/dev/null || echo 0)
+    SAML_FINDINGS=$(count_vuln "$FINDINGS_DIR/saml/findings.txt")
     [ "$SAML_FINDINGS" -gt 0 ] && log_ok "[SAML] $SAML_FINDINGS finding(s) — review $FINDINGS_DIR/saml/"
 fi
 
@@ -464,7 +464,7 @@ if ! skip_has import; then
         done <<< "$IMPORT_URL_ENDPOINTS"
     fi
 
-    IMPORT_COUNT=$(wc -l < "$FINDINGS_DIR/import_export/endpoints.txt" 2>/dev/null || echo 0)
+    IMPORT_COUNT=$(count_vuln "$FINDINGS_DIR/import_export/endpoints.txt")
     [ "$IMPORT_COUNT" -gt 0 ] && log_ok "[IMPORT] $IMPORT_COUNT import/export endpoint(s) found — high-priority manual test surface"
 fi
 
@@ -518,7 +518,7 @@ if ! skip_has deserialize; then
 
     done <<< "$LIVE_HOSTS"
 
-    DESER_COUNT=$(wc -l < "$FINDINGS_DIR/deserialize/findings.txt" 2>/dev/null || echo 0)
+    DESER_COUNT=$(count_vuln "$FINDINGS_DIR/deserialize/findings.txt")
     [ "$DESER_COUNT" -gt 0 ] && log_ok "[DESERIALIZE] $DESER_COUNT deserialization surface(s) — requires manual ysoserial/PHPGGC follow-up"
 fi
 
@@ -574,7 +574,7 @@ if ! skip_has supplychain; then
 
     done <<< "$LIVE_HOSTS"
 
-    SC_COUNT=$(wc -l < "$FINDINGS_DIR/supply_chain/findings.txt" 2>/dev/null || echo 0)
+    SC_COUNT=$(count_vuln "$FINDINGS_DIR/supply_chain/findings.txt")
     [ "$SC_COUNT" -gt 0 ] && log_ok "[SUPPLY-CHAIN] $SC_COUNT supply chain exposure(s) — review $FINDINGS_DIR/supply_chain/"
 fi
 
