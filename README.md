@@ -19,7 +19,7 @@
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
 
-[Quick Start](#quick-start) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
+[Quick Start](#quick-start) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [API Keys](#api-keys-setup) · [Contributing](#contributing)
 
 ---
 
@@ -227,9 +227,16 @@ sudo apt install golang python3 nodejs jq nmap
 chmod +x setup.sh && ./setup.sh
 ```
 
-Installs: `subfinder`, `httpx`, `dnsx`, `nuclei`, `katana`, `waybackurls`, `gau`, `dalfox`,
-`ffuf`, `anew`, `qsreplace`, `assetfinder`, `subzy`, `naabu`, `sqlmap`, `interactsh-client`,
-`trufflehog`, `gitleaks`, nuclei-templates.
+`setup.sh` installs **25+ tools** automatically:
+
+| Source | Tools |
+|:-------|:------|
+| **Homebrew** | `subfinder` `httpx` `nuclei` `ffuf` `nmap` `amass` `sqlmap` `trufflehog` `gitleaks` `whatweb` |
+| **Go** | `dnsx` `katana` `naabu` `cdncheck` `interactsh-client` `gau` `dalfox` `subzy` `waybackurls` `anew` `qsreplace` `assetfinder` `gf` |
+| **Prebuilt binary** | `gowitness` (v3, Apple Silicon + Intel) |
+| **pip** | `arjun` `httpx[cli]` `mlx-lm` *(arm64 only)* |
+| **git clone → tools/** | `LinkFinder` `SecretFinder` `XSStrike` `drupalgeddon2` |
+| **Auto** | nuclei-templates, gf patterns (`~/.gf/`), subfinder config scaffold |
 
 ### Python dependencies
 
@@ -238,6 +245,60 @@ pip install -r requirements.txt
 ```
 
 See `requirements.txt` for LLM provider SDK details.
+
+---
+
+## API Keys Setup
+
+### CHAOS API (ProjectDiscovery) — Required for best subdomain coverage
+
+The recon pipeline uses the [Chaos](https://chaos.projectdiscovery.io) dataset from ProjectDiscovery — millions of pre-enumerated subdomains indexed per domain. Free key.
+
+1. Sign up at **[chaos.projectdiscovery.io](https://chaos.projectdiscovery.io)**
+2. Copy your API key
+3. Export before running:
+
+```bash
+export CHAOS_API_KEY="your-key-here"
+
+# For persistence:
+echo 'export CHAOS_API_KEY="your-key-here"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+`recon.sh` detects `$CHAOS_API_KEY` and auto-injects it into subfinder's provider config on first run. **The key is never stored in any file in this repo.**
+
+---
+
+### Optional API Keys — Better Subdomain Coverage
+
+`setup.sh` creates a config scaffold at `~/.config/subfinder/provider-config.yaml`. Uncomment and fill in any of these free/cheap keys:
+
+| Provider | Free? | Signup | Benefit |
+|:---------|:------|:-------|:--------|
+| **VirusTotal** | ✅ Free | [virustotal.com](https://www.virustotal.com/gui/my-apikey) | +passive subdomain data |
+| **SecurityTrails** | ✅ Free tier | [securitytrails.com](https://securitytrails.com/app/account/credentials) | +historical DNS |
+| **Censys** | ✅ Free tier | [search.censys.io/account/api](https://search.censys.io/account/api) | +certificate transparency |
+| **Shodan** | 💲 ~$9/mo | [account.shodan.io](https://account.shodan.io) | +banner grab, port data |
+| **GitHub** | ✅ Free | [github.com/settings/tokens](https://github.com/settings/tokens) | +source code subdomain leaks |
+
+```yaml
+# ~/.config/subfinder/provider-config.yaml
+chaos:
+  - YOUR_CHAOS_API_KEY
+virustotal:
+  - YOUR_VIRUSTOTAL_API_KEY
+securitytrails:
+  - YOUR_SECURITYTRAILS_API_KEY
+censys:
+  - YOUR_CENSYS_API_ID:YOUR_CENSYS_API_SECRET
+shodan:
+  - YOUR_SHODAN_API_KEY
+github:
+  - YOUR_GITHUB_TOKEN
+```
+
+See [`subfinder-config.yaml.example`](subfinder-config.yaml.example) for the full template.
 
 ---
 

@@ -1,0 +1,98 @@
+# subfinder provider-config.yaml — OBSIDIAN API Key Template
+# =============================================================================
+# Copy to: ~/.config/subfinder/provider-config.yaml
+#
+#   mkdir -p ~/.config/subfinder
+#   cp subfinder-config.yaml.example ~/.config/subfinder/provider-config.yaml
+#   # Edit the file and fill in your keys
+#
+# Keys are NEVER committed to this repo. The file lives only on your machine.
+# =============================================================================
+
+# ── ProjectDiscovery Chaos ────────────────────────────────────────────────────
+# Free. Sign up: https://chaos.projectdiscovery.io
+# Millions of pre-enumerated subdomains indexed by domain — biggest coverage boost.
+# Also: export CHAOS_API_KEY="..." — recon.sh auto-injects it here on first run.
+#
+# chaos:
+#   - YOUR_CHAOS_API_KEY
+
+# ── VirusTotal ────────────────────────────────────────────────────────────────
+# Free. Sign up: https://www.virustotal.com/gui/my-apikey
+# Passive DNS + subdomain data from malware scanning infrastructure.
+#
+# virustotal:
+#   - YOUR_VIRUSTOTAL_API_KEY
+
+# ── SecurityTrails ────────────────────────────────────────────────────────────
+# Free tier (50 API calls/month). Sign up: https://securitytrails.com/app/account/credentials
+# Historical DNS records — finds subdomains that no longer exist in passive sources.
+#
+# securitytrails:
+#   - YOUR_SECURITYTRAILS_API_KEY
+
+# ── Censys ────────────────────────────────────────────────────────────────────
+# Free tier (250 queries/month). Sign up: https://search.censys.io/account/api
+# Certificate transparency logs — finds subdomains via TLS certificate SANs.
+# Format: API_ID:API_SECRET (colon-separated)
+#
+# censys:
+#   - YOUR_CENSYS_API_ID:YOUR_CENSYS_API_SECRET
+
+# ── Shodan ────────────────────────────────────────────────────────────────────
+# Paid (~$9/month Freelancer plan). Sign up: https://account.shodan.io
+# Internet-wide port scanning + banner grab data. Best for infrastructure recon.
+#
+# shodan:
+#   - YOUR_SHODAN_API_KEY
+
+# ── GitHub ────────────────────────────────────────────────────────────────────
+# Free. Create token: https://github.com/settings/tokens (no scopes needed)
+# Finds subdomains leaked in public repos, CI configs, and commit history.
+# Add multiple tokens to rotate around GitHub's rate limits.
+#
+# github:
+#   - YOUR_GITHUB_TOKEN_1
+#   - YOUR_GITHUB_TOKEN_2
+
+# ── Hunter.io ─────────────────────────────────────────────────────────────────
+# Free tier (25 searches/month). Sign up: https://hunter.io/api-keys
+# Email + subdomain discovery via email pattern analysis.
+#
+# hunter:
+#   - YOUR_HUNTER_API_KEY
+
+# ── Fofa ─────────────────────────────────────────────────────────────────────
+# Free tier. Sign up: https://en.fofa.info/
+# Chinese internet scanning engine — good coverage for Asian-hosted targets.
+# Format: email:api_key
+#
+# fofa:
+#   - YOUR_FOFA_EMAIL:YOUR_FOFA_API_KEY
+
+# ── Quake (360) ───────────────────────────────────────────────────────────────
+# Free tier. Sign up: https://quake.360.net/quake/#/index
+# Alternative internet-wide scanner — good supplementary coverage.
+#
+# quake:
+#   - YOUR_QUAKE_API_KEY
+
+# ── ZoomEye ───────────────────────────────────────────────────────────────────
+# Free tier (10,000 results/month). Sign up: https://www.zoomeye.org/
+# Internet scanner focused on device fingerprinting.
+#
+# zoomeye:
+#   - YOUR_ZOOMEYE_API_KEY
+
+# =============================================================================
+# Quick setup — minimal effective config (all free):
+#
+#   chaos:
+#     - <chaos_key>        # biggest single improvement
+#   virustotal:
+#     - <vt_key>
+#   github:
+#     - <gh_token>
+#   censys:
+#     - <censys_id>:<censys_secret>
+# =============================================================================
