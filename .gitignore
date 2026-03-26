@@ -3,6 +3,14 @@ recon/
 findings/
 reports/
 targets/
+
+# ── Engagement data — NEVER commit these ──────────────────────────────────────
+*_FINDINGS.md
+*_findings.md
+verify_targets.txt
+targets.txt
+scope.txt
+*.scope
 __pycache__/
 *.pyc
 *.pyo
