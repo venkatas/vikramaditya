@@ -80,6 +80,7 @@ GO_TOOLS=(
     "github.com/tomnomnom/anew@latest"
     "github.com/tomnomnom/qsreplace@latest"
     "github.com/tomnomnom/assetfinder@latest"
+    "github.com/tomnomnom/gf@latest"
 )
 
 GO_TOOL_NAMES=(
@@ -95,6 +96,7 @@ GO_TOOL_NAMES=(
     "anew"
     "qsreplace"
     "assetfinder"
+    "gf"
 )
 
 for i in "${!GO_TOOLS[@]}"; do
@@ -176,10 +178,11 @@ else
     echo "[*] Intel/Linux — skipping MLX (Apple Silicon only)"
 fi
 
-# Repo-local helper tools
+# Repo-local helper tools (Python scripts cloned to tools/)
 echo ""
 echo "[*] Installing repo-local helper tools..."
 mkdir -p "$REPO_TOOLS_DIR"
+
 if [ -f "$REPO_TOOLS_DIR/drupalgeddon2.py" ]; then
     log_ok "drupalgeddon2.py already present ($REPO_TOOLS_DIR/drupalgeddon2.py)"
 else
@@ -189,6 +192,108 @@ else
     else
         log_err "drupalgeddon2.py failed to download"
     fi
+fi
+
+# LinkFinder — extract endpoints from JavaScript files
+if [ -d "$REPO_TOOLS_DIR/LinkFinder" ]; then
+    log_ok "LinkFinder already present"
+else
+    echo "    Cloning LinkFinder..."
+    if git clone --quiet https://github.com/GerbenJavado/LinkFinder.git "$REPO_TOOLS_DIR/LinkFinder" 2>/dev/null; then
+        pip3 install --quiet -r "$REPO_TOOLS_DIR/LinkFinder/requirements.txt" 2>/dev/null || true
+        log_ok "LinkFinder installed to $REPO_TOOLS_DIR/LinkFinder/"
+    else
+        log_err "LinkFinder failed to clone"
+    fi
+fi
+
+# SecretFinder — find secrets/credentials in JavaScript files
+if [ -d "$REPO_TOOLS_DIR/SecretFinder" ]; then
+    log_ok "SecretFinder already present"
+else
+    echo "    Cloning SecretFinder..."
+    if git clone --quiet https://github.com/m4ll0k/SecretFinder.git "$REPO_TOOLS_DIR/SecretFinder" 2>/dev/null; then
+        pip3 install --quiet -r "$REPO_TOOLS_DIR/SecretFinder/requirements.txt" 2>/dev/null || true
+        log_ok "SecretFinder installed to $REPO_TOOLS_DIR/SecretFinder/"
+    else
+        log_err "SecretFinder failed to clone"
+    fi
+fi
+
+# XSStrike — advanced XSS scanner with WAF bypass
+if [ -d "$REPO_TOOLS_DIR/XSStrike" ]; then
+    log_ok "XSStrike already present"
+else
+    echo "    Cloning XSStrike..."
+    if git clone --quiet https://github.com/s0md3v/XSStrike.git "$REPO_TOOLS_DIR/XSStrike" 2>/dev/null; then
+        pip3 install --quiet -r "$REPO_TOOLS_DIR/XSStrike/requirements.txt" 2>/dev/null || true
+        log_ok "XSStrike installed to $REPO_TOOLS_DIR/XSStrike/"
+    else
+        log_err "XSStrike failed to clone"
+    fi
+fi
+
+# Install gf patterns (tomnomnom's pattern pack)
+GF_PATTERNS_DIR="$HOME/.gf"
+if [ -d "$GF_PATTERNS_DIR" ] && [ "$(ls -A "$GF_PATTERNS_DIR" 2>/dev/null | wc -l)" -gt 2 ]; then
+    log_ok "gf patterns already installed ($GF_PATTERNS_DIR)"
+else
+    echo "    Installing gf patterns..."
+    mkdir -p "$GF_PATTERNS_DIR"
+    # tomnomnom's own patterns
+    GOPATH_BIN="${GOPATH:-$HOME/go}"
+    [ -d "$GOPATH_BIN/pkg/mod/github.com/tomnomnom/gf"* ] && \
+        cp -r "$GOPATH_BIN/pkg/mod/github.com/tomnomnom/gf"*/examples/. "$GF_PATTERNS_DIR/" 2>/dev/null || true
+    # 1ndianl33t community patterns (xss, sqli, ssrf, redirect, lfi, idor, rce, debug_logic, img-traversal, interestingparams, jsvar, cors)
+    if git clone --quiet https://github.com/1ndianl33t/Gf-Patterns.git /tmp/gf-patterns 2>/dev/null; then
+        cp /tmp/gf-patterns/*.json "$GF_PATTERNS_DIR/" 2>/dev/null || true
+        rm -rf /tmp/gf-patterns
+        log_ok "gf patterns installed to $GF_PATTERNS_DIR/"
+    else
+        log_warn "gf community patterns failed — add manually: https://github.com/1ndianl33t/Gf-Patterns"
+    fi
+fi
+
+# subfinder API key config (optional — improves subdomain coverage significantly)
+echo ""
+echo "[*] Setting up subfinder API key config..."
+SUBFINDER_CONFIG_DIR="$HOME/.config/subfinder"
+SUBFINDER_CONFIG="$SUBFINDER_CONFIG_DIR/provider-config.yaml"
+mkdir -p "$SUBFINDER_CONFIG_DIR"
+if [ -f "$SUBFINDER_CONFIG" ]; then
+    log_ok "subfinder config already exists: $SUBFINDER_CONFIG"
+else
+    cat > "$SUBFINDER_CONFIG" << 'SUBFINDER_EOF'
+# subfinder provider-config.yaml
+# Fill in your API keys below for better subdomain coverage.
+# Free tiers available for all providers.
+#
+# chaos (ProjectDiscovery) — https://chaos.projectdiscovery.io
+# chaos:
+#   - YOUR_CHAOS_API_KEY
+#
+# virustotal — https://www.virustotal.com/gui/my-apikey
+# virustotal:
+#   - YOUR_VIRUSTOTAL_API_KEY
+#
+# securitytrails — https://securitytrails.com/app/account/credentials
+# securitytrails:
+#   - YOUR_SECURITYTRAILS_API_KEY
+#
+# censys — https://search.censys.io/account/api
+# censys:
+#   - YOUR_CENSYS_API_ID:YOUR_CENSYS_API_SECRET
+#
+# shodan — https://account.shodan.io
+# shodan:
+#   - YOUR_SHODAN_API_KEY
+#
+# github — https://github.com/settings/tokens (no scopes needed)
+# github:
+#   - YOUR_GITHUB_TOKEN
+SUBFINDER_EOF
+    log_ok "subfinder config scaffold created: $SUBFINDER_CONFIG"
+    log_warn "Edit $SUBFINDER_CONFIG to add API keys for better coverage"
 fi
 
 # Update nuclei templates
@@ -213,7 +318,7 @@ echo "============================================="
 echo "[*] Installation Verification"
 echo "============================================="
 
-ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun)
+ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf)
 INSTALLED=0
 MISSING=0
 
@@ -234,6 +339,17 @@ else
     log_err "drupalgeddon2.py: NOT FOUND"
     ((MISSING++))
 fi
+
+for local_tool in "LinkFinder/linkfinder.py" "SecretFinder/SecretFinder.py" "XSStrike/xsstrike.py"; do
+    tool_name="${local_tool%%/*}"
+    if [ -d "$REPO_TOOLS_DIR/$tool_name" ]; then
+        log_ok "$tool_name: $REPO_TOOLS_DIR/$tool_name/"
+        ((INSTALLED++))
+    else
+        log_err "$tool_name: NOT FOUND in $REPO_TOOLS_DIR/"
+        ((MISSING++))
+    fi
+done
 
 echo ""
 echo "============================================="

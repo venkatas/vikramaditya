@@ -303,9 +303,24 @@ if [ "$SCOPE_LOCK" = "1" ]; then
 else  # normal subdomain enum
 
 # subfinder — passive, fast
+# Uses CHAOS_API_KEY env var if set (ProjectDiscovery chaos dataset — massive coverage boost)
+# Optional: set VirusTotal/SecurityTrails/Censys/Shodan keys in ~/.config/subfinder/provider-config.yaml
 if tool_ok subfinder; then
     log_step "subfinder..."
-    subfinder -d "$TARGET" -silent -all \
+    SUBFINDER_CHAOS_FLAG=""
+    if [ -n "${CHAOS_API_KEY:-}" ]; then
+        # chaos provider uses the key via provider-config.yaml, but we can also
+        # inject it inline so no config file is needed
+        SUBFINDER_CHAOS_FLAG="-provider chaos"
+        # Write a temp provider config with the chaos key if config doesn't have it
+        _chaos_config="$HOME/.config/subfinder/provider-config.yaml"
+        if ! grep -q "^chaos:" "$_chaos_config" 2>/dev/null; then
+            mkdir -p "$(dirname "$_chaos_config")"
+            printf "chaos:\n  - %s\n" "$CHAOS_API_KEY" >> "$_chaos_config"
+            log_step "CHAOS_API_KEY injected into subfinder config"
+        fi
+    fi
+    subfinder -d "$TARGET" -silent -all $SUBFINDER_CHAOS_FLAG \
         -o "$RECON_DIR/subdomains/subfinder.txt" 2>/dev/null || true
     log_done "subfinder: $(file_lines "$RECON_DIR/subdomains/subfinder.txt") subdomains"
 else
@@ -835,6 +850,52 @@ if tool_ok trufflehog && [ -s "$RECON_DIR/urls/js_files.txt" ]; then
     done
     [ -s "$RECON_DIR/js/trufflehog.json" ] && \
         log_warn "trufflehog findings: $RECON_DIR/js/trufflehog.json"
+fi
+
+# SecretFinder — dedicated JS secret/credential extractor
+_SECRETFINDER="${SCRIPT_DIR}/tools/SecretFinder/SecretFinder.py"
+if [ -f "$_SECRETFINDER" ] && [ -s "$RECON_DIR/urls/js_files.txt" ]; then
+    log_step "SecretFinder on JS files (top 50)..."
+    mkdir -p "$RECON_DIR/js/secretfinder"
+    head -50 "$RECON_DIR/urls/js_files.txt" | while IFS= read -r js_url; do
+        _safe_name=$(echo "$js_url" | sed 's|[^a-zA-Z0-9]|_|g' | cut -c1-80)
+        python3 "$_SECRETFINDER" -i "$js_url" -o cli \
+            2>/dev/null >> "$RECON_DIR/js/secretfinder/findings.txt" || true
+    done
+    _sf_count=$(grep -c "." "$RECON_DIR/js/secretfinder/findings.txt" 2>/dev/null || echo 0)
+    [ "$_sf_count" -gt 0 ] && \
+        log_warn "SecretFinder: $_sf_count potential secrets — $RECON_DIR/js/secretfinder/findings.txt"
+fi
+
+# LinkFinder — extract endpoints from JavaScript files (complements katana)
+_LINKFINDER="${SCRIPT_DIR}/tools/LinkFinder/linkfinder.py"
+if [ -f "$_LINKFINDER" ] && [ -s "$RECON_DIR/urls/js_files.txt" ]; then
+    log_step "LinkFinder endpoint extraction on JS files (top 50)..."
+    mkdir -p "$RECON_DIR/js/linkfinder"
+    head -50 "$RECON_DIR/urls/js_files.txt" | while IFS= read -r js_url; do
+        python3 "$_LINKFINDER" -i "$js_url" -o cli \
+            2>/dev/null >> "$RECON_DIR/js/linkfinder/endpoints_raw.txt" || true
+    done
+    if [ -s "$RECON_DIR/js/linkfinder/endpoints_raw.txt" ]; then
+        sort -u "$RECON_DIR/js/linkfinder/endpoints_raw.txt" \
+            > "$RECON_DIR/js/linkfinder/endpoints.txt"
+        # Merge into main JS endpoints file
+        cat "$RECON_DIR/js/linkfinder/endpoints.txt" >> "$RECON_DIR/js/endpoints.txt" 2>/dev/null || true
+        sort -u "$RECON_DIR/js/endpoints.txt" -o "$RECON_DIR/js/endpoints.txt" 2>/dev/null || true
+        log_done "LinkFinder: $(file_lines "$RECON_DIR/js/linkfinder/endpoints.txt") additional endpoints"
+    fi
+fi
+
+# gf — pattern-match collected URLs for interesting params (xss, sqli, ssrf, lfi, redirect, rce)
+if tool_ok gf && [ -s "$RECON_DIR/urls/all.txt" ]; then
+    log_step "gf pattern matching on collected URLs..."
+    mkdir -p "$RECON_DIR/urls/gf"
+    for pattern in xss sqli ssrf lfi redirect rce idor cors; do
+        gf "$pattern" < "$RECON_DIR/urls/all.txt" \
+            > "$RECON_DIR/urls/gf/${pattern}.txt" 2>/dev/null || true
+        _cnt=$(file_lines "$RECON_DIR/urls/gf/${pattern}.txt")
+        [ "$_cnt" -gt 0 ] && log_warn "gf[$pattern]: $_cnt URLs — $RECON_DIR/urls/gf/${pattern}.txt"
+    done
 fi
 fi  # end Phase 7 resume skip
 
