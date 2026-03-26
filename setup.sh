@@ -159,6 +159,23 @@ for pkg in "${PIP_TOOLS[@]}"; do
     fi
 done
 
+# Apple Silicon MLX — faster than Ollama on M-series chips
+echo ""
+if [[ "$(uname -m)" == "arm64" ]]; then
+    echo "[*] Apple Silicon detected — installing MLX for faster local inference..."
+    if python3 -c "import mlx_lm" &>/dev/null 2>&1; then
+        log_ok "mlx-lm already installed"
+    else
+        if pip3 install --quiet mlx-lm 2>/dev/null; then
+            log_ok "mlx-lm installed successfully (set BRAIN_PROVIDER=mlx to use)"
+        else
+            log_err "mlx-lm failed to install (requires macOS 13.3+ with Apple Silicon)"
+        fi
+    fi
+else
+    echo "[*] Intel/Linux — skipping MLX (Apple Silicon only)"
+fi
+
 # Repo-local helper tools
 echo ""
 echo "[*] Installing repo-local helper tools..."

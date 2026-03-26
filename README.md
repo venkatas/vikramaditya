@@ -17,7 +17,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
+[![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
 
 [Quick Start](#quick-start) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
 
@@ -180,18 +180,25 @@ The agent operates in a tight loop: **Observe → Think (LLM) → Act (tool) →
 
 ## Multi-Provider AI
 
-`brain.py` supports four LLM backends. Set `BRAIN_PROVIDER` to force one, or let OBSIDIAN auto-detect in priority order: **Ollama → Claude → OpenAI → Grok**.
+`brain.py` supports five LLM backends. Set `BRAIN_PROVIDER` to force one, or let OBSIDIAN auto-detect in priority order: **Ollama → MLX → Claude → OpenAI → Grok**.
 
-| Provider | Env var required | Example models |
-|:---------|:----------------|:---------------|
-| **Ollama** (local, default) | — | `qwen2.5:14b`, `qwen3-coder:32b` |
-| **Claude** (Anthropic) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6`, `claude-opus-4-6` |
-| **OpenAI** | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini` |
-| **Grok** (xAI) | `XAI_API_KEY` | `grok-2-latest`, `grok-3-mini` |
+| Provider | Env var required | Example models | Notes |
+|:---------|:----------------|:---------------|:------|
+| **Ollama** (local, default) | — | `qwen2.5:14b`, `qwen3-coder:32b` | CPU/GPU, all platforms |
+| **MLX** (Apple Silicon) | — | `Qwen2.5-14B-Instruct-4bit`, `DeepSeek-R1-14B-4bit` | ~40 tok/s on M4, SSD paging |
+| **Claude** (Anthropic) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6`, `claude-opus-4-6` | Best reasoning |
+| **OpenAI** | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini` | |
+| **Grok** (xAI) | `XAI_API_KEY` | `grok-2-latest`, `grok-3-mini` | |
 
 ```bash
 # Run fully local — no API keys, no data leaves your machine
 ollama pull qwen2.5:14b
+python3 hunt.py --target example.com
+
+# Apple Silicon — MLX is faster than Ollama on M-series chips (auto-detected)
+# Install: pip3 install mlx-lm   (or: ./setup.sh)
+export BRAIN_PROVIDER=mlx
+export MLX_MODEL=mlx-community/Qwen2.5-14B-Instruct-4bit
 python3 hunt.py --target example.com
 
 # Force Claude as the analysis engine

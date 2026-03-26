@@ -3,10 +3,10 @@ from __future__ import annotations
 
 """
 Brain — Multi-Provider LLM Reasoning Layer for VAPT
-Supports: Ollama (local), Claude API, OpenAI, Grok (xAI)
+Supports: Ollama (local), MLX (Apple Silicon), Claude API, OpenAI, Grok (xAI)
 
 Provider selection (in order of precedence):
-  1. BRAIN_PROVIDER env var  (ollama | claude | openai | grok)
+  1. BRAIN_PROVIDER env var  (ollama | mlx | claude | openai | grok)
   2. Auto-detect: uses first provider whose API key / server is available
 
 API keys (env vars):
@@ -14,6 +14,12 @@ API keys (env vars):
   OPENAI_API_KEY      — OpenAI (gpt-4o, o1, etc.)
   XAI_API_KEY         — Grok (grok-2-latest, grok-3-mini, etc.)
   OLLAMA_HOST         — Ollama base URL (default: http://localhost:11434)
+  MLX_MODEL           — MLX model path (default: mlx-community/Qwen2.5-14B-Instruct-4bit)
+
+MLX setup (Apple Silicon — faster than Ollama on M-series chips):
+  pip install mlx-lm
+  export BRAIN_PROVIDER=mlx
+  # Runs Qwen2.5-14B at ~40 tok/s on M4, Qwen3.5-32B on 16GB via SSD paging
 
 Default model priority (uses first available):
   1. vapt-qwen25:latest     — custom 32B VAPT-tuned model
@@ -63,8 +69,14 @@ try:
 except ImportError:
     _ollama_lib = None
 
+try:
+    import mlx_lm as _mlx_lm
+except ImportError:
+    _mlx_lm = None
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+MLX_DEFAULT_MODEL = os.environ.get("MLX_MODEL", "mlx-community/Qwen2.5-14B-Instruct-4bit")
 
 # ── Multi-provider LLM client ──────────────────────────────────────────────────
 # Wraps Ollama, Claude, OpenAI, Grok behind a single .chat() interface.
@@ -79,19 +91,21 @@ class LLMClient:
         reply  = client.chat(model, system_prompt, user_prompt, max_tokens=2000)
     """
 
-    PROVIDER_PRIORITY = ["ollama", "claude", "openai", "grok"]
+    PROVIDER_PRIORITY = ["ollama", "mlx", "claude", "openai", "grok"]
 
     # Default models per provider
     DEFAULT_MODELS = {
         "claude":  "claude-sonnet-4-6",
         "openai":  "gpt-4o",
         "grok":    "grok-2-latest",
-        "ollama":  None,  # resolved dynamically
+        "ollama":  None,   # resolved dynamically
+        "mlx":     None,   # resolved from MLX_MODEL env var or default
     }
 
     def __init__(self, provider: str | None = None):
         self.provider    = (provider or os.environ.get("BRAIN_PROVIDER", "")).lower()
         self._ollama     = None
+        self._mlx_model  = None   # loaded MLX model + tokenizer tuple
         self._http       = None   # requests session for OpenAI-compatible APIs
         self.available   = False
         self.description = ""
@@ -155,6 +169,18 @@ class LLMClient:
             self.available    = True
             self.description  = "OpenAI API"
 
+        elif provider == "mlx":
+            if _mlx_lm is None:
+                return
+            try:
+                mlx_model_id = os.environ.get("MLX_MODEL", MLX_DEFAULT_MODEL)
+                model, tokenizer = _mlx_lm.load(mlx_model_id)
+                self._mlx_model  = (model, tokenizer, mlx_model_id)
+                self.available   = True
+                self.description = f"MLX ({mlx_model_id}) — Apple Silicon"
+            except Exception:
+                pass
+
         elif provider == "grok":
             key = os.environ.get("XAI_API_KEY", "")
             if not key:
@@ -175,6 +201,8 @@ class LLMClient:
         try:
             if self.provider == "ollama":
                 return self._chat_ollama(model, system, user, max_tokens, temperature)
+            elif self.provider == "mlx":
+                return self._chat_mlx(model, system, user, max_tokens, temperature)
             elif self.provider == "claude":
                 return self._chat_claude(model, system, user, max_tokens, temperature)
             elif self.provider in ("openai", "grok"):
@@ -183,6 +211,21 @@ class LLMClient:
             print(f"{YELLOW}[Brain/{self.provider}] chat error: {e}{NC}", flush=True)
             return ""
         return ""
+
+    def _chat_mlx(self, model, system, user, max_tokens, temperature) -> str:
+        """Apple Silicon MLX inference — significantly faster than Ollama on M-series."""
+        mlx_model, tokenizer, model_id = self._mlx_model
+        prompt = f"<|system|>\n{system}\n<|user|>\n{user}\n<|assistant|>\n"
+        # mlx_lm.generate returns a string
+        response = _mlx_lm.generate(
+            mlx_model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temp=temperature,
+            verbose=False,
+        )
+        return response.strip()
 
     def _chat_ollama(self, model, system, user, max_tokens, temperature) -> str:
         resp = self._ollama.chat(
@@ -232,6 +275,14 @@ class LLMClient:
                 return [m.model for m in self._ollama.list().models]
             except Exception:
                 return []
+        elif self.provider == "mlx":
+            return [
+                "mlx-community/Qwen2.5-14B-Instruct-4bit",
+                "mlx-community/Qwen2.5-32B-Instruct-4bit",
+                "mlx-community/Qwen3-32B-4bit",
+                "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit",
+                "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+            ]
         elif self.provider == "claude":
             return ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
         elif self.provider == "openai":
@@ -244,7 +295,7 @@ class LLMClient:
 MODEL_PRIORITY = [
     "qwen3-coder-64k:latest",    # PRIMARY — 30.5B, 64K context
     "vapt-qwen25:latest",        # custom 32B VAPT-tuned
-    "obsidian-custom:latest",     # custom 32B obsidian
+    "obsidian-custom:latest",    # custom 32B obsidian
     "vapt-model:latest",         # custom 30B VAPT
     "qwen3-coder:30b",           # coder 30B
     "deepseek-r1:32b",           # strong reasoning
@@ -256,6 +307,16 @@ MODEL_PRIORITY = [
     "baron-llm:latest",          # BaronLLM 8B — offensive security fine-tune (fast)
     "qwen3:8b",                  # 8B fallback
     "mistral:7b-instruct-v0.3-q8_0",  # 7B last resort
+]
+
+# MLX model preference order (Apple Silicon — mac-code technique, ~40 tok/s on M4)
+# Runs via SSD paging: 32B models work on 16GB unified memory
+MLX_MODEL_PRIORITY = [
+    "mlx-community/Qwen2.5-32B-Instruct-4bit",       # 32B via SSD paging on 16GB M-series
+    "mlx-community/Qwen3-32B-4bit",                   # Qwen3 32B Apple Silicon optimised
+    "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit",# reasoning 14B
+    "mlx-community/Qwen2.5-14B-Instruct-4bit",        # 14B — fast, fits in 16GB
+    "mlx-community/Mistral-7B-Instruct-v0.3-4bit",    # 7B fallback
 ]
 
 # Fast triage model priority — BaronLLM first (8B, security-focused, low latency)
@@ -315,6 +376,13 @@ Your technical rules:
 9. Mobile app = different attack surface: APK decompilation finds hardcoded secrets, hidden endpoints, JS bridge RCE
 10. CI/CD pipelines are attack surface: pull_request_target + checkout = secret exfil, expression injection in issue titles
 11. WebSocket endpoints bypass many WAF rules and often have no auth — test IDOR, CSWSH, injection via message body
+
+TOP-100 PAID PATTERNS (from real HackerOne payouts $10K–$50K):
+12. Import/export features are the #1 RCE surface: bulk import, project templates, file conversion (ExifTool, ImageMagick, Kroki, Kramdown) — always test these first
+13. Integration points (GitHub import, OAuth connectors, webhook receivers) have auth logic written by tired developers — they almost always miss edge cases
+14. Supply chain exposure: internal registries (JFrog Artifactory, npm, pip, Maven) accessible without auth = $20K+. Look for /artifactory/, registry.internal, packages.target.com
+15. Deserialization endpoints: Java (look for AC ED 00 05 magic bytes, application/x-java-serialized-object), PHP (O:N: patterns), Python pickle — always chain to RCE
+16. Git flag injection: targets with git operations in UI (import from URL, mirror, clone) — test --upload-pack, --exec, -u flags in repository URL fields
 
 When asked to analyze data:
 - Lead with the highest-impact finding, not the most common one

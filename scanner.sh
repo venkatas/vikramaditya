@@ -409,6 +409,175 @@ if ! skip_has saml; then
     [ "$SAML_FINDINGS" -gt 0 ] && log_ok "[SAML] $SAML_FINDINGS finding(s) — review $FINDINGS_DIR/saml/"
 fi
 
+# ── Check 10: Import/Export Abuse (TOP100 #1 RCE surface) ────────────────────
+if ! skip_has import; then
+    log_info "Check 10: Import/Export Feature Abuse"
+    mkdir -p "$FINDINGS_DIR/import_export"
+
+    LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -30 || true)
+
+    while IFS= read -r host; do
+        [ -z "$host" ] && continue
+
+        # ── Discover import/export endpoints ──
+        for PATH in \
+            "/import" "/export" "/api/import" "/api/export" \
+            "/admin/import" "/admin/export" "/bulk/import" \
+            "/api/v1/import" "/api/v2/import" \
+            "/projects/import" "/repositories/import" \
+            "/upload/import" "/data/import" "/migrate" \
+            "/api/migrate" "/template/import" "/backup/restore"; do
+            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                "${host}${PATH}" 2>/dev/null || echo "0")
+            case "$CODE" in
+                200|201|301|302|400|403|405|422)
+                    log_vuln "[IMPORT] Endpoint exists (HTTP $CODE): ${host}${PATH}"
+                    echo "[IMPORT-ENDPOINT] ${host}${PATH} | HTTP $CODE" >> "$FINDINGS_DIR/import_export/endpoints.txt"
+                    ;;
+            esac
+        done
+
+        # ── File converter exposure (ExifTool, ImageMagick, FFmpeg vectors) ──
+        for CONV_PATH in \
+            "/convert" "/api/convert" "/process" "/render" \
+            "/thumbnail" "/preview" "/api/preview" \
+            "/pdf" "/api/pdf" "/export/pdf" "/generate/pdf" \
+            "/diagram" "/api/diagram" "/kroki" "/plantuml"; do
+            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                "${host}${CONV_PATH}" 2>/dev/null || echo "0")
+            if [ "$CODE" = "200" ] || [ "$CODE" = "405" ]; then
+                log_vuln "[IMPORT] File converter endpoint (${CODE}): ${host}${CONV_PATH} — test ExifTool/ImageMagick RCE"
+                echo "[CONVERTER-ENDPOINT] ${host}${CONV_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/import_export/converters.txt"
+            fi
+        done
+
+    done <<< "$LIVE_HOSTS"
+
+    # ── URL-based import (git flag injection surface) ──
+    IMPORT_URL_ENDPOINTS=$(grep -iE "/(import|clone|mirror|fetch).*(url|uri|repo|source)" \
+        "$ORDERED_SCAN" 2>/dev/null | head -10 || true)
+    if [ -n "$IMPORT_URL_ENDPOINTS" ]; then
+        while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            log_vuln "[IMPORT] URL import endpoint detected — test git flag injection: $url"
+            echo "[GIT-FLAG-INJECTION-CANDIDATE] $url" >> "$FINDINGS_DIR/import_export/git_injection.txt"
+        done <<< "$IMPORT_URL_ENDPOINTS"
+    fi
+
+    IMPORT_COUNT=$(wc -l < "$FINDINGS_DIR/import_export/endpoints.txt" 2>/dev/null || echo 0)
+    [ "$IMPORT_COUNT" -gt 0 ] && log_ok "[IMPORT] $IMPORT_COUNT import/export endpoint(s) found — high-priority manual test surface"
+fi
+
+# ── Check 11: Deserialization Probes ─────────────────────────────────────────
+if ! skip_has deserialize; then
+    log_info "Check 11: Deserialization Probes"
+    mkdir -p "$FINDINGS_DIR/deserialize"
+
+    LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -20 || true)
+
+    while IFS= read -r host; do
+        [ -z "$host" ] && continue
+
+        # ── Java deserialization: detect AC ED 00 05 magic bytes in responses ──
+        # Also check for endpoints that accept serialized objects
+        for JAVA_PATH in \
+            "/api/deserialize" "/api/object" "/rpc" "/remoting" \
+            "/invoker" "/jmxinvokerservlet" "/web-console/invoker" \
+            "/cluster/pickled" "/api/pickle" "/api/marshal"; do
+            RESP_HEADERS=$(curl -skI --max-time 5 "${host}${JAVA_PATH}" 2>/dev/null || true)
+            CODE=$(echo "$RESP_HEADERS" | grep -oE "HTTP/[0-9.]+ [0-9]+" | tail -1 | awk '{print $2}')
+            CT=$(echo "$RESP_HEADERS" | grep -i "content-type" | head -1)
+            if echo "$CT" | grep -qi "java-serialized\|application/x-java\|x-java-serialized"; then
+                log_vuln "[DESERIALIZE] Java serialized object endpoint: ${host}${JAVA_PATH} — ysoserial candidate"
+                echo "[JAVA-DESER] ${host}${JAVA_PATH} | $CT" >> "$FINDINGS_DIR/deserialize/findings.txt"
+            fi
+            # JMX/JBoss/WebLogic common deser paths
+            case "$CODE" in 200|500|400)
+                if echo "$JAVA_PATH" | grep -qi "invoker\|jmx\|remoting"; then
+                    log_vuln "[DESERIALIZE] Java RMI/JMX endpoint (HTTP $CODE): ${host}${JAVA_PATH}"
+                    echo "[JAVA-RMI] ${host}${JAVA_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/deserialize/findings.txt"
+                fi ;;
+            esac
+        done
+
+        # ── PHP object injection: detect unserialize() call surfaces ──
+        PHP_TARGETS=$(grep -iE "\.(php)(\?|$)" "$ORDERED_SCAN" 2>/dev/null | \
+            grep -iE "data=|object=|session=|token=|payload=" | head -10 || true)
+        if [ -n "$PHP_TARGETS" ]; then
+            while IFS= read -r url; do
+                [ -z "$url" ] && continue
+                # Send PHP serialized string — O:4:"Test":0:{} — look for fatal error leaking class name
+                RESP=$(curl -sk --max-time 5 \
+                    -G --data-urlencode "data=O:4:\"Test\":0:{}" "$url" 2>/dev/null || true)
+                if echo "$RESP" | grep -qi "unserialize\|__wakeup\|__destruct\|class.*not.*found\|Fatal error"; then
+                    log_vuln "[DESERIALIZE] PHP object injection surface: $url"
+                    echo "[PHP-DESER] $url" >> "$FINDINGS_DIR/deserialize/findings.txt"
+                fi
+            done <<< "$PHP_TARGETS"
+        fi
+
+    done <<< "$LIVE_HOSTS"
+
+    DESER_COUNT=$(wc -l < "$FINDINGS_DIR/deserialize/findings.txt" 2>/dev/null || echo 0)
+    [ "$DESER_COUNT" -gt 0 ] && log_ok "[DESERIALIZE] $DESER_COUNT deserialization surface(s) — requires manual ysoserial/PHPGGC follow-up"
+fi
+
+# ── Check 12: Supply Chain Exposure ──────────────────────────────────────────
+if ! skip_has supplychain; then
+    log_info "Check 12: Supply Chain Exposure"
+    mkdir -p "$FINDINGS_DIR/supply_chain"
+
+    LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -30 || true)
+
+    while IFS= read -r host; do
+        [ -z "$host" ] && continue
+
+        # ── Internal package registries ──
+        for REG_PATH in \
+            "/artifactory" "/artifactory/api/system/ping" \
+            "/nexus" "/nexus/service/rest/v1/status" \
+            "/repository" "/npm" "/pypi" "/maven" \
+            "/.npmrc" "/packages" "/registry" \
+            "/api/packages" "/api/v1/packages"; do
+            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                "${host}${REG_PATH}" 2>/dev/null || echo "0")
+            case "$CODE" in
+                200|201|401)
+                    RESP=$(curl -sk --max-time 5 "${host}${REG_PATH}" 2>/dev/null || true)
+                    if echo "$RESP" | grep -qi "artifactory\|nexus\|jfrog\|npm\|pypi\|maven\|registry"; then
+                        log_vuln "[SUPPLY-CHAIN] Package registry exposed (HTTP $CODE): ${host}${REG_PATH}"
+                        echo "[REGISTRY-EXPOSED] ${host}${REG_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/supply_chain/findings.txt"
+                    fi ;;
+            esac
+        done
+
+        # ── Exposed credential/config files ──
+        for CRED_PATH in \
+            "/.npmrc" "/.pypirc" "/.m2/settings.xml" \
+            "/pip.conf" "/requirements.txt" \
+            "/Gemfile.lock" "/package-lock.json" \
+            "/composer.lock" "/yarn.lock" \
+            "/docker-compose.yml" "/docker-compose.yaml" \
+            "/.docker/config.json" "/Dockerfile"; do
+            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                "${host}${CRED_PATH}" 2>/dev/null || echo "0")
+            if [ "$CODE" = "200" ]; then
+                RESP=$(curl -sk --max-time 5 "${host}${CRED_PATH}" 2>/dev/null || true)
+                if echo "$RESP" | grep -qiE "password|token|secret|auth|key|credential|registry_url|//npm|@scope"; then
+                    log_vuln "[SUPPLY-CHAIN] Credential file exposed: ${host}${CRED_PATH}"
+                    echo "[CRED-FILE] ${host}${CRED_PATH}" >> "$FINDINGS_DIR/supply_chain/findings.txt"
+                    # Save snippet (first 5 lines, no full secrets in log)
+                    echo "$RESP" | head -5 >> "$FINDINGS_DIR/supply_chain/snippets.txt" 2>/dev/null || true
+                fi
+            fi
+        done
+
+    done <<< "$LIVE_HOSTS"
+
+    SC_COUNT=$(wc -l < "$FINDINGS_DIR/supply_chain/findings.txt" 2>/dev/null || echo 0)
+    [ "$SC_COUNT" -gt 0 ] && log_ok "[SUPPLY-CHAIN] $SC_COUNT supply chain exposure(s) — review $FINDINGS_DIR/supply_chain/"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 log_info "Scan Complete. Consolidating..."
 {
@@ -421,5 +590,8 @@ log_info "Scan Complete. Consolidating..."
     echo "SSTI Confirmed       : $(count_vuln "$FINDINGS_DIR/ssti/ssti_candidates.txt")"
     echo "MFA Bypass Findings  : $(count_vuln "$FINDINGS_DIR/mfa/findings.txt")"
     echo "SAML/SSO Findings    : $(count_vuln "$FINDINGS_DIR/saml/findings.txt")"
+    echo "Import/Export        : $(count_vuln "$FINDINGS_DIR/import_export/endpoints.txt")"
+    echo "Deserialization      : $(count_vuln "$FINDINGS_DIR/deserialize/findings.txt")"
+    echo "Supply Chain         : $(count_vuln "$FINDINGS_DIR/supply_chain/findings.txt")"
 } > "$FINDINGS_DIR/summary.txt"
 cat "$FINDINGS_DIR/summary.txt"
