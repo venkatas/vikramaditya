@@ -1,14 +1,25 @@
 <div align="center">
 
-# OBSIDIAN
+```
+  ██████╗ ██████╗ ███████╗██╗██████╗ ██╗ █████╗ ███╗   ██╗
+ ██╔═══██╗██╔══██╗██╔════╝██║██╔══██╗██║██╔══██╗████╗  ██║
+ ██║   ██║██████╔╝███████╗██║██║  ██║██║███████║██╔██╗ ██║
+ ██║   ██║██╔══██╗╚════██║██║██║  ██║██║██╔══██║██║╚██╗██║
+ ╚██████╔╝██████╔╝███████║██║██████╔╝██║██║  ██║██║ ╚████║
+  ╚═════╝ ╚═════╝ ╚══════╝╚═╝╚═════╝ ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝
+```
 
 **Autonomous VAPT platform. Give it a target — FQDN, IP, or CIDR range. It hunts, it reports.**
+
+> *"The Obsidian Order has files on everyone."*
+> — Garak, Star Trek: Deep Space Nine
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
+[![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
 
-[Quick Start](#quick-start) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation)
+[Quick Start](#quick-start) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
 
 ---
 
@@ -18,41 +29,51 @@
 
 ---
 
+## The Obsidian Order
+
+In *Star Trek: Deep Space Nine*, the **Obsidian Order** was the most feared intelligence organisation in the quadrant. Nothing escaped their notice. No secret stayed buried.
+
+OBSIDIAN operates the same way. Give it a target. Walk away. Come back to a full VAPT report.
+
+It was inspired by and evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) — the original AI-assisted bug bounty automation platform that laid the recon pipeline, ReAct agent architecture, and AI analysis engine that powers this tool today.
+
+---
+
 ## What It Does
 
 OBSIDIAN is an autonomous VAPT tool built for professional security consultants. You give it a target — a domain, a single IP, or an entire subnet. It runs the full assessment pipeline and produces a submission-ready report.
 
 | Stage | What happens |
 |:------|:-------------|
-| **Recon** | Subdomain enumeration, DNS resolution, live host discovery, URL crawling, JS analysis, secret extraction |
-| **Fingerprint** | Tech stack detection (httpx), CVE risk scoring, priority host ranking |
-| **Scan** | SQLi, XSS, SSTI, RCE, file upload, CORS, JWT, cloud misconfigs, framework exposure |
-| **Exploit** | CMS exploit chains (Drupal, WordPress), Spring actuators, exposed admin panels |
-| **Analyze** | AI-powered triage — finds chains, ranks by impact, kills noise |
-| **Report** | Burp Suite-style HTML report: executive summary, CVSS scores, PoC evidence, remediation |
+| 🔭 **Recon** | Subdomain enumeration, DNS resolution, live host discovery, URL crawling, JS analysis, secret extraction |
+| 🔬 **Fingerprint** | Tech stack detection (httpx), CVE risk scoring, priority host ranking |
+| 🔍 **Scan** | SQLi, XSS, SSTI, RCE, file upload, CORS, JWT, cloud misconfigs, framework exposure |
+| 💥 **Exploit** | CMS exploit chains (Drupal, WordPress), Spring actuators, exposed admin panels |
+| 🧠 **Analyze** | AI-powered triage — finds chains, ranks by impact, kills noise |
+| 📋 **Report** | Burp Suite-style HTML report: executive summary, CVSS scores, PoC evidence, remediation |
 
 ---
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/obsidian.git
+git clone https://github.com/venkatas/obsidian.git
 cd obsidian
 chmod +x setup.sh && ./setup.sh      # installs all required tools
 
 # Run a full assessment
 python3 hunt.py --target example.com
 
-# IP address
+# Single IP address
 python3 hunt.py --target 192.168.1.100
 
-# Subnet (discovers live hosts first)
+# Subnet (discovers live hosts first via nmap ping sweep)
 python3 hunt.py --target 10.0.0.0/24
 
-# Quick scan (faster, fewer checks)
+# Faster scan (fewer checks)
 python3 hunt.py --target example.com --quick
 
-# Autonomous mode (AI drives all decisions)
+# Autonomous mode — AI drives all decisions
 python3 hunt.py --target example.com --autonomous
 ```
 
@@ -64,7 +85,7 @@ python3 hunt.py --target example.com --autonomous
 Target (FQDN / IP / CIDR)
         │
         ▼
-   hunt.py  ←── brain.py (AI analysis)
+   hunt.py  ◄── brain.py (AI analysis + multi-provider LLM)
         │         └── agent.py (autonomous ReAct loop)
         │
    ┌────┴────────────────────────────────────┐
@@ -76,10 +97,10 @@ recon.sh                               scanner.sh
   ├── amass / dnsx                        ├── XSS (dalfox)
   ├── httpx (tech detect)                 ├── SSTI (math-canary probes)
   ├── katana / waybackurls / gau          ├── RCE (Log4Shell, Tomcat, JBoss)
-  ├── nuclei (CVE templates)              ├── File upload
+  ├── nuclei (CVE templates)              ├── File upload bypass
   ├── nmap / naabu (port scan)            ├── Cloud exposure (Firebase, K8s, Docker)
   ├── subzy (takeover check)              ├── Framework exposure (Spring, GraphQL)
-  └── trufflehog / gitleaks (JS secrets)  └── Race conditions
+  └── trufflehog / gitleaks (JS secrets)  └── Race conditions (xargs -P 20)
         │
         ▼
   prioritize.py (CVE risk scoring)
@@ -89,7 +110,7 @@ recon.sh                               scanner.sh
         │
         ▼
    reporter.py
-     └── vapt_report.html  (Burp Suite-style)
+     ├── vapt_report.html  (Burp Suite-style, self-contained)
      └── vapt_report.md    (Markdown summary)
 ```
 
@@ -105,22 +126,22 @@ recon.sh                               scanner.sh
 | **Auth** | JWT (alg=none, RS256→HS256, weak secret), OAuth misconfig, session fixation |
 | **IDOR** | Object-level, field-level, GraphQL node() IDOR, UUID enumeration |
 | **File Upload** | Extension bypass, MIME confusion, polyglots, SVG XSS |
-| **Cloud** | Firebase open read/write, K8s API unauthenticated, Docker socket exposure, S3 bucket enumeration |
+| **Cloud** | Firebase open read/write, K8s API unauthenticated, Docker socket exposure, S3 bucket enum |
 | **Framework** | Spring actuators (env/heapdump), H2 console, GraphQL introspection, Swagger UI |
 | **CMS** | Drupalgeddon2 (CVE-2018-7600), WordPress user enum + xmlrpc, Joomla/Magento |
 | **Infrastructure** | Subdomain takeover (subzy), CORS misconfiguration, open redirect, HTTP smuggling |
-| **Secrets** | JS bundle secrets (trufflehog/gitleaks), .env exposure, .git/config exposure |
-| **Race Conditions** | Concurrent probes on OTP, coupon, payment endpoints (`xargs -P 20`) |
+| **Secrets** | JS bundle secrets (trufflehog/gitleaks), .env exposure, .git/config leak |
+| **Race Conditions** | Concurrent probes on OTP, coupon, payment endpoints |
 
 ---
 
 ## Reports
 
-The report output matches professional pentest report standards.
+The report output matches professional pentest engagement standards — suitable for client submission.
 
-**HTML report** (`vapt_report.html`):
-- Cover page with client name, consultant, date, classification
-- Executive summary with risk breakdown
+**HTML report** (`vapt_report.html`) — single self-contained file:
+- Dark navy cover page with client name, consultant, date, and classification
+- Executive summary with risk breakdown bar
 - Vulnerability summary table (ID, name, severity, CVSS, host)
 - Per-finding detail: description, impact, PoC evidence, remediation, CWE/OWASP reference
 - Appendix: tools used, methodology, assessment timeline
@@ -139,36 +160,44 @@ Output: `reports/example.com/vapt_report.html` + `vapt_report.md`
 
 ## Autonomous Agent Mode
 
-The `--autonomous` flag enables the ReAct agent (`agent.py`) which drives the entire assessment without manual intervention.
+The `--autonomous` flag activates the ReAct agent (`agent.py`) which drives the entire assessment without manual intervention — planning, choosing tools, analysing results, and pivoting to the next attack surface on its own.
 
 ```bash
-# Autonomous hunt with 4-hour budget
+# Autonomous hunt with a 4-hour budget
 python3 hunt.py --target example.com --autonomous --time 4
 
-# Watch live decisions
+# Watch live decisions as they happen
 tail -f recon/example.com/sessions/<session_id>/agent_trace.jsonl
 
-# Inject guidance mid-run without stopping
+# Inject operator guidance mid-run without stopping the agent
 python3 agent.py --bump recon/example.com/sessions/<session_id>/ \
-    "Focus on /api/v2/ endpoints, de-prioritize static assets"
+    "Focus on /api/v2/ endpoints — de-prioritize static assets"
 ```
 
-The agent uses Ollama (local LLM) for all analysis — no data leaves your machine.
+The agent operates in a tight loop: **Observe → Think (LLM) → Act (tool) → Observe**. Every decision is logged to `agent_trace.jsonl` for post-engagement review.
 
 ---
 
-## AI Analysis
+## Multi-Provider AI
 
-`brain.py` provides AI-powered triage using local Ollama models. Recommended models:
+`brain.py` supports four LLM backends. Set `BRAIN_PROVIDER` to force one, or let OBSIDIAN auto-detect in priority order: **Ollama → Claude → OpenAI → Grok**.
 
-| Role | Model | Size |
-|:-----|:------|:-----|
-| Deep analysis | `qwen3-coder:32b` | ~19 GB |
-| Fast triage | `baron-llm:latest` (BaronLLM, offensive security fine-tune) | 6.6 GB |
-| Fallback | `qwen2.5:14b` | ~9 GB |
+| Provider | Env var required | Example models |
+|:---------|:----------------|:---------------|
+| **Ollama** (local, default) | — | `qwen2.5:14b`, `qwen3-coder:32b` |
+| **Claude** (Anthropic) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6`, `claude-opus-4-6` |
+| **OpenAI** | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini` |
+| **Grok** (xAI) | `XAI_API_KEY` | `grok-2-latest`, `grok-3-mini` |
 
 ```bash
-ollama pull qwen2.5:14b   # minimum recommended
+# Run fully local — no API keys, no data leaves your machine
+ollama pull qwen2.5:14b
+python3 hunt.py --target example.com
+
+# Force Claude as the analysis engine
+export BRAIN_PROVIDER=claude
+export ANTHROPIC_API_KEY=sk-ant-...
+python3 hunt.py --target example.com
 ```
 
 ---
@@ -181,23 +210,27 @@ ollama pull qwen2.5:14b   # minimum recommended
 # macOS
 brew install go python3 node jq nmap
 
-# Linux (Debian/Ubuntu)
+# Debian/Ubuntu
 sudo apt install golang python3 nodejs jq nmap
 ```
 
-### Install tools
+### Install security tools
 
 ```bash
 chmod +x setup.sh && ./setup.sh
 ```
 
-Installs: `subfinder`, `httpx`, `dnsx`, `nuclei`, `katana`, `waybackurls`, `gau`, `dalfox`, `ffuf`, `anew`, `qsreplace`, `assetfinder`, `subzy`, `naabu`, `sqlmap`, `interactsh-client`, `trufflehog`, `gitleaks`, nuclei-templates.
+Installs: `subfinder`, `httpx`, `dnsx`, `nuclei`, `katana`, `waybackurls`, `gau`, `dalfox`,
+`ffuf`, `anew`, `qsreplace`, `assetfinder`, `subzy`, `naabu`, `sqlmap`, `interactsh-client`,
+`trufflehog`, `gitleaks`, nuclei-templates.
 
 ### Python dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
+
+See `requirements.txt` for LLM provider SDK details.
 
 ---
 
@@ -209,13 +242,13 @@ hunt.py — VAPT Orchestrator
 Target input:
   --target example.com          FQDN
   --target 192.168.1.100        Single IP
-  --target 10.0.0.0/24          CIDR range
+  --target 10.0.0.0/24          CIDR range (nmap ping sweep first)
 
 Scan modes:
   --quick                       Faster scan, fewer checks
   --full                        All checks including race conditions
   --autonomous                  AI-driven autonomous assessment
-  --scope-lock                  Test exact target only (no subdomains)
+  --scope-lock                  Test exact target only (no subdomain expansion)
 
 Selective phases:
   --recon-only                  Recon only
@@ -233,10 +266,10 @@ Selective phases:
 AI options:
   --no-brain                    Skip AI analysis (tools only)
   --brain-only                  AI analysis on existing recon data
-  --brain-next                  Ask AI: what's the highest-impact next action?
+  --brain-next                  Ask AI: what is the highest-impact next action?
 
 Reporting:
-  python3 reporter.py <findings_dir> [--client NAME] [--consultant NAME]
+  python3 reporter.py <findings_dir> [--client NAME] [--consultant NAME] [--title TITLE]
 
 Utilities:
   --repair-tools                Auto-install missing tools
@@ -252,7 +285,7 @@ Utilities:
 ```
 obsidian/
 ├── hunt.py              Main orchestrator
-├── brain.py             AI analysis engine (Ollama)
+├── brain.py             AI analysis engine (multi-provider LLM)
 ├── agent.py             Autonomous ReAct agent
 ├── recon.sh             Subdomain + URL discovery
 ├── scanner.sh           Vulnerability scanner
@@ -271,13 +304,15 @@ obsidian/
 ├── race.py              Race condition tester
 ├── payloads.py          Payload generator
 ├── probe.py             HTTP prober
-├── browser_recon.js     Browser-side recon
+├── browser_recon.js     Browser-side recon (Playwright)
 ├── evasion.py           WAF bypass helpers
 ├── zendesk_idor.py      Zendesk-specific IDOR
 ├── setup.sh             Tool installer
-├── procs.sh             Pipeline process monitor
 ├── sqli_verify.sh       SQLi verification
-├── skills/              Claude Code skill definitions
+├── procs.sh             Pipeline process monitor
+├── requirements.txt     Python dependencies
+├── config.example.json  Configuration template
+├── skills/              Skill definitions
 ├── wordlists/           Custom wordlists
 ├── recon/               Scan output (gitignored)
 ├── findings/            Validated findings (gitignored)
@@ -286,44 +321,94 @@ obsidian/
 
 ---
 
-## Multi-Provider AI
+## Configuration
 
-`brain.py` supports four LLM backends. Set `BRAIN_PROVIDER` to choose, or let OBSIDIAN auto-detect.
-
-| Provider | Env var | Example models |
-|:---------|:--------|:---------------|
-| **Ollama** (local, default) | — | `qwen2.5:14b`, `qwen3-coder:32b` |
-| **Claude** (Anthropic) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6`, `claude-opus-4-6` |
-| **OpenAI** | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini` |
-| **Grok** (xAI) | `XAI_API_KEY` | `grok-2-latest`, `grok-3-mini` |
+Copy and edit the example config:
 
 ```bash
-# Force a specific provider
-export BRAIN_PROVIDER=claude
-export ANTHROPIC_API_KEY=sk-ant-...
-python3 hunt.py --target example.com
-
-# Or use Ollama locally (no API key needed)
-ollama pull qwen2.5:14b
-python3 hunt.py --target example.com
+cp config.example.json config.json
 ```
+
+Key settings:
+
+```json
+{
+  "brain_provider": "ollama",
+  "ollama_model": "qwen2.5:14b",
+  "interactsh_token": "YOUR_INTERACTSH_TOKEN",
+  "rate_limit": 50,
+  "threads": 10,
+  "timeout": 30,
+  "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+}
+```
+
+---
+
+## Contributing
+
+PRs welcome. This tool was originally inspired by and built on top of [`shuvonsec/claude-bug-bounty`](https://github.com/shuvonsec/claude-bug-bounty) — the original AI-assisted bug bounty platform. Contributions that advance its mission are appreciated.
+
+**Good contributions:**
+
+- New vulnerability scanners or detection modules for `scanner.sh`
+- Payload additions to `skills/` and `wordlists/`
+- New agent tool definitions in `agent.py`
+- Report template improvements — better HTML, better Markdown
+- New AI provider support in `brain.py`
+- Real-world methodology improvements (with evidence from authorized engagements)
+- IP / network scanning improvements (better CIDR handling, IPv6)
+- Platform-specific modules (Jira, Confluence, GitLab, cloud consoles)
+
+**How to contribute:**
+
+```bash
+git checkout -b feature/your-contribution
+# ... make your changes ...
+git commit -m "Add: short description"
+git push origin feature/your-contribution
+```
+
+Then open a pull request describing what you added and why it's useful.
+
+**Commit message conventions:**
+
+| Prefix | Use for |
+|:-------|:--------|
+| `Add:` | New scanner, module, or feature |
+| `Fix:` | Bug fix |
+| `Improve:` | Enhancement to existing functionality |
+| `Refactor:` | Code cleanup, no behaviour change |
+| `Docs:` | README, comments, docs only |
 
 ---
 
 ## Legal
 
-**For authorized security testing only.** Only use this tool against systems you own or have explicit written authorization to test. Unauthorized use is illegal. The authors accept no liability for misuse.
+**For authorized security testing only.**
+
+Only use this tool against systems you own or have explicit written authorization to test. OBSIDIAN is designed for professional VAPT consultants working under signed engagement letters. Unauthorized use against systems you do not have permission to test is illegal in most jurisdictions.
+
+The authors accept no liability for misuse.
 
 ---
 
 ## Credits
 
-OBSIDIAN grew out of [claude-bug-bounty](https://github.com/YOUR_USERNAME/claude-bug-bounty) — an AI-assisted bug bounty automation project. The original recon pipeline, ReAct agent architecture, and brain.py AI analysis engine were built there and later extended into this professional VAPT platform.
+OBSIDIAN evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) by [@shuvonsec](https://github.com/shuvonsec) — an AI-assisted bug bounty automation framework that pioneered the recon pipeline, ReAct agent loop, and AI-driven analysis engine that form the core of this tool.
+
+The name is inspired by the **Obsidian Order** from *Star Trek: Deep Space Nine* — the Cardassian intelligence agency so thorough, so methodical, that no secret was safe and no target was invisible.
+
+Like the Order: thorough, relentless, and leaves no stone unturned.
+
+Unlike the Order: you control what it does.
 
 ---
 
 <div align="center">
 
 MIT License · Built for professional VAPT consultants
+
+*"In the end, the Order sees all."*
 
 </div>
