@@ -45,12 +45,20 @@ NC     = "\033[0m"
 OLLAMA_HOST       = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 # Same model priority list as brain.py
 OLLAMA_MODEL_LIST = [
-    "vapt-qwen25:latest",
-    "obsidian-custom:latest",
-    "vapt-model:latest",
-    "deepseek-r1:32b",
-    "qwen3:30b-a3b",
-    "qwen2.5-coder:32b",
+    "qwen3-coder-64k:latest",    # PRIMARY — 30.5B, 64K context
+    "vapt-qwen25:latest",        # custom 32B VAPT-tuned
+    "obsidian-custom:latest",    # custom 32B obsidian
+    "vapt-model:latest",         # custom 30B VAPT
+    "qwen3-coder:30b",           # coder 30B
+    "deepseek-r1:32b",           # strong reasoning
+    "qwen3:30b-a3b",             # MoE 30B
+    "qwen2.5-coder:32b",         # coder 32B
+    "qwen2.5:32b",               # general 32B
+    "deepseek-r1:14b",           # reasoning 14B
+    "qwen3:14b",                 # 14B fallback
+    "baron-llm:latest",          # BaronLLM 8B — offensive security fine-tune (fast)
+    "qwen3:8b",                  # 8B fallback
+    "mistral:7b-instruct-v0.3-q8_0",  # 7B last resort
 ]
 TASK_TIMEOUT = int(os.environ.get("BROWSER_TASK_TIMEOUT", "120"))
 
@@ -153,10 +161,12 @@ class BrowserAgent:
         findings_dir: str | Path,
         headed: bool = False,
         model_override: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.target = target
         self.findings_dir = Path(findings_dir)
         self.headed = headed
+        self.session_id = session_id
         self.llm = init_browser_llm(model_override=model_override)
 
     def is_ready(self) -> bool:
