@@ -19,7 +19,7 @@ Usage (standalone):
 """
 from __future__ import annotations
 
-import asyncio
+import asyncio  # pre-declared for async task execution in BrowserAgent (Tasks 2-3)
 import os
 import sys
 from datetime import datetime
@@ -44,7 +44,7 @@ NC     = "\033[0m"
 
 OLLAMA_HOST       = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 # Same model priority list as brain.py
-OLLAMA_MODEL_LIST = [
+MODEL_PRIORITY = [
     "qwen3-coder-64k:latest",    # PRIMARY — 30.5B, 64K context
     "vapt-qwen25:latest",        # custom 32B VAPT-tuned
     "obsidian-custom:latest",    # custom 32B obsidian
@@ -116,7 +116,7 @@ def _try_ollama(model_override: str | None):
         available = {m["model"] for m in client.list().get("models", [])}
         model = model_override
         if not model:
-            for m in OLLAMA_MODEL_LIST:
+            for m in MODEL_PRIORITY:
                 if m in available:
                     model = m
                     break
@@ -126,7 +126,8 @@ def _try_ollama(model_override: str | None):
             return None
         _log("info", f"Browser LLM: Ollama ({model})")
         return ChatOllama(model=model, base_url=OLLAMA_HOST)
-    except Exception:
+    except Exception as exc:
+        _log("warn", f"Ollama unavailable: {exc}")
         return None
 
 
@@ -142,7 +143,8 @@ def _try_claude(model_override: str | None):
     except ImportError:
         _log("warn", "langchain-anthropic not installed — pip install langchain-anthropic")
         return None
-    except Exception:
+    except Exception as exc:
+        _log("warn", f"Claude LLM unavailable: {exc}")
         return None
 
 
