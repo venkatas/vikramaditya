@@ -150,11 +150,10 @@ def _try_claude(model_override: str | None):
 
 class BrowserAgent:
     """
-    Placeholder class for the autonomous browser-based vulnerability validator.
+    Orchestrates browser-based validation tasks against a single target.
 
-    Full implementation (task execution, finding extraction, report integration)
-    is added in subsequent tasks. This scaffold satisfies the import contract
-    required by tests/test_browser_agent.py.
+    The findings directory should be the resolved per-session path so browser
+    artifacts land alongside the rest of the pipeline outputs.
     """
 
     def __init__(
@@ -165,25 +164,278 @@ class BrowserAgent:
         model_override: str | None = None,
         session_id: str | None = None,
     ) -> None:
-        self.target = target
+        self.target = target.rstrip("/")
         self.findings_dir = Path(findings_dir)
         self.headed = headed
+        self.model_override = model_override
         self.session_id = session_id
-        self.llm = init_browser_llm(model_override=model_override)
+        self.llm = None
+        (self.findings_dir / "browser" / "screenshots").mkdir(parents=True, exist_ok=True)
+
+    def _init_llm(self) -> bool:
+        self.llm = init_browser_llm(model_override=self.model_override)
+        return self.llm is not None
 
     def is_ready(self) -> bool:
         """Return True only when browser-use is installed and an LLM is available."""
-        return _browser_use_ok and self.llm is not None
+        if not _browser_use_ok:
+            return False
+        if self.llm is None:
+            return self._init_llm()
+        return True
+
+    def _load_dalfox_candidates(self) -> list[str]:
+        dalfox_file = self.findings_dir / "xss" / "dalfox_results.txt"
+        if not dalfox_file.is_file():
+            return []
+
+        lines: list[str] = []
+        try:
+            with open(dalfox_file, errors="ignore") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if line and not line.startswith("#"):
+                        lines.append(line)
+        except OSError:
+            return []
+        return lines[:20]
+
+    def _write_finding(self, task: "BrowserTask", result_text: str) -> int:
+        """Write confirmed finding lines to the task output file."""
+        out_file = Path(task.output_file())
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        lines_written = 0
+        with open(out_file, "a", encoding="utf-8") as fh:
+            for raw in result_text.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("http") and f"[{task.vtype}]" in line:
+                    fh.write(line + "\n")
+                    lines_written += 1
+        return lines_written
+
+    async def _run_task(self, task: "BrowserTask") -> int:
+        if not _browser_use_ok:
+            _log("warn", "browser-use not installed — skipping browser task")
+            return 0
+        if self.llm is None and not self._init_llm():
+            _log("warn", "No LLM available — skipping browser task")
+            return 0
+
+        _log("info", f"Browser task: {task.__class__.__name__} -> {self.target}")
+        cfg = BrowserConfig(headless=not self.headed)
+        browser = Browser(config=cfg)
+        try:
+            agent = BUAgent(task=task.prompt, llm=self.llm, browser=browser)
+            result = await asyncio.wait_for(agent.run(), timeout=TASK_TIMEOUT)
+            count = self._write_finding(task, str(result))
+            if count:
+                _log("ok", f"{task.__class__.__name__}: {count} finding(s)")
+            return count
+        except asyncio.TimeoutError:
+            _log("warn", f"{task.__class__.__name__} timed out after {TASK_TIMEOUT}s")
+            return 0
+        except Exception as exc:
+            _log("err", f"{task.__class__.__name__} failed: {exc}")
+            return 0
+        finally:
+            try:
+                maybe_close = browser.close()
+                if asyncio.iscoroutine(maybe_close):
+                    await maybe_close
+            except Exception:
+                pass
+
+    async def _run_all_tasks(self, tasks: list["BrowserTask"]) -> dict[str, int]:
+        """Run all tasks inside a single event loop to avoid loop teardown issues."""
+        results: dict[str, int] = {}
+        for task in tasks:
+            name = task.__class__.__name__
+            try:
+                results[name] = await self._run_task(task)
+            except Exception as exc:
+                _log("err", f"Task {name} crashed: {exc}")
+                results[name] = 0
+        return results
+
+    def run(self) -> dict[str, int]:
+        """Run all configured browser tasks and return finding counts per task."""
+        if not _browser_use_ok:
+            _log(
+                "warn",
+                "browser-use not installed. Run: "
+                "pip install 'browser-use>=0.1.40' playwright langchain-anthropic "
+                "&& playwright install chromium",
+            )
+            return {}
+
+        if not self._init_llm():
+            _log("warn", "No LLM available for browser phase — skipping")
+            return {}
+
+        target_url = self.target if self.target.startswith("http") else f"https://{self.target}"
+        dalfox_candidates = self._load_dalfox_candidates()
+
+        tasks: list[BrowserTask] = [
+            XSSDOMTask(target_url, str(self.findings_dir)),
+            CSRFTask(target_url, str(self.findings_dir)),
+            AuthBypassTask(target_url, str(self.findings_dir)),
+            OpenRedirectTask(target_url, str(self.findings_dir)),
+            FormDiscoveryTask(target_url, str(self.findings_dir)),
+        ]
+        if dalfox_candidates:
+            tasks.insert(
+                1,
+                XSSReflectedBrowserTask(
+                    target_url,
+                    str(self.findings_dir),
+                    candidates=dalfox_candidates,
+                ),
+            )
+
+        results = asyncio.run(self._run_all_tasks(tasks))
+        total = sum(results.values())
+        _log("ok" if total else "info", f"Browser phase complete — {total} finding(s)")
+        return results
+
+
+class BrowserTask:
+    """Base class for a single browser-based security validation task."""
+    vtype:    str = "misconfig"
+    severity: str = "medium"
+
+    def __init__(self, target_url: str, findings_dir: str):
+        self.target_url   = target_url.rstrip("/")
+        self.findings_dir = findings_dir
+        self.prompt       = self._build_prompt()
+
+    def _build_prompt(self) -> str:
+        raise NotImplementedError
+
+    def output_file(self) -> str:
+        return os.path.join(self.findings_dir, "browser", self.vtype, f"{self.vtype}.txt")
+
+
+class XSSDOMTask(BrowserTask):
+    vtype    = "xss_dom"
+    severity = "high"
+
+    def _build_prompt(self) -> str:
+        return (
+            f"Navigate to {self.target_url}. "
+            "After the page fully loads, inspect the JavaScript source for dangerous DOM sinks: "
+            "document.write(), innerHTML, outerHTML, insertAdjacentHTML, eval(), setTimeout() with string args. "
+            "For each sink found, determine whether user-controlled input (URL fragment, query parameter, "
+            "postMessage, localStorage) reaches it without sanitisation. "
+            "If you find a reachable sink, craft a PoC payload and confirm it executes. "
+            "Return one finding per vulnerable URL in this EXACT format (no other text): "
+            "URL [xss_dom] [high] DESCRIPTION"
+        )
+
+
+class XSSReflectedBrowserTask(BrowserTask):
+    vtype    = "xss_dom"
+    severity = "high"
+
+    def __init__(self, target_url: str, findings_dir: str, candidates: list[str] | None = None):
+        self.candidates = candidates or []
+        super().__init__(target_url, findings_dir)
+
+    def _build_prompt(self) -> str:
+        candidate_block = "\n".join(self.candidates[:10]) if self.candidates else self.target_url
+        return (
+            "You are validating reflected XSS candidates in a real browser. "
+            "For each URL below, navigate to it, wait for the page to render, then check "
+            "whether the injected payload appears and EXECUTES in the live DOM "
+            "(alert fires, console error, DOM mutation — not just present in raw HTML). "
+            f"URLs to test:\n{candidate_block}\n"
+            "Return one confirmed finding per URL in this EXACT format (no other text): "
+            "URL [xss_dom] [high] DESCRIPTION"
+        )
+
+
+class CSRFTask(BrowserTask):
+    vtype    = "csrf"
+    severity = "medium"
+
+    def _build_prompt(self) -> str:
+        return (
+            f"Navigate to {self.target_url}. "
+            "Find all forms that perform state-changing actions (POST, PUT, DELETE). "
+            "For each form check: "
+            "1) Is a CSRF token present as a hidden field or request header? "
+            "2) Is the SameSite cookie attribute set to Strict or Lax on session cookies? "
+            "3) Does the form submit succeed if you remove or change the CSRF token value? "
+            "Report any form missing CSRF protection in this EXACT format (no other text): "
+            "URL [csrf] [medium] DESCRIPTION"
+        )
+
+
+class AuthBypassTask(BrowserTask):
+    vtype    = "auth_bypass"
+    severity = "high"
+
+    def _build_prompt(self) -> str:
+        return (
+            f"Navigate to {self.target_url}. "
+            "This is an authorised penetration test. "
+            "Try to access protected routes without authentication: "
+            "/admin, /dashboard, /settings, /api/admin, /manage, /internal. "
+            "Also try JS-rendered login forms with default credentials: "
+            "admin/admin, admin/password, admin/123456, test/test. "
+            "Note any route that loads protected content without requiring login. "
+            "Report each bypass in this EXACT format (no other text): "
+            "URL [auth_bypass] [high] DESCRIPTION"
+        )
+
+
+class OpenRedirectTask(BrowserTask):
+    vtype    = "open_redirect"
+    severity = "medium"
+
+    def _build_prompt(self) -> str:
+        return (
+            f"Navigate to {self.target_url}. "
+            "Find all URL parameters that look like redirect targets: "
+            "?url=, ?redirect=, ?next=, ?return=, ?goto=, ?dest=, ?target=. "
+            "For each one, replace the value with https://evil.example.com and follow the redirect. "
+            "If the browser ends up at evil.example.com (JS or HTTP redirect), it is vulnerable. "
+            "Report each open redirect in this EXACT format (no other text): "
+            "URL [open_redirect] [medium] DESCRIPTION"
+        )
+
+
+class FormDiscoveryTask(BrowserTask):
+    """
+    Discovers JS-rendered forms invisible to static crawlers.
+    Output format: PAGE_URL FORM_ACTION_URL (one per line, no brackets).
+    This file is NOT loaded by reporter.py — it is a feed-forward artifact
+    for future scanner phases (e.g. passed back into scanner.sh URL lists).
+    """
+    vtype    = "form_discovery"
+    severity = "info"
+
+    def _build_prompt(self) -> str:
+        return (
+            f"Navigate to {self.target_url}. "
+            "Wait for all JavaScript to execute and dynamic content to load. "
+            "List every form and input field rendered dynamically by JavaScript "
+            "(i.e. NOT present in the initial HTML source). "
+            "For each, output exactly: PAGE_URL FORM_ACTION_URL"
+        )
+
+    def output_file(self) -> str:
+        return os.path.join(self.findings_dir, "browser", "form_discovery.txt")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="OBSIDIAN browser agent — real-browser vuln validation"
-    )
-    parser.add_argument("--target", required=True, help="Target FQDN or IP")
-    parser.add_argument("--findings-dir", required=True, help="Session findings directory")
+    parser = argparse.ArgumentParser(description="OBSIDIAN browser agent — real-browser vuln validation")
+    parser.add_argument("--target", required=True, help="Target URL or domain")
+    parser.add_argument("--findings-dir", required=True, help="Per-session findings directory")
     parser.add_argument("--headed", action="store_true", help="Show browser window")
     parser.add_argument("--model", default=None, help="LLM model override")
     args = parser.parse_args()
@@ -194,7 +446,5 @@ if __name__ == "__main__":
         headed=args.headed,
         model_override=args.model,
     )
-    if not agent.is_ready():
-        _log("warn", "browser_agent not ready — install: pip install 'browser-use>=0.1.40' playwright langchain-anthropic")
-        sys.exit(1)
-    _log("info", f"BrowserAgent initialised for {args.target}")
+    results = agent.run()
+    sys.exit(0 if results else 1)

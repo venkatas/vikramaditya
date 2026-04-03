@@ -4,7 +4,7 @@ from __future__ import annotations
 """
 VAPT Orchestrator v4
 Chains: recon → tech-CVE → JS analysis → secret hunt → param discovery →
-        API fuzz → CORS check → vuln scan → OOB → brain analysis → VAPT reports
+        API fuzz → CORS check → vuln scan → browser scan → OOB → brain analysis → VAPT reports
 
 Usage:
     python3 hunt.py --target example.com          Focused high-yield pipeline (SQLi/RCE/CMS/CVEs)
@@ -22,6 +22,7 @@ Usage:
     python3 hunt.py --target x --rce-scan         RCE: Log4Shell OOB + CVE-2017-12615 Tomcat PUT + JBoss admin
     python3 hunt.py --target x --sqlmap           sqlmap on SQLi candidates
     python3 hunt.py --target x --jwt-audit        JWT audit: alg=none, crack, RS256→HS256
+    python3 hunt.py --target x --browser-scan     Real-browser validation phase
     python3 hunt.py --target x --skip xss         Skip XSS inside the focused/full vuln scan
     python3 hunt.py --target x --semgrep PATH     Semgrep static analysis on source dir
     python3 hunt.py --oob-setup                   Show interactsh OOB token for blind tests
@@ -192,6 +193,7 @@ TOOL_REGISTRY = [
     # ── Auth testing ────────────────────────────────────────────────────────
     ("jwt_tool",          f"{HOME}/jwt_tool/jwt_tool.py",               "git clone https://github.com/ticarpi/jwt_tool.git ~/jwt_tool"),
     # ── JS-rendered form extraction ──────────────────────────────────────────
+    ("browser-use",       "playwright",                                 'pip install "browser-use>=0.1.40" playwright langchain-anthropic && playwright install chromium'),
     ("lightpanda",        f"{TOOLS_DIR}/lightpanda/lightpanda",          "see _install_lightpanda()"),
 ]
 
@@ -209,6 +211,7 @@ SKIP_ALIASES = {
     "rce": "rce_scan",
     "jwt": "jwt_audit",
     "cve": "cve_hunt",
+    "browser": "browser_scan",
     "report": "reports",
 }
 
@@ -5033,6 +5036,53 @@ def generate_reports(domain: str) -> int:
     return 0
 
 
+def run_browser_scan(
+    domain: str,
+    findings_dir: str,
+    headed: bool = False,
+    model_override: str | None = None,
+    session_id: str | None = None,
+) -> bool:
+    """Run the optional real-browser validation phase safely."""
+    phase_name = "BROWSER SCAN"
+    if _brain and _brain.enabled:
+        _brain.phase_start(
+            phase_name,
+            f"target={domain} headed={headed} session={session_id or 'legacy'}",
+        )
+
+    try:
+        from browser_agent import BrowserAgent
+    except ImportError:
+        log("warn", "browser_agent.py not found — skipping browser phase")
+        _brain_phase_complete(phase_name, False, detail=f"target={domain} import_error")
+        return False
+
+    log("phase", f"BROWSER SCAN: {domain}")
+    try:
+        agent = BrowserAgent(
+            target=domain,
+            findings_dir=findings_dir,
+            headed=headed,
+            model_override=model_override,
+            session_id=session_id,
+        )
+        results = agent.run()
+        total = sum(results.values()) if results else 0
+        log("ok" if total else "info", f"Browser scan complete: {total} finding(s)")
+        _brain_phase_complete(
+            phase_name,
+            bool(results),
+            detail=f"target={domain} headed={headed} findings={total}",
+            artifacts={"findings": findings_dir},
+        )
+        return bool(results)
+    except Exception as exc:
+        log("err", f"Browser scan failed: {exc}")
+        _brain_phase_complete(phase_name, False, detail=f"target={domain} error={exc}")
+        return False
+
+
 def run_cve_hunt(domain: str) -> bool:
     log("info", f"CVE hunt: {domain}")
     script    = os.path.join(SCRIPT_DIR, "cve.py")
@@ -5205,6 +5255,9 @@ def hunt_target(
     skip_scan: bool = False,
     scope_lock: bool = False,
     max_urls: int = 100,
+    browser_scan: bool = False,
+    browser_headed: bool = False,
+    browser_model: str | None = None,
 ) -> dict:
     skip_items = skip_items or set()
     result = {
@@ -5223,6 +5276,7 @@ def hunt_target(
         "rce_scan":          False,
         "sqlmap":            False,
         "jwt_audit":         False,
+        "browser_scan":      False,
         "session_id":        None,
         "recon_dir":         "",
         "findings_dir":      "",
@@ -5232,7 +5286,7 @@ def hunt_target(
     explicit_phase_selection = any((
         js_scan, param_discover, api_fuzz, secret_hunt, cors_check,
         cms_exploit, rce_scan, sqlmap_scan, jwt_audit, cve_hunt, zero_day,
-        post_param_discover,
+        post_param_discover, browser_scan,
     ))
     selected_only_mode = explicit_phase_selection and not full and not (recon_only or scan_only or prioritize_only)
 
@@ -5240,11 +5294,11 @@ def hunt_target(
     if full:
         js_scan = param_discover = api_fuzz = secret_hunt = cors_check = True
         cve_hunt = cms_exploit = rce_scan = sqlmap_scan = jwt_audit = True
-        post_param_discover = True
+        post_param_discover = browser_scan = True
     elif not any((
         js_scan, param_discover, api_fuzz, secret_hunt, cors_check,
         cms_exploit, rce_scan, sqlmap_scan, jwt_audit, cve_hunt, zero_day,
-        post_param_discover,
+        post_param_discover, browser_scan,
     )) and not (recon_only or scan_only or prioritize_only):
         cms_exploit = True
         rce_scan = True
@@ -5368,6 +5422,20 @@ def hunt_target(
     if jwt_audit and not skip_has(skip_items, "jwt_audit"):
         result["jwt_audit"] = run_jwt_audit(domain)
 
+    # ── Phase 11: Browser Scan (real-browser validation) ───────────────────
+    findings_dir_early = (
+        result.get("findings_dir")
+        or _resolve_findings_dir(domain, session_id=result.get("session_id"), create=True)
+    )
+    if browser_scan and not skip_has(skip_items, "browser_scan", "browser"):
+        result["browser_scan"] = run_browser_scan(
+            domain,
+            findings_dir=findings_dir_early,
+            headed=browser_headed,
+            model_override=browser_model,
+            session_id=result.get("session_id"),
+        )
+
     # Brain: post-scan hook — interpret + chains + triage + exploit + report
     findings_dir = result.get("findings_dir") or _resolve_findings_dir(domain, session_id=result.get("session_id"), create=True)
     recon_dir = result.get("recon_dir") or _resolve_recon_dir(domain, session_id=resume_session_id)
@@ -5422,6 +5490,7 @@ def print_dashboard(results: list) -> None:
         if r.get("rce_scan"):        phases.append(f"{RED}RCE✓{NC}")
         if r.get("sqlmap"):          phases.append(f"{RED}SQLi✓{NC}")
         if r.get("jwt_audit"):       phases.append(f"{YELLOW}JWT✓{NC}")
+        if r.get("browser_scan"):    phases.append(f"{CYAN}Browser✓{NC}")
         if phases:
             print(f"       Phases : {' | '.join(phases)}")
         print(f"       Reports: {r.get('reports', 0)}")
@@ -5534,6 +5603,7 @@ Examples:
   python3 hunt.py --target example.com --rce-scan   Log4Shell OOB + CVE-2017-12615 Tomcat PUT + JBoss admin
   python3 hunt.py --target example.com --sqlmap      sqlmap on all SQLi candidates
   python3 hunt.py --target example.com --jwt-audit   jwt_tool: alg=none, crack, RS256→HS256
+  python3 hunt.py --target example.com --browser-scan Real-browser validation phase
   python3 hunt.py --target example.com --skip xss,sqli,cors
   python3 hunt.py --semgrep /path/to/source --target example.com
   python3 hunt.py --oob-setup                       Show OOB interactsh setup
@@ -5596,6 +5666,12 @@ Examples:
                         help="sqlmap on SQLi candidates (level=3, risk=2)")
     parser.add_argument("--jwt-audit",        action="store_true",
                         help="jwt_tool: alg=none, secret crack, RS256→HS256 confusion")
+    parser.add_argument("--browser-scan",     action="store_true",
+                        help="Real-browser vuln validation: DOM XSS, CSRF, auth bypass, open redirect")
+    parser.add_argument("--browser-headed",   action="store_true",
+                        help="Show browser window during --browser-scan (default: headless)")
+    parser.add_argument("--browser-model",    type=str, default=None, metavar="MODEL",
+                        help="Override LLM model for browser agent (default: auto-detect)")
     parser.add_argument("--scope-lock",       action="store_true",
                         help="Scope-lock: skip subdomain enumeration entirely — test only the exact --target given (no assetfinder/subfinder/amass/crt.sh)")
     parser.add_argument("--max-urls",         type=int, default=100, metavar="N",
@@ -5888,6 +5964,9 @@ Examples:
                 full=args.full,
                 scope_lock=args.scope_lock,
                 max_urls=args.max_urls,
+                browser_scan=args.browser_scan,
+                browser_headed=args.browser_headed,
+                browser_model=args.browser_model,
             )
         print_dashboard([result])
         return
@@ -5917,6 +5996,9 @@ Examples:
             resume_session_id=resume_session_id,
             batch_size=args.batch_size,
             full=args.full,
+            browser_scan=args.browser_scan if hasattr(args, "browser_scan") else False,
+            browser_headed=args.browser_headed if hasattr(args, "browser_headed") else False,
+            browser_model=args.browser_model if hasattr(args, "browser_model") else None,
         )
         results.append(result)
 
