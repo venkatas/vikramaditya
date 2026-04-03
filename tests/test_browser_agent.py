@@ -71,6 +71,12 @@ def test_task_has_required_attrs():
     assert "example.com" in task.prompt
     assert task.output_file().endswith("browser/xss_dom/xss_dom.txt")
 
+def test_task_prompt_keeps_scope_instructions():
+    import browser_agent
+    task = browser_agent.OpenRedirectTask("https://target.test/base", "/tmp/findings")
+    assert "authorised target origin https://target.test" in task.prompt
+    assert "Do not substitute placeholder domains such as example.com or iana.org." in task.prompt
+
 def test_xss_reflected_task_accepts_candidates():
     import browser_agent
     candidates = ["https://example.com/search?q=test", "https://example.com/q=x"]
@@ -128,3 +134,32 @@ def test_browser_agent_allows_unsafe_tasks_with_opt_in(tmp_path):
     )
     assert agent._task_allowed(browser_agent.CSRFTask("https://example.com", str(tmp_path))) is True
     assert agent._task_allowed(browser_agent.AuthBypassTask("https://example.com", str(tmp_path))) is True
+
+def test_browser_agent_prefers_raw_mode_for_ollama(tmp_path):
+    import browser_agent
+    agent = browser_agent.BrowserAgent(
+        target="https://example.com",
+        findings_dir=tmp_path,
+        session_id=None,
+    )
+    agent.llm = type("ChatOllama", (), {})()
+    task = browser_agent.XSSDOMTask("https://example.com", str(tmp_path))
+    assert agent._browser_use_kwargs(task) == {
+        "initial_actions": [{"go_to_url": {"url": "https://example.com"}}],
+        "tool_calling_method": "raw",
+    }
+
+def test_browser_agent_allows_tool_calling_override(tmp_path, monkeypatch):
+    import browser_agent
+    agent = browser_agent.BrowserAgent(
+        target="https://example.com",
+        findings_dir=tmp_path,
+        session_id=None,
+    )
+    agent.llm = object()
+    monkeypatch.setenv("BROWSER_TOOL_CALLING_METHOD", "json_mode")
+    task = browser_agent.XSSDOMTask("https://example.com", str(tmp_path))
+    assert agent._browser_use_kwargs(task) == {
+        "initial_actions": [{"go_to_url": {"url": "https://example.com"}}],
+        "tool_calling_method": "json_mode",
+    }

@@ -24,6 +24,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from request_guard import SafeMethodPolicy
 
@@ -239,6 +240,25 @@ class BrowserAgent:
         )
         return False
 
+    def _browser_use_kwargs(self, task: "BrowserTask | None" = None) -> dict[str, object]:
+        """Tune browser-use settings for the active LLM backend."""
+        kwargs: dict[str, object] = {}
+
+        if task is not None and task.target_url.startswith(("http://", "https://")):
+            kwargs["initial_actions"] = [{"go_to_url": {"url": task.target_url}}]
+
+        configured = os.environ.get("BROWSER_TOOL_CALLING_METHOD", "").strip().lower()
+        if configured in {"function_calling", "json_mode", "raw"}:
+            kwargs["tool_calling_method"] = configured
+            return kwargs
+
+        if self.llm is not None and self.llm.__class__.__name__ == "ChatOllama":
+            # Ollama models often fail browser-use's default structured-output path
+            # with "does not support tools". Raw mode keeps the run usable.
+            kwargs["tool_calling_method"] = "raw"
+
+        return kwargs
+
     async def _run_task(self, task: "BrowserTask") -> int:
         if not _browser_use_ok:
             _log("warn", "browser-use not installed — skipping browser task")
@@ -251,7 +271,12 @@ class BrowserAgent:
         cfg = BrowserConfig(headless=not self.headed)
         browser = Browser(config=cfg)
         try:
-            agent = BUAgent(task=task.prompt, llm=self.llm, browser=browser)
+            agent = BUAgent(
+                task=task.prompt,
+                llm=self.llm,
+                browser=browser,
+                **self._browser_use_kwargs(task),
+            )
             result = await asyncio.wait_for(agent.run(), timeout=TASK_TIMEOUT)
             count = self._write_finding(task, str(result))
             if count:
@@ -338,6 +363,19 @@ class BrowserTask:
         self.findings_dir = findings_dir
         self.prompt       = self._build_prompt()
 
+    def _scope_prefix(self) -> str:
+        parts = urlsplit(self.target_url)
+        origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else self.target_url
+        return (
+            f"Stay within the authorised target origin {origin}. "
+            f"Begin at {self.target_url}. "
+            "Do not substitute placeholder domains such as example.com or iana.org. "
+            "Only leave the target origin when the specific test explicitly requires following a redirect destination. "
+        )
+
+    def _scoped(self, instructions: str) -> str:
+        return self._scope_prefix() + instructions
+
     def _build_prompt(self) -> str:
         raise NotImplementedError
 
@@ -350,7 +388,7 @@ class XSSDOMTask(BrowserTask):
     severity = "high"
 
     def _build_prompt(self) -> str:
-        return (
+        return self._scoped(
             f"Navigate to {self.target_url}. "
             "After the page fully loads, inspect the JavaScript source for dangerous DOM sinks: "
             "document.write(), innerHTML, outerHTML, insertAdjacentHTML, eval(), setTimeout() with string args. "
@@ -372,7 +410,7 @@ class XSSReflectedBrowserTask(BrowserTask):
 
     def _build_prompt(self) -> str:
         candidate_block = "\n".join(self.candidates[:10]) if self.candidates else self.target_url
-        return (
+        return self._scoped(
             "You are validating reflected XSS candidates in a real browser. "
             "For each URL below, navigate to it, wait for the page to render, then check "
             "whether the injected payload appears and EXECUTES in the live DOM "
@@ -389,7 +427,7 @@ class CSRFTask(BrowserTask):
     required_method = "POST"
 
     def _build_prompt(self) -> str:
-        return (
+        return self._scoped(
             f"Navigate to {self.target_url}. "
             "Find all forms that perform state-changing actions (POST, PUT, DELETE). "
             "For each form check: "
@@ -407,7 +445,7 @@ class AuthBypassTask(BrowserTask):
     required_method = "POST"
 
     def _build_prompt(self) -> str:
-        return (
+        return self._scoped(
             f"Navigate to {self.target_url}. "
             "This is an authorised penetration test. "
             "Try to access protected routes without authentication: "
@@ -425,7 +463,7 @@ class OpenRedirectTask(BrowserTask):
     severity = "medium"
 
     def _build_prompt(self) -> str:
-        return (
+        return self._scoped(
             f"Navigate to {self.target_url}. "
             "Find all URL parameters that look like redirect targets: "
             "?url=, ?redirect=, ?next=, ?return=, ?goto=, ?dest=, ?target=. "
@@ -447,7 +485,7 @@ class FormDiscoveryTask(BrowserTask):
     severity = "info"
 
     def _build_prompt(self) -> str:
-        return (
+        return self._scoped(
             f"Navigate to {self.target_url}. "
             "Wait for all JavaScript to execute and dynamic content to load. "
             "List every form and input field rendered dynamically by JavaScript "
