@@ -25,6 +25,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from request_guard import SafeMethodPolicy
+
 # ── Optional heavy deps ────────────────────────────────────────────────────────
 try:
     from browser_use import Agent as BUAgent, Browser, BrowserConfig
@@ -163,12 +165,16 @@ class BrowserAgent:
         headed: bool = False,
         model_override: str | None = None,
         session_id: str | None = None,
+        allow_unsafe: bool = False,
     ) -> None:
         self.target = target.rstrip("/")
         self.findings_dir = Path(findings_dir)
         self.headed = headed
         self.model_override = model_override
         self.session_id = session_id
+        env_allow_unsafe = os.environ.get("ALLOW_UNSAFE_BROWSER_TASKS", "").lower()
+        self.allow_unsafe = allow_unsafe or env_allow_unsafe in {"1", "true", "yes", "on"}
+        self.method_policy = SafeMethodPolicy()
         self.llm = None
         (self.findings_dir / "browser" / "screenshots").mkdir(parents=True, exist_ok=True)
 
@@ -216,6 +222,23 @@ class BrowserAgent:
                     lines_written += 1
         return lines_written
 
+    def _task_allowed(self, task: "BrowserTask") -> bool:
+        decision = self.method_policy.check(task.required_method, self.target)
+        if decision["decision"] == "allow":
+            return True
+        if self.allow_unsafe:
+            _log(
+                "warn",
+                f"{task.__class__.__name__} uses {task.required_method}; proceeding because unsafe browser tasks are enabled",
+            )
+            return True
+        _log(
+            "warn",
+            f"Skipping {task.__class__.__name__}: {decision['reason']}. "
+            "Re-run with --browser-unsafe or ALLOW_UNSAFE_BROWSER_TASKS=1 to opt in.",
+        )
+        return False
+
     async def _run_task(self, task: "BrowserTask") -> int:
         if not _browser_use_ok:
             _log("warn", "browser-use not installed — skipping browser task")
@@ -253,6 +276,9 @@ class BrowserAgent:
         results: dict[str, int] = {}
         for task in tasks:
             name = task.__class__.__name__
+            if not self._task_allowed(task):
+                results[name] = 0
+                continue
             try:
                 results[name] = await self._run_task(task)
             except Exception as exc:
@@ -305,6 +331,7 @@ class BrowserTask:
     """Base class for a single browser-based security validation task."""
     vtype:    str = "misconfig"
     severity: str = "medium"
+    required_method: str = "GET"
 
     def __init__(self, target_url: str, findings_dir: str):
         self.target_url   = target_url.rstrip("/")
@@ -359,6 +386,7 @@ class XSSReflectedBrowserTask(BrowserTask):
 class CSRFTask(BrowserTask):
     vtype    = "csrf"
     severity = "medium"
+    required_method = "POST"
 
     def _build_prompt(self) -> str:
         return (
@@ -376,6 +404,7 @@ class CSRFTask(BrowserTask):
 class AuthBypassTask(BrowserTask):
     vtype    = "auth_bypass"
     severity = "high"
+    required_method = "POST"
 
     def _build_prompt(self) -> str:
         return (
@@ -438,6 +467,8 @@ if __name__ == "__main__":
     parser.add_argument("--findings-dir", required=True, help="Per-session findings directory")
     parser.add_argument("--headed", action="store_true", help="Show browser window")
     parser.add_argument("--model", default=None, help="LLM model override")
+    parser.add_argument("--allow-unsafe", action="store_true",
+                        help="Allow browser tasks that may submit forms or use credentials")
     args = parser.parse_args()
 
     agent = BrowserAgent(
@@ -445,6 +476,7 @@ if __name__ == "__main__":
         findings_dir=args.findings_dir,
         headed=args.headed,
         model_override=args.model,
+        allow_unsafe=args.allow_unsafe,
     )
     results = agent.run()
     sys.exit(0 if results else 1)

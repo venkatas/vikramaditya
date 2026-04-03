@@ -67,6 +67,7 @@ def test_task_has_required_attrs():
     assert hasattr(task, "prompt")
     assert hasattr(task, "vtype")
     assert hasattr(task, "severity")
+    assert hasattr(task, "required_method")
     assert "example.com" in task.prompt
     assert task.output_file().endswith("browser/xss_dom/xss_dom.txt")
 
@@ -105,3 +106,25 @@ def test_reporter_parses_lowercase_bracket_severity():
         "xss_dom",
     )
     assert finding["severity"] == "high"
+
+def test_browser_agent_blocks_unsafe_tasks_by_default(tmp_path):
+    import browser_agent
+    agent = browser_agent.BrowserAgent(
+        target="https://example.com",
+        findings_dir=tmp_path,
+        session_id=None,
+    )
+    assert agent._task_allowed(browser_agent.XSSDOMTask("https://example.com", str(tmp_path))) is True
+    assert agent._task_allowed(browser_agent.CSRFTask("https://example.com", str(tmp_path))) is False
+    assert agent._task_allowed(browser_agent.AuthBypassTask("https://example.com", str(tmp_path))) is False
+
+def test_browser_agent_allows_unsafe_tasks_with_opt_in(tmp_path):
+    import browser_agent
+    agent = browser_agent.BrowserAgent(
+        target="https://example.com",
+        findings_dir=tmp_path,
+        session_id=None,
+        allow_unsafe=True,
+    )
+    assert agent._task_allowed(browser_agent.CSRFTask("https://example.com", str(tmp_path))) is True
+    assert agent._task_allowed(browser_agent.AuthBypassTask("https://example.com", str(tmp_path))) is True

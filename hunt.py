@@ -5042,6 +5042,7 @@ def run_browser_scan(
     headed: bool = False,
     model_override: str | None = None,
     session_id: str | None = None,
+    allow_unsafe: bool = False,
 ) -> bool:
     """Run the optional real-browser validation phase safely."""
     phase_name = "BROWSER SCAN"
@@ -5066,6 +5067,7 @@ def run_browser_scan(
             headed=headed,
             model_override=model_override,
             session_id=session_id,
+            allow_unsafe=allow_unsafe,
         )
         results = agent.run()
         total = sum(results.values()) if results else 0
@@ -5258,6 +5260,7 @@ def hunt_target(
     browser_scan: bool = False,
     browser_headed: bool = False,
     browser_model: str | None = None,
+    browser_unsafe: bool = False,
 ) -> dict:
     skip_items = skip_items or set()
     result = {
@@ -5434,6 +5437,7 @@ def hunt_target(
             headed=browser_headed,
             model_override=browser_model,
             session_id=result.get("session_id"),
+            allow_unsafe=browser_unsafe,
         )
 
     # Brain: post-scan hook — interpret + chains + triage + exploit + report
@@ -5672,6 +5676,8 @@ Examples:
                         help="Show browser window during --browser-scan (default: headless)")
     parser.add_argument("--browser-model",    type=str, default=None, metavar="MODEL",
                         help="Override LLM model for browser agent (default: auto-detect)")
+    parser.add_argument("--browser-unsafe",   action="store_true",
+                        help="Allow browser tasks that may submit forms or try default credentials")
     parser.add_argument("--scope-lock",       action="store_true",
                         help="Scope-lock: skip subdomain enumeration entirely — test only the exact --target given (no assetfinder/subfinder/amass/crt.sh)")
     parser.add_argument("--max-urls",         type=int, default=100, metavar="N",
@@ -5967,6 +5973,7 @@ Examples:
                 browser_scan=args.browser_scan,
                 browser_headed=args.browser_headed,
                 browser_model=args.browser_model,
+                browser_unsafe=args.browser_unsafe,
             )
         print_dashboard([result])
         return
@@ -5999,6 +6006,7 @@ Examples:
             browser_scan=args.browser_scan if hasattr(args, "browser_scan") else False,
             browser_headed=args.browser_headed if hasattr(args, "browser_headed") else False,
             browser_model=args.browser_model if hasattr(args, "browser_model") else None,
+            browser_unsafe=args.browser_unsafe if hasattr(args, "browser_unsafe") else False,
         )
         results.append(result)
 
