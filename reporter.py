@@ -175,6 +175,70 @@ VULN_TEMPLATES = {
             ("OWASP Security Misconfiguration", "https://owasp.org/Top10/A05_2021-Security_Misconfiguration/"),
         ],
     },
+    "xss_dom": {
+        "title": "DOM-Based Cross-Site Scripting (XSS) on {host}",
+        "severity": "high", "cvss": "7.5", "cwe": "CWE-79",
+        "impact": (
+            "An attacker can execute arbitrary JavaScript in the victim's browser by "
+            "manipulating client-side DOM sinks such as innerHTML, document.write, or eval."
+        ),
+        "remediation": (
+            "Avoid writing user-controlled data to dangerous DOM sinks. "
+            "Prefer textContent over innerHTML. "
+            "Use DOMPurify for unavoidable HTML rendering and deploy a strict CSP."
+        ),
+        "references": [
+            ("OWASP DOM XSS", "https://owasp.org/www-community/attacks/DOM_Based_XSS"),
+        ],
+    },
+    "csrf": {
+        "title": "Cross-Site Request Forgery (CSRF) on {host}",
+        "severity": "medium", "cvss": "6.5", "cwe": "CWE-352",
+        "impact": (
+            "An attacker can trick an authenticated user into submitting unintended "
+            "state-changing actions without the victim noticing."
+        ),
+        "remediation": (
+            "Implement CSRF tokens on all state-changing forms. "
+            "Set SameSite=Lax or SameSite=Strict on session cookies and validate Origin/Referer."
+        ),
+        "references": [
+            ("OWASP CSRF", "https://owasp.org/www-community/attacks/csrf"),
+        ],
+    },
+    "auth_bypass": {
+        "title": "Authentication Bypass on {host}",
+        "severity": "high", "cvss": "8.1", "cwe": "CWE-287",
+        "impact": (
+            "An attacker can access protected resources or administrative interfaces "
+            "without valid credentials, potentially leading to account takeover or data exposure."
+        ),
+        "remediation": (
+            "Enforce authentication checks server-side on every protected route, "
+            "remove default credentials, and verify SPA route guards are not relied on alone."
+        ),
+        "references": [
+            ("OWASP Forced Browsing", "https://owasp.org/www-community/attacks/Forced_browsing"),
+        ],
+    },
+    "open_redirect": {
+        "title": "Open Redirect on {host}",
+        "severity": "medium", "cvss": "6.1", "cwe": "CWE-601",
+        "impact": (
+            "An attacker can redirect victims to a malicious site using a trusted-looking "
+            "link from the legitimate domain, which increases phishing risk."
+        ),
+        "remediation": (
+            "Validate redirect destinations against an allowlist and avoid "
+            "redirecting directly from user-controlled parameters."
+        ),
+        "references": [
+            (
+                "OWASP Unvalidated Redirects",
+                "https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html",
+            ),
+        ],
+    },
 }
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -191,6 +255,8 @@ SUBDIR_VTYPE = {
     "rce": "rce", "lfi": "lfi", "idor": "idor", "ssrf": "ssrf",
     "cors": "cors", "takeover": "takeover", "exposure": "exposure",
     "cves": "cves", "cloud": "misconfig", "metasploit": "rce",
+    "browser/xss_dom": "xss_dom", "browser/csrf": "csrf",
+    "browser/auth_bypass": "auth_bypass", "browser/open_redirect": "open_redirect",
     "misconfig": "misconfig",
 }
 
@@ -209,7 +275,11 @@ def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
     m = re.search(r'https?://\S+', line)
     if m:
         url = m.group(0).rstrip(".,;)")
-    tags = re.findall(r'\[([^\]]+)\]', line)
+    tags = [tag.strip().lower() for tag in re.findall(r'\[([^\]]+)\]', line)]
+    if len(tags) > 1 and tags[1] in SEVERITY_ORDER:
+        sev = tags[1]
+    elif tags and tags[0] in SEVERITY_ORDER:
+        sev = tags[0]
     return {"raw": line, "url": url, "severity": sev,
             "template_id": tags[0] if tags else default_vtype,
             "vtype": default_vtype}
