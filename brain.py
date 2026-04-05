@@ -23,7 +23,7 @@ MLX setup (Apple Silicon — faster than Ollama on M-series chips):
 
 Default model priority (uses first available):
   1. vapt-qwen25:latest     — custom 32B VAPT-tuned model
-  2. obsidian-custom:latest  — custom 32B obsidian model
+  2. vikramaditya-custom:latest — custom 32B vikramaditya model
   3. vapt-model:latest      — custom 30B VAPT model
   4. deepseek-r1:32b        — strong reasoning model
   5. qwen3:30b-a3b          — general capable model
@@ -306,7 +306,7 @@ class LLMClient:
 MODEL_PRIORITY = [
     "qwen3-coder-64k:latest",    # PRIMARY — 30.5B, 64K context
     "vapt-qwen25:latest",        # custom 32B VAPT-tuned
-    "obsidian-custom:latest",    # custom 32B obsidian
+    "vikramaditya-custom:latest", # custom 32B vikramaditya
     "vapt-model:latest",         # custom 30B VAPT
     "qwen3-coder:30b",           # coder 30B
     "deepseek-r1:32b",           # strong reasoning

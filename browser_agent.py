@@ -50,7 +50,7 @@ OLLAMA_HOST       = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL_PRIORITY = [
     "qwen3-coder-64k:latest",    # PRIMARY — 30.5B, 64K context
     "vapt-qwen25:latest",        # custom 32B VAPT-tuned
-    "obsidian-custom:latest",    # custom 32B obsidian
+    "vikramaditya-custom:latest", # custom 32B vikramaditya
     "vapt-model:latest",         # custom 30B VAPT
     "qwen3-coder:30b",           # coder 30B
     "deepseek-r1:32b",           # strong reasoning
