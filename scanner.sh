@@ -243,11 +243,34 @@ if ! skip_has xss; then
         DAL_OUT="$FINDINGS_DIR/xss/dalfox_results.txt"
         DAL_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 30 || echo 100)
         DAL_MAX_TIME=$([ "$QUICK_MODE" = "--quick" ] && echo 300 || echo 900)
-        log_step "Running dalfox on up to $DAL_LIMIT URLs (global timeout: ${DAL_MAX_TIME}s)..."
-        head -"$DAL_LIMIT" "$PARAMS_FILE" | \
+        # Deduplicate by base-URL + sorted param keys to avoid scanning the same
+        # endpoint N times with different random values (e.g. ?rand=1.234 variants)
+        DAL_DEDUP_FILE=$(mktemp /tmp/dalfox_dedup_XXXXXX.txt)
+        python3 - "$PARAMS_FILE" "$DAL_DEDUP_FILE" <<'PYEOF' 2>/dev/null || cp "$PARAMS_FILE" "$DAL_DEDUP_FILE"
+import sys
+from urllib.parse import urlparse, parse_qs
+seen = set()
+with open(sys.argv[1]) as fin, open(sys.argv[2], 'w') as fout:
+    for line in fin:
+        url = line.strip()
+        if not url:
+            continue
+        try:
+            p = urlparse(url)
+            key = (p.scheme, p.netloc, p.path, frozenset(parse_qs(p.query).keys()))
+        except Exception:
+            key = url
+        if key not in seen:
+            seen.add(key)
+            fout.write(url + '\n')
+PYEOF
+        DEDUP_COUNT=$(wc -l < "$DAL_DEDUP_FILE" 2>/dev/null || echo 0)
+        log_step "Running dalfox on up to $DAL_LIMIT URLs (deduped from $(wc -l < "$PARAMS_FILE") → ${DEDUP_COUNT}, timeout: ${DAL_MAX_TIME}s)..."
+        head -"$DAL_LIMIT" "$DAL_DEDUP_FILE" | \
             gtimeout "$DAL_MAX_TIME" dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null \
             || timeout "$DAL_MAX_TIME" dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null \
             || true
+        rm -f "$DAL_DEDUP_FILE"
         log_done "dalfox check done"
     fi
 

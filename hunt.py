@@ -3796,8 +3796,27 @@ check
                 remember_host(wp_hosts_map, host.strip())
     wp_hosts = list(wp_hosts_map.values())
 
+    # Live-verify WordPress hosts before running recon — historical GAU URLs
+    # can trigger WP detection for sites that have since migrated away from WordPress.
+    # A 200 on wp-login.php or a JSON response from wp-json confirms it's still active.
+    confirmed_wp_hosts = []
+    for host in wp_hosts[:5]:
+        for probe in (f"{host}/wp-login.php", f"{host}/wp-json/wp/v2/"):
+            ok_p, probe_out = run_cmd(
+                f'curl -sk -o /dev/null -w "%{{http_code}}" --max-time 8 --max-redirs 1 "{probe}"',
+                timeout=12
+            )
+            status = probe_out.strip()
+            if status in ("200", "401", "403"):
+                confirmed_wp_hosts.append(host)
+                log("crit", f"WordPress confirmed live at {host} (probe={probe} status={status})")
+                break
+        else:
+            log("warn", f"WordPress fingerprint found for {host} but live probes returned no WP response — skipping WP recon (likely migrated)")
+    wp_hosts = confirmed_wp_hosts
+
     if wp_hosts:
-        log("crit", f"WordPress detected on {len(wp_hosts)} host(s)")
+        log("crit", f"WordPress confirmed on {len(wp_hosts)} host(s)")
         for host in wp_hosts[:5]:
             safe = host.replace("://", "_").replace("/", "_").replace(":", "_")
             wp_out = os.path.join(exploit_dir, f"wordpress_{safe}.txt")
