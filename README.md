@@ -11,8 +11,8 @@
 
 **Autonomous VAPT platform. Give it a target — FQDN, IP, or CIDR range. It hunts, it reports.**
 
-> *"The Obsidian Order has files on everyone."*
-> — Garak, Star Trek: Deep Space Nine
+> *"He who seeks the truth must be ready to face the fire."*
+> — inspired by the legend of Vikramaditya
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
@@ -29,11 +29,11 @@
 
 ---
 
-## The Obsidian Order
+## The Legend
 
-In *Star Trek: Deep Space Nine*, the **Obsidian Order** was the most feared intelligence organisation in the quadrant. Nothing escaped their notice. No secret stayed buried.
+**Vikramaditya** — the legendary Indian emperor whose throne could only be ascended by one who sought truth fearlessly and judged without bias. His name means *"valour of the sun"*.
 
-Vikramaditya operates the same way. Give it a target. Walk away. Come back to a full VAPT report.
+This tool operates the same way. Give it a target. Walk away. Come back to a full VAPT report — every vulnerability exposed, every weakness catalogued.
 
 It was inspired by and evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) — the original AI-assisted bug bounty automation platform that laid the recon pipeline, ReAct agent architecture, and AI analysis engine that powers this tool today.
 
@@ -57,8 +57,8 @@ Vikramaditya is an autonomous VAPT tool built for professional security consulta
 ## Quick Start
 
 ```bash
-git clone https://github.com/venkatas/obsidian.git
-cd obsidian
+git clone https://github.com/venkatas/vikramaditya.git
+cd vikramaditya
 chmod +x setup.sh && ./setup.sh      # installs all required tools
 
 # Run a full assessment
@@ -351,7 +351,7 @@ Utilities:
 ## Directory Structure
 
 ```
-obsidian/
+vikramaditya/
 ├── hunt.py              Main orchestrator
 ├── brain.py             AI analysis engine (multi-provider LLM)
 ├── agent.py             Autonomous ReAct agent
@@ -465,11 +465,7 @@ The authors accept no liability for misuse.
 
 Vikramaditya evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) by [@shuvonsec](https://github.com/shuvonsec) — an AI-assisted bug bounty automation framework that pioneered the recon pipeline, ReAct agent loop, and AI-driven analysis engine that form the core of this tool.
 
-The name is inspired by the **Obsidian Order** from *Star Trek: Deep Space Nine* — the Cardassian intelligence agency so thorough, so methodical, that no secret was safe and no target was invisible.
-
-Like the Order: thorough, relentless, and leaves no stone unturned.
-
-Unlike the Order: you control what it does.
+Named after **Emperor Vikramaditya** — whose legendary throne tested every claimant with 32 trials of truth before granting the seat of judgment. Like the emperor's court: thorough, relentless, and no weakness goes unexamined.
 
 ---
 
