@@ -104,7 +104,27 @@ AMASS_TIMEOUT=600      # 10 minutes (was 5 min)
 CURL_TIMEOUT=10        # per request
 HTTP_PROBE_TIMEOUT=5   # reduced: 5s per-host timeout (was 10) — avoids macOS TCP hang
 
-mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params,priority,exposure,screenshots,api_specs}
+mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params,priority,exposure,screenshots,api_specs,cors,secrets,vhosts}
+
+# ── Safety net: merge partial subdomain results on early exit ────────────────
+# If the watchdog or timeout kills this script mid-Phase-1, the merge step at
+# the end of Phase 1 never runs and all.txt is empty → 0 live hosts.
+# This trap ensures any partial results are merged before exit.
+_emergency_merge_subs() {
+    if [ ! -s "$RECON_DIR/subdomains/all.txt" ] && \
+       ls "$RECON_DIR/subdomains/"*.txt &>/dev/null; then
+        cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/^\*\.//' \
+            | grep -E "^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$" \
+            | sort -u > "$RECON_DIR/subdomains/all.txt" 2>/dev/null || true
+        _count=$(wc -l < "$RECON_DIR/subdomains/all.txt" 2>/dev/null || echo 0)
+        if [ "${_count:-0}" -gt 0 ]; then
+            echo -e "${YELLOW}[$(ts)] [!]${NC} Emergency merge: ${_count} subdomains saved to all.txt"
+        fi
+    fi
+}
+trap _emergency_merge_subs EXIT
 
 echo ""
 echo -e "${BOLD}============================================================${NC}"
