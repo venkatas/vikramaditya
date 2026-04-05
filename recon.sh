@@ -66,7 +66,20 @@ SESSION_ID="${RECON_SESSION_ID:-}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Prefer ProjectDiscovery httpx (~/go/bin) over Python httpx (/opt/homebrew/bin)
-export PATH="$HOME/go/bin:$PATH"
+export PATH="$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# macOS compatibility: 'timeout' is a Linux coreutils command.
+# On macOS use gtimeout (brew install coreutils) or fall back to a no-op wrapper.
+if ! command -v timeout &>/dev/null; then
+    if command -v gtimeout &>/dev/null; then
+        timeout() { gtimeout "$@"; }
+        export -f timeout
+    else
+        # No timeout available — define a passthrough so commands still run
+        timeout() { shift; "$@"; }
+        export -f timeout
+    fi
+fi
 
 BATCH_SIZE="${BATCH_SIZE:-5}"
 THREADS="${THREADS_OVERRIDE:-50}"
@@ -554,6 +567,7 @@ else
             -title \
             -tech-detect \
             -content-length \
+            -ip \
             -no-fallback \
             -no-color \
             -threads "$THREADS" \
@@ -612,8 +626,9 @@ else
     grep '\[429\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_429.txt"  2>/dev/null || true
 
     # Extract unique IPs from httpx output (needed for vhost discovery Phase 7.5)
-    grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' "$RECON_DIR/live/httpx_full.txt" \
-        | sort -u > "$RECON_DIR/live/ips.txt" 2>/dev/null || true
+    # httpx -ip outputs IP as last bracketed field: https://host [200] [...] [1.2.3.4]
+    grep -oE '\[([0-9]{1,3}\.){3}[0-9]{1,3}\]' "$RECON_DIR/live/httpx_full.txt" \
+        | tr -d '[]' | sort -u > "$RECON_DIR/live/ips.txt" 2>/dev/null || true
 
     log_done "200 OK:         $(file_lines "$RECON_DIR/live/status_200.txt")"
     log_done "3xx Redirect:   $(file_lines "$RECON_DIR/live/status_3xx.txt")"
