@@ -33,7 +33,7 @@
 
 In *Star Trek: Deep Space Nine*, the **Obsidian Order** was the most feared intelligence organisation in the quadrant. Nothing escaped their notice. No secret stayed buried.
 
-OBSIDIAN operates the same way. Give it a target. Walk away. Come back to a full VAPT report.
+Vikramaditya operates the same way. Give it a target. Walk away. Come back to a full VAPT report.
 
 It was inspired by and evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) — the original AI-assisted bug bounty automation platform that laid the recon pipeline, ReAct agent architecture, and AI analysis engine that powers this tool today.
 
@@ -41,7 +41,7 @@ It was inspired by and evolved from [**claude-bug-bounty**](https://github.com/s
 
 ## What It Does
 
-OBSIDIAN is an autonomous VAPT tool built for professional security consultants. You give it a target — a domain, a single IP, or an entire subnet. It runs the full assessment pipeline and produces a submission-ready report.
+Vikramaditya is an autonomous VAPT tool built for professional security consultants. You give it a target — a domain, a single IP, or an entire subnet. It runs the full assessment pipeline and produces a submission-ready report.
 
 | Stage | What happens |
 |:------|:-------------|
@@ -180,7 +180,7 @@ The agent operates in a tight loop: **Observe → Think (LLM) → Act (tool) →
 
 ## Multi-Provider AI
 
-`brain.py` supports five LLM backends. Set `BRAIN_PROVIDER` to force one, or let OBSIDIAN auto-detect in priority order: **Ollama → MLX → Claude → OpenAI → Grok**.
+`brain.py` supports five LLM backends. Set `BRAIN_PROVIDER` to force one, or let Vikramaditya auto-detect in priority order: **Ollama → MLX → Claude → OpenAI → Grok**.
 
 | Provider | Env var required | Example models | Notes |
 |:---------|:----------------|:---------------|:------|
@@ -455,7 +455,7 @@ Then open a pull request describing what you added and why it's useful.
 
 **For authorized security testing only.**
 
-Only use this tool against systems you own or have explicit written authorization to test. OBSIDIAN is designed for professional VAPT consultants working under signed engagement letters. Unauthorized use against systems you do not have permission to test is illegal in most jurisdictions.
+Only use this tool against systems you own or have explicit written authorization to test. Vikramaditya is designed for professional VAPT consultants working under signed engagement letters. Unauthorized use against systems you do not have permission to test is illegal in most jurisdictions.
 
 The authors accept no liability for misuse.
 
@@ -463,7 +463,7 @@ The authors accept no liability for misuse.
 
 ## Credits
 
-OBSIDIAN evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) by [@shuvonsec](https://github.com/shuvonsec) — an AI-assisted bug bounty automation framework that pioneered the recon pipeline, ReAct agent loop, and AI-driven analysis engine that form the core of this tool.
+Vikramaditya evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) by [@shuvonsec](https://github.com/shuvonsec) — an AI-assisted bug bounty automation framework that pioneered the recon pipeline, ReAct agent loop, and AI-driven analysis engine that form the core of this tool.
 
 The name is inspired by the **Obsidian Order** from *Star Trek: Deep Space Nine* — the Cardassian intelligence agency so thorough, so methodical, that no secret was safe and no target was invisible.
 

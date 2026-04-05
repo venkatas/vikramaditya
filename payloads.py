@@ -226,7 +226,7 @@ Excessive data exposure in API response could be leveraged for social engineerin
 
 # ════════════════════════════════════════════════════════════════════════════════
 # VAPT PAYLOAD LIBRARY
-# Source: shuvonsec/claude-bug-bounty v2.1.0 + OBSIDIAN extensions
+# Source: shuvonsec/claude-bug-bounty v2.1.0 + Vikramaditya extensions
 # ════════════════════════════════════════════════════════════════════════════════
 
 VAPT_PAYLOADS = {

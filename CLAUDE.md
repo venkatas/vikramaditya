@@ -1,4 +1,4 @@
-# OBSIDIAN — VAPT Tool Guide
+# Vikramaditya — VAPT Tool Guide
 
 Autonomous penetration testing platform for professional VAPT engagements.
 Targets: FQDN, single IP, or CIDR range. Outputs Burp Suite-style HTML reports.

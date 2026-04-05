@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# OBSIDIAN — Tool Installer
+# Vikramaditya — Tool Installer
 # Installs all required tools via Homebrew, Go, and pip
 # Usage: ./setup.sh
 # =============================================================================
@@ -19,7 +19,7 @@ log_err()  { echo -e "${RED}[-]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 
 echo "============================================="
-echo "  OBSIDIAN — Tool Installer"
+echo "  Vikramaditya — Tool Installer"
 echo "============================================="
 
 # Check for Homebrew

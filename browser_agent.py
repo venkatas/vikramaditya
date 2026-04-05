@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-browser_agent.py — Real-browser vulnerability validation phase for OBSIDIAN.
+browser_agent.py — Real-browser vulnerability validation phase for Vikramaditya.
 
 Drives a Chromium browser via browser-use + Playwright + LLM against external
 targets to validate JS-rendered vulnerabilities that static scanners miss.
@@ -500,7 +500,7 @@ class FormDiscoveryTask(BrowserTask):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="OBSIDIAN browser agent — real-browser vuln validation")
+    parser = argparse.ArgumentParser(description="Vikramaditya browser agent — real-browser vuln validation")
     parser.add_argument("--target", required=True, help="Target URL or domain")
     parser.add_argument("--findings-dir", required=True, help="Per-session findings directory")
     parser.add_argument("--headed", action="store_true", help="Show browser window")
