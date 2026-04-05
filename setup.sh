@@ -143,6 +143,20 @@ else
     fi
 fi
 
+# Browser agent deps (optional — needed for --browser-scan phase)
+echo ""
+echo "[*] Installing browser agent dependencies (optional)..."
+if python3 -c "import browser_use" &>/dev/null 2>&1; then
+    log_ok "browser-use already installed"
+else
+    if pip3 install --quiet "browser-use>=0.1.40" "playwright>=1.44.0" "langchain-anthropic>=0.1.0" 2>/dev/null; then
+        log_ok "browser-use + playwright + langchain-anthropic installed"
+        playwright install chromium --with-deps 2>/dev/null || log_warn "playwright chromium install failed — run: playwright install chromium"
+    else
+        log_warn "browser-use install failed — --browser-scan phase will be skipped (non-fatal)"
+    fi
+fi
+
 # Tools to install via pip
 echo ""
 echo "[*] Installing Python tools..."
