@@ -15,6 +15,16 @@
 
 set -uo pipefail
 
+# macOS compatibility: 'timeout' is Linux-only; use gtimeout or passthrough
+export PATH="$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+if ! command -v timeout &>/dev/null; then
+    if command -v gtimeout &>/dev/null; then
+        timeout() { gtimeout "$@"; }; export -f timeout
+    else
+        timeout() { shift; "$@"; }; export -f timeout
+    fi
+fi
+
 # ── Colours ──────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
 RED='\033[0;31m'
