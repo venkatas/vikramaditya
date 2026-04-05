@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 agent.py — LangGraph-style ReAct hunting agent for bug bounty automation.
 

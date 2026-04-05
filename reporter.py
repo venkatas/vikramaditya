@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 reporter.py — VAPT Report Generator
 Produces a Burp Suite-style HTML report + Markdown summary from scan findings.

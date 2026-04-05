@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 OpenAPI / Swagger discovery and low-noise unauthenticated API audit.
 
