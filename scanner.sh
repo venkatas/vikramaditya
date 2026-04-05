@@ -242,8 +242,12 @@ if ! skip_has xss; then
     if tool_ok dalfox && [ -s "$PARAMS_FILE" ]; then
         DAL_OUT="$FINDINGS_DIR/xss/dalfox_results.txt"
         DAL_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 30 || echo 100)
-        log_step "Running dalfox on up to $DAL_LIMIT URLs..."
-        head -"$DAL_LIMIT" "$PARAMS_FILE" | dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null || true
+        DAL_MAX_TIME=$([ "$QUICK_MODE" = "--quick" ] && echo 300 || echo 900)
+        log_step "Running dalfox on up to $DAL_LIMIT URLs (global timeout: ${DAL_MAX_TIME}s)..."
+        head -"$DAL_LIMIT" "$PARAMS_FILE" | \
+            gtimeout "$DAL_MAX_TIME" dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null \
+            || timeout "$DAL_MAX_TIME" dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null \
+            || true
         log_done "dalfox check done"
     fi
 
