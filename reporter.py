@@ -265,6 +265,39 @@ VULN_TEMPLATES = {
     },
 }
 
+VULN_TEMPLATES["race_condition"] = {
+    "title": "Race Condition on {host}",
+    "severity": "high", "cvss": "7.5", "cwe": "CWE-362",
+    "impact": (
+        "An attacker can exploit a time-of-check to time-of-use (TOCTOU) race "
+        "to bypass business logic controls such as balance checks, coupon limits, "
+        "or rate limiting on critical actions."
+    ),
+    "remediation": (
+        "Implement database-level locking (SELECT FOR UPDATE) or optimistic concurrency "
+        "control with version counters. Use idempotency keys for financial operations."
+    ),
+    "references": [
+        ("OWASP Race Conditions", "https://owasp.org/www-community/vulnerabilities/Race_condition"),
+    ],
+}
+VULN_TEMPLATES["oauth"] = {
+    "title": "OAuth/OIDC Misconfiguration on {host}",
+    "severity": "high", "cvss": "8.1", "cwe": "CWE-287",
+    "impact": (
+        "An attacker can bypass authentication or steal authorization codes via "
+        "redirect_uri manipulation, weak state parameters, or missing PKCE enforcement, "
+        "leading to account takeover."
+    ),
+    "remediation": (
+        "Enforce strict redirect_uri validation (exact match), require PKCE for public clients, "
+        "use high-entropy state parameters (32+ bytes), and validate state on callback."
+    ),
+    "references": [
+        ("OAuth 2.0 Security Best Practices", "https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics"),
+    ],
+}
+
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 SEVERITY_COLOR = {
     "critical": "#dc3545",
@@ -277,6 +310,7 @@ CVSS_DEFAULT = {"critical": "9.0", "high": "7.5", "medium": "5.0", "low": "2.5",
 SUBDIR_VTYPE = {
     "sqli": "sqli", "xss": "xss", "ssti": "ssti", "upload": "upload",
     "rce": "rce", "lfi": "lfi", "idor": "idor", "ssrf": "ssrf",
+    "race": "race_condition", "oauth": "oauth",
     "cors": "cors", "takeover": "takeover", "exposure": "exposure",
     "cves": "cves", "cloud": "misconfig", "metasploit": "rce",
     "browser/xss_dom": "xss_dom", "browser/csrf": "csrf",
