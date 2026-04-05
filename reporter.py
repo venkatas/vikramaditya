@@ -288,7 +288,11 @@ SUBDIR_VTYPE = {
 # ── Parsing ────────────────────────────────────────────────────────────────────
 
 def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
-    sev = "medium"
+    # Start with the template severity for this vulnerability type, not a hardcoded default
+    tmpl = VULN_TEMPLATES.get(default_vtype, {})
+    sev = tmpl.get("severity", "medium")
+
+    # Override with explicit severity keywords in the raw finding text
     if any(k in line for k in ("SQLI-POC-VERIFIED", "RCE-POC", "CRITICAL", "CONFIRMED")):
         sev = "critical"
     elif "HIGH" in line:
