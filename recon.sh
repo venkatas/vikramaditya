@@ -400,6 +400,29 @@ curl -s --max-time 20 \
     > "$RECON_DIR/subdomains/hackertarget.txt" 2>/dev/null || true
 log_done "hackertarget: $(file_lines "$RECON_DIR/subdomains/hackertarget.txt") subdomains"
 
+# asnmap — enumerate IP ranges for the target org (ASN → CIDR → IPs)
+if tool_ok asnmap && [ "$QUICK_MODE" != "--quick" ]; then
+    log_step "asnmap (ASN → IP range enumeration)..."
+    mkdir -p "$RECON_DIR/asn"
+    asnmap -d "$TARGET" -silent -json \
+        > "$RECON_DIR/asn/asnmap.json" 2>/dev/null || true
+    # Extract CIDRs and expand to IPs if mapcidr is available
+    if tool_ok mapcidr && [ -s "$RECON_DIR/asn/asnmap.json" ]; then
+        python3 -c "
+import json, sys
+try:
+    for line in open('$RECON_DIR/asn/asnmap.json'):
+        obj = json.loads(line.strip())
+        for cidr in obj.get('cidr', []):
+            print(cidr)
+except: pass
+" 2>/dev/null | mapcidr -silent > "$RECON_DIR/asn/ip_ranges.txt" 2>/dev/null || true
+        log_done "asnmap: $(file_lines "$RECON_DIR/asn/ip_ranges.txt") IPs in org range"
+    else
+        log_done "asnmap: $RECON_DIR/asn/asnmap.json (mapcidr not available for expansion)"
+    fi
+fi
+
 # ── Merge & deduplicate ───────────────────────────────────────────────────────
 cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null \
     | tr '[:upper:]' '[:lower:]' \
@@ -408,7 +431,26 @@ cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null \
     | sort -u > "$RECON_DIR/subdomains/all.txt"
 
 TOTAL_SUBS=$(file_lines "$RECON_DIR/subdomains/all.txt")
-log_ok "Total unique subdomains: $TOTAL_SUBS"
+log_ok "Total unique subdomains (pre-permutation): $TOTAL_SUBS"
+
+# alterx — permutation-based subdomain generation (BugBounty-Recon-Methodology)
+# Generates variations like: dev-api, api-dev, api2, api-internal etc.
+# Often finds assets that passive sources miss entirely.
+if tool_ok alterx && [ "$QUICK_MODE" != "--quick" ] && [ "$TOTAL_SUBS" -gt 0 ]; then
+    log_step "alterx (subdomain permutation generation)..."
+    alterx -l "$RECON_DIR/subdomains/all.txt" -silent \
+        > "$RECON_DIR/subdomains/alterx.txt" 2>/dev/null || true
+    ALTERX_COUNT=$(file_lines "$RECON_DIR/subdomains/alterx.txt")
+    log_done "alterx: $ALTERX_COUNT permutations generated"
+    # Merge permutations back into all.txt and re-resolve in Phase 2
+    if [ "$ALTERX_COUNT" -gt 0 ]; then
+        cat "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/alterx.txt" \
+            | sort -u > "$RECON_DIR/subdomains/all_with_permutations.txt"
+        cp "$RECON_DIR/subdomains/all_with_permutations.txt" "$RECON_DIR/subdomains/all.txt"
+        TOTAL_SUBS=$(file_lines "$RECON_DIR/subdomains/all.txt")
+        log_ok "Total unique subdomains (with permutations): $TOTAL_SUBS"
+    fi
+fi
 
 fi  # end SCOPE_LOCK else block
 fi  # end Phase 1 resume skip
@@ -569,6 +611,10 @@ else
     grep '\[401\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_401.txt"  2>/dev/null || true
     grep '\[429\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_429.txt"  2>/dev/null || true
 
+    # Extract unique IPs from httpx output (needed for vhost discovery Phase 7.5)
+    grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' "$RECON_DIR/live/httpx_full.txt" \
+        | sort -u > "$RECON_DIR/live/ips.txt" 2>/dev/null || true
+
     log_done "200 OK:         $(file_lines "$RECON_DIR/live/status_200.txt")"
     log_done "3xx Redirect:   $(file_lines "$RECON_DIR/live/status_3xx.txt")"
     log_done "403 Forbidden:  $(file_lines "$RECON_DIR/live/status_403.txt")"
@@ -686,6 +732,15 @@ if tool_ok waybackurls; then
     log_done "waybackurls: $(file_lines "$RECON_DIR/urls/waybackurls.txt") URLs"
 fi
 
+# waymore — richer archive coverage than gau+waybackurls combined
+# Pulls from Wayback, URLScan, CommonCrawl, VirusTotal, AlienVault
+if tool_ok waymore && [ "$QUICK_MODE" != "--quick" ]; then
+    log_step "waymore (multi-source archive URLs)..."
+    waymore -i "$TARGET" -mode U -oU "$RECON_DIR/urls/waymore.txt" \
+        2>/dev/null || true
+    log_done "waymore: $(file_lines "$RECON_DIR/urls/waymore.txt") URLs"
+fi
+
 # katana — active crawl on live hosts (prioritised first)
 if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
     log_step "katana crawl on high-priority + sample live hosts..."
@@ -734,6 +789,20 @@ if [ "${MAX_URLS:-0}" -gt 0 ] && [ "$TOTAL_URLS_RAW" -gt "$MAX_URLS" ]; then
     awk '!seen[$0]++' "$TMP_CAPPED" | head -"$MAX_URLS" > "$ALL_URL_FILE"
     rm -f "$TMP_CAPPED"
     log_ok "URL cap applied: $(file_lines "$ALL_URL_FILE") URLs kept (priority-ordered)"
+fi
+
+# uro — URL normalization: deduplicate semantically identical URLs before scanning
+# Removes pattern noise (e.g. ?id=1, ?id=2 → ?id=GFP) so dalfox/sqlmap
+# don't waste time on duplicate attack surfaces.
+if tool_ok uro && [ -s "$RECON_DIR/urls/all.txt" ]; then
+    log_step "uro (URL deduplication + normalization)..."
+    uro < "$RECON_DIR/urls/all.txt" > "$RECON_DIR/urls/all_uro.txt" 2>/dev/null || true
+    URO_BEFORE=$(file_lines "$RECON_DIR/urls/all.txt")
+    URO_AFTER=$(file_lines "$RECON_DIR/urls/all_uro.txt")
+    if [ "$URO_AFTER" -gt 0 ]; then
+        cp "$RECON_DIR/urls/all_uro.txt" "$RECON_DIR/urls/all.txt"
+        log_done "uro: $URO_BEFORE → $URO_AFTER URLs (removed $((URO_BEFORE - URO_AFTER)) duplicates)"
+    fi
 fi
 
 # Filter subsets
@@ -897,7 +966,68 @@ if tool_ok gf && [ -s "$RECON_DIR/urls/all.txt" ]; then
         [ "$_cnt" -gt 0 ] && log_warn "gf[$pattern]: $_cnt URLs — $RECON_DIR/urls/gf/${pattern}.txt"
     done
 fi
+# Gxss — JS sink detection: find reflected parameters that land in JS contexts
+# Better signal than raw dalfox — narrows XSS surface to real sinks first.
+if tool_ok Gxss && [ -s "$RECON_DIR/urls/with_params.txt" ]; then
+    log_step "Gxss JS sink detection..."
+    mkdir -p "$RECON_DIR/urls/gf"
+    GXSS_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 50 || echo 200)
+    head -"$GXSS_LIMIT" "$RECON_DIR/urls/with_params.txt" \
+        | Gxss -c 100 -p Rxss \
+        > "$RECON_DIR/urls/gf/gxss_sinks.txt" 2>/dev/null || true
+    GXSS_COUNT=$(file_lines "$RECON_DIR/urls/gf/gxss_sinks.txt")
+    [ "$GXSS_COUNT" -gt 0 ] && \
+        log_warn "Gxss: $GXSS_COUNT JS sink candidates — $RECON_DIR/urls/gf/gxss_sinks.txt"
+fi
+
 fi  # end Phase 7 resume skip
+
+# ============================================================
+# Phase 7.5: Virtual Host Discovery
+# ============================================================
+echo ""
+log_info "Phase 7.5: Virtual Host Discovery (Host header fuzzing)"
+if phase_done "$RECON_DIR/vhosts/found.txt"; then true; else
+
+mkdir -p "$RECON_DIR/vhosts"
+# Use resolved subdomains as Host header wordlist, fuzz against live IPs
+# This finds assets not in DNS — same IP, different virtual host
+if tool_ok ffuf && [ -s "$RECON_DIR/subdomains/resolved.txt" ] && [ -s "$RECON_DIR/live/ips.txt" ]; then
+    log_step "Fuzzing Host headers against live IPs..."
+    VHOST_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 5 || echo 20)
+    head -"$VHOST_LIMIT" "$RECON_DIR/live/ips.txt" | while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        # Get baseline response size to filter false positives
+        BASELINE=$(curl -sk --max-time 5 -o /dev/null -w "%{size_download}" \
+            "https://$ip" 2>/dev/null || echo 0)
+        ffuf -u "https://$ip/" \
+            -H "Host: FUZZ.$TARGET" \
+            -w "$RECON_DIR/subdomains/resolved.txt" \
+            -mc 200,201,301,302,401,403 \
+            -fs "$BASELINE" \
+            -t 30 -timeout 5 -s \
+            -o "$RECON_DIR/vhosts/ffuf_${ip//./_}.json" \
+            -of json 2>/dev/null || true
+        # Extract found vhosts
+        python3 -c "
+import json, sys
+try:
+    d = json.load(open('$RECON_DIR/vhosts/ffuf_${ip//./_}.json'))
+    for r in d.get('results', []):
+        print(r.get('input', {}).get('FUZZ','') + '.$TARGET | IP: $ip | HTTP ' + str(r.get('status',0)))
+except: pass
+" 2>/dev/null >> "$RECON_DIR/vhosts/found.txt" || true
+    done
+    VHOST_COUNT=$(file_lines "$RECON_DIR/vhosts/found.txt")
+    [ "$VHOST_COUNT" -gt 0 ] && \
+        log_warn "Virtual hosts found: $VHOST_COUNT — $RECON_DIR/vhosts/found.txt"
+    log_done "Virtual host discovery done"
+else
+    log_warn "vhost discovery skipped (needs ffuf + resolved.txt + live IPs)"
+    touch "$RECON_DIR/vhosts/found.txt"
+fi
+
+fi  # end Phase 7.5 resume skip
 
 # ============================================================
 # Phase 8: Directory Fuzzing (on prioritised hosts)

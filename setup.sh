@@ -81,6 +81,12 @@ GO_TOOLS=(
     "github.com/tomnomnom/qsreplace@latest"
     "github.com/tomnomnom/assetfinder@latest"
     "github.com/tomnomnom/gf@latest"
+    "github.com/projectdiscovery/asnmap/cmd/asnmap@latest"
+    "github.com/projectdiscovery/mapcidr/cmd/mapcidr@latest"
+    "github.com/projectdiscovery/alterx/cmd/alterx@latest"
+    "github.com/projectdiscovery/urlfinder/cmd/urlfinder@latest"
+    "github.com/s0md3v/uro@latest"
+    "github.com/KathanP19/Gxss@latest"
 )
 
 GO_TOOL_NAMES=(
@@ -97,6 +103,12 @@ GO_TOOL_NAMES=(
     "qsreplace"
     "assetfinder"
     "gf"
+    "asnmap"
+    "mapcidr"
+    "alterx"
+    "urlfinder"
+    "uro"
+    "Gxss"
 )
 
 for i in "${!GO_TOOLS[@]}"; do
@@ -160,7 +172,7 @@ fi
 # Tools to install via pip
 echo ""
 echo "[*] Installing Python tools..."
-PIP_TOOLS=("arjun" "httpx[cli]")
+PIP_TOOLS=("arjun" "httpx[cli]" "waymore" "puredns")
 for pkg in "${PIP_TOOLS[@]}"; do
     name="${pkg%%[*}"   # strip extras like [cli]
     if command -v "$name" &>/dev/null || python3 -c "import ${name//-/_}" &>/dev/null 2>&1; then
@@ -332,7 +344,7 @@ echo "============================================="
 echo "[*] Installation Verification"
 echo "============================================="
 
-ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf)
+ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss)
 INSTALLED=0
 MISSING=0
 

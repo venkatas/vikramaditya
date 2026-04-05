@@ -20,6 +20,27 @@ BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 
 # ── Vulnerability templates ────────────────────────────────────────────────────
+# MITRE ATT&CK technique IDs per vuln class (Decepticon kill-chain tagging)
+ATTACK_IDS = {
+    "sqli":         "T1190",   # Exploit Public-Facing Application
+    "xss":          "T1059.007",  # Command & Scripting: JavaScript
+    "ssti":         "T1059",   # Command & Scripting Interpreter
+    "upload":       "T1105",   # Ingress Tool Transfer → RCE
+    "rce":          "T1190",   # Exploit Public-Facing Application
+    "lfi":          "T1083",   # File & Directory Discovery
+    "idor":         "T1078",   # Valid Accounts (privilege abuse)
+    "ssrf":         "T1090",   # Proxy / Internal pivot
+    "cors":         "T1557",   # Adversary-in-the-Middle
+    "takeover":     "T1584",   # Compromise Infrastructure
+    "exposure":     "T1552",   # Unsecured Credentials
+    "cves":         "T1190",   # Exploit Public-Facing Application
+    "misconfig":    "T1562",   # Impair Defenses
+    "xss_dom":      "T1059.007",
+    "csrf":         "T1185",   # Browser Session Hijacking
+    "auth_bypass":  "T1078",   # Valid Accounts
+    "open_redirect":"T1598",   # Phishing for Information
+}
+
 VULN_TEMPLATES = {
     "sqli": {
         "title": "SQL Injection on {host}",
@@ -367,7 +388,8 @@ def render_html_report(findings: list, target: str, report_dir: str,
     # Detailed findings
     details = ""
     for i, f in enumerate(findings, 1):
-        tmpl   = VULN_TEMPLATES.get(f["vtype"], VULN_TEMPLATES["misconfig"])
+        vtype  = f["vtype"]
+        tmpl   = VULN_TEMPLATES.get(vtype, VULN_TEMPLATES["misconfig"])
         host   = re.search(r'https?://([^/]+)', f["url"])
         host   = host.group(1) if host else target
         vtitle = tmpl["title"].format(host=host)
@@ -379,13 +401,14 @@ def render_html_report(findings: list, target: str, report_dir: str,
 <div id="VN-{i:03d}" style="margin-bottom:36px;border:1px solid #dee2e6;border-radius:6px;overflow:hidden">
   <div style="background:{SEVERITY_COLOR[sev]};padding:12px 18px;color:#fff">
     <b>VN-{i:03d} — {vtitle}</b>
-    <span style="float:right;font-size:0.9em">CVSS: {cvss} | {tmpl.get("cwe","N/A")}</span>
+    <span style="float:right;font-size:0.9em">CVSS: {cvss} | {tmpl.get("cwe","N/A")} | ATT&amp;CK: {ATTACK_IDS.get(vtype,"—")}</span>
   </div>
   <div style="padding:18px">
     <table style="border-collapse:collapse;margin-bottom:14px">
       <tr><td style="width:130px;font-weight:bold;color:#495057;padding:4px 12px 4px 0">Severity</td><td>{_badge(sev)}</td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">CVSS</td><td>{cvss}</td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">CWE</td><td>{tmpl.get("cwe","N/A")}</td></tr>
+      <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">ATT&amp;CK</td><td><a href="https://attack.mitre.org/techniques/{ATTACK_IDS.get(vtype,'').replace('.','/')}" target="_blank">{ATTACK_IDS.get(vtype,"—")}</a></td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0;vertical-align:top">Affected URL</td>
           <td><code style="word-break:break-all">{f["url"]}</code></td></tr>
     </table>
@@ -547,7 +570,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         refs  = "\n".join(f"- [{n}]({u})" for n, u in tmpl.get("references", []))
         lines += [
             f"### VN-{i:03d} — {tmpl['title'].format(host=host)}",
-            f"**Severity:** {f['severity'].upper()} | **CVSS:** {cvss} | **CWE:** {tmpl.get('cwe','N/A')}  ",
+            f"**Severity:** {f['severity'].upper()} | **CVSS:** {cvss} | **CWE:** {tmpl.get('cwe','N/A')} | **ATT&CK:** {ATTACK_IDS.get(f['vtype'],'—')}  ",
             f"**Affected URL:** `{f['url']}`", "",
             f"**Impact:** {tmpl['impact']}", "",
             "**Evidence:**", "```", f["raw"], "```", "",

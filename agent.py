@@ -961,7 +961,25 @@ CORE RULES:
 9. Call finish when: all high-priority tools done, time running low, or no new attack surface.
 10. DO NOT repeat a tool that already completed in this session unless explicitly justified.
 
+PAOR LOOP (Plan-Act-Observe-Reflect):
+- After every 5 steps you will receive a Reflect prompt. Answer it honestly:
+  • What hypotheses have been confirmed or eliminated?
+  • What attack paths remain unexplored?
+  • Is the current strategy still optimal or should you pivot?
+- Prioritize 3+ parallel attack hypotheses at all times (inspired by Phantom).
+
 Think step by step. Pick the highest-impact next action given what you know."""
+
+# Reflect prompt injected every MEMORY_REFRESH_N steps (Phantom PAOR loop)
+_REFLECT_PROMPT = """\
+=== REFLECT PHASE (PAOR) ===
+Review your progress so far and answer:
+1. Which hypotheses were confirmed? Which were eliminated?
+2. What high-value attack paths have NOT been tested yet?
+3. Is the current strategy optimal? If not, what pivot is needed?
+4. Rank your remaining hypotheses by impact × likelihood.
+Update your working memory with this reflection, then continue with the highest-priority untested path.
+"""
 
 
 class ReActAgent:
@@ -1252,6 +1270,34 @@ class ReActAgent:
         for i in range(self.max_steps):
             if self.done:
                 break
+
+            # ── PAOR Reflect phase (Phantom technique) ───────────────────────
+            # Every MEMORY_REFRESH_N steps inject a structured reflection prompt
+            # so the agent re-evaluates hypotheses instead of blindly continuing.
+            if i > 0 and i % MEMORY_REFRESH_N == 0:
+                print(f"{YELLOW}[Agent] ── REFLECT (step {i}) ──{NC}", flush=True)
+                if self.tracer:
+                    self.tracer._write({"event": "reflect", "step": i})
+                ctx = self._build_context()
+                reflect_input = f"{ctx}\n\n{_REFLECT_PROMPT}"
+                try:
+                    r = self.client.chat(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": AGENT_SYSTEM},
+                            {"role": "user",   "content": reflect_input},
+                        ],
+                        options={"num_ctx": 8192, "num_predict": 600, "temperature": 0.2},
+                    )
+                    reflection = (r.get("message", {}).get("content") or "").strip()
+                    if reflection:
+                        self.memory.working_memory = (
+                            self.memory.working_memory + f"\n\n[REFLECT step {i}]\n{reflection}"
+                        )[-MAX_CTX_CHARS:]
+                        self.memory.save()
+                        print(f"{DIM}[Reflect] {reflection[:300]}{NC}", flush=True)
+                except Exception:
+                    pass
 
             obs = self.step()
             if obs:
