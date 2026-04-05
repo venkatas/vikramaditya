@@ -802,17 +802,25 @@ def auto_repair_tools(tool_names: list[str], include_system: bool = False) -> di
 
         log("info", f"Auto-installing {name}...")
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 shell=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 stdin=subprocess.DEVNULL,
                 cwd=SCRIPT_DIR,
-                timeout=900,
                 env=_tool_env(),
+                preexec_fn=os.setsid,
             )
+            stdout, _ = proc.communicate(timeout=900)
+            result = type("R", (), {"returncode": proc.returncode, "stdout": stdout or "", "stderr": ""})()
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.wait()
             log("warn", f"Auto-install timed out for {name}")
             results["failed"].append(name)
             continue
@@ -1090,14 +1098,22 @@ def run_cmd(
             log(end_level, f"END {label}: PID {proc.pid} rc={rc} duration={duration:.1f}s{timeout_note}")
             return rc == 0, (stdout or "") + (stderr or "")
 
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
+        proc = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            cwd=cwd, timeout=timeout, env=_tool_env()
+            cwd=cwd, env=_tool_env(), text=True,
+            preexec_fn=os.setsid,
         )
-        return result.returncode == 0, result.stdout + result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "Command timed out"
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.wait()
+            return False, "Command timed out"
+        return proc.returncode == 0, stdout or ""
     except Exception as exc:
         return False, str(exc)
 
