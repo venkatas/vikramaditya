@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a real-browser vulnerability validation phase (`browser_agent.py`) to OBSIDIAN using `browser-use` + Playwright + LLM, integrated as `--browser-scan` and auto-included in `--full`.
+**Goal:** Add a real-browser vulnerability validation phase (`browser_agent.py`) to Vikramaditya using `browser-use` + Playwright + LLM, integrated as `--browser-scan` and auto-included in `--full`.
 
 **Architecture:** `browser_agent.py` is a self-contained module that mirrors `brain.py`'s LLM provider priority (Ollama → mlx → Claude fallback), drives 6 browser-based security tasks against external targets, and writes findings as `.txt` files into the per-session `FINDINGS_DIR/browser/` directory so `reporter.py` picks them up without extra parsing logic.
 
@@ -64,7 +64,7 @@ Expected: `ModuleNotFoundError: No module named 'browser_agent'`
 ```python
 #!/usr/bin/env python3
 """
-browser_agent.py — Real-browser vulnerability validation phase for OBSIDIAN.
+browser_agent.py — Real-browser vulnerability validation phase for Vikramaditya.
 
 Drives a Chromium browser via browser-use + Playwright + LLM against external
 targets to validate JS-rendered vulnerabilities that static scanners miss.
@@ -110,7 +110,7 @@ OLLAMA_HOST       = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 # Same model priority list as brain.py
 OLLAMA_MODEL_LIST = [
     "vapt-qwen25:latest",
-    "obsidian-custom:latest",
+    "vikramaditya-custom:latest",
     "vapt-model:latest",
     "deepseek-r1:32b",
     "qwen3:30b-a3b",
@@ -611,7 +611,7 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(
-        description="OBSIDIAN Browser Agent — real-browser vuln validation"
+        description="Vikramaditya Browser Agent — real-browser vuln validation"
     )
     ap.add_argument("--target",       required=True, help="Target URL or domain")
     ap.add_argument("--findings-dir", required=True, help="Per-session findings directory")

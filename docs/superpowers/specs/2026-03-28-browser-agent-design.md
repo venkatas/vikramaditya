@@ -5,7 +5,7 @@
 
 ## Overview
 
-Add a real-browser vulnerability validation phase to OBSIDIAN using `browser-use` (Python + Playwright + LLM). The agent drives a Chromium browser against external targets, testing attack surfaces that require a live browser to validate: DOM XSS, CSRF, auth bypass on JS-rendered SPAs, open redirects, and JS-rendered form discovery.
+Add a real-browser vulnerability validation phase to Vikramaditya using `browser-use` (Python + Playwright + LLM). The agent drives a Chromium browser against external targets, testing attack surfaces that require a live browser to validate: DOM XSS, CSRF, auth bypass on JS-rendered SPAs, open redirects, and JS-rendered form discovery.
 
 ## Architecture
 
