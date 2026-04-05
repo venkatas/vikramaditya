@@ -116,7 +116,18 @@ class LLMClient:
             self._init_provider(self.provider)
 
     def _auto_detect(self) -> str:
-        for p in self.PROVIDER_PRIORITY:
+        # Build dynamic priority: cloud providers with keys go first (instant, no server needed)
+        key_providers = []
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            key_providers.append("claude")
+        if os.environ.get("OPENAI_API_KEY"):
+            key_providers.append("openai")
+        if os.environ.get("XAI_API_KEY"):
+            key_providers.append("grok")
+        local_providers = [p for p in self.PROVIDER_PRIORITY if p not in key_providers]
+        ordered = key_providers + local_providers
+
+        for p in ordered:
             try:
                 self._init_provider(p)
                 if self.available:

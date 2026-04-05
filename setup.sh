@@ -261,22 +261,30 @@ fi
 
 # Install gf patterns (tomnomnom's pattern pack)
 GF_PATTERNS_DIR="$HOME/.gf"
-if [ -d "$GF_PATTERNS_DIR" ] && [ "$(ls -A "$GF_PATTERNS_DIR" 2>/dev/null | wc -l)" -gt 2 ]; then
-    log_ok "gf patterns already installed ($GF_PATTERNS_DIR)"
+_GF_PATTERN_COUNT=$(find "$GF_PATTERNS_DIR" -maxdepth 1 -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+if [ "${_GF_PATTERN_COUNT:-0}" -gt 5 ]; then
+    log_ok "gf patterns already installed ($GF_PATTERNS_DIR — ${_GF_PATTERN_COUNT} patterns)"
 else
     echo "    Installing gf patterns..."
     mkdir -p "$GF_PATTERNS_DIR"
-    # tomnomnom's own patterns
-    GOPATH_BIN="${GOPATH:-$HOME/go}"
-    [ -d "$GOPATH_BIN/pkg/mod/github.com/tomnomnom/gf"* ] && \
-        cp -r "$GOPATH_BIN/pkg/mod/github.com/tomnomnom/gf"*/examples/. "$GF_PATTERNS_DIR/" 2>/dev/null || true
-    # 1ndianl33t community patterns (xss, sqli, ssrf, redirect, lfi, idor, rce, debug_logic, img-traversal, interestingparams, jsvar, cors)
+    # 1ndianl33t community patterns — primary source (reliable, no GOPATH dependency)
+    rm -rf /tmp/gf-patterns
     if git clone --quiet https://github.com/1ndianl33t/Gf-Patterns.git /tmp/gf-patterns 2>/dev/null; then
         cp /tmp/gf-patterns/*.json "$GF_PATTERNS_DIR/" 2>/dev/null || true
         rm -rf /tmp/gf-patterns
-        log_ok "gf patterns installed to $GF_PATTERNS_DIR/"
     else
-        log_warn "gf community patterns failed — add manually: https://github.com/1ndianl33t/Gf-Patterns"
+        log_warn "1ndianl33t/Gf-Patterns clone failed — trying tomnomnom examples..."
+    fi
+    # tomnomnom's own patterns — fallback via go install + copy from module cache
+    GOPATH_DIR="${GOPATH:-$HOME/go}"
+    for gf_src in "$GOPATH_DIR"/pkg/mod/github.com/tomnomnom/gf*/examples/; do
+        [ -d "$gf_src" ] && cp -r "$gf_src". "$GF_PATTERNS_DIR/" 2>/dev/null || true
+    done
+    _INSTALLED=$(find "$GF_PATTERNS_DIR" -maxdepth 1 -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${_INSTALLED:-0}" -gt 0 ]; then
+        log_ok "gf patterns installed to $GF_PATTERNS_DIR/ (${_INSTALLED} patterns)"
+    else
+        log_warn "gf patterns: 0 patterns installed — run manually: git clone https://github.com/1ndianl33t/Gf-Patterns /tmp/gf-p && cp /tmp/gf-p/*.json ~/.gf/"
     fi
 fi
 
