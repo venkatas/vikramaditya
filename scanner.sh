@@ -225,14 +225,57 @@ fi
 
 # ── Check 3: XSS ────────────────────────────────────────────────────────
 if ! skip_has xss; then
-    log_info "Check 3: XSS (dalfox)"
+    log_info "Check 3: XSS (dalfox + CSP analysis + XSStrike WAF bypass)"
     PARAMS_FILE="$RECON_DIR/urls/with_params.txt"
+
+    # 3a — dalfox automated scan
     if tool_ok dalfox && [ -s "$PARAMS_FILE" ]; then
         DAL_OUT="$FINDINGS_DIR/xss/dalfox_results.txt"
         DAL_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 30 || echo 100)
         log_step "Running dalfox on up to $DAL_LIMIT URLs..."
         head -"$DAL_LIMIT" "$PARAMS_FILE" | dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null || true
         log_done "dalfox check done"
+    fi
+
+    # 3b — CSP header analysis on live hosts
+    log_step "Analysing Content-Security-Policy headers..."
+    CSP_WEAK="$FINDINGS_DIR/xss/csp_weak.txt"
+    CSP_MISSING="$FINDINGS_DIR/xss/csp_missing.txt"
+    while IFS= read -r host; do
+        [ -z "$host" ] && continue
+        HDR=$(curl -sk --max-time 8 -I "$host" 2>/dev/null | tr -d '\r')
+        CSP=$(echo "$HDR" | grep -i "^content-security-policy:" | cut -d: -f2-)
+        if [ -z "$CSP" ]; then
+            log_warn "[CSP-MISSING] No CSP header: $host"
+            echo "[CSP-MISSING] $host" >> "$CSP_MISSING"
+        else
+            # Flag dangerous directives
+            WEAK=""
+            echo "$CSP" | grep -qi "unsafe-inline"  && WEAK="$WEAK unsafe-inline"
+            echo "$CSP" | grep -qi "unsafe-eval"    && WEAK="$WEAK unsafe-eval"
+            echo "$CSP" | grep -qi "'\\*'"          && WEAK="$WEAK wildcard-src"
+            echo "$CSP" | grep -qi "data:"          && WEAK="$WEAK data-uri"
+            if [ -n "$WEAK" ]; then
+                log_vuln "[CSP-WEAK]$WEAK — $host"
+                echo "[CSP-WEAK]$WEAK | $host" >> "$CSP_WEAK"
+            fi
+        fi
+    done < <(cat "$RECON_DIR/live/live_hosts.txt" 2>/dev/null | head -50)
+
+    # 3c — XSStrike WAF-bypass scan (full mode only, requires tools/XSStrike)
+    XSSSTRIKE_SCRIPT="$SCRIPT_DIR/tools/XSStrike/xsstrike.py"
+    if [ "$FULL_MODE" = "--full" ] && [ -f "$XSSSTRIKE_SCRIPT" ] && [ -s "$PARAMS_FILE" ]; then
+        log_step "Running XSStrike WAF-bypass scan (--full mode)..."
+        XSS_WAF_OUT="$FINDINGS_DIR/xss/xsstrike_results.txt"
+        XSS_LIMIT=10
+        head -"$XSS_LIMIT" "$PARAMS_FILE" | while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            python3 "$XSSSTRIKE_SCRIPT" --url "$url" --blind --skip-dom \
+                2>/dev/null | grep -iE "xss|payload|vulnerable" >> "$XSS_WAF_OUT" || true
+        done
+        XSS_WAF_COUNT=$(count_vuln "$XSS_WAF_OUT")
+        [ "$XSS_WAF_COUNT" -gt 0 ] && log_ok "[XSS-WAF] $XSS_WAF_COUNT XSStrike finding(s)"
+        log_done "XSStrike WAF-bypass check done"
     fi
 fi
 
@@ -587,6 +630,9 @@ log_info "Scan Complete. Consolidating..."
     echo "Verified RCE PoCs    : $(count_vuln "$FINDINGS_DIR/upload/verified_rce_pocs.txt")"
     echo "Verified Upload Only : $(count_vuln "$FINDINGS_DIR/upload/verified_upload_pocs.txt")"
     echo "XSS (dalfox)         : $(count_vuln "$FINDINGS_DIR/xss/dalfox_results.txt")"
+    echo "XSS (XSStrike WAF)   : $(count_vuln "$FINDINGS_DIR/xss/xsstrike_results.txt")"
+    echo "CSP Missing          : $(count_vuln "$FINDINGS_DIR/xss/csp_missing.txt")"
+    echo "CSP Weak             : $(count_vuln "$FINDINGS_DIR/xss/csp_weak.txt")"
     echo "SSTI Confirmed       : $(count_vuln "$FINDINGS_DIR/ssti/ssti_candidates.txt")"
     echo "MFA Bypass Findings  : $(count_vuln "$FINDINGS_DIR/mfa/findings.txt")"
     echo "SAML/SSO Findings    : $(count_vuln "$FINDINGS_DIR/saml/findings.txt")"
