@@ -1,0 +1,6 @@
+# GHSA-gc5v-m9x4-r6x2: requests extract_zipped_paths() predictable temp file
+# Fixed in requests 2.33.0 which requires Python 3.10+
+# We support Python 3.9 and don't call extract_zipped_paths()
+[[IgnoredVulns]]
+id = "GHSA-gc5v-m9x4-r6x2"
+reason = "Fix requires Python 3.10+; we support 3.9 and don't use extract_zipped_paths()"
