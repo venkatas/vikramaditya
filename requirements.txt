@@ -13,7 +13,8 @@ ollama>=0.2.0
 
 # Grok API (xAI) — grok-2-latest, grok-3-mini, etc.
 # Set: export XAI_API_KEY=xai-...
-# requests>=2.31.0   # used for Grok (OpenAI-compatible HTTP)
+ 
+requests>=2.32.4   # used for vulnerablity fixing
 
 # Optional LangGraph backend for agent.py
 # pip install langgraph langchain-ollama langchain-core
