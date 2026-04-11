@@ -833,6 +833,13 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
     chains = ChainBuilder().run(all_findings, saver)
     all_findings.extend(chains)
 
+    # Phase 13: Brain Validation (FP removal + severity correction)
+    if with_brain:
+        try:
+            all_findings = _brain_validate_findings(all_findings, output_dir)
+        except Exception as e:
+            log("warn", f"Brain validation failed: {e}")
+
     # Save summary
     if saver:
         saver.save_summary()
@@ -855,7 +862,7 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
     print(f"  Output: {output_dir or 'stdout only'}")
     print("=" * 60 + "\n")
 
-    # Optional brain analysis
+    # Brain chain analysis + recommendations
     if with_brain:
         try:
             _run_brain_analysis(all_findings, output_dir)
@@ -863,6 +870,126 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
             log("warn", f"Brain analysis failed: {e}")
 
     return {"findings": all_findings, "endpoints": endpoints, "chains": chains}
+
+
+def _brain_validate_findings(findings: list[dict], output_dir: str = None) -> list[dict]:
+    """Use local LLM to review findings for false positives and severity inflation."""
+    log("phase", "Phase 13: Brain Validation (FP + Severity Review)")
+    try:
+        import ollama
+    except ImportError:
+        log("warn", "  ollama not installed — skipping brain validation")
+        return findings
+
+    # For JSON validation, prefer non-thinking models (Gemma 4 puts output in thinking field)
+    model = None
+    for candidate in ["qwen3-coder-64k:latest", "vapt-qwen25:latest",
+                      "qwen2.5-coder:32b", "baron-llm:latest", "qwen3:8b"]:
+        try:
+            ollama.show(candidate)
+            model = candidate
+            break
+        except Exception:
+            continue
+    if not model:
+        log("warn", "  No Ollama model found — skipping validation")
+        return findings
+
+    log("info", f"  Validation model: {model} (non-thinking for JSON)")
+
+    summary = "\n".join(
+        f"[{f['severity'].upper()}] {f['type']}: {f['detail']}"
+        for f in findings
+    )
+
+    prompt = f"""Review these {len(findings)} VAPT findings. Return JSON with severity corrections.
+
+Rules:
+- S3 does NOT execute PHP/Python. Upload to S3 is NOT RCE. If CRITICAL for S3 upload, downgrade to HIGH.
+- Django DEBUG=True is HIGH (CVSS 7.5), NOT CRITICAL (requires CVSS >= 9.0).
+- Server version disclosure alone is INFO, not LOW/MEDIUM.
+- Missing rate limiting is MEDIUM unless it directly enables account takeover.
+- If a finding claims "RCE" but the file is stored on static S3, downgrade to HIGH.
+
+Findings:
+{summary}
+
+Return ONLY this JSON format, no other text:
+{{"fixes": [{{"finding_type": "type_name", "action": "downgrade", "new_severity": "high", "reason": "one line"}}]}}
+
+If all findings are correctly rated, return: {{"fixes": []}}"""
+
+    try:
+        resp = ollama.chat(model=model, messages=[
+            {"role": "system", "content": "You are a VAPT severity reviewer. Output ONLY valid JSON. No markdown fences. No explanation."},
+            {"role": "user", "content": prompt},
+        ], options={"num_predict": 1000, "temperature": 0.1})
+
+        content = resp["message"].get("content", "") or ""
+        thinking = resp["message"].get("thinking", "") or ""
+        combined = content + " " + thinking
+
+        # Strip markdown fences if present
+        combined = re.sub(r'```json\s*', '', combined)
+        combined = re.sub(r'```\s*', '', combined)
+
+        # Extract JSON from response
+        json_match = re.search(r'\{[^{}]*"fixes"\s*:\s*\[[\s\S]*?\]\s*\}', combined)
+        if not json_match:
+            log("warn", "  Brain returned no actionable JSON — keeping all findings")
+            return findings
+
+        review = json.loads(json_match.group(0))
+        fixes = review.get("fixes", [])
+
+        if not fixes:
+            log("ok", "  Brain approved all findings — no changes needed")
+            return findings
+
+        # Apply fixes
+        removed = 0
+        downgraded = 0
+        for fix in fixes:
+            ftype = fix.get("finding_type", "")
+            action = fix.get("action", "keep")
+            new_sev = fix.get("new_severity", "")
+            reason = fix.get("reason", "")
+
+            for f in findings:
+                if ftype and ftype in f.get("type", ""):
+                    if action == "remove":
+                        f["_removed"] = True
+                        removed += 1
+                        log("warn", f"  REMOVED: {f['type']} — {reason}")
+                    elif action == "downgrade" and new_sev:
+                        old_sev = f["severity"]
+                        f["severity"] = new_sev
+                        downgraded += 1
+                        log("info", f"  DOWNGRADED: {f['type']} {old_sev}→{new_sev} — {reason}")
+                    break
+
+        # Remove marked findings
+        validated = [f for f in findings if not f.get("_removed")]
+
+        log("ok", f"  Brain review: {removed} removed, {downgraded} downgraded, {len(validated)} kept")
+
+        # Save review log
+        if output_dir:
+            review_path = os.path.join(output_dir, "brain_validation.json")
+            with open(review_path, "w") as fh:
+                json.dump({"model": model, "fixes": fixes,
+                           "removed": removed, "downgraded": downgraded,
+                           "total_before": len(findings), "total_after": len(validated)}, fh, indent=2)
+            log("info", f"  Review log: {review_path}")
+
+        return validated
+
+    except json.JSONDecodeError as e:
+        log("warn", f"  Brain returned invalid JSON: {e}")
+        return findings
+    except Exception as e:
+        log("warn", f"  Brain validation error: {e}")
+        return findings
 
 
 def _run_brain_analysis(findings: list[dict], output_dir: str = None):
