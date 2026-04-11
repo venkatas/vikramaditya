@@ -182,30 +182,40 @@ The agent operates in a tight loop: **Observe → Think (LLM) → Act (tool) →
 
 `brain.py` supports five LLM backends. Set `BRAIN_PROVIDER` to force one, or let Vikramaditya auto-detect in priority order: **Ollama → MLX → Claude → OpenAI → Grok**.
 
-| Provider | Env var required | Example models | Notes |
-|:---------|:----------------|:---------------|:------|
-| **Ollama** (local, default) | — | `qwen2.5:14b`, `qwen3-coder:32b` | CPU/GPU, all platforms |
-| **MLX** (Apple Silicon) | — | `Qwen2.5-14B-Instruct-4bit`, `DeepSeek-R1-14B-4bit` | ~40 tok/s on M4, SSD paging |
-| **Claude** (Anthropic) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6`, `claude-opus-4-6` | Best reasoning |
-| **OpenAI** | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini` | |
-| **Grok** (xAI) | `XAI_API_KEY` | `grok-2-latest`, `grok-3-mini` | |
+### Recommended Local Models (Benchmark-Tested)
+
+Tested on MacBook Pro M4 Max (36GB) with a real VAPT findings set. Quality scored on: exploit chain identification, missed-test suggestions, and attack path analysis.
+
+| Rank | Model | Speed | Quality | RAM | Best For |
+|:-----|:------|------:|:--------|----:|:---------|
+| #1 | **`gemma4:26b`** | 25.6 tok/s | 4/4 | 17GB | **Primary brain** — fastest with full quality, native tool calling, 262K context |
+| #2 | **`qwen3-coder-64k`** | 10.2 tok/s | 4/4 | 18GB | **Code analysis** — 64K context for large JS bundles |
+| #3 | **`vapt-qwen25`** | 4.1 tok/s | 4/4 | 19GB | **Deep analysis** — custom VAPT training data |
+| #4 | `deepseek-r1:32b` | 3.9 tok/s | 4/4 | 19GB | Chain-of-thought reasoning (slow) |
+| #5 | **`baron-llm`** | 14.2 tok/s | 2/4 | 6.6GB | **Fast triage** — offensive security fine-tune |
+| — | `gemma4:e4b` | fast | 3/4 | 9.6GB | Lightweight — laptops with 16GB RAM |
 
 ```bash
+# Recommended setup (one command):
+ollama pull gemma4:26b
+
 # Run fully local — no API keys, no data leaves your machine
-ollama pull qwen2.5:14b
 python3 hunt.py --target example.com
 
-# Apple Silicon — MLX is faster than Ollama on M-series chips (auto-detected)
-# Install: pip3 install mlx-lm   (or: ./setup.sh)
-export BRAIN_PROVIDER=mlx
-export MLX_MODEL=mlx-community/Qwen2.5-14B-Instruct-4bit
-python3 hunt.py --target example.com
-
-# Force Claude as the analysis engine
-export BRAIN_PROVIDER=claude
-export ANTHROPIC_API_KEY=sk-ant-...
-python3 hunt.py --target example.com
+# Autopilot API VAPT (autonomous, no manual direction needed)
+python3 autopilot_api_hunt.py --base-url https://api.target.com \
+    --auth-creds user:pass --with-brain
 ```
+
+### All Supported Providers
+
+| Provider | Env var required | Notes |
+|:---------|:----------------|:------|
+| **Ollama** (local, default) | — | CPU/GPU, all platforms, auto-detects best model |
+| **MLX** (Apple Silicon) | — | ~40 tok/s on M-series, SSD paging for large models |
+| **Claude** (Anthropic) | `ANTHROPIC_API_KEY` | Best reasoning, cloud-only |
+| **OpenAI** | `OPENAI_API_KEY` | `gpt-4o`, `o3-mini` |
+| **Grok** (xAI) | `XAI_API_KEY` | `grok-2-latest`, `grok-3-mini` |
 
 ---
 

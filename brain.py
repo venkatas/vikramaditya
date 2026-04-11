@@ -303,21 +303,27 @@ class LLMClient:
         return []
 
 # Model preference order — first available wins
+# Benchmark-tested model priority (M4 Max 36GB, April 2026):
+#   #1 gemma4:26b         23s  25.6 tok/s  4/4 quality  ★ CHAMPION
+#   #2 qwen3-coder-64k    26s  10.2 tok/s  4/4 quality  Best for code/JS analysis
+#   #3 vapt-qwen25         88s   4.1 tok/s  4/4 quality  Deepest VAPT knowledge
+#   #4 deepseek-r1:32b   153s   3.9 tok/s  4/4 quality  Chain-of-thought reasoning
+#   #5 baron-llm           17s  14.2 tok/s  2/4 quality  Fast triage only
 MODEL_PRIORITY = [
-    "qwen3-coder-64k:latest",    # PRIMARY — 30.5B, 64K context
-    "vapt-qwen25:latest",        # custom 32B VAPT-tuned
+    "gemma4:26b",                # ★ #1 — 25.8B MoE, 25.6 tok/s, 262K context, native tool calling
+    "qwen3-coder-64k:latest",   # #2 — 30.5B, 10.2 tok/s, 64K context, best for code
+    "vapt-qwen25:latest",       # #3 — custom 32B VAPT-tuned, deepest security knowledge
     "vikramaditya-custom:latest", # custom 32B vikramaditya
     "vapt-model:latest",         # custom 30B VAPT
-    "gemma4:26b",                # Gemma 4 27B MoE — native tool calling, multimodal
     "qwen3-coder:30b",           # coder 30B
-    "deepseek-r1:32b",           # strong reasoning
-    "qwen3:30b-a3b",             # MoE 30B
-    "qwen2.5-coder:32b",         # coder 32B
+    "deepseek-r1:32b",           # strong reasoning (slow: 3.9 tok/s)
+    "qwen3:30b-a3b",             # MoE 30B, 25.1 tok/s but 3/4 quality
+    "qwen2.5-coder:32b",         # coder 32B (slow: 2.7 tok/s)
     "qwen2.5:32b",               # general 32B
     "gemma4:e4b",                # Gemma 4 4B — fast, fits anywhere
     "deepseek-r1:14b",           # reasoning 14B
     "qwen3:14b",                 # 14B fallback
-    "baron-llm:latest",          # BaronLLM 8B — offensive security fine-tune (fast)
+    "baron-llm:latest",          # BaronLLM 8B — fast triage (14.2 tok/s, 2/4 quality)
     "qwen3:8b",                  # 8B fallback
     "mistral:7b-instruct-v0.3-q8_0",  # 7B last resort
 ]
