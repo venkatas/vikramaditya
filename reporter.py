@@ -654,8 +654,11 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
 
 
 def process_findings_dir(findings_dir: str, client: str = "",
-                         consultant: str = "", title: str = "") -> tuple:
+                         consultant: str = "", title: str = "",
+                         target_override: str = "") -> tuple:
     target, session, report_dir = resolve_target_and_report_dir(findings_dir)
+    if target_override:
+        target = target_override
     os.makedirs(report_dir, exist_ok=True)
     findings = load_findings(findings_dir)
     if not title:
@@ -739,6 +742,7 @@ def main() -> None:
     parser.add_argument("--client",     default="")
     parser.add_argument("--consultant", default="")
     parser.add_argument("--title",      default="Vulnerability Assessment & Penetration Test Report")
+    parser.add_argument("--target",     default="", help="Target domain name (overrides auto-detect from dir name)")
     args = parser.parse_args()
 
     if args.manual:
@@ -772,7 +776,8 @@ def main() -> None:
         sys.exit(1)
 
     count, _, report_dir, html, md = process_findings_dir(
-        args.findings_dir, args.client, args.consultant, args.title)
+        args.findings_dir, args.client, args.consultant, args.title,
+        target_override=args.target)
 
     html_path = os.path.join(report_dir, "vapt_report.html")
     md_path   = os.path.join(report_dir, "vapt_report.md")
