@@ -889,8 +889,8 @@ def _run_brain_analysis(findings: list[dict], output_dir: str = None):
         # qwen3-coder-64k (4/4, 10 tok/s) > vapt-qwen25 (4/4, 4 tok/s) >
         # gemma4:26b (untested) > deepseek-r1:32b (4/4, 3.9 tok/s) >
         # baron-llm (2/4, 14 tok/s) > qwen3:8b (fallback)
-        for candidate in ["qwen3-coder-64k:latest", "vapt-qwen25:latest",
-                          "gemma4:26b", "deepseek-r1:32b", "qwen2.5-coder:32b",
+        for candidate in ["gemma4:26b", "qwen3-coder-64k:latest",
+                          "vapt-qwen25:latest", "deepseek-r1:32b",
                           "baron-llm:latest", "qwen3:8b"]:
             try:
                 ollama.show(candidate)
