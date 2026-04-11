@@ -361,10 +361,13 @@ class AuthBypassScanner:
         base_url = session.base_url
 
         # IMPORTANT: create a FRESH Session for bare requests to prevent
-        # cookie leakage from the authenticated session's module-level jar
+        # cookie leakage from the authenticated session's module-level jar.
+        # Also clear the module-level default cookie jar which requests.post() shares.
         import requests as _req_mod
+        _req_mod.utils.default_headers()  # Reset defaults
         _bare = _req_mod.Session()
         _bare.verify = False
+        _bare.cookies.clear()
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -388,13 +391,19 @@ class AuthBypassScanner:
 
             for test_name, (test_token, severity, detail) in tests.items():
                 try:
+                    # Create a completely new Session per test to guarantee zero cookie leak
+                    _test_session = _req_mod.Session()
+                    _test_session.verify = False
+
                     if test_token == "":
-                        # No auth at all — fresh session, zero cookies
-                        r = _bare.post(url, json={}, timeout=15)
+                        # No auth at all — zero cookies
+                        r = _test_session.post(url, json={}, timeout=15)
                     else:
                         # Only cf_at cookie (NO cf_rt to prevent silent refresh)
-                        r = _bare.post(url, json={}, cookies={"cf_at": test_token},
-                                       timeout=15)
+                        r = _test_session.post(url, json={}, cookies={"cf_at": test_token},
+                                               timeout=15)
+                    _test_session.close()
+
                     if r.status_code in (200, 201, 204):
                         f = {"type": f"auth_bypass_{test_name}", "severity": severity,
                              "detail": f"{detail} ({path})", "url": url,
@@ -1029,14 +1038,22 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
                   with_brain: bool = False) -> dict:
     """Run all 12 phases of the autonomous API VAPT."""
 
-    print(r"""
- ██╗   ██╗██╗██╗  ██╗██████╗  █████╗ ███╗   ███╗ █████╗ ██████╗ ██╗████████╗██╗   ██╗ █████╗
- ██║   ██║██║██║ ██╔╝██╔══██╗██╔══██╗████╗ ████║██╔══██╗██╔══██╗██║╚══██╔══╝╚██╗ ██╔╝██╔══██╗
- ██║   ██║██║█████╔╝ ██████╔╝███████║██╔████╔██║███████║██║  ██║██║   ██║    ╚████╔╝ ███████║
- ╚██╗ ██╔╝██║██╔═██╗ ██╔══██╗██╔══██║██║╚██╔╝██║██╔══██║██║  ██║██║   ██║     ╚██╔╝  ██╔══██║
-  ╚████╔╝ ██║██║  ██╗██║  ██║██║  ██║██║ ╚═╝ ██║██║  ██║██████╔╝██║   ██║      ██║   ██║  ██║
-   ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
-              Brain-Supervised Autonomous API VAPT Engine
+    R = "\033[0;31m"  # Red
+    G = "\033[0;32m"  # Green
+    Y = "\033[1;33m"  # Yellow
+    B = "\033[0;34m"  # Blue
+    M = "\033[0;35m"  # Magenta
+    C = "\033[0;36m"  # Cyan
+    W = "\033[1;37m"  # White bold
+    N = "\033[0m"     # Reset
+    print(f"""
+{R} ██╗   ██╗{Y}██╗{G}██╗  ██╗{C}██████╗ {B} █████╗ {M}███╗   ███╗{R} █████╗ {Y}██████╗ {G}██╗{C}████████╗{B}██╗   ██╗{M} █████╗{N}
+{R} ██║   ██║{Y}██║{G}██║ ██╔╝{C}██╔══██╗{B}██╔══██╗{M}████╗ ████║{R}██╔══██╗{Y}██╔══██╗{G}██║{C}╚══██╔══╝{B}╚██╗ ██╔╝{M}██╔══██╗{N}
+{R} ██║   ██║{Y}██║{G}█████╔╝ {C}██████╔╝{B}███████║{M}██╔████╔██║{R}███████║{Y}██║  ██║{G}██║{C}   ██║   {B} ╚████╔╝ {M}███████║{N}
+{R} ╚██╗ ██╔╝{Y}██║{G}██╔═██╗ {C}██╔══██╗{B}██╔══██║{M}██║╚██╔╝██║{R}██╔══██║{Y}██║  ██║{G}██║{C}   ██║   {B}  ╚██╔╝  {M}██╔══██║{N}
+{R}  ╚████╔╝ {Y}██║{G}██║  ██╗{C}██║  ██║{B}██║  ██║{M}██║ ╚═╝ ██║{R}██║  ██║{Y}██████╔╝{G}██║{C}   ██║   {B}   ██║   {M}██║  ██║{N}
+{R}   ╚═══╝  {Y}╚═╝{G}╚═╝  ╚═╝{C}╚═╝  ╚═╝{B}╚═╝  ╚═╝{M}╚═╝     ╚═╝{R}╚═╝  ╚═╝{Y}╚═════╝ {G}╚═╝{C}   ╚═╝   {B}   ╚═╝   {M}╚═╝  ╚═╝{N}
+{W}              Brain-Supervised Autonomous API VAPT Engine{N}
 """)
     print(f"  Target : {base_url}")
     print(f"  Time   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
