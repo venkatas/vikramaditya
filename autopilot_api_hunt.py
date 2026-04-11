@@ -1110,7 +1110,7 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
         ctx.all_findings.extend(findings)
         ctx.completed_phases.append(phase_name)
 
-        # Brain supervisor decision
+        # Brain supervisor decision — visible reasoning
         if with_brain and findings:
             decision = _brain_decide_next(phase_name, findings, ctx)
             action = decision.get("action", "continue")
@@ -1121,6 +1121,13 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
                 "reason": reason, "findings_count": len(findings),
             })
 
+            # Show brain's thinking to the user
+            pending_names = [p["phase"] for p in ctx.test_plan[:3]]
+            print(f"\033[0;35m  ┌─ Brain Supervisor ─────────────────────────────────\033[0m")
+            print(f"\033[0;35m  │\033[0m Reviewed: {phase_name} ({len(findings)} findings)")
+            print(f"\033[0;35m  │\033[0m Thinking: {reason[:100]}")
+            print(f"\033[0;35m  │\033[0m Decision: \033[1m{action.upper()}\033[0m", end="")
+
             if action == "inject" and decision.get("phase"):
                 new_phase = {
                     "phase": decision["phase"],
@@ -1129,15 +1136,20 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
                     "reason": reason,
                 }
                 ctx.test_plan.insert(0, new_phase)
-                log("vuln", f"  Brain INJECT: {decision['phase']} — {reason}")
+                inject_eps = decision.get("endpoints", [])
+                print(f" → {decision['phase']} ({len(inject_eps)} endpoints)")
+                print(f"\033[0;35m  │\033[0m Next: {decision['phase']} → {' → '.join(pending_names[:2])}")
 
             elif action == "skip" and decision.get("skip_phase"):
                 skip_name = decision["skip_phase"]
                 ctx.test_plan = [p for p in ctx.test_plan if p["phase"] != skip_name]
-                log("info", f"  Brain SKIP: {skip_name} — {reason}")
+                print(f" → removing {skip_name} from queue")
+                print(f"\033[0;35m  │\033[0m Next: {' → '.join(pending_names[:3])}")
 
-            elif action == "continue":
-                log("info", f"  Brain: {reason[:80]}")
+            else:
+                print(f" → next: {pending_names[0] if pending_names else 'done'}")
+
+            print(f"\033[0;35m  └─────────────────────────────────────────────────────\033[0m", flush=True)
 
     if ctx.phases_executed >= MAX_PHASES:
         log("warn", f"  Safety cap: stopped after {MAX_PHASES} phases")
