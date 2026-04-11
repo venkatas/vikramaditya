@@ -130,43 +130,107 @@ class AuthSession:
         self._session.headers["Authorization"] = f"Bearer {token}"
 
     def auto_login(self, login_path: str, username: str, password: str) -> str:
-        """Login and extract JWT token from response."""
+        """Login and extract JWT token from response body or cookies.
+
+        Tries JSON body first, then form-data. Checks response body for token,
+        then cookies (cf_at, access_token, token, jwt).
+        """
         self._login_url = login_path
         self._creds = (username, password)
         url = f"{self.base_url}/{login_path.lstrip('/')}"
         self._limiter.wait()
-        try:
-            resp = self._session.post(url, json={"email": username, "password": password}, timeout=15)
-            data = resp.json()
-            token = (data.get("token") or data.get("access_token")
-                     or data.get("data", {}).get("token")
-                     or data.get("data", {}).get("access_token") or "")
-            if token:
-                self.set_token(token)
-                return token
-        except Exception:
-            pass
+
+        # Try JSON first, then form-data
+        for payload_kwargs in [
+            {"json": {"email": username, "password": password}},
+            {"data": {"email": username, "password": password}},
+            {"json": {"username": username, "password": password}},
+        ]:
+            try:
+                resp = self._session.post(url, timeout=15, **payload_kwargs)
+                # Check response body for token
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {}
+                token = (body.get("token") or body.get("access_token")
+                         or (body.get("data") or {}).get("token")
+                         or (body.get("data") or {}).get("access_token") or "")
+                if token:
+                    self.set_token(token)
+                    return token
+
+                # Check cookies for JWT (common patterns: cf_at, access_token, jwt, token)
+                for cookie_name in ("cf_at", "access_token", "jwt", "token", "session"):
+                    cookie_val = resp.cookies.get(cookie_name) or self._session.cookies.get(cookie_name)
+                    if cookie_val and cookie_val.count(".") == 2:  # JWT format: header.payload.sig
+                        self.token = cookie_val
+                        # Keep cookies in session (already stored by requests.Session)
+                        return cookie_val
+
+                # If we got a success response but no token, cookies may handle auth
+                if body.get("status") is True or resp.status_code in (200, 201):
+                    # Check if session cookies were set
+                    if self._session.cookies:
+                        self.token = "cookie-auth"
+                        return "cookie-auth"
+            except Exception:
+                continue
         return ""
 
     def request(self, method: str, path: str, token: str = None,
                 json_body: dict = None, data: dict = None,
                 headers: dict = None, timeout: int = 15) -> dict:
-        """Make an HTTP request with rate limiting."""
+        """Make an HTTP request with rate limiting.
+
+        Token handling:
+        - token=None: use session's current auth state (cookies + headers)
+        - token="": strip all auth (no cookies, no Authorization header)
+        - token="<jwt>": send as both Bearer header AND cf_at cookie
+        """
         self._limiter.wait()
         url = f"{self.base_url}/{path.lstrip('/')}"
         hdrs = dict(self._session.headers)
+        cookies = dict(self._session.cookies)
+
         if token is not None:
-            if token:
-                hdrs["Authorization"] = f"Bearer {token}"
-            else:
+            if token == "":
+                # No auth: strip everything
                 hdrs.pop("Authorization", None)
+                cookies = {}
+            elif token == "cookie-auth":
+                # Cookie-based auth: use session cookies as-is
+                hdrs.pop("Authorization", None)
+            else:
+                # Token auth: send as both Bearer header and cf_at cookie
+                hdrs["Authorization"] = f"Bearer {token}"
+                cookies["cf_at"] = token
         if headers:
             hdrs.update(headers)
         try:
-            resp = self._session.request(
-                method, url, json=json_body, data=data,
-                headers=hdrs, timeout=timeout, allow_redirects=False,
-            )
+            if token == "":
+                # No auth: use a bare request (no session cookies)
+                import requests as _bare_req
+                resp = _bare_req.request(
+                    method, url, json=json_body, data=data,
+                    headers=hdrs, timeout=timeout, allow_redirects=False,
+                    verify=False,
+                )
+            elif token is not None and token != "cookie-auth":
+                # Explicit token: bare request with ONLY this token (no session cookies)
+                import requests as _bare_req
+                resp = _bare_req.request(
+                    method, url, json=json_body, data=data,
+                    headers=hdrs, cookies={"cf_at": token},
+                    timeout=timeout, allow_redirects=False,
+                    verify=False,
+                )
+            else:
+                # Default: use session as-is (carries login cookies)
+                resp = self._session.request(
+                    method, url, json=json_body, data=data,
+                    headers=hdrs, timeout=timeout, allow_redirects=False,
+                )
             try:
                 body = resp.json()
             except Exception:

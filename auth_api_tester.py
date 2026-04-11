@@ -37,12 +37,12 @@ def test_endpoint(session: AuthSession, endpoint: dict, valid_token: str) -> dic
 
     result = {"path": path, "method": method, "tests": {}, "findings": []}
 
-    # 1. Valid token (baseline)
-    resp = session.request(method, path, token=valid_token, json_body=body)
+    # 1. Valid token (baseline) — use session's auth state (cookies)
+    resp = session.request(method, path, json_body=body)
     result["tests"]["valid"] = resp["status"]
     baseline = resp["status"]
 
-    # 2. No token
+    # 2. No token / no cookies
     resp = session.request(method, path, token="", json_body=body)
     result["tests"]["no_auth"] = resp["status"]
     if resp["status"] in (200, 201, 204) and baseline in (200, 201, 204):
