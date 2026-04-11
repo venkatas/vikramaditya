@@ -60,8 +60,13 @@ Vikramaditya is an autonomous VAPT tool built for professional security consulta
 git clone https://github.com/venkatas/vikramaditya.git
 cd vikramaditya
 chmod +x setup.sh && ./setup.sh      # installs all required tools
+ollama pull gemma4:26b               # recommended brain model (17GB)
+```
 
-# Run a full assessment
+### Infrastructure VAPT (domains, IPs, subnets)
+
+```bash
+# Full assessment on a domain
 python3 hunt.py --target example.com
 
 # Single IP address
@@ -75,6 +80,57 @@ python3 hunt.py --target example.com --quick
 
 # Autonomous mode — AI drives all decisions
 python3 hunt.py --target example.com --autonomous
+```
+
+### Authenticated API VAPT (SPA + REST API targets)
+
+```bash
+# Brain-supervised autonomous scan (recommended)
+python3 autopilot_api_hunt.py \
+    --base-url https://api.target.com \
+    --auth-creds "admin@target.com:password" \
+    --login-url sign-in/ \
+    --frontend-url https://app.target.com \
+    --with-brain
+
+# With second account for IDOR + privilege escalation testing
+python3 autopilot_api_hunt.py \
+    --base-url https://api.target.com \
+    --auth-creds "admin@target.com:password" \
+    --auth-creds-b "user@target.com:password" \
+    --login-url sign-in/ \
+    --with-brain
+
+# Without brain (fully deterministic, no LLM needed)
+python3 autopilot_api_hunt.py \
+    --base-url https://api.target.com \
+    --auth-creds "admin@target.com:password" \
+    --login-url sign-in/
+```
+
+### Individual Tools
+
+```bash
+# Authenticated API broken access control
+python3 auth_api_tester.py --base-url URL --auth-creds user:pass --login-url sign-in/
+
+# Generic REST API IDOR scanner (two-token cross-user testing)
+python3 api_idor_scanner.py --base-url URL --token-a TOKEN1 --token-b TOKEN2
+
+# Business logic testing (score manipulation, rate limits, pagination abuse)
+python3 business_logic_tester.py --base-url URL --auth-creds user:pass --login-url sign-in/
+
+# OAuth/OIDC security testing
+python3 oauth_tester.py --target target.com
+
+# Finding validator (7-Question Gate — kills weak findings before report)
+python3 finding_validator.py findings/target/
+
+# Chain builder (A→B exploit escalation)
+python3 chain_builder.py findings/target/
+
+# Generate VAPT report (HTML + Markdown with inline PoC)
+python3 reporter.py findings/target/ --target target.com --client "Client Name"
 ```
 
 ---
@@ -347,14 +403,85 @@ AI options:
   --brain-next                  Ask AI: what is the highest-impact next action?
 
 Reporting:
-  python3 reporter.py <findings_dir> [--client NAME] [--consultant NAME] [--title TITLE]
+  python3 reporter.py <findings_dir> [--client NAME] [--consultant NAME] [--title TITLE] [--target DOMAIN]
 
 Utilities:
   --repair-tools                Auto-install missing tools
   --status                      Show current assessment progress
   --oob-setup                   Configure interactsh OOB token
   --resume SESSION_ID           Resume a previous session
+
+Autopilot API VAPT (autopilot_api_hunt.py):
+  --base-url URL                API base URL (required)
+  --auth-creds user:pass        Primary account credentials (required)
+  --auth-creds-b user:pass      Second account for IDOR/priv esc testing
+  --login-url PATH              Login endpoint path (default: sign-in/)
+  --frontend-url URL            Frontend URL for JS bundle scraping
+  --with-brain                  Enable brain supervisor (local LLM)
+  --rate-limit N                Max requests/sec (default: 5)
+  --output DIR                  Output directory for findings
 ```
+
+---
+
+## Autopilot API VAPT Engine
+
+The `autopilot_api_hunt.py` module is a **brain-supervised dynamic VAPT engine** for modern SPA + REST API applications. It runs 12 attack phases autonomously with an AI supervisor that decides what to test next based on discoveries.
+
+### How the Brain Supervisor Works
+
+```
+Discover endpoints (JS bundle + Django debug + crawl)
+  → Brain categorizes endpoints and creates prioritized test plan
+  → Loop:
+      Execute top-priority phase
+      → Brain reviews findings
+      → Brain decides: CONTINUE / INJECT / SKIP / PIVOT
+      → Modify test queue based on decision
+  → Chain building → Brain validation (FP removal) → Report
+```
+
+### Attack Phases
+
+| Phase | Tests |
+|-------|-------|
+| Auth Bypass | No token, expired, tampered, alg=none |
+| IDOR | Sequential ID enum, Base64 decode, PII detection |
+| Privilege Escalation | Learner → admin endpoint access |
+| Business Logic | Score manipulation, workflow bypass, negative values |
+| File Upload | Double extension, MIME mismatch, polyglot, S3 arbitrary type |
+| Injection | SQLi (time + error), SSTI, command injection |
+| Info Disclosure | Django DEBUG, server headers, SMTP creds, AWS keys, DB schema |
+| Rate Limiting | Rapid login, password change, reset |
+| Token Security | JWT lifetime, refresh token abuse |
+| Timing Oracles | User enumeration via response time |
+| Chain Building | Cross-reference findings for escalation |
+| Brain Validation | FP removal + severity correction via LLM |
+
+### Brain Model Stack
+
+| Role | Model | Speed | Use |
+|------|-------|-------|-----|
+| Decision engine | `baron-llm` | 14 tok/s | Per-phase INJECT/SKIP/CONTINUE decisions |
+| FP validation | `qwen3-coder-64k` | 10 tok/s | JSON severity corrections |
+| Chain analysis | `gemma4:26b` | 25 tok/s | Final exploit chain + recommendations |
+
+---
+
+## New Modules (v5+)
+
+| Module | Purpose |
+|--------|---------|
+| `autopilot_api_hunt.py` | Brain-supervised autonomous API VAPT (12 phases) |
+| `auth_api_tester.py` | Broken access control testing (5 auth states per endpoint) |
+| `api_idor_scanner.py` | Generic two-token IDOR scanner (ID mutation + Base64 decode) |
+| `business_logic_tester.py` | Score manipulation, rate limits, pagination abuse |
+| `oauth_tester.py` | OAuth state entropy, redirect_uri bypass, host header injection |
+| `auth_utils.py` | JWT decode/tamper (no PyJWT), rate limiter, auth session |
+| `finding_validator.py` | 7-Question Gate + 28-pattern never-submit list |
+| `chain_builder.py` | 12-pattern A→B exploit chain discovery |
+| `scope_checker.py` | Deterministic domain matching (anchored suffix, IP rejection) |
+| `memory/` | Hunt journal (JSONL), pattern DB, audit log with circuit breaker |
 
 ---
 
@@ -362,12 +489,22 @@ Utilities:
 
 ```
 vikramaditya/
-├── hunt.py              Main orchestrator
-├── brain.py             AI analysis engine (multi-provider LLM)
-├── agent.py             Autonomous ReAct agent
-├── recon.sh             Subdomain + URL discovery
-├── scanner.sh           Vulnerability scanner
-├── reporter.py          Report generator (HTML + Markdown)
+├── hunt.py                  Main orchestrator (infrastructure VAPT)
+├── autopilot_api_hunt.py    Brain-supervised API VAPT engine
+├── brain.py                 AI analysis engine (Gemma 4, Ollama, MLX, Claude, OpenAI, Grok)
+├── agent.py                 Autonomous ReAct agent
+├── auth_api_tester.py       Authenticated API broken access control
+├── api_idor_scanner.py      Generic REST IDOR scanner
+├── business_logic_tester.py Score manipulation, rate limits, pagination
+├── oauth_tester.py          OAuth/OIDC security testing
+├── auth_utils.py            JWT helper, rate limiter, auth session
+├── finding_validator.py     7-Question Gate + never-submit list
+├── chain_builder.py         A→B exploit chain discovery
+├── scope_checker.py         Deterministic scope enforcement
+├── recon.sh                 Subdomain + URL discovery
+├── scanner.sh               Vulnerability scanner
+├── reporter.py              Report generator (HTML + Markdown + inline PoC)
+├── memory/                  Hunt journal, pattern DB, audit log
 ├── prioritize.py        CVE risk scoring
 ├── api_audit.py         OpenAPI/REST API auditing
 ├── cve.py               CVE matcher
