@@ -885,8 +885,13 @@ def _run_brain_analysis(findings: list[dict], output_dir: str = None):
         )
         # Try models in priority order: Gemma 4 27B → vapt-qwen25 → qwen2.5:32b → qwen3:8b
         model = None
-        for candidate in ["gemma4:26b", "gemma4:e4b", "vapt-qwen25:latest",
-                          "qwen2.5:32b", "qwen3:8b", "baron-llm:latest"]:
+        # Tested priority order (benchmark: quality + speed):
+        # qwen3-coder-64k (4/4, 10 tok/s) > vapt-qwen25 (4/4, 4 tok/s) >
+        # gemma4:26b (untested) > deepseek-r1:32b (4/4, 3.9 tok/s) >
+        # baron-llm (2/4, 14 tok/s) > qwen3:8b (fallback)
+        for candidate in ["qwen3-coder-64k:latest", "vapt-qwen25:latest",
+                          "gemma4:26b", "deepseek-r1:32b", "qwen2.5-coder:32b",
+                          "baron-llm:latest", "qwen3:8b"]:
             try:
                 ollama.show(candidate)
                 model = candidate
@@ -900,8 +905,9 @@ def _run_brain_analysis(findings: list[dict], output_dir: str = None):
         resp = ollama.chat(model=model, messages=[
             {"role": "system", "content": "You are a VAPT expert. Be concise and actionable."},
             {"role": "user", "content": prompt},
-        ])
-        analysis = resp["message"]["content"]
+        ], options={"num_predict": 800, "temperature": 0.3})
+        # Some models (GLM, DeepSeek-R1) put output in "thinking" field
+        analysis = resp["message"].get("content", "") or resp["message"].get("thinking", "")
         log("ok", f"  Brain analysis: {len(analysis)} chars")
         if output_dir:
             with open(os.path.join(output_dir, "brain_analysis.md"), "w") as f:
