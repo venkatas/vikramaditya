@@ -840,14 +840,23 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
     log("ok", f"Authenticated as {parts[0]}")
 
     # Second account login (for IDOR/priv esc)
+    # Try org API first, then learner API (different user tables)
     token_b = None
     if auth_creds_b:
         parts_b = auth_creds_b.split(":", 1)
         if len(parts_b) == 2:
+            # Try 1: same API (org)
             session_b = AuthSession(base_url, limiter)
             token_b = session_b.auto_login(login_url, parts_b[0], parts_b[1])
+            if not token_b:
+                # Try 2: learner API (replace /organization/ with /learner/)
+                learner_base = base_url.replace("/organization", "/learner")
+                session_b = AuthSession(learner_base, limiter)
+                token_b = session_b.auto_login(login_url, parts_b[0], parts_b[1])
             if token_b:
-                log("ok", f"Second account: {parts_b[0]}")
+                log("ok", f"Second account: {parts_b[0]} (role: learner)")
+            else:
+                log("warn", f"Second account login failed for {parts_b[0]}")
 
     # Output
     if output_dir:
@@ -879,12 +888,29 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
         ("timing_oracle", TimingOracle(), lambda p: p.run(session, saver)),
     ]
 
+    brain_notes = []  # Supervisor accumulates context across phases
+
     for name, phase_obj, runner in phases:
         try:
             findings = runner(phase_obj)
             all_findings.extend(findings)
+
+            # Brain supervisor: review after each phase
+            if with_brain and findings:
+                note = _brain_supervisor_review(name, findings, all_findings, brain_notes)
+                if note:
+                    brain_notes.append(note)
+
         except Exception as e:
             log("err", f"  Phase {name} failed: {e}")
+
+    # Save brain supervisor notes
+    if with_brain and brain_notes and output_dir:
+        with open(os.path.join(output_dir, "brain_supervisor_log.txt"), "w") as f:
+            f.write("# Brain Supervisor Log\n\n")
+            for note in brain_notes:
+                f.write(f"{note}\n")
+        log("info", f"  Supervisor log: {output_dir}/brain_supervisor_log.txt")
 
     # Phase 12: Chain Building
     chains = ChainBuilder().run(all_findings, saver)
@@ -927,6 +953,63 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
             log("warn", f"Brain analysis failed: {e}")
 
     return {"findings": all_findings, "endpoints": endpoints, "chains": chains}
+
+
+def _brain_supervisor_review(phase_name: str, phase_findings: list[dict],
+                              all_findings: list[dict], prior_notes: list[str]) -> str:
+    """Brain supervisor reviews each phase's findings in real-time.
+
+    Returns a one-line note for context accumulation, or empty string.
+    """
+    try:
+        import ollama
+    except ImportError:
+        return ""
+
+    if not phase_findings:
+        return ""
+
+    # Use fast model for per-phase review (speed > depth)
+    model = None
+    for candidate in ["baron-llm:latest", "gemma4:e4b", "qwen3:8b"]:
+        try:
+            ollama.show(candidate)
+            model = candidate
+            break
+        except Exception:
+            continue
+    if not model:
+        return ""
+
+    findings_text = "\n".join(f"  [{f['severity'].upper()}] {f['type']}: {f['detail'][:80]}"
+                               for f in phase_findings)
+    prior_context = "\n".join(prior_notes[-3:]) if prior_notes else "No prior context."
+
+    prompt = f"""/no_think
+Phase '{phase_name}' just completed with {len(phase_findings)} findings:
+{findings_text}
+
+Prior context from earlier phases:
+{prior_context}
+
+Total findings so far: {len(all_findings)}
+
+In ONE sentence: what should the next phases focus on based on these results? Flag any false positives."""
+
+    try:
+        resp = ollama.chat(model=model, messages=[
+            {"role": "user", "content": prompt},
+        ], options={"num_predict": 100, "temperature": 0.2})
+
+        content = (resp["message"].get("content", "") or resp["message"].get("thinking", "") or "").strip()
+        if content:
+            # Show only first line
+            first_line = content.split("\n")[0][:120]
+            log("info", f"  Brain [{phase_name}]: {first_line}")
+            return f"[{phase_name}] {first_line}"
+    except Exception:
+        pass
+    return ""
 
 
 def _brain_validate_findings(findings: list[dict], output_dir: str = None) -> list[dict]:
