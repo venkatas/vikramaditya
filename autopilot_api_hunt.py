@@ -391,23 +391,28 @@ class AuthBypassScanner:
 
             for test_name, (test_token, severity, detail) in tests.items():
                 try:
-                    # Create a completely new Session per test to guarantee zero cookie leak
-                    _test_session = _req_mod.Session()
-                    _test_session.verify = False
+                    # Use subprocess curl for COMPLETE process-level isolation.
+                    # requests.Session() leaks cookies via urllib3 connection pool
+                    # after other phases have used the same session.
+                    import subprocess
+                    curl_args = [
+                        "/usr/bin/curl", "-sk", "-X", "POST", url,
+                        "-H", "Content-Type: application/json",
+                        "-d", "{}",
+                        "-o", "/dev/null", "-w", "%{http_code}",
+                        "--max-time", "10",
+                    ]
+                    if test_token:
+                        curl_args += ["--cookie", f"cf_at={test_token}"]
+                    # No --cookie flag = no auth at all
 
-                    if test_token == "":
-                        # No auth at all — zero cookies
-                        r = _test_session.post(url, json={}, timeout=15)
-                    else:
-                        # Only cf_at cookie (NO cf_rt to prevent silent refresh)
-                        r = _test_session.post(url, json={}, cookies={"cf_at": test_token},
-                                               timeout=15)
-                    _test_session.close()
+                    result = subprocess.run(curl_args, capture_output=True, text=True, timeout=15)
+                    status_code = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
 
-                    if r.status_code in (200, 201, 204):
+                    if status_code in (200, 201, 204):
                         f = {"type": f"auth_bypass_{test_name}", "severity": severity,
                              "detail": f"{detail} ({path})", "url": url,
-                             "evidence": f"{test_name}: HTTP {r.status_code}"}
+                             "evidence": f"{test_name}: HTTP {status_code}"}
                         findings.append(f)
                         if saver:
                             saver.save(f)
