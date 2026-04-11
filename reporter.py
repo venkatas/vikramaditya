@@ -297,6 +297,38 @@ VULN_TEMPLATES["oauth"] = {
         ("OAuth 2.0 Security Best Practices", "https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics"),
     ],
 }
+VULN_TEMPLATES["auth_bypass"] = {
+    "title": "Broken Authentication on {host}",
+    "severity": "critical", "cvss": "9.8", "cwe": "CWE-287",
+    "impact": (
+        "An attacker can access protected API endpoints without valid authentication, "
+        "potentially reading or modifying all data in the system including PII, credentials, "
+        "and administrative functions."
+    ),
+    "remediation": (
+        "Enforce server-side JWT validation on every endpoint. Verify signature, expiry, "
+        "issuer, and audience claims. Reject tokens with alg=none or tampered signatures."
+    ),
+    "references": [
+        ("OWASP Broken Authentication", "https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/"),
+    ],
+}
+VULN_TEMPLATES["business_logic"] = {
+    "title": "Business Logic Flaw on {host}",
+    "severity": "high", "cvss": "8.1", "cwe": "CWE-840",
+    "impact": (
+        "An attacker can manipulate application business logic to bypass intended controls, "
+        "such as modifying scores, skipping workflow steps, or escalating privileges through "
+        "parameter tampering."
+    ),
+    "remediation": (
+        "Validate all business-critical values server-side. Enforce workflow state machines. "
+        "Never trust client-submitted scores, totals, or status values."
+    ),
+    "references": [
+        ("OWASP Business Logic", "https://owasp.org/www-community/vulnerabilities/Business_logic_vulnerability"),
+    ],
+}
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 SEVERITY_COLOR = {
@@ -311,6 +343,7 @@ SUBDIR_VTYPE = {
     "sqli": "sqli", "xss": "xss", "ssti": "ssti", "upload": "upload",
     "rce": "rce", "lfi": "lfi", "idor": "idor", "ssrf": "ssrf",
     "race": "race_condition", "oauth": "oauth",
+    "auth_bypass": "auth_bypass", "business_logic": "business_logic",
     "cors": "cors", "takeover": "takeover", "exposure": "exposure",
     "cves": "cves", "cloud": "misconfig", "metasploit": "rce",
     "browser/xss_dom": "xss_dom", "browser/csrf": "csrf",
