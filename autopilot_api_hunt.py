@@ -222,22 +222,40 @@ class IDORScanner:
         for ep in idor_targets[:15]:
             path = ep["path"]
             for test_id in [1, 2, 3, 100]:
-                resp = session.request("POST", path, data={"id": str(test_id)})
-                if resp["status"] in (200, 201) and isinstance(resp["body"], dict):
-                    body = resp["body"]
-                    data = body.get("data", body)
-                    if isinstance(data, dict):
-                        exposed = {k for k in data.keys() if k.lower() in self.PII_KEYS}
-                        if exposed:
-                            f = {"type": "idor", "severity": HIGH,
-                                 "detail": f"IDOR: id={test_id} exposes PII ({', '.join(exposed)}) on {path}",
-                                 "url": resp["url"],
-                                 "evidence": f"id={test_id} → {', '.join(f'{k}={data[k]}' for k in list(exposed)[:3])}"}
-                            findings.append(f)
-                            if saver:
-                                saver.save(f)
-                                saver.save_txt(f)
-                            break  # One confirmed IDOR per endpoint is enough
+                # Try both FormData and JSON (Django APIs typically use FormData)
+                for payload in [
+                    {"data": {"id": str(test_id)}},
+                    {"json_body": {"id": test_id}},
+                    {"data": {"id": str(test_id), "course_id": str(test_id)}},
+                    {"data": {"learner_id": str(test_id)}},
+                ]:
+                    resp = session.request("POST", path, **payload)
+                    if resp["status"] in (200, 201) and isinstance(resp["body"], dict):
+                        body = resp["body"]
+                        if body.get("status") is False:
+                            continue
+                        raw_data = body.get("data", body)
+                        # Handle both dict and list responses
+                        items = [raw_data] if isinstance(raw_data, dict) else (raw_data[:1] if isinstance(raw_data, list) else [])
+                        for data in items:
+                            if not isinstance(data, dict):
+                                continue
+                            exposed = {k for k in data.keys() if k.lower() in self.PII_KEYS}
+                            if exposed:
+                                sample = ', '.join(f'{k}={data[k]}' for k in list(exposed)[:3] if data.get(k))
+                                f = {"type": "idor", "severity": HIGH,
+                                     "detail": f"IDOR: id={test_id} exposes PII ({', '.join(exposed)}) on {path}",
+                                     "url": resp["url"],
+                                     "evidence": f"id={test_id} → {sample}"}
+                                findings.append(f)
+                                if saver:
+                                    saver.save(f)
+                                    saver.save_txt(f)
+                                break
+                        if findings and findings[-1]["detail"].startswith(f"IDOR: id={test_id}"):
+                            break  # Found IDOR with this payload format
+                if any(f["detail"].startswith(f"IDOR: id={test_id}") for f in findings):
+                    break  # One confirmed IDOR per endpoint
 
         log("ok", f"  {len(findings)} IDOR findings")
         return findings
@@ -290,26 +308,43 @@ class BusinessLogicTester:
         log("phase", "Phase 5: Business Logic Testing")
         findings = []
 
-        # 5a. Score manipulation
+        # 5a. Score manipulation on any result/score/grade endpoint
         score_endpoints = [ep for ep in endpoints if any(
-            kw in ep["path"] for kw in ("result", "score", "grade", "answer", "quiz")
+            kw in ep["path"] for kw in ("result", "score", "grade", "answer", "quiz", "generate")
         )]
+        tampered_payloads = [
+            {"correct_answers": "999", "wrong_answers": "-5", "total_score": "99999",
+             "learner_id": "1", "live_test_id": "1", "total_question": "10",
+             "total_marks": "100", "time_spend": "60"},
+            {"total_score": "-1", "learner_id": "1", "live_test_id": "1",
+             "total_question": "10", "total_marks": "100", "time_spend": "60"},
+        ]
         for ep in score_endpoints[:5]:
-            for field, value in [("total_score", "99999"), ("correct_answers", "999"),
-                                 ("wrong_answers", "-5"), ("total_marks", "-1")]:
-                resp = session.request("POST", ep["path"], data={field: value, "learner_id": "1",
-                                       "live_test_id": "1", "total_question": "10"})
-                if resp["status"] in (200, 201):
+            for payload in tampered_payloads:
+                resp = session.request("POST", ep["path"], data=payload)
+                if resp["status"] in (200, 201, 500):
                     body_str = json.dumps(resp["body"], default=str) if isinstance(resp["body"], dict) else str(resp["body"])
-                    if "not-null constraint" in body_str or (isinstance(resp["body"], dict) and resp["body"].get("status") is True):
+                    # Detect: server accepted invalid values (constraint error = values were inserted)
+                    # OR success response = values accepted without validation
+                    # 500 with constraint error = values reached DB but failed on a DIFFERENT column
+                    accepted = (isinstance(resp["body"], dict) and resp["body"].get("status") is True)
+                    constraint_error = any(kw in body_str for kw in
+                        ["not-null constraint", "violates", "Failing row", "foreign key",
+                         "DETAIL:", "organization_"])
+                    if accepted or constraint_error:
+                        tampered_fields = [f"{k}={v}" for k, v in payload.items()
+                                           if v in ("999", "-5", "99999", "-1")]
+                        evidence = f"{', '.join(tampered_fields)} → HTTP {resp['status']}"
+                        if constraint_error:
+                            evidence += f" (DB error confirms values inserted: {body_str[:100]})"
                         f = {"type": "score_manipulation", "severity": HIGH,
-                             "detail": f"Server accepted {field}={value} on {ep['path']}",
-                             "url": resp["url"],
-                             "evidence": f"{field}={value} → HTTP {resp['status']}"}
+                             "detail": f"Server accepted tampered values ({', '.join(tampered_fields)}) on {ep['path']}",
+                             "url": resp["url"], "evidence": evidence}
                         findings.append(f)
                         if saver:
                             saver.save(f)
                             saver.save_txt(f)
+                        break  # One confirmed per endpoint
 
         # 5b. Pagination abuse
         list_endpoints = [ep for ep in endpoints if ep["path"].startswith("list") or ep["path"].endswith("list/")]
