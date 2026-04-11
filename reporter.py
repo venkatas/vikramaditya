@@ -95,15 +95,18 @@ VULN_TEMPLATES = {
         ],
     },
     "upload": {
-        "title": "Unrestricted File Upload / Remote Code Execution on {host}",
-        "severity": "critical", "cvss": "9.8", "cwe": "CWE-434",
+        "title": "Unrestricted File Upload on {host}",
+        "severity": "high", "cvss": "8.8", "cwe": "CWE-434",
         "impact": (
-            "An attacker can upload a malicious file and execute arbitrary commands "
-            "on the server, leading to full system compromise."
+            "An attacker can upload files with malicious content (PHP webshells, HTML with "
+            "JavaScript, executable scripts) by bypassing file type validation. If the storage "
+            "backend serves files with executable content-types or if server-side processing "
+            "(image resize, thumbnail generation) parses the content, this escalates to RCE or stored XSS."
         ),
         "remediation": (
-            "Restrict allowed file types using an allowlist. Rename uploaded files server-side. "
-            "Store uploads outside the web root and serve via a separate static domain."
+            "Validate file content (magic bytes), not just extension. Restrict allowed MIME types "
+            "via allowlist. Strip metadata and re-encode images. Serve uploads from a separate "
+            "cookieless domain with Content-Disposition: attachment."
         ),
         "references": [
             ("OWASP File Upload Cheat Sheet", "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"),
