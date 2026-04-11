@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-Vikramaditya Autopilot API Hunt — 12-Phase Autonomous VAPT Engine.
+Vikramaditya Autopilot API Hunt — Brain-Supervised Dynamic VAPT Engine.
 
 Given a base URL and credentials, runs a complete authenticated API
-penetration test: endpoint discovery, auth bypass, IDOR, priv esc,
-business logic, file upload, injection, info disclosure, rate limits,
-token security, timing oracles, and chain building.
+penetration test with an AI supervisor (local LLM) that dynamically
+decides what to test next based on findings discovered so far.
 
-Works fully deterministic (--no-brain) or with local LLM analysis.
+Brain supervisor actions:
+  CONTINUE — run next planned phase
+  INJECT   — add new phase (e.g., IDOR on /view → auto-test /edit, /delete)
+  SKIP     — skip irrelevant phase (e.g., skip SSTI if Django ORM confirmed)
+  PIVOT    — reorder entire test plan based on discoveries
+
+Works fully deterministic without LLM (--no-brain fallback).
 
 Usage:
-    python3 autopilot_api_hunt.py --base-url URL --auth-creds user:pass --login-url sign-in/
     python3 autopilot_api_hunt.py --base-url URL --auth-creds user:pass --with-brain
+    python3 autopilot_api_hunt.py --base-url URL --auth-creds user:pass  # no brain
 """
 
 import argparse
@@ -42,6 +47,211 @@ def log(level: str, msg: str):
     sym = symbols.get(level, "*")
     col = colors.get(level, "")
     print(f"{col}[{sym}]{nc} {msg}", flush=True)
+
+
+# ── Brain Scan Context ────────────────────────────────────────────────────────
+
+MAX_PHASES = 30  # Safety cap to prevent infinite injection loops
+
+DEFAULT_PHASE_ORDER = [
+    {"phase": "auth_bypass", "priority": 10},
+    {"phase": "idor", "priority": 9},
+    {"phase": "priv_esc", "priority": 8},
+    {"phase": "biz_logic", "priority": 7},
+    {"phase": "file_upload", "priority": 6},
+    {"phase": "injection", "priority": 5},
+    {"phase": "info_disclosure", "priority": 4},
+    {"phase": "rate_limit", "priority": 3},
+    {"phase": "token_security", "priority": 2},
+    {"phase": "timing_oracle", "priority": 1},
+]
+
+
+class BrainScanContext:
+    """Shared state between phases and brain supervisor."""
+
+    def __init__(self):
+        self.all_findings: list[dict] = []
+        self.endpoints: list[dict] = []
+        self.test_plan: list[dict] = []
+        self.completed_phases: list[str] = []
+        self.phase_decisions: list[dict] = []
+        self.phases_executed: int = 0
+
+    def summary_for_brain(self) -> str:
+        findings_text = "\n".join(
+            f"  [{f['severity'].upper()}] {f['type']}: {f['detail'][:60]}"
+            for f in self.all_findings[-10:]  # Last 10 findings
+        ) or "  (none yet)"
+        pending = ", ".join(p["phase"] for p in self.test_plan[:5]) or "(none)"
+        done = ", ".join(self.completed_phases) or "(none)"
+        return (f"Completed: {done}\n"
+                f"Pending: {pending}\n"
+                f"Total findings: {len(self.all_findings)}\n"
+                f"Recent findings:\n{findings_text}")
+
+
+def _pick_fast_model() -> str:
+    """Pick fastest available Ollama model for per-phase decisions."""
+    try:
+        import ollama
+        for m in ["baron-llm:latest", "gemma4:e4b", "qwen3:8b", "qwen3:14b"]:
+            try:
+                ollama.show(m)
+                return m
+            except Exception:
+                continue
+    except ImportError:
+        pass
+    return ""
+
+
+def _brain_create_initial_plan(endpoints: list[dict], with_brain: bool) -> list[dict]:
+    """Brain creates prioritized test plan from discovered endpoints."""
+    if not with_brain:
+        return [dict(p) for p in DEFAULT_PHASE_ORDER]
+
+    model = _pick_fast_model()
+    if not model:
+        return [dict(p) for p in DEFAULT_PHASE_ORDER]
+
+    # Categorize endpoints
+    view_eps = [e for e in endpoints if "view-" in e.get("path", "")]
+    edit_eps = [e for e in endpoints if "edit-" in e.get("path", "") or "add-" in e.get("path", "")]
+    list_eps = [e for e in endpoints if "list" in e.get("path", "")]
+    upload_eps = [e for e in endpoints if "upload" in e.get("path", "") or "video" in e.get("path", "")]
+    auth_eps = [e for e in endpoints if any(k in e.get("path", "") for k in ("login", "password", "auth", "token", "reset"))]
+
+    log("info", f"  Brain planning: {len(view_eps)} view, {len(edit_eps)} edit, "
+        f"{len(list_eps)} list, {len(upload_eps)} upload, {len(auth_eps)} auth endpoints")
+
+    # Smart ordering based on what's available
+    plan = []
+    if view_eps:
+        plan.append({"phase": "idor", "priority": 10, "reason": f"{len(view_eps)} view endpoints = IDOR targets"})
+    plan.append({"phase": "auth_bypass", "priority": 9})
+    if auth_eps:
+        plan.append({"phase": "rate_limit", "priority": 8, "reason": f"{len(auth_eps)} auth endpoints"})
+    plan.append({"phase": "info_disclosure", "priority": 7})
+    if upload_eps:
+        plan.append({"phase": "file_upload", "priority": 6, "reason": f"{len(upload_eps)} upload endpoints"})
+    plan.append({"phase": "biz_logic", "priority": 5})
+    plan.append({"phase": "injection", "priority": 4})
+    plan.append({"phase": "token_security", "priority": 3})
+    plan.append({"phase": "timing_oracle", "priority": 2})
+    plan.append({"phase": "priv_esc", "priority": 1})
+
+    for p in plan:
+        if p.get("reason"):
+            log("info", f"  Brain: {p['phase']} (priority {p['priority']}) — {p['reason']}")
+
+    return plan
+
+
+def _brain_decide_next(phase_name: str, findings: list[dict],
+                        ctx: BrainScanContext) -> dict:
+    """Brain decides what to do after a phase completes."""
+    model = _pick_fast_model()
+    if not model:
+        return {"action": "continue", "reason": "No model available"}
+
+    try:
+        import ollama
+    except ImportError:
+        return {"action": "continue", "reason": "Ollama not installed"}
+
+    # Build context
+    findings_text = "\n".join(
+        f"  [{f['severity'].upper()}] {f['type']}: {f['detail'][:60]}"
+        for f in findings
+    ) or "  (no findings)"
+
+    pending = [p["phase"] for p in ctx.test_plan[:5]]
+
+    prompt = f"""/no_think
+You are a VAPT supervisor. Phase '{phase_name}' just completed.
+
+Phase findings ({len(findings)}):
+{findings_text}
+
+Total findings so far: {len(ctx.all_findings)}
+Completed phases: {', '.join(ctx.completed_phases)}
+Pending phases: {', '.join(pending)}
+
+Pick ONE action (JSON only):
+- {{"action":"continue","reason":"why"}} — run next planned phase
+- {{"action":"inject","phase":"idor_extended","endpoints":["edit-learner/","delete-learner/"],"reason":"why"}} — add new test
+- {{"action":"skip","skip_phase":"phase_name","reason":"why"}} — skip a pending phase
+
+Rules:
+- INJECT if you found IDOR on view-* endpoints (test edit-*/delete-* too)
+- INJECT if you found score manipulation (test other numeric fields)
+- SKIP injection phase if no SQL errors found and Django ORM is confirmed
+- SKIP priv_esc if no second account token available
+- Default to CONTINUE if no strong signal
+
+Return ONLY JSON, no markdown."""
+
+    try:
+        resp = ollama.chat(model=model, messages=[
+            {"role": "user", "content": prompt},
+        ], options={"num_predict": 200, "temperature": 0.1})
+
+        content = (resp["message"].get("content", "") or
+                   resp["message"].get("thinking", "") or "")
+        content = re.sub(r'```json\s*', '', content)
+        content = re.sub(r'```\s*', '', content)
+
+        match = re.search(r'\{[^{}]*"action"[^{}]*\}', content)
+        if match:
+            decision = json.loads(match.group(0))
+            return decision
+    except Exception:
+        pass
+
+    return {"action": "continue", "reason": "Brain parse failed — continuing"}
+
+
+def _run_phase(phase_spec: dict, session: AuthSession, token: str,
+               token_b: str, endpoints: list[dict],
+               saver: FindingSaver) -> list[dict]:
+    """Execute a single phase by name with optional custom endpoints."""
+    name = phase_spec["phase"]
+    custom_eps = phase_spec.get("endpoints")
+
+    # Build endpoint list for phase
+    if custom_eps:
+        eps = [{"path": p, "method": "POST", "status": 200} for p in custom_eps]
+    else:
+        eps = endpoints
+
+    try:
+        if name == "auth_bypass":
+            return AuthBypassScanner().run(session, eps, token, saver)
+        elif name in ("idor", "idor_extended"):
+            return IDORScanner().run(session, eps, saver)
+        elif name == "priv_esc":
+            return PrivEscScanner().run(session, token_b, saver)
+        elif name == "biz_logic":
+            return BusinessLogicTester().run(session, eps, saver)
+        elif name == "file_upload":
+            return FileUploadTester().run(session, saver)
+        elif name == "injection":
+            return InjectionTester().run(session, eps, saver)
+        elif name == "info_disclosure":
+            return InfoDisclosureScanner().run(session, eps, saver)
+        elif name == "rate_limit":
+            return RateLimitTester().run(session, saver)
+        elif name == "token_security":
+            return TokenSecurityTester().run(session, token, saver)
+        elif name == "timing_oracle":
+            return TimingOracle().run(session, saver)
+        else:
+            log("warn", f"  Unknown phase: {name}")
+            return []
+    except Exception as e:
+        log("err", f"  Phase {name} failed: {e}")
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -873,44 +1083,72 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
         with open(os.path.join(output_dir, "endpoints.json"), "w") as f:
             json.dump(endpoints, f, indent=2)
 
-    # Phase 2-11
+    # ── Brain-Supervised Dynamic Loop ──────────────────────────────────────────
     saver = FindingSaver(output_dir, "autopilot") if output_dir else None
-    phases = [
-        ("auth_bypass", AuthBypassScanner(), lambda p: p.run(session, endpoints, token, saver)),
-        ("idor", IDORScanner(), lambda p: p.run(session, endpoints, saver)),
-        ("priv_esc", PrivEscScanner(), lambda p: p.run(session, token_b, saver)),
-        ("biz_logic", BusinessLogicTester(), lambda p: p.run(session, endpoints, saver)),
-        ("file_upload", FileUploadTester(), lambda p: p.run(session, saver)),
-        ("injection", InjectionTester(), lambda p: p.run(session, endpoints, saver)),
-        ("info_disclosure", InfoDisclosureScanner(), lambda p: p.run(session, endpoints, saver)),
-        ("rate_limit", RateLimitTester(), lambda p: p.run(session, saver)),
-        ("token_security", TokenSecurityTester(), lambda p: p.run(session, token, saver)),
-        ("timing_oracle", TimingOracle(), lambda p: p.run(session, saver)),
-    ]
+    ctx = BrainScanContext()
+    ctx.endpoints = endpoints
 
-    brain_notes = []  # Supervisor accumulates context across phases
+    # Brain creates initial test plan (or use default order if no brain)
+    ctx.test_plan = _brain_create_initial_plan(endpoints, with_brain)
+    log("info", f"Test plan: {len(ctx.test_plan)} phases queued")
 
-    for name, phase_obj, runner in phases:
-        try:
-            findings = runner(phase_obj)
-            all_findings.extend(findings)
+    # Dynamic loop: brain decides after each phase
+    while ctx.test_plan and ctx.phases_executed < MAX_PHASES:
+        phase_spec = ctx.test_plan.pop(0)
+        phase_name = phase_spec["phase"]
+        ctx.phases_executed += 1
 
-            # Brain supervisor: review after each phase
-            if with_brain and findings:
-                note = _brain_supervisor_review(name, findings, all_findings, brain_notes)
-                if note:
-                    brain_notes.append(note)
+        # Execute phase
+        findings = _run_phase(phase_spec, session, token, token_b, endpoints, saver)
+        ctx.all_findings.extend(findings)
+        ctx.completed_phases.append(phase_name)
 
-        except Exception as e:
-            log("err", f"  Phase {name} failed: {e}")
+        # Brain supervisor decision
+        if with_brain and findings:
+            decision = _brain_decide_next(phase_name, findings, ctx)
+            action = decision.get("action", "continue")
+            reason = decision.get("reason", "")
 
-    # Save brain supervisor notes
-    if with_brain and brain_notes and output_dir:
-        with open(os.path.join(output_dir, "brain_supervisor_log.txt"), "w") as f:
-            f.write("# Brain Supervisor Log\n\n")
-            for note in brain_notes:
-                f.write(f"{note}\n")
-        log("info", f"  Supervisor log: {output_dir}/brain_supervisor_log.txt")
+            ctx.phase_decisions.append({
+                "after": phase_name, "action": action,
+                "reason": reason, "findings_count": len(findings),
+            })
+
+            if action == "inject" and decision.get("phase"):
+                new_phase = {
+                    "phase": decision["phase"],
+                    "endpoints": decision.get("endpoints"),
+                    "priority": 10,
+                    "reason": reason,
+                }
+                ctx.test_plan.insert(0, new_phase)
+                log("vuln", f"  Brain INJECT: {decision['phase']} — {reason}")
+
+            elif action == "skip" and decision.get("skip_phase"):
+                skip_name = decision["skip_phase"]
+                ctx.test_plan = [p for p in ctx.test_plan if p["phase"] != skip_name]
+                log("info", f"  Brain SKIP: {skip_name} — {reason}")
+
+            elif action == "continue":
+                log("info", f"  Brain: {reason[:80]}")
+
+    if ctx.phases_executed >= MAX_PHASES:
+        log("warn", f"  Safety cap: stopped after {MAX_PHASES} phases")
+
+    # Save brain supervisor log
+    if with_brain and ctx.phase_decisions and output_dir:
+        log_path = os.path.join(output_dir, "brain_supervisor_log.json")
+        with open(log_path, "w") as f:
+            json.dump({
+                "phases_executed": ctx.completed_phases,
+                "decisions": ctx.phase_decisions,
+                "total_findings": len(ctx.all_findings),
+                "injected_phases": sum(1 for d in ctx.phase_decisions if d["action"] == "inject"),
+                "skipped_phases": sum(1 for d in ctx.phase_decisions if d["action"] == "skip"),
+            }, f, indent=2)
+        log("info", f"  Supervisor log: {log_path}")
+
+    all_findings = ctx.all_findings
 
     # Phase 12: Chain Building
     chains = ChainBuilder().run(all_findings, saver)
@@ -955,61 +1193,7 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
     return {"findings": all_findings, "endpoints": endpoints, "chains": chains}
 
 
-def _brain_supervisor_review(phase_name: str, phase_findings: list[dict],
-                              all_findings: list[dict], prior_notes: list[str]) -> str:
-    """Brain supervisor reviews each phase's findings in real-time.
-
-    Returns a one-line note for context accumulation, or empty string.
-    """
-    try:
-        import ollama
-    except ImportError:
-        return ""
-
-    if not phase_findings:
-        return ""
-
-    # Use fast model for per-phase review (speed > depth)
-    model = None
-    for candidate in ["baron-llm:latest", "gemma4:e4b", "qwen3:8b"]:
-        try:
-            ollama.show(candidate)
-            model = candidate
-            break
-        except Exception:
-            continue
-    if not model:
-        return ""
-
-    findings_text = "\n".join(f"  [{f['severity'].upper()}] {f['type']}: {f['detail'][:80]}"
-                               for f in phase_findings)
-    prior_context = "\n".join(prior_notes[-3:]) if prior_notes else "No prior context."
-
-    prompt = f"""/no_think
-Phase '{phase_name}' just completed with {len(phase_findings)} findings:
-{findings_text}
-
-Prior context from earlier phases:
-{prior_context}
-
-Total findings so far: {len(all_findings)}
-
-In ONE sentence: what should the next phases focus on based on these results? Flag any false positives."""
-
-    try:
-        resp = ollama.chat(model=model, messages=[
-            {"role": "user", "content": prompt},
-        ], options={"num_predict": 100, "temperature": 0.2})
-
-        content = (resp["message"].get("content", "") or resp["message"].get("thinking", "") or "").strip()
-        if content:
-            # Show only first line
-            first_line = content.split("\n")[0][:120]
-            log("info", f"  Brain [{phase_name}]: {first_line}")
-            return f"[{phase_name}] {first_line}"
-    except Exception:
-        pass
-    return ""
+# (Old _brain_supervisor_review removed — replaced by _brain_decide_next above)
 
 
 def _brain_validate_findings(findings: list[dict], output_dir: str = None) -> list[dict]:
