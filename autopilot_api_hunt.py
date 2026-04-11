@@ -147,15 +147,28 @@ class AuthBypassScanner:
             saver: FindingSaver = None) -> list[dict]:
         log("phase", "Phase 2: Authentication Bypass Testing")
         findings = []
-
         sample = endpoints[:20]  # Test top 20 endpoints
+        base_url = session.base_url
+
+        # IMPORTANT: create a FRESH Session for bare requests to prevent
+        # cookie leakage from the authenticated session's module-level jar
+        import requests as _req_mod
+        _bare = _req_mod.Session()
+        _bare.verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         for ep in sample:
             path = ep["path"]
-            # Baseline
+            url = f"{base_url}/{path.lstrip('/')}"
+
+            # Baseline: use session (with cookies) to confirm endpoint works
             resp_valid = session.request("POST", path, json_body={})
             if resp_valid["status"] not in (200, 201):
                 continue
 
+            # All auth bypass tests use BARE requests (no session cookies)
+            # to prevent cf_rt cookie from silently re-authenticating
             tests = {
                 "no_auth": ("", CRITICAL, "Endpoint accessible without authentication"),
                 "expired": (JWTHelper.expire_token(token), HIGH, "Expired JWT accepted"),
@@ -164,15 +177,24 @@ class AuthBypassScanner:
             }
 
             for test_name, (test_token, severity, detail) in tests.items():
-                resp = session.request("POST", path, token=test_token, json_body={})
-                if resp["status"] in (200, 201, 204):
-                    f = {"type": f"auth_bypass_{test_name}", "severity": severity,
-                         "detail": f"{detail} ({path})", "url": resp["url"],
-                         "evidence": f"{test_name}: HTTP {resp['status']}"}
-                    findings.append(f)
-                    if saver:
-                        saver.save(f)
-                        saver.save_txt(f)
+                try:
+                    if test_token == "":
+                        # No auth at all — fresh session, zero cookies
+                        r = _bare.post(url, json={}, timeout=15)
+                    else:
+                        # Only cf_at cookie (NO cf_rt to prevent silent refresh)
+                        r = _bare.post(url, json={}, cookies={"cf_at": test_token},
+                                       timeout=15)
+                    if r.status_code in (200, 201, 204):
+                        f = {"type": f"auth_bypass_{test_name}", "severity": severity,
+                             "detail": f"{detail} ({path})", "url": url,
+                             "evidence": f"{test_name}: HTTP {r.status_code}"}
+                        findings.append(f)
+                        if saver:
+                            saver.save(f)
+                            saver.save_txt(f)
+                except Exception:
+                    pass
 
         log("ok", f"  {len(findings)} auth bypass findings")
         return findings
