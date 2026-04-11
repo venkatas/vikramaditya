@@ -883,7 +883,21 @@ def _run_brain_analysis(findings: list[dict], output_dir: str = None):
             f"3. What manual tests should the operator run next?\n"
             f"Be specific — cite finding types and chain them."
         )
-        resp = ollama.chat(model="qwen2.5:32b", messages=[
+        # Try models in priority order: Gemma 4 27B → vapt-qwen25 → qwen2.5:32b → qwen3:8b
+        model = None
+        for candidate in ["gemma4:26b", "gemma4:e4b", "vapt-qwen25:latest",
+                          "qwen2.5:32b", "qwen3:8b", "baron-llm:latest"]:
+            try:
+                ollama.show(candidate)
+                model = candidate
+                break
+            except Exception:
+                continue
+        if not model:
+            log("warn", "  No suitable Ollama model found")
+            return
+        log("info", f"  Using model: {model}")
+        resp = ollama.chat(model=model, messages=[
             {"role": "system", "content": "You are a VAPT expert. Be concise and actionable."},
             {"role": "user", "content": prompt},
         ])

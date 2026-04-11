@@ -308,11 +308,13 @@ MODEL_PRIORITY = [
     "vapt-qwen25:latest",        # custom 32B VAPT-tuned
     "vikramaditya-custom:latest", # custom 32B vikramaditya
     "vapt-model:latest",         # custom 30B VAPT
+    "gemma4:26b",                # Gemma 4 27B MoE — native tool calling, multimodal
     "qwen3-coder:30b",           # coder 30B
     "deepseek-r1:32b",           # strong reasoning
     "qwen3:30b-a3b",             # MoE 30B
     "qwen2.5-coder:32b",         # coder 32B
     "qwen2.5:32b",               # general 32B
+    "gemma4:e4b",                # Gemma 4 4B — fast, fits anywhere
     "deepseek-r1:14b",           # reasoning 14B
     "qwen3:14b",                 # 14B fallback
     "baron-llm:latest",          # BaronLLM 8B — offensive security fine-tune (fast)
@@ -334,6 +336,7 @@ MLX_MODEL_PRIORITY = [
 # Used by triage_finding() and next_action() where speed > depth
 TRIAGE_MODEL_PRIORITY = [
     "baron-llm:latest",          # BaronLLM — RLHF on offensive security data
+    "gemma4:e4b",                # Gemma 4 4B — fast triage with tool calling
     "vapt-qwen25:latest",        # custom VAPT-tuned fallback
     "vapt-model:latest",
     "qwen3:8b",
