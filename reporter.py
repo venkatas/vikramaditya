@@ -380,12 +380,38 @@ def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
             "vtype": default_vtype}
 
 
+def _load_poc_blocks(poc_path: str) -> dict:
+    """Load PoC blocks from a .poc file. Format: ### FINDING_TEXT\\n(poc lines)\\n###"""
+    pocs = {}
+    if not os.path.isfile(poc_path):
+        return pocs
+    current_key = None
+    current_lines = []
+    with open(poc_path, errors="replace") as f:
+        for line in f:
+            if line.startswith("### "):
+                if current_key and current_lines:
+                    pocs[current_key] = "\n".join(current_lines).strip()
+                current_key = line[4:].strip()
+                current_lines = []
+            elif current_key is not None:
+                current_lines.append(line.rstrip())
+    if current_key and current_lines:
+        pocs[current_key] = "\n".join(current_lines).strip()
+    return pocs
+
+
 def load_findings(findings_dir: str) -> list:
     results = []
     for subdir, vtype in SUBDIR_VTYPE.items():
         path = os.path.join(findings_dir, subdir)
         if not os.path.isdir(path):
             continue
+        # Load PoC blocks if .poc file exists alongside .txt
+        all_pocs = {}
+        for fn in sorted(os.listdir(path)):
+            if fn.endswith(".poc"):
+                all_pocs.update(_load_poc_blocks(os.path.join(path, fn)))
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
                 continue
@@ -394,7 +420,13 @@ def load_findings(findings_dir: str) -> list:
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    results.append(parse_custom_line(line, vtype))
+                    finding = parse_custom_line(line, vtype)
+                    # Match PoC by finding text prefix (first 60 chars)
+                    for poc_key, poc_text in all_pocs.items():
+                        if poc_key in line or line[:60] in poc_key:
+                            finding["poc"] = poc_text
+                            break
+                    results.append(finding)
     results.sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 4))
     return results
 
@@ -487,7 +519,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
     <h4 style="color:#343a40;margin:10px 0 6px">Description / Impact</h4>
     <p style="margin:0 0 10px">{tmpl["impact"]}</p>
     <h4 style="color:#343a40;margin:10px 0 6px">Evidence / Proof of Concept</h4>
-    <pre style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:12px;overflow-x:auto;font-size:0.85em;white-space:pre-wrap">{f["raw"]}</pre>
+    <pre style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:12px;overflow-x:auto;font-size:0.85em;white-space:pre-wrap">{f.get("poc", f["raw"])}</pre>
     <h4 style="color:#343a40;margin:10px 0 6px">Remediation</h4>
     <p style="margin:0 0 10px">{tmpl["remediation"]}</p>
     <h4 style="color:#343a40;margin:4px 0 6px">References</h4>
@@ -645,7 +677,9 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
             f"**Severity:** {f['severity'].upper()} | **CVSS:** {cvss} | **CWE:** {tmpl.get('cwe','N/A')} | **ATT&CK:** {ATTACK_IDS.get(f['vtype'],'—')}  ",
             f"**Affected URL:** `{f['url']}`", "",
             f"**Impact:** {tmpl['impact']}", "",
-            "**Evidence:**", "```", f["raw"], "```", "",
+            "**Evidence / Proof of Concept:**", "```",
+            f.get("poc", f["raw"]),
+            "```", "",
             f"**Remediation:** {tmpl['remediation']}", "",
             "**References:**", refs, "", "---", "",
         ]
