@@ -2,21 +2,25 @@
 
 ## Critical (tool fails on real targets)
 
-### 1. Endpoint Discovery fails on Vite/Next.js/code-split apps
-- Current: only extracts from single main.js bundle
-- Needed: fetch ALL JS chunks, parse lazy-loaded routes
-- Also: brute-force common API paths (/v1/, /api/v1/, /graphql, etc.)
-- Also: try OpenAPI/Swagger discovery (/docs, /swagger.json, /openapi.json)
-- Tested on: app.foctta.com (Vite) — found 0 endpoints, should find 8+
+### 1. ~~Endpoint Discovery fails on Vite/Next.js/code-split apps~~ DONE
+- Fixed: scrapes ALL JS chunks (Vite /assets/, Next.js /_next/, CRA /static/js/)
+- Fixed: follows dynamic imports and modulepreload links for code-split chunks
+- Fixed: extracts from fetch(), axios, and template literal API calls
+- Fixed: OpenAPI/Swagger spec discovery (/docs, /swagger.json, /openapi.json)
+- Fixed: noise filter rejects HTTP headers, CSS classes, template artifacts
+- Tested on: app.foctta.com (Vite) — found 226 live endpoints from 52 JS files
 
-### 2. Login URL not auto-discovered
-- Current: user must specify --login-url
-- Needed: try common patterns (auth/login, login, sign-in, api/auth/login, v1/auth/login)
-- Also: detect auth type from response (JWT in body vs cookies vs headers)
+### 2. ~~Login URL not auto-discovered~~ DONE
+- Fixed: probes 18+ common login patterns (auth/login, login-view/, v1/auth/login, etc.)
+- Fixed: supports dev/staging token endpoints (/dev/token)
+- Fixed: extracts role/tenant from email for dev token login
+- Tested on: app.foctta.com — auto-detected v1/auth/login
 
-### 3. API base path not auto-detected
-- Current: user must specify exact base URL
-- Needed: probe /api/, /v1/, /v2/, /graphql and detect which responds
+### 3. ~~API base path not auto-detected~~ DONE
+- Fixed: probes /api/, /v1/, /api/v1/, /graphql, /api/organization/, etc.
+- Fixed: tries subdomain variants (api.example.com from app.example.com)
+- Fixed: validates responses are JSON (not SPA HTML false positives)
+- Tested on: app.foctta.com — correctly detected same-origin API
 
 ### 4. No GraphQL support
 - Many modern apps use GraphQL, not REST

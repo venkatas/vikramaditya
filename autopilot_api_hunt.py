@@ -259,7 +259,39 @@ def _run_phase(phase_spec: dict, session: AuthSession, token: str,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class EndpointDiscovery:
-    """Discover API endpoints from JS bundles, debug pages, and common patterns."""
+    """Discover API endpoints from JS bundles, debug pages, OpenAPI, and common patterns."""
+
+    # JS chunk URL patterns for different bundlers
+    JS_PATTERNS = [
+        r'src="(/static/js/[^"]+\.js)"',          # CRA / Webpack
+        r'src="(/assets/[^"]+\.js)"',              # Vite
+        r'src="(/_next/static/[^"]+\.js)"',        # Next.js
+        r'src="(/js/[^"]+\.js)"',                  # Generic
+        r'src="(/build/[^"]+\.js)"',               # Remix / custom
+        r'href="(/assets/[^"]+\.js)"',             # Vite preload
+        r'"(/assets/[^"]+\.js)"',                  # Vite dynamic import refs in inline scripts
+    ]
+
+    # Patterns to extract API paths from JS source
+    API_PATH_PATTERNS = [
+        r'"(/api/[a-zA-Z0-9/_-]+/?)"',                           # "/api/foo/bar/"
+        r"'(/api/[a-zA-Z0-9/_-]+/?)'",                           # '/api/foo/bar/'
+        r'`(/api/[a-zA-Z0-9/_${}.-]+/?)`',                       # template literals
+        r'"(/v[0-9]+/[a-zA-Z0-9/_-]+/?)"',                       # "/v1/foo/"
+        r'"([a-z][a-z0-9_-]{2,40}/)"',                           # "endpoint-name/"
+        r'(?:url|endpoint|path|api|route)\s*[=:]\s*["\']([a-zA-Z0-9/_-]{3,60}/?)["\']',  # url = "foo/"
+        r'(?:get|post|put|patch|delete)\s*\(\s*[`"\']([a-zA-Z0-9/_${}.-]+/?)[`"\']',     # axios.get("foo/")
+        r'fetch\s*\(\s*[`"\'](?:https?://[^/]+)?(/[a-zA-Z0-9/_-]+/?)[`"\']',             # fetch("/api/foo")
+    ]
+
+    # OpenAPI / Swagger discovery paths
+    OPENAPI_PATHS = [
+        "docs", "swagger.json", "openapi.json", "api-docs", "swagger/",
+        "api/docs", "api/swagger.json", "api/openapi.json", "api/schema",
+        "v1/docs", "v1/swagger.json", "v1/openapi.json",
+        "v2/docs", "v2/swagger.json", "v2/openapi.json",
+        "redoc", "api/redoc",
+    ]
 
     COMMON_ENDPOINTS = [
         "learner-list/", "instructor-list/", "course-list/", "list-package/",
@@ -285,47 +317,197 @@ class EndpointDiscovery:
         log("phase", "Phase 1: Endpoint Discovery")
         discovered = set()
 
-        # 1a. Scrape JS bundles
+        # 1a. Scrape ALL JS bundles (Vite, Next.js, CRA, etc.)
         if self.frontend_url:
-            js_endpoints = self._scrape_js_bundle(self.frontend_url)
+            js_endpoints = self._scrape_js_bundles(self.frontend_url)
             discovered.update(js_endpoints)
-            log("info", f"  JS bundle: {len(js_endpoints)} endpoints")
+            log("info", f"  JS bundles: {len(js_endpoints)} endpoints")
 
-        # 1b. Django debug page
+        # 1b. OpenAPI / Swagger discovery
+        openapi_endpoints = self._discover_openapi()
+        discovered.update(openapi_endpoints)
+        if openapi_endpoints:
+            log("info", f"  OpenAPI/Swagger: {len(openapi_endpoints)} endpoints")
+
+        # 1c. Django debug page
         debug_endpoints = self._scrape_debug_page()
         discovered.update(debug_endpoints)
         log("info", f"  Debug page: {len(debug_endpoints)} endpoints")
 
-        # 1c. Common patterns
+        # 1d. Common patterns
         discovered.update(self.COMMON_ENDPOINTS)
 
-        # 1d. Probe each endpoint to check if it exists
+        # 1e. Probe each endpoint to check if it exists
         live = []
         for ep in sorted(discovered):
             resp = self.session.request("POST", ep, json_body={})
             if resp["status"] != 404 and resp["status"] != 0:
                 live.append({"path": ep, "method": "POST", "status": resp["status"]})
 
+        # Also try GET for paths that may not accept POST
+        post_paths = {e["path"] for e in live}
+        for ep in sorted(discovered - post_paths):
+            resp = self.session.request("GET", ep)
+            if resp["status"] not in (404, 405, 0):
+                live.append({"path": ep, "method": "GET", "status": resp["status"]})
+
         self.endpoints = live
         log("ok", f"  {len(live)} live endpoints confirmed")
         return live
 
-    def _scrape_js_bundle(self, url: str) -> set:
-        """Extract API paths from a React JS bundle."""
+    def _scrape_js_bundles(self, url: str) -> set:
+        """Extract API paths from ALL JS chunks (Vite, Next.js, CRA, etc.)."""
         endpoints = set()
         try:
-            resp = self.session.request("GET", "", headers={"Host": urlparse(url).netloc})
-            # This won't work via the API session — use requests directly
             import requests
+            # Fetch the HTML page
             html = requests.get(url, verify=False, timeout=15).text
-            js_files = re.findall(r'src="(/static/js/[^"]+\.js)"', html)
+
+            # Collect JS file URLs from ALL bundler patterns
+            js_files = set()
+            for pattern in self.JS_PATTERNS:
+                js_files.update(re.findall(pattern, html))
+
+            # Also find modulepreload/preload links (Vite uses these for code-split chunks)
+            js_files.update(re.findall(
+                r'<link[^>]+(?:rel="modulepreload"|as="script")[^>]+href="([^"]+\.js)"', html))
+
+            # Follow lazy-loaded chunk references: import("./chunk-xyz.js")
+            # First pass: get all directly referenced JS
+            base = url.rstrip("/")
+            fetched_js = {}
             for js_path in js_files:
-                js_url = url.rstrip("/") + js_path
-                js_content = requests.get(js_url, verify=False, timeout=30).text
-                paths = re.findall(r'"([a-z][a-z0-9_-]+/)"', js_content)
-                endpoints.update(p for p in paths if 3 < len(p) < 50)
-        except Exception:
-            pass
+                if js_path.startswith("http"):
+                    js_url = js_path
+                else:
+                    js_url = base + js_path
+                try:
+                    content = requests.get(js_url, verify=False, timeout=30).text
+                    fetched_js[js_path] = content
+                except Exception:
+                    continue
+
+            # Second pass: find dynamically imported chunks from fetched JS
+            additional_chunks = set()
+            for content in fetched_js.values():
+                # import("./SomeComponent-abc123.js") or import("/assets/chunk-xyz.js")
+                additional_chunks.update(re.findall(
+                    r'import\s*\(\s*["\']([^"\']+\.js)["\']', content))
+                # Vite: __vitePreload(() => import("./chunk.js"), ...)
+                additional_chunks.update(re.findall(
+                    r'__vitePreload\s*\(\s*\(\)\s*=>\s*import\s*\(\s*["\']([^"\']+\.js)["\']', content))
+                # Webpack: __webpack_require__.e(N).then(...)
+                # Not directly fetchable, but chunk naming: N.chunk.js
+                additional_chunks.update(re.findall(
+                    r'["\']([^"\']*(?:chunk|lazy|page)[^"\']*\.js)["\']', content))
+
+            # Fetch additional chunks
+            for chunk_ref in additional_chunks:
+                if chunk_ref in fetched_js:
+                    continue
+                if chunk_ref.startswith("http"):
+                    chunk_url = chunk_ref
+                elif chunk_ref.startswith("/"):
+                    chunk_url = base + chunk_ref
+                elif chunk_ref.startswith("./"):
+                    # Relative to the assets dir — find the common prefix
+                    assets_prefix = "/assets/"
+                    for known_path in js_files:
+                        if "/assets/" in known_path:
+                            assets_prefix = known_path.rsplit("/", 1)[0] + "/"
+                            break
+                    chunk_url = base + assets_prefix + chunk_ref[2:]
+                else:
+                    continue
+                try:
+                    content = requests.get(chunk_url, verify=False, timeout=30).text
+                    fetched_js[chunk_ref] = content
+                except Exception:
+                    continue
+
+            log("info", f"  Fetched {len(fetched_js)} JS files (main + code-split chunks)")
+
+            # Extract API paths from ALL fetched JS content
+            # Noise filter: reject HTTP headers, sentry internals, CSS classes, etc.
+            NOISE_PREFIXES = {
+                "content-", "x-", "retry-", "sentry.", "location", "token",
+                "tenant", "auto.", "font-", "text-", "h-", "w-",
+            }
+            for content in fetched_js.values():
+                for pattern in self.API_PATH_PATTERNS:
+                    for match in re.findall(pattern, content):
+                        # Clean up template literal vars
+                        cleaned = re.sub(r'\$\{[^}]+\}', '1', match)
+                        # Normalize: strip leading slash, ensure trailing slash
+                        cleaned = cleaned.strip("/")
+                        if not cleaned or len(cleaned) <= 2 or len(cleaned) >= 80:
+                            continue
+                        # Skip noise: HTTP headers, CSS classes, sentry keys
+                        lower = cleaned.lower()
+                        if any(lower.startswith(p) for p in NOISE_PREFIXES):
+                            continue
+                        # Skip paths that are just numbers or start with a number
+                        # (template substitution artifacts like "1/consents")
+                        if re.match(r'^[\d/]+$', cleaned) or re.match(r'^\d+/', cleaned):
+                            continue
+                        # Skip paths with uppercase (likely header names like Content-Disposition)
+                        if cleaned[0].isupper():
+                            continue
+                        endpoints.add(cleaned + "/")
+                        endpoints.add(cleaned)
+
+        except Exception as e:
+            log("warn", f"  JS scraping error: {e}")
+        return endpoints
+
+    def _discover_openapi(self) -> set:
+        """Discover endpoints from OpenAPI/Swagger specs."""
+        endpoints = set()
+        import requests
+        base = self.session.base_url
+
+        for doc_path in self.OPENAPI_PATHS:
+            try:
+                resp = requests.get(f"{base}/{doc_path}", verify=False, timeout=10)
+                if resp.status_code != 200:
+                    continue
+
+                # Try to parse as JSON (swagger.json / openapi.json)
+                try:
+                    spec = resp.json()
+                except Exception:
+                    # Check if it's an HTML docs page with embedded spec
+                    spec_urls = re.findall(r'(?:url|spec)\s*[=:]\s*["\']([^"\']+\.json)["\']', resp.text)
+                    for spec_url in spec_urls:
+                        try:
+                            if not spec_url.startswith("http"):
+                                spec_url = base + "/" + spec_url.lstrip("/")
+                            spec_resp = requests.get(spec_url, verify=False, timeout=10)
+                            spec = spec_resp.json()
+                            break
+                        except Exception:
+                            continue
+                    else:
+                        continue
+
+                # Extract paths from OpenAPI/Swagger spec
+                paths = spec.get("paths", {})
+                if paths:
+                    log("vuln", f"  OpenAPI spec found at /{doc_path} — {len(paths)} paths!")
+                    for path, methods in paths.items():
+                        cleaned = path.strip("/")
+                        # Replace path params: /users/{id} → users/1
+                        cleaned = re.sub(r'\{[^}]+\}', '1', cleaned)
+                        if cleaned:
+                            endpoints.add(cleaned + "/")
+                            # Record methods
+                            for method in methods:
+                                if method.upper() in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+                                    endpoints.add(cleaned + "/")
+                    break  # Found a valid spec, no need to keep searching
+
+            except Exception:
+                continue
         return endpoints
 
     def _scrape_debug_page(self) -> set:
@@ -1037,6 +1219,134 @@ class ChainBuilder:
 # MAIN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _auto_detect_login_url(session: AuthSession, username: str, password: str) -> tuple:
+    """Try common login URL patterns and return (token, login_path) or ("", "").
+
+    Tries standard login paths first, then dev/staging token endpoints.
+    Detects auth type from response (JWT in body, cookies, or bearer token).
+    """
+    import requests as _req
+    base = session.base_url
+
+    # ── Standard login paths (try with both JSON body key patterns) ───────
+    COMMON_LOGIN_PATHS = [
+        "auth/login", "auth/login/", "login-view/", "login/", "login",
+        "api/auth/login", "api/auth/login/", "api/login/", "api/login",
+        "v1/auth/login/", "v1/auth/login", "api/v1/login/",
+        "sign-in/", "auth/sign-in/", "api/sign-in/",
+        "api/token/", "oauth/token/", "v1/login/", "v2/auth/login/",
+        "users/login/", "account/login/",
+    ]
+
+    for path in COMMON_LOGIN_PATHS:
+        token = session.auto_login(path, username, password)
+        if token:
+            log("ok", f"  Login URL auto-detected: {path}")
+            return token, path
+        # Reset session state for next attempt
+        session._session.cookies.clear()
+        session.token = None
+        if "Authorization" in session._session.headers:
+            del session._session.headers["Authorization"]
+
+    # ── Dev/staging token endpoints (some apps expose /dev/token) ─────────
+    DEV_TOKEN_PATHS = ["dev/token", "dev/token/"]
+    # Extract role from email (e.g., dpo@acme → role=dpo)
+    role_guess = username.split("@")[0] if "@" in username else "admin"
+    # Extract tenant from email domain (e.g., dpo@acme-financial.dev → slug=acme-financial)
+    tenant_guess = ""
+    if "@" in username:
+        domain_part = username.split("@")[1]
+        tenant_guess = domain_part.rsplit(".", 1)[0]  # strip TLD
+
+    for path in DEV_TOKEN_PATHS:
+        url = f"{base}/{path.lstrip('/')}"
+        for payload in [
+            {"role": role_guess, "tenantSlug": tenant_guess},
+            {"role": "admin", "tenantSlug": tenant_guess},
+            {"email": username, "password": password},
+        ]:
+            try:
+                resp = _req.post(url, json=payload, verify=False, timeout=10)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    token = body.get("token") or body.get("access_token") or ""
+                    if token:
+                        session.set_token(token)
+                        log("ok", f"  Login via dev token endpoint: {path}")
+                        return token, path
+            except Exception:
+                continue
+
+    return "", ""
+
+
+def _auto_detect_api_base(domain_url: str, rate_limit: float = 5.0) -> str:
+    """Probe common API base paths and return the one that responds.
+
+    Given a domain like https://app.foctta.com, tries:
+      https://app.foctta.com/api/
+      https://api.foctta.com/
+      https://app.foctta.com/v1/
+      etc.
+    Returns the base URL that gives a non-404 response, or the original URL.
+    """
+    import requests as _req
+    parsed = urlparse(domain_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Path suffixes to try on the same host
+    PATH_PROBES = [
+        "/api/", "/api/v1/", "/api/v2/", "/v1/", "/v2/",
+        "/graphql", "/api/organization/", "/api/learner/",
+    ]
+    # Subdomain variants to try
+    host_parts = parsed.netloc.split(".")
+    subdomain_bases = []
+    if host_parts[0] != "api" and len(host_parts) >= 2:
+        api_host = "api." + ".".join(host_parts[1:] if host_parts[0] in ("app", "www") else host_parts)
+        subdomain_bases.append(f"{parsed.scheme}://{api_host}")
+
+    candidates = []
+    # Try path probes on the given host
+    for suffix in PATH_PROBES:
+        candidates.append(base + suffix.rstrip("/"))
+    # Try subdomain variants
+    for sub_base in subdomain_bases:
+        candidates.append(sub_base)
+        for suffix in PATH_PROBES[:3]:
+            candidates.append(sub_base + suffix.rstrip("/"))
+
+    for candidate in candidates:
+        try:
+            resp = _req.get(candidate, verify=False, timeout=8, allow_redirects=False)
+            # A valid API base returns JSON or a non-HTML response
+            # Skip if it returns the SPA HTML (false positive)
+            content_type = resp.headers.get("Content-Type", "")
+            is_html = "text/html" in content_type
+            is_json = "application/json" in content_type
+
+            if resp.status_code not in (404, 405, 502, 503, 0):
+                if is_json:
+                    log("ok", f"  API base auto-detected: {candidate}")
+                    return candidate
+                elif not is_html and resp.status_code in (200, 301, 302):
+                    log("ok", f"  API base auto-detected: {candidate}")
+                    return candidate
+            # Also try POST — some API bases only accept POST
+            resp_post = _req.post(candidate + "/", json={}, verify=False, timeout=8)
+            ct_post = resp_post.headers.get("Content-Type", "")
+            if resp_post.status_code not in (404, 405, 502, 503, 0) and "application/json" in ct_post:
+                log("ok", f"  API base auto-detected: {candidate}")
+                return candidate
+        except Exception:
+            continue
+
+    # If no API base found, the API may be on the same origin (no prefix)
+    log("info", "  No separate API base found — API may be on same origin")
+    return domain_url.rstrip("/")
+
+
 def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/",
                   auth_creds_b: str = None, frontend_url: str = None,
                   output_dir: str = None, rate_limit: float = 5.0,
@@ -1060,17 +1370,35 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
     print(f"  Time   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60 + "\n")
 
+    # ── Fix #3: Auto-detect API base path ─────────────────────────────────────
+    # If the URL looks like a frontend domain (no /api/ or /v1/ in path),
+    # probe for the actual API base path
+    parsed_base = urlparse(base_url)
+    if not any(seg in parsed_base.path for seg in ("/api/", "/v1/", "/v2/", "/graphql")):
+        log("info", "Probing for API base path...")
+        base_url = _auto_detect_api_base(base_url, rate_limit)
+
     limiter = RateLimiter(rate_limit)
     session = AuthSession(base_url, limiter)
 
-    # Login
+    # ── Fix #2: Auto-detect login URL ─────────────────────────────────────────
     parts = auth_creds.split(":", 1)
     if len(parts) != 2:
         log("err", f"Invalid creds format (use user:pass)")
         return {}
+
+    # Try the specified login URL first
     token = session.auto_login(login_url, parts[0], parts[1])
     if not token:
-        log("err", "Login failed")
+        # Auto-detect login URL by probing common patterns
+        log("info", "Specified login URL failed — auto-detecting...")
+        session._session.cookies.clear()
+        session.token = None
+        if "Authorization" in session._session.headers:
+            del session._session.headers["Authorization"]
+        token, login_url = _auto_detect_login_url(session, parts[0], parts[1])
+    if not token:
+        log("err", "Login failed (tried all common login URLs)")
         return {}
     log("ok", f"Authenticated as {parts[0]}")
 
@@ -1100,6 +1428,22 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
     all_findings = []
 
     # Phase 1: Endpoint Discovery
+    # Auto-infer frontend URL from API base if not specified
+    if not frontend_url:
+        parsed_api = urlparse(base_url)
+        # If API is at api.example.com, frontend is likely at app.example.com or example.com
+        host = parsed_api.netloc
+        if host.startswith("api."):
+            # Try app. subdomain, then bare domain
+            domain_tail = host[4:]
+            for prefix in ["app.", "www.", ""]:
+                frontend_url = f"{parsed_api.scheme}://{prefix}{domain_tail}"
+                break
+        else:
+            # API is on same host (e.g., app.foctta.com/api/organization/)
+            frontend_url = f"{parsed_api.scheme}://{parsed_api.netloc}"
+        log("info", f"Frontend URL inferred: {frontend_url}")
+
     discovery = EndpointDiscovery(session, frontend_url)
     endpoints = discovery.run()
 
