@@ -1,31 +1,43 @@
 # Vikramaditya — VAPT Tool Guide
 
 Autonomous penetration testing platform for professional VAPT engagements.
-Targets: FQDN, single IP, or CIDR range. Outputs Burp Suite-style HTML reports.
+Targets: URL, FQDN, single IP, or CIDR range. Outputs Burp Suite-style HTML reports.
+
+## Quick Usage
+
+```bash
+python3 vikramaditya.py      # Interactive — handles everything automatically
+```
+
+No flags needed. It auto-detects the target type, fingerprints the tech stack,
+finds login pages and API endpoints, collects credentials interactively, enables
+the AI brain if Ollama is installed, and routes to the right scan engine.
 
 ## Core Files
 
 | File | Role |
 |------|------|
-| `hunt.py` | Main orchestrator — run all phases or individual stages |
+| `vikramaditya.py` | **Main entry point** — interactive orchestrator, auto-detects everything |
+| `autopilot_api_hunt.py` | Brain-supervised 12-phase API VAPT engine |
+| `hunt.py` | Infrastructure VAPT — recon + vuln scan for domains/IPs/CIDR |
 | `brain.py` | AI analysis engine (Ollama local LLM) |
 | `agent.py` | Autonomous ReAct agent — drives assessment without manual input |
 | `recon.sh` | Subdomain enum, live host discovery, URL crawling |
 | `scanner.sh` | Vulnerability scanner (SQLi, XSS, SSTI, RCE, cloud, frameworks) |
 | `reporter.py` | Burp Suite-style HTML + Markdown report generator |
+| `auth_utils.py` | JWT helper, rate limiter, authenticated session management |
 | `prioritize.py` | CVE risk scoring and host prioritization |
 
-## Quick Usage
+## Advanced Usage (Direct Engine Access)
 
 ```bash
-# Full assessment
+# Infrastructure VAPT
 python3 hunt.py --target example.com
-
-# IP or subnet
 python3 hunt.py --target 192.168.1.0/24
-
-# Autonomous (AI-driven)
 python3 hunt.py --target example.com --autonomous --time 4
+
+# API VAPT with explicit flags
+python3 autopilot_api_hunt.py --base-url URL --auth-creds user:pass --with-brain
 
 # Report
 python3 reporter.py recon/example.com/sessions/<id>/findings/ --client "Acme Corp"
