@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
+**v2.0 — Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -19,13 +19,29 @@
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
 
-[Quick Start](#quick-start) · [How It Works](#how-it-works) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [API Keys](#api-keys-setup) · [Contributing](#contributing)
+[Quick Start](#quick-start) · [What's New in v2.0](#whats-new-in-v20) · [How It Works](#how-it-works) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
 
 ---
 
-**One target → Auto-fingerprint → Smart engine selection → AI-supervised scan → Professional report**
+**One target → Auto-fingerprint → Smart engine selection → AI writes exploit code → Professional report**
 
 </div>
+
+---
+
+## What's New in v2.0
+
+| Feature | v1.x | v2.0 |
+|:--------|:-----|:-----|
+| **Entry point** | 5+ scripts with flags (`hunt.py --target x --full`) | `python3 vikramaditya.py` — one command, interactive |
+| **Target detection** | Manual: pick the right script | Auto: fingerprints tech stack, login, API, routes to right engine |
+| **Brain role** | Supervisor only (CONTINUE/SKIP/INJECT) | **Writes and executes exploit code** — PoCs, bypasses, code audits |
+| **Fix verification** | Manual retest | `--verify-fix` mode: brain reads deployed code, finds logic flaws, writes bypasses |
+| **Code audit** | Not available | `--audit-code` mode: feed source code, brain finds vulns and writes PoCs |
+| **Endpoint discovery** | Single main.js bundle only | All JS chunks (Vite, Next.js, CRA), dynamic imports, OpenAPI/Swagger |
+| **Login detection** | Required `--login-url` flag | Auto-detects from 18+ common patterns + dev/staging endpoints |
+| **API base path** | Required `--base-url` flag | Auto-probes `/api/`, `/v1/`, subdomains, same-origin detection |
+| **Banner** | Orange gradient | Indian flag colors (saffron, white, green, Ashoka blue) |
 
 ---
 
