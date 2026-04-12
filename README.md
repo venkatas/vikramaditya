@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**Autonomous VAPT platform. Give it a target — FQDN, IP, or CIDR range. It hunts, it reports.**
+**Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -19,11 +19,11 @@
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
 
-[Quick Start](#quick-start) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [API Keys](#api-keys-setup) · [Contributing](#contributing)
+[Quick Start](#quick-start) · [How It Works](#how-it-works) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [API Keys](#api-keys-setup) · [Contributing](#contributing)
 
 ---
 
-**Recon → Tech fingerprinting → CVE mapping → Vulnerability scanning → AI analysis → Professional report**
+**One target → Auto-fingerprint → Smart engine selection → AI-supervised scan → Professional report**
 
 </div>
 
@@ -63,111 +63,127 @@ chmod +x setup.sh && ./setup.sh      # installs all required tools
 ollama pull gemma4:26b               # recommended brain model (17GB)
 ```
 
-### Infrastructure VAPT (domains, IPs, subnets)
+### The Only Command You Need
 
 ```bash
-# Full assessment on a domain
+python3 vikramaditya.py
+```
+
+That's it. No flags, no script selection, no manual configuration. It will:
+
+1. Ask for a target (URL, domain, IP, or CIDR)
+2. Auto-fingerprint the target (tech stack, login pages, API endpoints, JS bundles, OpenAPI specs)
+3. Show a summary of what it found and recommend the right scan type
+4. Ask for credentials if a login page is detected (password input is hidden)
+5. Enable the AI brain supervisor automatically if Ollama is installed
+6. Route to the right scan engine and run the full assessment
+7. Offer to generate a professional report at the end
+
+```
+$ python3 vikramaditya.py
+
+  Enter target: https://app.example.com
+
+  ────────────────────────────────────────────────────────
+    TARGET SUMMARY
+  ────────────────────────────────────────────────────────
+    Target  : https://app.example.com
+    Status  : HTTP 200
+    Tech    : Vite, React
+    Login   : /auth/login
+    API     : https://app.example.com/v1
+    JS      : 52 bundles, 80+ API calls found
+    OpenAPI : found
+
+    Recommended: Authenticated API VAPT
+  ────────────────────────────────────────────────────────
+
+  Proceed? [Y/n]: y
+  Do you have credentials? [Y/n]: y
+  Username / email: admin@example.com
+  Password: ********
+  Second account for IDOR / privilege escalation testing? [y/N]: n
+  AI brain supervisor: enabled. Keep enabled? [Y/n]: y
+
+  [launching 12-phase brain-supervised API VAPT...]
+```
+
+### Direct Engine Access (Advanced)
+
+If you prefer flags and direct control, the individual engines are still available:
+
+```bash
+# Infrastructure VAPT (domains, IPs, subnets)
 python3 hunt.py --target example.com
-
-# Single IP address
-python3 hunt.py --target 192.168.1.100
-
-# Subnet (discovers live hosts first via nmap ping sweep)
 python3 hunt.py --target 10.0.0.0/24
-
-# Faster scan (fewer checks)
-python3 hunt.py --target example.com --quick
-
-# Autonomous mode — AI drives all decisions
 python3 hunt.py --target example.com --autonomous
-```
 
-### Authenticated API VAPT (SPA + REST API targets)
-
-```bash
-# Brain-supervised autonomous scan (recommended)
+# Authenticated API VAPT (with all options)
 python3 autopilot_api_hunt.py \
     --base-url https://api.target.com \
     --auth-creds "admin@target.com:password" \
-    --login-url sign-in/ \
-    --frontend-url https://app.target.com \
     --with-brain
 
-# With second account for IDOR + privilege escalation testing
-python3 autopilot_api_hunt.py \
-    --base-url https://api.target.com \
-    --auth-creds "admin@target.com:password" \
-    --auth-creds-b "user@target.com:password" \
-    --login-url sign-in/ \
-    --with-brain
-
-# Without brain (fully deterministic, no LLM needed)
-python3 autopilot_api_hunt.py \
-    --base-url https://api.target.com \
-    --auth-creds "admin@target.com:password" \
-    --login-url sign-in/
+# Generate report manually
+python3 reporter.py findings/target/ --client "Acme Corp"
 ```
 
-### Individual Tools
+---
 
-```bash
-# Authenticated API broken access control
-python3 auth_api_tester.py --base-url URL --auth-creds user:pass --login-url sign-in/
+## How It Works
 
-# Generic REST API IDOR scanner (two-token cross-user testing)
-python3 api_idor_scanner.py --base-url URL --token-a TOKEN1 --token-b TOKEN2
+`vikramaditya.py` is the smart orchestrator. It classifies your target and routes to the right engine:
 
-# Business logic testing (score manipulation, rate limits, pagination abuse)
-python3 business_logic_tester.py --base-url URL --auth-creds user:pass --login-url sign-in/
+| You give it | It detects | It runs |
+|:------------|:-----------|:--------|
+| `https://app.example.com` | Vite SPA, login page, API at `/v1` | Authenticated API VAPT (autopilot) |
+| `https://api.example.com` | REST API, no frontend | API VAPT with endpoint discovery |
+| `example.com` | Domain with web app | Fingerprint → API VAPT or recon |
+| `example.com` | Domain, no web app | Full recon + vulnerability scan |
+| `192.168.1.100` | Single IP | Recon + vulnerability scan |
+| `10.0.0.0/24` | CIDR range | Network sweep + scan |
 
-# OAuth/OIDC security testing
-python3 oauth_tester.py --target target.com
-
-# Finding validator (7-Question Gate — kills weak findings before report)
-python3 finding_validator.py findings/target/
-
-# Chain builder (A→B exploit escalation)
-python3 chain_builder.py findings/target/
-
-# Generate VAPT report (HTML + Markdown with inline PoC)
-python3 reporter.py findings/target/ --target target.com --client "Client Name"
-```
+**Auto-detection features:**
+- **Tech stack** — Vite, React, Next.js, Vue, Angular, Django, Laravel, WordPress, etc.
+- **Login pages** — scans JS bundles + probes common auth URLs (`/auth/login`, `/login`, `/sign-in`, etc.)
+- **API base path** — probes `/api/`, `/v1/`, `/graphql`, subdomain `api.*`, same-origin detection
+- **JS code-split chunks** — follows Vite/Next.js/Webpack dynamic imports to find all endpoints
+- **OpenAPI/Swagger** — discovers specs at `/docs`, `/swagger.json`, `/openapi.json`
 
 ---
 
 ## Architecture
 
 ```
-Target (FQDN / IP / CIDR)
+python3 vikramaditya.py
         │
-        ▼
-   hunt.py  ◄── brain.py (AI analysis + multi-provider LLM)
-        │         └── agent.py (autonomous ReAct loop)
+        ├── Classify target (URL / domain / IP / CIDR)
+        ├── Fingerprint (tech stack, login, API, JS bundles, OpenAPI)
+        ├── Interactive prompts (credentials, brain toggle)
         │
-   ┌────┴────────────────────────────────────┐
-   │                                         │
-   ▼                                         ▼
-recon.sh                               scanner.sh
-  │                                       │
-  ├── subfinder / assetfinder             ├── SQLi (sqlmap + verifier)
-  ├── amass / dnsx                        ├── XSS (dalfox)
-  ├── httpx (tech detect)                 ├── SSTI (math-canary probes)
-  ├── katana / waybackurls / gau          ├── RCE (Log4Shell, Tomcat, JBoss)
-  ├── nuclei (CVE templates)              ├── File upload bypass
-  ├── nmap / naabu (port scan)            ├── Cloud exposure (Firebase, K8s, Docker)
-  ├── subzy (takeover check)              ├── Framework exposure (Spring, GraphQL)
-  └── trufflehog / gitleaks (JS secrets)  └── Race conditions (xargs -P 20)
+        ├──► Web app + credentials ──► autopilot_api_hunt.py (12-phase API VAPT)
+        │                                    │
+        │                              brain.py (AI supervisor: INJECT/SKIP/CONTINUE)
         │
-        ▼
-  prioritize.py (CVE risk scoring)
+        ├──► Web app, no creds ──► hunt.py (unauthenticated scan)
         │
-        ▼
-   brain.py (AI triage)
-        │
-        ▼
-   reporter.py
-     ├── vapt_report.html  (Burp Suite-style, self-contained)
-     └── vapt_report.md    (Markdown summary)
+        └──► Domain / IP / CIDR ──► hunt.py (recon + vuln scan)
+                                       │
+                                  ┌────┴──────────────────────────┐
+                                  │                               │
+                               recon.sh                      scanner.sh
+                                  │                               │
+                                  ├── subfinder / assetfinder     ├── SQLi (sqlmap)
+                                  ├── httpx (tech detect)         ├── XSS (dalfox)
+                                  ├── katana / waybackurls        ├── SSTI / RCE
+                                  ├── nuclei (CVE templates)      ├── File upload
+                                  ├── nmap / naabu (ports)        ├── Cloud exposure
+                                  └── trufflehog (secrets)        └── Race conditions
+                                       │
+                                       ▼
+                                  reporter.py
+                                    ├── vapt_report.html
+                                    └── vapt_report.md
 ```
 
 ---
@@ -370,9 +386,17 @@ See [`subfinder-config.yaml.example`](subfinder-config.yaml.example) for the ful
 
 ## CLI Reference
 
-```
-hunt.py — VAPT Orchestrator
+### vikramaditya.py — The Main Entry Point
 
+```bash
+python3 vikramaditya.py        # Interactive — no flags needed
+```
+
+Everything is handled through prompts. No flags to remember.
+
+### hunt.py — Infrastructure VAPT (Advanced)
+
+```
 Target input:
   --target example.com          FQDN
   --target 192.168.1.100        Single IP
@@ -382,44 +406,37 @@ Scan modes:
   --quick                       Faster scan, fewer checks
   --full                        All checks including race conditions
   --autonomous                  AI-driven autonomous assessment
-  --scope-lock                  Test exact target only (no subdomain expansion)
 
 Selective phases:
-  --recon-only                  Recon only
-  --scan-only                   Scan only (requires prior recon)
-  --js-scan                     JS analysis + secret extraction
-  --param-discover              Parameter discovery (Arjun + ParamSpider)
-  --api-fuzz                    API endpoint brute (Kiterunner)
-  --secret-hunt                 TruffleHog + GitHound
-  --cors-check                  CORS misconfiguration check
-  --exploit                     CMS exploit chains (Drupal, WordPress)
-  --rce-scan                    RCE: Log4Shell, Tomcat, JBoss, Spring
-  --sqlmap                      sqlmap on discovered SQLi candidates
-  --jwt-audit                   JWT algorithm confusion + weak secret crack
+  --recon-only / --scan-only / --js-scan / --param-discover
+  --api-fuzz / --secret-hunt / --cors-check / --exploit
+  --rce-scan / --sqlmap / --jwt-audit
 
 AI options:
   --no-brain                    Skip AI analysis (tools only)
-  --brain-only                  AI analysis on existing recon data
-  --brain-next                  Ask AI: what is the highest-impact next action?
-
-Reporting:
-  python3 reporter.py <findings_dir> [--client NAME] [--consultant NAME] [--title TITLE] [--target DOMAIN]
+  --brain-only / --brain-next   AI analysis on existing data
 
 Utilities:
-  --repair-tools                Auto-install missing tools
-  --status                      Show current assessment progress
-  --oob-setup                   Configure interactsh OOB token
-  --resume SESSION_ID           Resume a previous session
+  --repair-tools / --status / --oob-setup / --resume SESSION_ID
+```
 
-Autopilot API VAPT (autopilot_api_hunt.py):
-  --base-url URL                API base URL (required)
-  --auth-creds user:pass        Primary account credentials (required)
+### autopilot_api_hunt.py — API VAPT (Advanced)
+
+```
+  --base-url URL                API base URL (auto-detected by vikramaditya.py)
+  --auth-creds user:pass        Primary account credentials
   --auth-creds-b user:pass      Second account for IDOR/priv esc testing
-  --login-url PATH              Login endpoint path (default: sign-in/)
-  --frontend-url URL            Frontend URL for JS bundle scraping
-  --with-brain                  Enable brain supervisor (local LLM)
+  --login-url PATH              Login endpoint (auto-detected by vikramaditya.py)
+  --frontend-url URL            Frontend URL for JS scraping (auto-inferred)
+  --with-brain                  Enable brain supervisor (auto-enabled by vikramaditya.py)
   --rate-limit N                Max requests/sec (default: 5)
   --output DIR                  Output directory for findings
+```
+
+### reporter.py — Report Generation
+
+```bash
+python3 reporter.py <findings_dir> [--client NAME] [--consultant NAME] [--title TITLE]
 ```
 
 ---
@@ -489,7 +506,8 @@ Discover endpoints (JS bundle + Django debug + crawl)
 
 ```
 vikramaditya/
-├── hunt.py                  Main orchestrator (infrastructure VAPT)
+├── vikramaditya.py          ★ Single entry point — run this
+├── hunt.py                  Infrastructure VAPT engine (domains, IPs, CIDR)
 ├── autopilot_api_hunt.py    Brain-supervised API VAPT engine
 ├── brain.py                 AI analysis engine (Gemma 4, Ollama, MLX, Claude, OpenAI, Grok)
 ├── agent.py                 Autonomous ReAct agent
