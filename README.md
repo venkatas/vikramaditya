@@ -75,9 +75,11 @@ That's it. No flags, no script selection, no manual configuration. It will:
 2. Auto-fingerprint the target (tech stack, login pages, API endpoints, JS bundles, OpenAPI specs)
 3. Show a summary of what it found and recommend the right scan type
 4. Ask for credentials if a login page is detected (password input is hidden)
-5. Enable the AI brain supervisor automatically if Ollama is installed
-6. Route to the right scan engine and run the full assessment
-7. Offer to generate a professional report at the end
+5. Enable the AI brain automatically if Ollama is installed
+6. Offer **brain active scanner** — LLM writes and executes exploit code, not just supervises
+7. Offer **fix verification** — developer says "fixed"? Brain reads the code and finds bypasses
+8. Route to the right scan engine and run the full assessment
+9. Offer to generate a professional report at the end
 
 ```
 $ python3 vikramaditya.py
@@ -104,9 +106,32 @@ $ python3 vikramaditya.py
   Password: ********
   Second account for IDOR / privilege escalation testing? [y/N]: n
   AI brain supervisor: enabled. Keep enabled? [Y/n]: y
+  Run brain active scanner? (LLM writes + executes exploit code) [y/N]: y
+  Verify a developer's fix claim? [y/N]: n
 
   [launching 12-phase brain-supervised API VAPT...]
+  [then brain active scanner writes + runs exploit PoCs...]
 ```
+
+### Brain Active Scanner
+
+The brain doesn't just supervise — it **writes exploit code, executes it, reads the results, and iterates**. Three modes:
+
+```bash
+# General scanning — brain writes PoCs for every vuln it finds
+python3 brain_scanner.py --target https://example.com
+
+# Fix verification — developer says "fixed", brain proves them wrong
+python3 brain_scanner.py --target https://example.com --verify-fix \
+    --fix-claim "File upload now blocks .phtml extensions" \
+    --code-url "https://example.com/scriptsNew/fileUpload-action.phtml"
+
+# Source code audit — feed code, brain finds vulns and writes PoCs
+python3 brain_scanner.py --target https://example.com --audit-code \
+    --code-file /path/to/source.php
+```
+
+The `--verify-fix` mode is what caught the Rediffmail Pro OR-logic flaw: developers claimed they fixed the file upload, but the brain read the actual PHP code, spotted `if (mime_ok OR ext_ok)` (should be AND), and wrote the bypass PoC that regained RCE.
 
 ### Direct Engine Access (Advanced)
 
@@ -123,6 +148,10 @@ python3 autopilot_api_hunt.py \
     --base-url https://api.target.com \
     --auth-creds "admin@target.com:password" \
     --with-brain
+
+# Brain active scanner (LLM writes + executes exploit code)
+python3 brain_scanner.py --target https://example.com --verify-fix \
+    --fix-claim "CSRF fixed via ols token"
 
 # Generate report manually
 python3 reporter.py findings/target/ --client "Acme Corp"
@@ -164,6 +193,11 @@ python3 vikramaditya.py
         ├──► Web app + credentials ──► autopilot_api_hunt.py (12-phase API VAPT)
         │                                    │
         │                              brain.py (AI supervisor: INJECT/SKIP/CONTINUE)
+        │
+        ├──► Verify developer fix ──► brain_scanner.py --verify-fix
+        │                              (reads code, finds logic flaws, writes bypass PoCs)
+        │
+        ├──► Brain active scan ──► brain_scanner.py (LLM writes + executes exploits)
         │
         ├──► Web app, no creds ──► hunt.py (unauthenticated scan)
         │
@@ -507,6 +541,7 @@ Discover endpoints (JS bundle + Django debug + crawl)
 ```
 vikramaditya/
 ├── vikramaditya.py          ★ Single entry point — run this
+├── brain_scanner.py         LLM writes + executes exploit code (scan/verify-fix/audit-code)
 ├── hunt.py                  Infrastructure VAPT engine (domains, IPs, CIDR)
 ├── autopilot_api_hunt.py    Brain-supervised API VAPT engine
 ├── brain.py                 AI analysis engine (Gemma 4, Ollama, MLX, Claude, OpenAI, Grok)

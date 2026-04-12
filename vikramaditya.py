@@ -404,6 +404,19 @@ def run_api_vapt(base_url: str, creds: str, creds_b: str = None,
     return result
 
 
+def run_brain_scan(target: str, cookies: str = "", briefing: str = "",
+                   mode: str = "scan", fix_claim: str = "",
+                   code_url: str = "", output_dir: str = None):
+    """Route to brain_scanner.py for LLM-driven active testing."""
+    sys.path.insert(0, SCRIPT_DIR)
+    from brain_scanner import run_brain_scanner
+    return run_brain_scanner(
+        target=target, briefing=briefing, cookies=cookies,
+        output_dir=output_dir, mode=mode, fix_claim=fix_claim,
+        code_url=code_url,
+    )
+
+
 def run_report(findings_dir: str, client: str = "", consultant: str = ""):
     """Route to reporter.py for report generation."""
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "reporter.py"), findings_dir]
@@ -516,9 +529,10 @@ def main():
                     if username_b and password_b:
                         creds_b = f"{username_b}:{password_b}"
 
-    # ── Step 4: Brain supervisor ──────────────────────────────────────────
+    # ── Step 4: Brain options ─────────────────────────────────────────────
     has_ollama = ollama_available()
     with_brain = False
+    use_brain_scanner = False
     if has_ollama:
         with_brain = True
         if not confirm("AI brain supervisor: enabled. Keep enabled?"):
@@ -526,10 +540,43 @@ def main():
             log("info", "Brain disabled")
         else:
             log("ok", "Brain supervisor enabled")
+
+        # Offer brain scanner for deeper testing
+        if confirm("Run brain active scanner? (LLM writes + executes exploit code)", default_yes=False):
+            use_brain_scanner = True
     else:
         log("info", "Ollama not installed — running without AI brain")
 
+    # ── Step 4b: Fix verification mode ────────────────────────────────────
+    verify_fix_mode = False
+    fix_claim = ""
+    code_url = ""
+    if has_ollama and confirm("Verify a developer's fix claim?", default_yes=False):
+        verify_fix_mode = True
+        fix_claim = prompt("What does the developer claim they fixed?")
+        code_url = prompt("URL to the fixed code (leave blank to auto-discover)", "")
+
     # ── Step 5: Route to engine ───────────────────────────────────────────
+
+    # --- Fix verification mode → brain_scanner --verify-fix ---
+    if verify_fix_mode and fix_claim:
+        output_dir = make_output_dir(urlparse(url).netloc)
+        cookie_str = ""
+        if creds:
+            cookie_str = f"(creds available: {creds.split(':')[0]})"
+        log("info", f"Output: {output_dir}")
+        print()
+        run_brain_scan(
+            target=url,
+            mode="verify-fix",
+            fix_claim=fix_claim,
+            code_url=code_url,
+            cookies=cookie_str,
+            output_dir=os.path.join(output_dir, "brain_verify"),
+        )
+        print(f"\n  {D}Done.{N}\n")
+        return
+
     if creds and fp["api_detected"]:
         # Authenticated API VAPT
         output_dir = make_output_dir(urlparse(url).netloc)
@@ -585,7 +632,7 @@ def main():
         else:
             print(f"\n  {D}Scan complete. No findings.{N}\n")
 
-    else:
+    elif not creds:
         # No creds — run hunt.py for unauthenticated scan
         domain = urlparse(url).netloc
         log("info", "No credentials — running unauthenticated recon + vulnerability scan")
@@ -610,6 +657,16 @@ def main():
                         print(f"  {Y}No findings directory found at {findings_dir}{N}")
             else:
                 print(f"  {Y}No scan sessions found for {domain}{N}")
+
+    # ── Brain active scanner follow-up ───────────────────────────────────
+    if use_brain_scanner and has_ollama:
+        log("info", "Launching brain active scanner — LLM writes + executes exploit code...")
+        brain_out = make_output_dir(urlparse(url).netloc)
+        run_brain_scan(
+            target=url,
+            mode="scan",
+            output_dir=os.path.join(brain_out, "brain_active"),
+        )
 
     print(f"\n  {D}Done.{N}\n")
 
