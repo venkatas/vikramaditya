@@ -1003,22 +1003,6 @@ class InfoDisclosureScanner:
                 saver.save(f)
                 saver.save_txt(f)
 
-        # 8e. Keycloak admin console
-        try:
-            resp_kc = _req.get("https://auth.cyberfrat.com/admin/master/console/",
-                               verify=False, timeout=10)
-            if resp_kc.status_code == 200:
-                f = {"type": "keycloak_admin_exposed", "severity": HIGH,
-                     "detail": "Keycloak admin console accessible",
-                     "url": "https://auth.cyberfrat.com/admin/master/console/",
-                     "evidence": f"HTTP {resp_kc.status_code}"}
-                findings.append(f)
-                if saver:
-                    saver.save(f)
-                    saver.save_txt(f)
-        except Exception:
-            pass
-
         log("ok", f"  {len(findings)} info disclosure findings")
         return findings
 
