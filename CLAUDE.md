@@ -18,6 +18,7 @@ the AI brain if Ollama is installed, and routes to the right scan engine.
 | File | Role |
 |------|------|
 | `vikramaditya.py` | **Main entry point** — interactive orchestrator, auto-detects everything |
+| `brain_scanner.py` | LLM writes + executes exploit code (scan / verify-fix / audit-code) |
 | `autopilot_api_hunt.py` | Brain-supervised 12-phase API VAPT engine |
 | `hunt.py` | Infrastructure VAPT — recon + vuln scan for domains/IPs/CIDR |
 | `brain.py` | AI analysis engine (Ollama local LLM) |
