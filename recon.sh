@@ -798,6 +798,63 @@ cat "$RECON_DIR/urls/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/urls/all.txt" ||
 TOTAL_URLS_RAW=$(file_lines "$RECON_DIR/urls/all.txt")
 log_ok "Total unique URLs (raw): $TOTAL_URLS_RAW"
 
+# ── Content URL deduplication: collapse repetitive patterns ───────────────────
+# News sites, blogs, video platforms, etc. produce thousands of URLs that share
+# the same code path (e.g., /news/report/*/DATE.htm). Keep ONE representative
+# per pattern and discard the rest — they have identical attack surface.
+if [ -s "$RECON_DIR/urls/all.txt" ]; then
+    BEFORE_PATTERN_DEDUP=$(file_lines "$RECON_DIR/urls/all.txt")
+    # Build a pattern-collapsed version: replace numeric IDs, dates, slugs,
+    # and path segments with placeholders, then keep only the first URL per
+    # unique pattern. This collapses news articles, video categories, tags, etc.
+    python3 -c "
+import re, sys
+from urllib.parse import urlparse
+seen_patterns = set()
+kept = []
+for line in sys.stdin:
+    url = line.strip()
+    if not url: continue
+    parsed = urlparse(url)
+    path = parsed.path
+    query = parsed.query
+    # Collapse dates: /20260404.htm → /DATE.htm
+    p = re.sub(r'/\d{8}\.\w+', '/DATE.ext', path)
+    # Collapse numeric path segments: /12345 or /62094 → /NUM
+    p = re.sub(r'/\d{4,}', '/NUM', p)
+    # Collapse long slugs (article titles, video titles): /some-long-slug-here/ → /SLUG/
+    p = re.sub(r'/[a-z0-9](?:[a-z0-9-]{15,})[a-z0-9](?=/|$)', '/SLUG', p)
+    # Collapse path categories: /video/recipes?q=N → /video/CAT?q=N
+    # Also: /tags/keyword → /tags/CAT (same template, different tag)
+    parts = p.rstrip('/').rsplit('/', 1)
+    if len(parts) == 2 and len(parts[1]) < 25:
+        parent = parts[0]
+        segment = parts[1]
+        # Collapse if: has query params, or parent is a known listing path
+        is_listing = any(kw in parent for kw in ('/tags', '/video', '/category', '/topic',
+            '/author', '/search', '/page', '/section', '/channel'))
+        if (q and segment.isalpha()) or is_listing:
+            p = parent + '/CAT'
+    # Collapse UUIDs
+    p = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'UUID', p)
+    # Collapse query params: q=12345 → q=N, id=abc → id=N, r=999 → r=N
+    q = re.sub(r'=[^&]+', '=N', query)
+    # Build pattern key: host + collapsed path + collapsed query
+    pattern = f'{parsed.netloc}{p}?{q}' if q else f'{parsed.netloc}{p}'
+    if pattern not in seen_patterns:
+        seen_patterns.add(pattern)
+        kept.append(url)
+for u in kept:
+    print(u)
+" < "$RECON_DIR/urls/all.txt" > "$RECON_DIR/urls/all_dedup.txt" 2>/dev/null || true
+    AFTER_PATTERN_DEDUP=$(file_lines "$RECON_DIR/urls/all_dedup.txt")
+    if [ "$AFTER_PATTERN_DEDUP" -gt 0 ] && [ "$AFTER_PATTERN_DEDUP" -lt "$BEFORE_PATTERN_DEDUP" ]; then
+        cp "$RECON_DIR/urls/all_dedup.txt" "$RECON_DIR/urls/all.txt"
+        log_ok "Pattern dedup: $BEFORE_PATTERN_DEDUP → $AFTER_PATTERN_DEDUP URLs (collapsed $(( BEFORE_PATTERN_DEDUP - AFTER_PATTERN_DEDUP )) repetitive content URLs)"
+    fi
+    rm -f "$RECON_DIR/urls/all_dedup.txt"
+fi
+
 # ── MAX_URLS cap: keep the most valuable URLs first ───────────────────────────
 # Priority order: parameterised > JS > API > sensitive > remaining.
 # This ensures the 100-URL default retains the highest-signal URLs for vuln
