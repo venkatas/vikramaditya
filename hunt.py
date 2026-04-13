@@ -5778,9 +5778,9 @@ Examples:
 
     print(f"""
 {BOLD}╔══════════════════════════════════════════════════════════╗
-║   VAPT Automation Pipeline v4                      ║
-║   Recon · JS · Secrets · Params · API · CORS             ║
-║   CMS Exploit · SQLmap · JWT · Brain                     ║
+║   VAPT Automation Pipeline v4                          ║
+║   Recon · JS · Secrets · Params · API · CORS           ║
+║   CMS Exploit · SQLmap · JWT · Brain                   ║
 ╚══════════════════════════════════════════════════════════╝{NC}
   {brain_status}
 """)
