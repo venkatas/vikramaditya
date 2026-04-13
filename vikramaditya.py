@@ -377,12 +377,14 @@ def ollama_available() -> bool:
 
 # ── Engine Routing ────────────────────────────────────────────────────────────
 
-def run_hunt(target: str, full: bool = False):
+def run_hunt(target: str, full: bool = False, scope_lock: bool = False):
     """Route to hunt.py for domain/IP/CIDR recon + scan."""
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "hunt.py"),
            "--target", target]
     if full:
         cmd.append("--full")
+    if scope_lock:
+        cmd.append("--scope-lock")
     print(f"\n  {B}[»]{N} Launching hunt.py → {target}\n")
     subprocess.run(cmd, cwd=SCRIPT_DIR)
 
@@ -448,7 +450,12 @@ def main():
     banner()
 
     # ── Step 1: Get target ────────────────────────────────────────────────
-    target_raw = prompt("Enter target (URL, domain, IP, or CIDR)")
+    # Accept target from command line args OR interactive prompt
+    target_raw = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
+    if not target_raw:
+        target_raw = prompt("Enter target (URL, domain, IP, or CIDR)")
+    else:
+        log("info", f"Target: {target_raw}")
     if not target_raw:
         print(f"  {R}No target provided. Exiting.{N}")
         return
@@ -483,7 +490,8 @@ def main():
             if not confirm("Proceed with recon + vulnerability scan?"):
                 print(f"  {D}Aborted.{N}")
                 return
-            run_hunt(target_info["value"], full=True)
+            scope_lock = confirm("Scope lock? (scan this exact domain only, no subdomain expansion)", default_yes=False)
+            run_hunt(target_info["value"], full=True, scope_lock=scope_lock)
             return
         else:
             # Web app found — treat it as a URL
@@ -635,9 +643,10 @@ def main():
     elif not creds:
         # No creds — run hunt.py for unauthenticated scan
         domain = urlparse(url).netloc
+        scope_lock = confirm("Scope lock? (scan this exact host only, no subdomain expansion)", default_yes=False)
         log("info", "No credentials — running unauthenticated recon + vulnerability scan")
         print()
-        run_hunt(domain, full=True)
+        run_hunt(domain, full=True, scope_lock=scope_lock)
 
         # Post-scan: check if there are findings to report
         # hunt.py manages its own output, so just offer the report prompt
