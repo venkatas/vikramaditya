@@ -787,10 +787,12 @@ if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
         head -20 "$RECON_DIR/live/urls.txt"
     } | sort -u | head -50 > "$RECON_DIR/urls/katana_targets.txt"
 
-    katana -list "$RECON_DIR/urls/katana_targets.txt" \
-        -d 5 -silent -jc \
+    timeout 300 katana -list "$RECON_DIR/urls/katana_targets.txt" \
+        -d 3 -silent -jc \
+        -crawl-duration 300 \
+        -known-files skip \
         -o "$RECON_DIR/urls/katana.txt" 2>/dev/null || true
-    log_done "katana: $(file_lines "$RECON_DIR/urls/katana.txt") URLs"
+    log_done "katana: $(file_lines "$RECON_DIR/urls/katana.txt") URLs (5 min cap)"
 fi
 
 # Merge all URLs
