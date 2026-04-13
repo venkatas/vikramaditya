@@ -1305,8 +1305,8 @@ if [ -s "$RECON_DIR/urls/with_params.txt" ]; then
     # arjun — hidden parameter discovery on API endpoints
     if tool_ok arjun && [ -s "$RECON_DIR/urls/api_endpoints.txt" ]; then
         log_step "arjun hidden parameter discovery (sample endpoints)..."
-        head -10 "$RECON_DIR/urls/api_endpoints.txt" | while IFS= read -r ep; do
-            arjun -u "$ep" --stable -q \
+        head -5 "$RECON_DIR/urls/api_endpoints.txt" | while IFS= read -r ep; do
+            timeout 60 arjun -u "$ep" --stable -q \
                 -oJ "$RECON_DIR/params/arjun_$(echo "$ep" | md5sum | cut -c1-8).json" \
                 2>/dev/null || true
         done
