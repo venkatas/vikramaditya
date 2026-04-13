@@ -41,6 +41,9 @@
 | **Endpoint discovery** | Single main.js bundle only | All JS chunks (Vite, Next.js, CRA), dynamic imports, OpenAPI/Swagger |
 | **Login detection** | Required `--login-url` flag | Auto-detects from 18+ common patterns + dev/staging endpoints |
 | **API base path** | Required `--base-url` flag | Auto-probes `/api/`, `/v1/`, subdomains, same-origin detection |
+| **URL dedup** | No dedup (scans thousands of identical news/video URLs) | Pattern-based collapse: 5000 → 50 unique code paths |
+| **Scope lock** | `--scope-lock` flag | Interactive prompt: "scan this exact host only?" |
+| **CLI args** | Required (`--target x --full --with-brain`) | `python3 vikramaditya.py example.com` — one arg, everything auto |
 | **Banner** | Orange gradient | Indian flag colors (saffron, white, green, Ashoka blue) |
 
 ---
@@ -82,7 +85,10 @@ ollama pull gemma4:26b               # recommended brain model (17GB)
 ### The Only Command You Need
 
 ```bash
-python3 vikramaditya.py
+python3 vikramaditya.py                    # interactive — asks for target
+python3 vikramaditya.py example.com        # pass target directly
+python3 vikramaditya.py https://app.example.com
+python3 vikramaditya.py 10.0.0.0/24
 ```
 
 That's it. No flags, no script selection, no manual configuration. It will:
@@ -98,9 +104,7 @@ That's it. No flags, no script selection, no manual configuration. It will:
 9. Offer to generate a professional report at the end
 
 ```
-$ python3 vikramaditya.py
-
-  Enter target: https://app.example.com
+$ python3 vikramaditya.py app.example.com
 
   ────────────────────────────────────────────────────────
     TARGET SUMMARY
@@ -127,6 +131,15 @@ $ python3 vikramaditya.py
 
   [launching 12-phase brain-supervised API VAPT...]
   [then brain active scanner writes + runs exploit PoCs...]
+```
+
+For unauthenticated domain scans, it asks about scope:
+
+```
+$ python3 vikramaditya.py is.rediff.com
+
+  Scope lock? (scan this exact host only, no subdomain expansion) [y/N]: y
+  [scans is.rediff.com only — no www.rediff.com, no ishare.rediff.com]
 ```
 
 ### Brain Active Scanner
