@@ -405,7 +405,10 @@ def _load_poc_blocks(poc_path: str) -> dict:
 
 
 def load_findings(findings_dir: str) -> list:
+    import json as _json
     results = []
+
+    # Method 1: Subdirectory-based findings (scanner.sh output)
     for subdir, vtype in SUBDIR_VTYPE.items():
         path = os.path.join(findings_dir, subdir)
         if not os.path.isdir(path):
@@ -424,12 +427,46 @@ def load_findings(findings_dir: str) -> list:
                     if not line or line.startswith("#"):
                         continue
                     finding = parse_custom_line(line, vtype)
-                    # Match PoC by finding text prefix (first 60 chars)
                     for poc_key, poc_text in all_pocs.items():
                         if poc_key in line or line[:60] in poc_key:
                             finding["poc"] = poc_text
                             break
                     results.append(finding)
+
+    # Method 2: Flat JSON findings (autopilot_api_hunt.py output)
+    # Reads finding_*.json files directly in the findings dir
+    if not results:
+        for fn in sorted(os.listdir(findings_dir)):
+            if not fn.startswith("finding_") or not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(findings_dir, fn)) as f:
+                    data = _json.load(f)
+                sev = data.get("severity", "medium").lower()
+                vtype = data.get("type", "misconfig")
+                tmpl = VULN_TEMPLATES.get(vtype, VULN_TEMPLATES.get("misconfig", {}))
+                raw_line = f"[{sev.upper()}] {data.get('detail', '')} {data.get('url', '')}"
+                finding = {
+                    "severity": sev,
+                    "vtype": vtype,
+                    "url": data.get("url", "N/A"),
+                    "raw": raw_line,
+                    "name": tmpl.get("name", vtype.replace("_", " ").title()),
+                    "detail": data.get("detail", ""),
+                    "evidence": data.get("evidence", ""),
+                    "poc": data.get("evidence", ""),
+                    "cvss": tmpl.get("cvss", "N/A"),
+                    "cwe": tmpl.get("cwe", ""),
+                    "owasp": tmpl.get("owasp", ""),
+                    "remediation": tmpl.get("remediation", ""),
+                    "description": tmpl.get("description", data.get("detail", "")),
+                    "impact": tmpl.get("impact", ""),
+                    "attack_id": "",
+                }
+                results.append(finding)
+            except Exception:
+                continue
+
     results.sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 4))
     return results
 

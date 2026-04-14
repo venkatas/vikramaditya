@@ -88,9 +88,22 @@ def ask_brain(model: str, messages: list[dict], max_tokens: int = 4000) -> str:
     resp = ollama.chat(
         model=model,
         messages=messages,
-        options={"num_predict": max_tokens, "temperature": 0.3},
+        options={
+            "num_predict": max_tokens,
+            "temperature": 0.1,
+            "repeat_penalty": 1.3,   # Prevent S_S_S_S degeneration
+            "top_p": 0.9,
+        },
     )
-    return resp["message"].get("content", "")
+    content = resp["message"].get("content", "")
+    # Detect and truncate repetition loops (model degeneration)
+    if "_S_S_S" in content or len(set(content[-200:])) < 10:
+        # Find where repetition starts and truncate
+        for i in range(len(content) - 100, 0, -100):
+            if len(set(content[i:i+100])) < 15:
+                content = content[:i].rstrip() + "\n\n[Brain output truncated — repetition detected]"
+                break
+    return content
 
 
 def extract_code_blocks(text: str) -> list[dict]:
