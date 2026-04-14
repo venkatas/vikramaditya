@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v2.1 — Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
+**v2.2 — Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -685,6 +685,34 @@ Then open a pull request describing what you added and why it's useful.
 | `Improve:` | Enhancement to existing functionality |
 | `Refactor:` | Code cleanup, no behaviour change |
 | `Docs:` | README, comments, docs only |
+
+---
+
+## Changelog
+
+### v2.2 (2026-04-14)
+- **fix:** Reporter now reads autopilot JSON findings (was showing 0 findings)
+- **fix:** Cross-origin API detection from JS bundles (`baseURL` in React/Angular apps)
+- **fix:** SPA false positive guard (`.env` returning `index.html` is not a finding)
+- **fix:** Brain scanner targets API base, not SPA frontend
+- **fix:** BugTraceAI repetition guard (`repeat_penalty=1.3` + auto-truncation)
+- **fix:** Removed invalid katana `--known-files skip` flag
+
+### v2.1 (2026-04-14)
+- **feat:** BugTraceAI-Apex as primary brain (security-tuned Gemma4, 0% refusal)
+- **feat:** Dual-model architecture (BugTraceAI for deep analysis, baron-llm for supervision)
+- **fix:** Arjun capped at 60s per endpoint
+- **fix:** Katana capped at 5 min crawl
+- **feat:** Pattern-based URL dedup (120K → 100 on content sites)
+- **feat:** CLI arg support (`python3 vikramaditya.py example.com`)
+- **feat:** Scope lock option
+
+### v2.0 (2026-04-12)
+- **feat:** `vikramaditya.py` — single interactive entry point
+- **feat:** `brain_scanner.py` — LLM writes + executes exploit code (scan/verify-fix/audit-code)
+- **feat:** Vite/Next.js/code-split endpoint discovery
+- **feat:** Auto-detect login URL, API base path, tech stack
+- **fix:** Removed false positive (login console accessible)
 
 ---
 
