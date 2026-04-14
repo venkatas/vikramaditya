@@ -197,18 +197,53 @@ def fingerprint_webapp(url: str) -> dict:
             if not first_js.startswith("http"):
                 first_js = base + first_js
             js_resp = requests.get(first_js, verify=False, timeout=15)
+            js_text = js_resp.text
+
             # Count API-like paths
             api_paths = set()
             for pat in [r'\.(get|post|put|patch|delete)\("[^"]*"',
                         r'fetch\(["`\'][^"`\']+["`\']']:
-                api_paths.update(re.findall(pat, js_resp.text))
+                api_paths.update(re.findall(pat, js_text))
             result["js_endpoints"] = len(api_paths)
 
             # Login detection from JS
-            login_patterns = re.findall(r'"(/(?:auth/)?(?:login|sign-in|signin)[^"]*)"', js_resp.text)
+            login_patterns = re.findall(r'"(/(?:auth/)?(?:login|sign-in|signin)[^"]*)"', js_text)
             if login_patterns:
                 result["login_detected"] = True
                 result["login_paths"] = list(set(login_patterns))
+
+            # Cross-origin API base detection from JS (baseURL, apiUrl, etc.)
+            # Catches: baseURL:"https://api.example.com/v1/"
+            cross_origin_apis = re.findall(
+                r'(?:baseURL|apiUrl|API_URL|apiBase|api_base)["\s:=]+["\']?(https?://[^"\'\s,;]+)',
+                js_text, re.IGNORECASE)
+            for api_url in cross_origin_apis:
+                api_url = api_url.rstrip("/")
+                if api_url and parsed.netloc not in api_url:
+                    # Cross-origin API found
+                    result["api_detected"] = True
+                    result["api_base"] = api_url
+                    log("info", f"Cross-origin API found in JS: {api_url}")
+                    # Check if this API has a login endpoint
+                    for lp in ["login-view/", "login/", "auth/login/"]:
+                        try:
+                            lp_resp = requests.post(f"{api_url}/{lp}",
+                                                     data={"email": "", "password": ""},
+                                                     verify=False, timeout=8)
+                            if lp_resp.status_code not in (404, 405, 0):
+                                result["login_detected"] = True
+                                result["login_paths"].append(f"{api_url}/{lp}")
+                                break
+                        except Exception:
+                            continue
+                    break
+
+            # Also detect login-view in JS fetch/post calls
+            if not result["login_detected"]:
+                login_js = re.findall(r'["\']([^"\']*login-view[^"\']*)["\']', js_text)
+                if login_js:
+                    result["login_detected"] = True
+                    result["login_paths"].extend(login_js[:3])
         except Exception:
             pass
 
