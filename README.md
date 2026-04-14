@@ -79,7 +79,13 @@ Vikramaditya is an autonomous VAPT tool built for professional security consulta
 git clone https://github.com/venkatas/vikramaditya.git
 cd vikramaditya
 chmod +x setup.sh && ./setup.sh      # installs all required tools
-ollama pull gemma4:26b               # recommended brain model (17GB)
+
+# Download BugTraceAI brain (security-tuned, recommended)
+wget -c 'https://huggingface.co/BugTraceAI/BugTraceAI-Apex-G4-26B-Q4/resolve/main/BugTraceAI-Apex-G4-26B-Q4.gguf' -O /tmp/BugTraceAI-Apex-G4-26B-Q4.gguf
+ollama create bugtraceai-apex -f Modelfiles/BugTraceAI-Modelfile
+
+# Or use stock Gemma4 (also works well)
+ollama pull gemma4:26b               # fast all-rounder brain (17GB)
 ```
 
 ### The Only Command You Need
@@ -319,14 +325,14 @@ The agent operates in a tight loop: **Observe → Think (LLM) → Act (tool) →
 
 ### Recommended Local Models (Benchmark-Tested)
 
-Tested on MacBook Pro M4 Max (36GB) with a real VAPT findings set. Quality scored on: exploit chain identification, missed-test suggestions, and attack path analysis.
+Tested on MacBook Pro M4 Max (36GB) with real VAPT findings. Dual-model setup: **BugTraceAI** for deep security analysis, **gemma4:26b** for fast supervision.
 
 | Rank | Model | Speed | Quality | RAM | Best For |
 |:-----|:------|------:|:--------|----:|:---------|
-| #1 | **`gemma4:26b`** | 25.6 tok/s | 4/4 | 17GB | **Primary brain** — fastest with full quality, native tool calling, 262K context |
-| #2 | **`qwen3-coder-64k`** | 10.2 tok/s | 4/4 | 18GB | **Code analysis** — 64K context for large JS bundles |
-| #3 | **`vapt-qwen25`** | 4.1 tok/s | 4/4 | 19GB | **Deep analysis** — custom VAPT training data |
-| #4 | `deepseek-r1:32b` | 3.9 tok/s | 4/4 | 19GB | Chain-of-thought reasoning (slow) |
+| #1 | **`bugtraceai-apex`** | 57.0 tok/s | 4/4 | 16GB | **Primary brain** — Gemma4 26B fine-tuned on HackerOne/Bugcrowd reports, `<thinking>` blocks, 0% refusal, DPO-trained |
+| #2 | **`gemma4:26b`** | 66.4 tok/s | 4/4 | 17GB | **Fast supervisor** — phase decisions (CONTINUE/SKIP/INJECT), 262K context |
+| #3 | **`qwen3-coder-64k`** | 10.2 tok/s | 4/4 | 18GB | **Code analysis** — 64K context for large JS bundles |
+| #4 | **`vapt-qwen25`** | 4.1 tok/s | 4/4 | 19GB | **Deep analysis** — custom VAPT training data |
 | #5 | **`baron-llm`** | 14.2 tok/s | 2/4 | 6.6GB | **Fast triage** — offensive security fine-tune |
 | — | `gemma4:e4b` | fast | 3/4 | 9.6GB | Lightweight — laptops with 16GB RAM |
 
@@ -538,13 +544,15 @@ Discover endpoints (JS bundle + Django debug + crawl)
 | Chain Building | Cross-reference findings for escalation |
 | Brain Validation | FP removal + severity correction via LLM |
 
-### Brain Model Stack
+### Brain Model Stack (Dual-Model Architecture)
 
 | Role | Model | Speed | Use |
 |------|-------|-------|-----|
-| Decision engine | `baron-llm` | 14 tok/s | Per-phase INJECT/SKIP/CONTINUE decisions |
-| FP validation | `qwen3-coder-64k` | 10 tok/s | JSON severity corrections |
-| Chain analysis | `gemma4:26b` | 25 tok/s | Final exploit chain + recommendations |
+| **Deep analysis** | `bugtraceai-apex` | 57 tok/s | Exploit writing, code audit, fix verification, brain_scanner |
+| Fast supervisor | `baron-llm` | 14 tok/s | Per-phase INJECT/SKIP/CONTINUE decisions |
+| Fast fallback | `gemma4:26b` | 66 tok/s | All-rounder when specialized models unavailable |
+| FP validation | `bugtraceai-apex` | 57 tok/s | Finding triage, severity corrections |
+| Chain analysis | `bugtraceai-apex` | 57 tok/s | Exploit chain identification + recommendations |
 
 ---
 

@@ -304,13 +304,15 @@ class LLMClient:
 
 # Model preference order — first available wins
 # Benchmark-tested model priority (M4 Max 36GB, April 2026):
-#   #1 gemma4:26b         23s  25.6 tok/s  4/4 quality  ★ CHAMPION
+#   #0 bugtraceai-apex     35s  57.0 tok/s  4/4 quality  ★ Security-tuned, <thinking> blocks, 0% refusal
+#   #1 gemma4:26b         23s  66.4 tok/s  4/4 quality  Fast all-rounder, supervisor decisions
 #   #2 qwen3-coder-64k    26s  10.2 tok/s  4/4 quality  Best for code/JS analysis
 #   #3 vapt-qwen25         88s   4.1 tok/s  4/4 quality  Deepest VAPT knowledge
 #   #4 deepseek-r1:32b   153s   3.9 tok/s  4/4 quality  Chain-of-thought reasoning
 #   #5 baron-llm           17s  14.2 tok/s  2/4 quality  Fast triage only
 MODEL_PRIORITY = [
-    "gemma4:26b",                # ★ #1 — 25.8B MoE, 25.6 tok/s, 262K context, native tool calling
+    "bugtraceai-apex",           # ★ #0 — Gemma4 26B security-tuned, DPO on bug bounty reports, 0% refusal
+    "gemma4:26b",                # #1 — 25.8B MoE, 66.4 tok/s, 262K context, fast all-rounder
     "qwen3-coder-64k:latest",   # #2 — 30.5B, 10.2 tok/s, 64K context, best for code
     "vapt-qwen25:latest",       # #3 — custom 32B VAPT-tuned, deepest security knowledge
     "vikramaditya-custom:latest", # custom 32B vikramaditya
