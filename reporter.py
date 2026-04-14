@@ -660,16 +660,22 @@ def load_findings(findings_dir: str) -> list:
 def resolve_target_and_report_dir(findings_dir: str) -> tuple:
     findings_dir = os.path.abspath(findings_dir)
     parts = findings_dir.split(os.sep)
-    if len(parts) >= 3 and parts[-2] == "sessions":
-        target = parts[-3]
-        session = parts[-1]
-        report_dir = os.environ.get("REPORTS_OUT_DIR") or \
-                     os.path.join(REPORTS_DIR, target, "sessions", session)
-    else:
-        target  = os.path.basename(findings_dir)
-        session = ""
-        report_dir = os.environ.get("REPORTS_OUT_DIR") or \
-                     os.path.join(REPORTS_DIR, target)
+    # Walk up the path to find "sessions" directory marker
+    # Handles both: .../sessions/SESSION_ID/findings/ (scanner)
+    #           and: .../sessions/SESSION_ID_autopilot/autopilot/ (autopilot)
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i] == "sessions" and i >= 1:
+            target = parts[i - 1]  # directory before "sessions"
+            # Session ID is the next part after "sessions"
+            session = parts[i + 1] if i + 1 < len(parts) else ""
+            report_dir = os.environ.get("REPORTS_OUT_DIR") or \
+                         os.path.join(REPORTS_DIR, target, "sessions", session)
+            return target, session, report_dir
+    # Fallback — no "sessions" in path
+    target = os.path.basename(findings_dir)
+    session = ""
+    report_dir = os.environ.get("REPORTS_OUT_DIR") or \
+                 os.path.join(REPORTS_DIR, target)
     return target, session, report_dir
 
 
