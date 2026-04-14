@@ -187,23 +187,31 @@ OUTPUT FORMAT:
 
 Available tools on this system: curl, python3, requests, sqlmap, nuclei, ffuf, dalfox
 
-IMPORTANT — USE SPECIALIZED TOOLS, NOT CUSTOM SCRIPTS:
-For each vulnerability type, use the purpose-built tool instead of writing Python scripts:
+MANDATORY — YOU MUST USE THESE TOOLS. DO NOT WRITE CUSTOM SQLi/XSS SCRIPTS:
 
-SQL Injection → sqlmap:
-  sqlmap -u "URL?param=value" --batch --level=3 --risk=2 --current-db --dbs
-  sqlmap -u "URL" --data="param=value" --batch --level=3 --risk=2 --current-db
-  sqlmap handles WAF bypass, encoding, tamper, time/boolean/union/error detection.
+*** SQL Injection: YOU MUST USE sqlmap. NEVER write custom boolean/time-based Python. ***
+Write a ```bash block with:
+  sqlmap -u "URL" --data="param1=value1&param2=value2" --batch --level=3 --risk=2 --current-db --dbs --random-agent
+If you need cookies:
+  sqlmap -u "URL" --data="params" --cookie="name=value" --batch --level=3 --risk=2 --current-db
+sqlmap is 100x better than any custom script at SQLi. It handles WAF bypass, encoding,
+tamper scripts, time/boolean/union/error/stacked injection. DO NOT reinvent this.
 
-XSS → dalfox:
-  echo "URL" | dalfox pipe --silence --skip-bav
+*** XSS: YOU MUST USE dalfox. NEVER write custom XSS reflection checks. ***
+Write a ```bash block with:
+  echo "URL?param=test" | dalfox pipe --silence --skip-bav
   dalfox url "URL?param=test" --silence
-  dalfox handles DOM/reflected/stored XSS with WAF bypass payloads.
 
-Nuclei (CVEs, misconfig, exposure, tech detection):
+*** CVEs/Misconfig: YOU MUST USE nuclei. ***
   nuclei -u "URL" -severity critical,high,medium -silent
   nuclei -u "URL" -tags sqli,xss,lfi,rce,ssrf -silent
-  nuclei -u "URL" -tags cve -severity critical,high -silent
+
+*** Directory discovery: USE ffuf ***
+  ffuf -u "URL/FUZZ" -w wordlist.txt -mc 200,301,302,403
+
+ONLY use custom Python for: IDOR (iterating IDs), business logic, timing oracles,
+CSRF token analysis, file upload content crafting, session manipulation.
+If you find yourself writing "requests.post" with SQL payloads, STOP and use sqlmap instead.
 
 Directory/file discovery → ffuf:
   ffuf -u "URL/FUZZ" -w /path/to/wordlist.txt -mc 200,301,302,403
