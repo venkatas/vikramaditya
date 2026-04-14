@@ -161,6 +161,12 @@ CRITICAL FALSE POSITIVE RULES:
   markers, and is the same as /, it's a false positive.
 - HTTP 200 alone does NOT confirm a finding. Check the CONTENT, not just the status code.
 - For API testing: test the API base URL (e.g., api.example.com), NOT the frontend SPA host.
+- SQL INJECTION FALSE POSITIVES: Django admin login (/admin/login/) shows "errornote" and
+  "Please enter the correct username and password" for ANY wrong credentials. This is NOT
+  a SQL error. A real SQL error contains: "syntax error", "psycopg2", "sqlite3.OperationalError",
+  "ProgrammingError", "relation does not exist", "column", "ORA-". Response size changes of
+  <100 bytes between payloads are usually just the injected string being reflected, NOT SQLi.
+  Django uses parameterized queries (ORM) — its admin login is NOT vulnerable to SQLi by default.
 
 RULES:
 1. Write COMPLETE, RUNNABLE scripts (Python 3 or bash/curl).
