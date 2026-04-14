@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v2.6 — Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
+**v3.0 — Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -689,6 +689,14 @@ Then open a pull request describing what you added and why it's useful.
 ---
 
 ## Changelog
+
+### v3.0 (2026-04-14)
+- **feat:** Auto-verification with specialized tools — sqlmap (SQLi), dalfox (XSS), nuclei (CVEs)
+- **feat:** Brain scanner uses tools instead of custom scripts
+- **fix:** Report prompt moved to after ALL testing completes
+- **fix:** Django admin SQLi false positive guard
+- **fix:** Chain PoCs with cross-references, actual data, plain English narratives
+- **fix:** Developer-friendly PoCs with browser/Postman steps (no curl dependency)
 
 ### v2.6 (2026-04-14)
 - **fix:** Detailed exploit chain PoCs with step-by-step curl commands (was "Chain: X + Y")
