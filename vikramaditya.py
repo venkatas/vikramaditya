@@ -677,8 +677,32 @@ def main():
             print(f"\n  {G}Autopilot complete.{N} {len(findings)} finding(s).\n")
             findings_dir = os.path.join(output_dir, "autopilot")
         else:
-            print(f"\n  {D}Autopilot complete. No findings.{N}\n")
+            print(f"\n  {D}Autopilot complete. No findings.{N}")
             findings_dir = None
+            # Fallback: run tools directly on target when autopilot finds nothing
+            # (legacy apps where REST endpoint patterns don't match)
+            if autonomous:
+                log("info", "Running direct tool scan (sqlmap + nuclei) on base URL...")
+                try:
+                    import subprocess as _sp
+                    # sqlmap on the login form
+                    log("info", "  sqlmap on login form...")
+                    _sp.run(["sqlmap", "-u", api_base,
+                             "--forms", "--batch", "--level=3", "--risk=2",
+                             "--random-agent", "--current-db",
+                             "--output-dir", os.path.join(output_dir, "sqlmap")],
+                            timeout=180, capture_output=True)
+                except Exception as e:
+                    log("warn", f"  sqlmap: {e}")
+                try:
+                    # nuclei on base URL
+                    log("info", "  nuclei CVE scan...")
+                    _sp.run(["nuclei", "-u", api_base,
+                             "-severity", "critical,high,medium", "-silent",
+                             "-o", os.path.join(output_dir, "nuclei_results.txt")],
+                            timeout=120, capture_output=True)
+                except Exception as e:
+                    log("warn", f"  nuclei: {e}")
 
     elif not creds:
         # No creds — run hunt.py for unauthenticated scan
