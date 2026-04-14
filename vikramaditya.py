@@ -476,7 +476,30 @@ def make_output_dir(target: str) -> str:
     return out_dir
 
 
-# ── Main Interactive Flow ─────────────────────────────────────────────────────
+# ── CLI Argument Parsing ──────────────────────────────────────────────────────
+
+def parse_cli_args() -> dict:
+    """Parse command-line arguments. Minimal — most decisions are automatic."""
+    args = {"target": "", "creds": "", "creds_b": "", "verify_fix": "", "code_url": ""}
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--creds" and i + 1 < len(argv):
+            args["creds"] = argv[i + 1]; i += 2
+        elif argv[i] == "--creds-b" and i + 1 < len(argv):
+            args["creds_b"] = argv[i + 1]; i += 2
+        elif argv[i] == "--verify-fix" and i + 1 < len(argv):
+            args["verify_fix"] = argv[i + 1]; i += 2
+        elif argv[i] == "--code-url" and i + 1 < len(argv):
+            args["code_url"] = argv[i + 1]; i += 2
+        elif not argv[i].startswith("--"):
+            args["target"] = argv[i]; i += 1
+        else:
+            i += 1
+    return args
+
+
+# ── Main Flow ─────────────────────────────────────────────────────────────────
 
 def main():
     import urllib3
@@ -484,9 +507,17 @@ def main():
 
     banner()
 
+    cli = parse_cli_args()
+    has_ollama = ollama_available()
+
+    # Autonomous mode: LLM present → no prompts, brain makes all decisions
+    # Interactive mode: no LLM → ask user for every decision
+    autonomous = has_ollama
+    if autonomous:
+        log("ok", "Autonomous mode — brain will drive all decisions")
+
     # ── Step 1: Get target ────────────────────────────────────────────────
-    # Accept target from command line args OR interactive prompt
-    target_raw = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
+    target_raw = cli["target"]
     if not target_raw:
         target_raw = prompt("Enter target (URL, domain, IP, or CIDR)")
     else:
@@ -506,7 +537,7 @@ def main():
     # --- CIDR / IP → hunt.py directly ---
     if target_info["type"] in ("cidr", "ip"):
         show_summary(target_info)
-        if not confirm("Proceed with scan?"):
+        if not autonomous and not confirm("Proceed with scan?"):
             print(f"  {D}Aborted.{N}")
             return
         run_hunt(target_info["value"])
@@ -514,24 +545,19 @@ def main():
 
     # --- Bare domain → hunt.py ---
     if target_info["type"] == "domain":
-        # Quick check: is there a web app at https://domain?
         url_to_check = f"https://{target_info['value']}"
         log("info", f"Checking {url_to_check} ...")
         fp = fingerprint_webapp(url_to_check)
 
         if fp["error"] or fp["status"] == 0:
-            # No web app responding — pure domain recon
             show_summary(target_info)
-            if not confirm("Proceed with recon + vulnerability scan?"):
+            if not autonomous and not confirm("Proceed with recon + vulnerability scan?"):
                 print(f"  {D}Aborted.{N}")
                 return
-            scope_lock = confirm("Scope lock? (scan this exact domain only, no subdomain expansion)", default_yes=False)
-            run_hunt(target_info["value"], full=True, scope_lock=scope_lock)
+            run_hunt(target_info["value"], full=True)
             return
         else:
-            # Web app found — treat it as a URL
             target_info = classify_target(url_to_check)
-            # Fall through to URL handling below
 
     # --- URL → fingerprint and decide ---
     url = target_info["value"]
@@ -543,61 +569,68 @@ def main():
 
     if fp["error"]:
         print(f"  {R}Error reaching target: {fp['error']}{N}")
-        if not confirm("Try recon-only scan anyway?"):
+        if not autonomous and not confirm("Try recon-only scan anyway?"):
             return
         run_hunt(urlparse(url).netloc)
         return
 
     show_summary(target_info, fp)
 
-    if not confirm("Proceed?"):
+    if not autonomous and not confirm("Proceed?"):
         print(f"  {D}Aborted.{N}")
         return
 
-    # ── Step 3: Collect credentials if login detected ─────────────────────
-    creds = None
-    creds_b = None
+    # ── Step 3: Credentials ───────────────────────────────────────────────
+    creds = cli["creds"] or None
+    creds_b = cli["creds_b"] or None
     api_base = fp.get("api_base") or url
 
-    if fp["login_detected"] or fp["api_detected"]:
-        if confirm("Do you have credentials?"):
-            username = prompt("Username / email")
-            password = getpass.getpass(f"  {C}Password: {N}")
-            if username and password:
-                creds = f"{username}:{password}"
+    # Only ask for credentials if login detected and not provided via CLI
+    if not creds and (fp["login_detected"] or fp["api_detected"]):
+        if autonomous:
+            log("info", "Login detected but no --creds provided. Running unauthenticated scan.")
+            log("info", "  Tip: python3 vikramaditya.py TARGET --creds user:pass")
+        else:
+            if confirm("Do you have credentials?"):
+                username = prompt("Username / email")
+                password = getpass.getpass(f"  {C}Password: {N}")
+                if username and password:
+                    creds = f"{username}:{password}"
 
-                if confirm("Second account for IDOR / privilege escalation testing?", default_yes=False):
-                    username_b = prompt("Second account username / email")
-                    password_b = getpass.getpass(f"  {C}Second account password: {N}")
-                    if username_b and password_b:
-                        creds_b = f"{username_b}:{password_b}"
+                    if confirm("Second account for IDOR / privilege escalation testing?", default_yes=False):
+                        username_b = prompt("Second account username / email")
+                        password_b = getpass.getpass(f"  {C}Second account password: {N}")
+                        if username_b and password_b:
+                            creds_b = f"{username_b}:{password_b}"
 
-    # ── Step 4: Brain options ─────────────────────────────────────────────
-    has_ollama = ollama_available()
-    with_brain = False
-    use_brain_scanner = False
-    if has_ollama:
-        with_brain = True
+    # ── Step 4: Brain — auto-enabled in autonomous mode ───────────────────
+    with_brain = has_ollama
+    use_brain_scanner = has_ollama  # Brain scanner auto-enabled when LLM present
+
+    if not autonomous and has_ollama:
         if not confirm("AI brain supervisor: enabled. Keep enabled?"):
             with_brain = False
-            log("info", "Brain disabled")
-        else:
-            log("ok", "Brain supervisor enabled")
+        if not confirm("Run brain active scanner?", default_yes=False):
+            use_brain_scanner = False
 
-        # Offer brain scanner for deeper testing
-        if confirm("Run brain active scanner? (LLM writes + executes exploit code)", default_yes=False):
-            use_brain_scanner = True
-    else:
+    if with_brain:
+        log("ok", "Brain supervisor: enabled")
+    if use_brain_scanner:
+        log("ok", "Brain active scanner: enabled")
+    if not has_ollama:
         log("info", "Ollama not installed — running without AI brain")
 
     # ── Step 4b: Fix verification mode ────────────────────────────────────
     verify_fix_mode = False
-    fix_claim = ""
-    code_url = ""
-    if has_ollama and confirm("Verify a developer's fix claim?", default_yes=False):
+    fix_claim = cli["verify_fix"]
+    code_url = cli["code_url"]
+    if fix_claim:
         verify_fix_mode = True
-        fix_claim = prompt("What does the developer claim they fixed?")
-        code_url = prompt("URL to the fixed code (leave blank to auto-discover)", "")
+    elif not autonomous and has_ollama:
+        if confirm("Verify a developer's fix claim?", default_yes=False):
+            verify_fix_mode = True
+            fix_claim = prompt("What does the developer claim they fixed?")
+            code_url = prompt("URL to the fixed code (leave blank to auto-discover)", "")
 
     # ── Step 5: Route to engine ───────────────────────────────────────────
 
@@ -668,7 +701,7 @@ def main():
     elif not creds:
         # No creds — run hunt.py for unauthenticated scan
         domain = urlparse(url).netloc
-        scope_lock = confirm("Scope lock? (scan this exact host only, no subdomain expansion)", default_yes=False)
+        scope_lock = autonomous or (not autonomous and confirm("Scope lock? (scan this exact host only, no subdomain expansion)", default_yes=False))
         log("info", "No credentials — running unauthenticated recon + vulnerability scan")
         print()
         run_hunt(domain, full=True, scope_lock=scope_lock)
@@ -715,7 +748,11 @@ def main():
     try:
         if findings_dir and os.path.isdir(findings_dir):
             print()
-            if confirm("Generate report?", default_yes=False):
+            if autonomous:
+                # Auto-generate report in autonomous mode
+                log("info", "Auto-generating report...")
+                run_report(findings_dir)
+            elif confirm("Generate report?", default_yes=False):
                 client = prompt("Client name", "")
                 consultant = prompt("Consultant name", "")
                 run_report(findings_dir, client, consultant)
