@@ -951,7 +951,7 @@ class InjectionTester:
                 try:
                     import subprocess as _sp
                     sqlmap_out = os.path.join(
-                        os.path.dirname(saver.output_dir) if saver else "/tmp",
+                        os.path.dirname(saver.dir) if saver else "/tmp",
                         "sqlmap_verify")
                     os.makedirs(sqlmap_out, exist_ok=True)
                     result = _sp.run([
@@ -1032,7 +1032,7 @@ class InjectionTester:
                     urls_file.write(f"{session.base_url}/{ep['path'].lstrip('/')}\n")
                 urls_file.close()
                 nuclei_out = os.path.join(
-                    os.path.dirname(saver.output_dir) if saver else "/tmp",
+                    os.path.dirname(saver.dir) if saver else "/tmp",
                     "nuclei_results.txt")
                 result = _sp.run(
                     ["nuclei", "-l", urls_file.name,
