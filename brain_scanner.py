@@ -412,12 +412,52 @@ YOUR TASK:
         # Auto-fingerprint the target
         log("info", "Auto-fingerprinting target...")
         fp_result = execute_script("bash", f'curl -sk -D- "{target}" -o /tmp/brain_fp.html --max-time 15 && head -50 /tmp/brain_fp.html')
+
+        # Load existing upload/file-type evasion findings if available
+        upload_findings_brief = ""
+        try:
+            target_slug = target.replace("https://", "").replace("http://", "").replace("/", "_")
+            findings_base = os.path.join(SCRIPT_DIR, "findings", target_slug)
+            matrix_candidates = []
+            for root, _dirs, files in os.walk(findings_base):
+                for fn in files:
+                    if fn == "upload_evasion_matrix.json":
+                        matrix_candidates.append(os.path.join(root, fn))
+            if matrix_candidates:
+                # Use the most recent matrix
+                matrix_path = sorted(matrix_candidates)[-1]
+                with open(matrix_path) as mf:
+                    matrix = json.load(mf)
+                bypassed = [r for r in matrix if r.get("result") == "VULN"]
+                blocked = [r for r in matrix if r.get("result") == "SAFE" and r.get("upload_ok")]
+                if bypassed or blocked:
+                    upload_findings_brief = "\n\nFILE UPLOAD EVASION RESULTS (from Phase 6b):\n"
+                    if bypassed:
+                        upload_findings_brief += f"  BYPASSED ({len(bypassed)}):\n"
+                        for b in bypassed[:5]:
+                            upload_findings_brief += (
+                                f"    - {b['technique']}: {b['filename']} → {b['true_type']}\n"
+                            )
+                    if blocked:
+                        upload_findings_brief += f"  BLOCKED ({len(blocked)}):\n"
+                        for b in blocked[:3]:
+                            upload_findings_brief += (
+                                f"    - {b['technique']}: {b['filename']}\n"
+                            )
+                    upload_findings_brief += (
+                        "\nUse this data to craft ADDITIONAL evasion payloads. "
+                        "If .php was blocked but .phtml or .pht wasn't tested, try those. "
+                        "If magic byte prepend worked for GIF, try PNG/JPEG polyglots too.\n"
+                    )
+        except Exception:
+            pass
+
         briefing = f"""TARGET: {target}
 COOKIES: {cookies or '(none — unauthenticated scan)'}
 
 FINGERPRINT (headers + first 50 lines):
 {fp_result['stdout'][:3000]}
-
+{upload_findings_brief}
 TASK: Perform a comprehensive vulnerability assessment. Test for:
 1. XSS (reflected, stored, DOM-based)
 2. SQL injection (error-based, time-based, boolean-based)
@@ -426,6 +466,7 @@ TASK: Perform a comprehensive vulnerability assessment. Test for:
 5. Information disclosure (error messages, version leaks, directory listing)
 6. Rate limiting on sensitive endpoints
 7. Session management issues
+8. File upload bypass (try polyglot files, double extensions, MIME mismatch)
 
 Start with reconnaissance — find forms, parameters, JS files, API endpoints.
 Then test the most promising attack vectors."""

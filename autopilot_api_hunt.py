@@ -254,7 +254,12 @@ def _run_phase(phase_spec: dict, session: AuthSession, token: str,
         elif name == "biz_logic":
             return BusinessLogicTester().run(session, eps, saver)
         elif name == "file_upload":
-            return FileUploadTester().run(session, saver)
+            results = FileUploadTester().run(session, saver)
+            # Phase 6b: Magika-validated file type evasion testing
+            upload_eps = [e.get("path", "") for e in endpoints
+                          if "upload" in e.get("path", "") or "video" in e.get("path", "")]
+            results.extend(FileTypeEvasionTester().run(session, upload_eps or None, saver))
+            return results
         elif name == "injection":
             return InjectionTester().run(session, eps, saver)
         elif name == "info_disclosure":
@@ -870,6 +875,184 @@ class FileUploadTester:
                 os.unlink(tmp.name)
 
         log("ok", f"  {len(findings)} upload findings")
+        return findings
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 6b: FILE TYPE EVASION (Magika-validated)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FileTypeEvasionTester:
+    """Systematic file-type evasion testing using polyglot payloads.
+
+    Uploads disguised payloads (PHP-in-JPEG, JS-in-SVG, etc.) and uses
+    Magika to verify whether the server stored executable content.
+    """
+
+    def run(self, session: AuthSession, upload_endpoints: list[str] = None,
+            saver: FindingSaver = None) -> list[dict]:
+        log("phase", "Phase 6b: File Type Evasion Testing (Magika)")
+        findings = []
+        matrix = []  # Upload test matrix for reporting
+
+        try:
+            from payloads import generate_upload_payloads, UploadPayload
+            from file_classifier import get_classifier
+        except ImportError as e:
+            log("warn", f"  Skipping Phase 6b — missing dependency: {e}")
+            return findings
+
+        fc = get_classifier()
+        payloads = generate_upload_payloads()
+        log("info", f"  {len(payloads)} evasion payloads across 7 technique categories")
+
+        # Discover upload endpoints if not provided
+        if not upload_endpoints:
+            upload_endpoints = []
+            # Common upload paths to probe
+            for path in ["add-learner/", "upload/", "api/upload/", "api/v1/upload/",
+                         "api/files/", "avatar/", "profile/image/", "media/upload/"]:
+                try:
+                    resp = session.request("OPTIONS", path)
+                    if resp["status"] < 405:
+                        upload_endpoints.append(path)
+                except Exception:
+                    pass
+            if not upload_endpoints:
+                upload_endpoints = ["add-learner/"]  # Fallback to known endpoint
+
+        for endpoint in upload_endpoints:
+            log("info", f"  Testing: {endpoint}")
+            for payload in payloads:
+                row = {
+                    "endpoint": endpoint,
+                    "technique": payload.technique,
+                    "filename": payload.filename,
+                    "upload_ok": False,
+                    "accessible": False,
+                    "true_type": "",
+                    "result": "SAFE",
+                }
+                try:
+                    import requests as _req
+                    cookies = {}
+                    if hasattr(session, '_session') and hasattr(session._session, 'cookies'):
+                        cookies = dict(session._session.cookies)
+
+                    # Upload the payload
+                    tmp = tempfile.NamedTemporaryFile(
+                        suffix=f"_{payload.filename}", delete=False
+                    )
+                    tmp.write(payload.content)
+                    tmp.close()
+
+                    resp_raw = _req.post(
+                        f"{session.base_url}/{endpoint}",
+                        files={"image": (payload.filename, open(tmp.name, "rb"),
+                                         payload.claimed_mime)},
+                        data={"first_name": "VAPTEvasion", "last_name": "Test",
+                              "email": f"vapt_evasion_{int(time.time())}@test.com",
+                              "contact_no": f"98765{int(time.time()) % 100000:05d}",
+                              "country_code": "IN"},
+                        cookies=cookies, verify=False, timeout=15,
+                    )
+                    os.unlink(tmp.name)
+
+                    if resp_raw.status_code == 200:
+                        row["upload_ok"] = True
+                        try:
+                            body = resp_raw.json()
+                            if body.get("status") is True:
+                                row["upload_ok"] = True
+                        except Exception:
+                            pass
+
+                    if not row["upload_ok"]:
+                        matrix.append(row)
+                        continue
+
+                    # Try to access/download the uploaded file and classify
+                    # Check common storage paths
+                    for storage_path in [
+                        f"media/{payload.filename}",
+                        f"uploads/{payload.filename}",
+                        f"static/uploads/{payload.filename}",
+                    ]:
+                        try:
+                            dl_resp = _req.get(
+                                f"{session.base_url}/{storage_path}",
+                                cookies=cookies, verify=False, timeout=10,
+                            )
+                            if dl_resp.status_code == 200 and len(dl_resp.content) > 10:
+                                row["accessible"] = True
+                                # Classify the downloaded file with Magika
+                                classify_result = fc.classify_bytes(
+                                    dl_resp.content,
+                                    claimed_mime=payload.claimed_mime,
+                                )
+                                row["true_type"] = classify_result.true_type
+
+                                # Verdict: if Magika detects the dangerous payload type
+                                if classify_result.risk_tier in ("critical", "high"):
+                                    row["result"] = "VULN"
+                                    severity = (CRITICAL if classify_result.risk_tier == "critical"
+                                                else HIGH)
+                                    f = {
+                                        "type": "upload_type_bypass",
+                                        "severity": severity,
+                                        "detail": (
+                                            f"File type validation bypass via {payload.technique}: "
+                                            f"uploaded {payload.filename} as {payload.claimed_mime}, "
+                                            f"true type: {classify_result.true_type}"
+                                        ),
+                                        "url": f"{session.base_url}/{endpoint}",
+                                        "evidence": (
+                                            f"Technique: {payload.technique} | "
+                                            f"Filename: {payload.filename} | "
+                                            f"Claimed MIME: {payload.claimed_mime} | "
+                                            f"True type: {classify_result.true_type} "
+                                            f"({classify_result.mime}) | "
+                                            f"Confidence: {classify_result.confidence:.0%} | "
+                                            f"Risk: {classify_result.risk_tier}"
+                                        ),
+                                        "file_type_info": {
+                                            "claimed_mime": payload.claimed_mime,
+                                            "claimed_ext": payload.filename.rsplit(".", 1)[-1],
+                                            "true_type": classify_result.true_type,
+                                            "true_mime": classify_result.mime,
+                                            "confidence": classify_result.confidence,
+                                            "risk_tier": classify_result.risk_tier,
+                                            "technique": payload.technique,
+                                        },
+                                    }
+                                    findings.append(f)
+                                    if saver:
+                                        saver.save(f)
+                                        saver.save_txt(f)
+                                    log("ok", f"  VULN: {payload.technique} → "
+                                        f"{classify_result.true_type} ({severity})")
+                                break  # Found it, stop checking storage paths
+                        except Exception:
+                            continue
+
+                except Exception as e:
+                    log("warn", f"  Error testing {payload.filename}: {e}")
+                finally:
+                    matrix.append(row)
+
+        # Save the upload test matrix for reporter.py
+        if matrix and saver:
+            matrix_path = os.path.join(
+                os.path.dirname(saver._base_dir) if hasattr(saver, '_base_dir')
+                else ".", "upload_evasion_matrix.json"
+            )
+            try:
+                with open(matrix_path, "w") as f:
+                    json.dump(matrix, f, indent=2)
+            except Exception:
+                pass
+
+        log("ok", f"  {len(findings)} evasion findings from {len(matrix)} tests")
         return findings
 
 

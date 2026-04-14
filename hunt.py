@@ -1495,12 +1495,22 @@ def _extract_urls(text: str) -> list[str]:
     ]
 
 
-def _looks_textual_content_type(content_type: str) -> bool:
+def _looks_textual_content_type(content_type: str, body: bytes = b"") -> bool:
+    """Check if content is text-like. Falls back to Magika when header is ambiguous."""
     lowered = (content_type or "").lower()
-    return any(token in lowered for token in (
+    if any(token in lowered for token in (
         "javascript", "json", "text/plain", "text/html", "text/xml",
         "application/xml",
-    ))
+    )):
+        return True
+    # Header says binary/octet-stream or missing — let Magika decide from body
+    if body and lowered in ("application/octet-stream", ""):
+        try:
+            from file_classifier import get_classifier
+            return get_classifier().is_text_like(body)
+        except Exception:
+            pass  # Magika not installed — fall back to header-only
+    return False
 
 
 def _probe_url_headers(url: str, timeout: int = 6) -> tuple[int, str]:
@@ -1524,6 +1534,47 @@ def _probe_url_headers(url: str, timeout: int = 6) -> tuple[int, str]:
                 status = int(parts[1])
         elif line.lower().startswith("content-type:"):
             content_type = line.split(":", 1)[1].strip()
+
+
+def _classify_exposed_file(url: str, domain: str, session_id: str | None = None,
+                           timeout: int = 6) -> str | None:
+    """Download first 8KB of an exposed URL and classify with Magika.
+
+    Returns a finding line if an executable/dangerous file type is detected,
+    or None if the file is benign or Magika is unavailable.
+    """
+    try:
+        from file_classifier import get_classifier
+    except ImportError:
+        return None
+
+    try:
+        proc = subprocess.run(
+            ["curl", "-sk", "--max-time", str(timeout), "-r", "0-8191", url],
+            capture_output=True, timeout=timeout + 2, check=False,
+        )
+    except Exception:
+        return None
+
+    body = proc.stdout
+    if not body or len(body) < 16:
+        return None
+
+    try:
+        fc = get_classifier()
+        result = fc.classify_bytes(body)
+    except Exception:
+        return None
+
+    if result.risk_tier == "critical":
+        return (f"[CRITICAL] Executable file exposed: {url} "
+                f"→ true type: {result.true_type} ({result.mime}, "
+                f"confidence: {result.confidence:.0%})")
+    elif result.risk_tier == "high" and result.mismatch:
+        return (f"[HIGH] Suspicious file type mismatch: {url} "
+                f"→ true type: {result.true_type} ({result.mime}), "
+                f"claimed: {result.claimed_mime or 'unknown'}")
+    return None
     return status, content_type
 
 
@@ -1692,6 +1743,11 @@ def _propagate_exposed_paths(domain: str, session_id: str | None = None, limit_p
         status, content_type = _probe_url_headers(url)
         if status == 200 and _looks_textual_content_type(content_type):
             return f"[PROPAGATED] path={path_value} url={url} sources={sources}"
+        # Magika deep-classify: detect exposed executables/webshells
+        if status == 200:
+            magika_hit = _classify_exposed_file(url, domain, session_id=session_id)
+            if magika_hit:
+                return magika_hit
         return None
 
     hits: list[str] = []

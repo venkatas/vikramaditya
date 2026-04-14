@@ -40,6 +40,7 @@ ATTACK_IDS = {
     "csrf":         "T1185",   # Browser Session Hijacking
     "auth_bypass":  "T1078",   # Valid Accounts
     "open_redirect":"T1598",   # Phishing for Information
+    "upload_type_bypass": "T1105",  # Ingress Tool Transfer → File type evasion
 }
 
 VULN_TEMPLATES = {
@@ -110,6 +111,29 @@ VULN_TEMPLATES = {
         ),
         "references": [
             ("OWASP File Upload Cheat Sheet", "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"),
+        ],
+    },
+    "upload_type_bypass": {
+        "title": "File Type Validation Bypass on {host}",
+        "severity": "critical", "cvss": "9.1", "cwe": "CWE-434",
+        "owasp": "A04:2021",
+        "impact": (
+            "The server's file type validation can be bypassed using evasion techniques "
+            "(double extensions, MIME mismatch, magic byte polyglots, or case variations). "
+            "An attacker can upload executable content (PHP webshells, JSP, shell scripts) "
+            "disguised as benign file types. Magika AI analysis confirmed the uploaded file's "
+            "true content type differs from the claimed type."
+        ),
+        "remediation": (
+            "Validate file content server-side using magic byte analysis (not Content-Type "
+            "header or extension alone). Use a deep-learning file classifier like Google Magika "
+            "for accurate detection. Implement an allowlist of permitted content types. "
+            "Re-encode uploaded images. Serve uploads from a separate cookieless domain "
+            "with Content-Disposition: attachment and X-Content-Type-Options: nosniff."
+        ),
+        "references": [
+            ("OWASP File Upload Cheat Sheet", "https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html"),
+            ("Google Magika", "https://github.com/google/magika"),
         ],
     },
     "rce": {
@@ -534,6 +558,7 @@ SUBDIR_VTYPE = {
     "browser/xss_dom": "xss_dom", "browser/csrf": "csrf",
     "browser/auth_bypass": "auth_bypass", "browser/open_redirect": "open_redirect",
     "misconfig": "misconfig",
+    "upload_type_bypass": "upload_type_bypass",
 }
 
 
@@ -930,6 +955,74 @@ def _badge(sev: str) -> str:
             f'font-size:0.85em;font-weight:bold">{sev.upper()}</span>')
 
 
+def _render_upload_evasion_matrix(findings: list) -> str:
+    """Render an HTML table summarizing file type evasion test results.
+
+    Extracts file_type_info from upload_type_bypass findings and builds
+    a pass/fail matrix showing what was tested and what bypassed.
+    """
+    evasion_findings = [f for f in findings if f.get("vtype") == "upload_type_bypass"
+                        or (isinstance(f.get("raw", ""), str) and "upload_type_bypass" in f.get("raw", ""))]
+    if not evasion_findings:
+        return ""
+
+    rows = ""
+    for f in evasion_findings:
+        # Try to extract file_type_info from the finding
+        fti = f.get("file_type_info", {})
+        technique = fti.get("technique", "—")
+        filename = fti.get("claimed_ext", "—")
+        claimed = fti.get("claimed_mime", "—")
+        true_type = fti.get("true_type", "—")
+        risk = fti.get("risk_tier", "—")
+        confidence = fti.get("confidence", 0)
+
+        # Fall back to parsing from evidence/raw text
+        if technique == "—":
+            raw = f.get("raw", "") or f.get("evidence", "")
+            if "Technique:" in raw:
+                technique = raw.split("Technique:")[1].split("|")[0].strip()
+            if "Filename:" in raw:
+                filename = raw.split("Filename:")[1].split("|")[0].strip()
+            if "True type:" in raw:
+                true_type = raw.split("True type:")[1].split("|")[0].split("(")[0].strip()
+
+        result_badge = ('<span style="background:#dc3545;color:#fff;padding:2px 8px;'
+                        'border-radius:3px;font-weight:bold;font-size:0.85em">VULN</span>')
+        rows += (
+            f"<tr>"
+            f"<td>{technique}</td>"
+            f"<td><code>{filename}</code></td>"
+            f"<td>{claimed}</td>"
+            f"<td><b>{true_type}</b></td>"
+            f"<td>{confidence:.0%}</td>" if isinstance(confidence, float) else f"<td>—</td>"
+            f"<td>{risk.upper()}</td>"
+            f"<td>{result_badge}</td>"
+            f"</tr>\n"
+        )
+
+    if not rows:
+        return ""
+
+    return f"""
+<h3 style="border-bottom:1px solid #dee2e6;padding-bottom:6px;margin-top:30px">
+  File Type Evasion Test Matrix (Magika AI Analysis)
+</h3>
+<p style="color:#6c757d;font-size:0.9em;margin-bottom:12px">
+  Tests used polyglot payloads to bypass file type validation. True content type
+  verified by <a href="https://github.com/google/magika" target="_blank">Google Magika</a>
+  deep learning classifier.
+</p>
+<table class="tbl">
+  <tr>
+    <th>Technique</th><th>Payload</th><th>Claimed MIME</th>
+    <th>True Type</th><th>Confidence</th><th>Risk</th><th>Result</th>
+  </tr>
+  {rows}
+</table>
+"""
+
+
 def render_html_report(findings: list, target: str, report_dir: str,
                        client: str, consultant: str, title: str) -> str:
     date_str = datetime.now().strftime("%d %B %Y")
@@ -1096,6 +1189,8 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 
 <h2 id="details" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px">4. Detailed Findings</h2>
 {details or '<p style="color:#6c757d">No findings.</p>'}
+
+{_render_upload_evasion_matrix(findings)}
 
 <h2 id="appendix-a" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">Appendix A: Tools Used</h2>
 <p>{tools}</p>
