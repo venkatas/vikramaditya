@@ -459,6 +459,26 @@ VULN_TEMPLATES["exploit_chain"] = {
     ],
 }
 
+VULN_TEMPLATES["sqli_sqlmap_confirmed"] = {
+    "title": "SQL Injection (sqlmap Confirmed) on {host}",
+    "severity": "critical", "cvss": "9.8", "cwe": "CWE-89",
+    "owasp": "A03:2021",
+    "impact": (
+        "SQL injection confirmed by sqlmap. An attacker can extract the entire database "
+        "including user credentials, personal data, and application secrets. Depending on "
+        "database privileges, this may escalate to remote code execution via xp_cmdshell (MSSQL), "
+        "COPY TO PROGRAM (PostgreSQL), or INTO OUTFILE (MySQL)."
+    ),
+    "remediation": (
+        "Use parameterized queries / prepared statements for ALL database interactions. "
+        "Never concatenate user input into SQL strings. Use an ORM (Django ORM, SQLAlchemy). "
+        "Apply least-privilege database accounts — no FILE, SUPER, or DBA privileges."
+    ),
+    "references": [
+        ("OWASP SQL Injection", "https://owasp.org/www-community/attacks/SQL_Injection"),
+    ],
+}
+
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 SEVERITY_COLOR = {
     "critical": "#dc3545",
