@@ -459,6 +459,42 @@ VULN_TEMPLATES["exploit_chain"] = {
     ],
 }
 
+VULN_TEMPLATES["xss_dalfox_confirmed"] = {
+    "title": "Cross-Site Scripting (dalfox Confirmed) on {host}",
+    "severity": "high", "cvss": "7.5", "cwe": "CWE-79",
+    "owasp": "A03:2021",
+    "impact": (
+        "XSS confirmed by dalfox. An attacker can inject JavaScript that executes in victims' "
+        "browsers — stealing session cookies, redirecting to phishing pages, or performing "
+        "actions as the victim (account takeover via session hijacking)."
+    ),
+    "remediation": (
+        "Encode all user input on output using context-appropriate encoding (HTML entity, "
+        "JavaScript, URL). Use Content-Security-Policy headers. Use frameworks' built-in "
+        "auto-escaping (Django templates, React JSX)."
+    ),
+    "references": [
+        ("OWASP XSS Prevention", "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html"),
+    ],
+}
+
+VULN_TEMPLATES["nuclei_finding"] = {
+    "title": "Vulnerability Detected (nuclei) on {host}",
+    "severity": "high", "cvss": "7.5", "cwe": "CWE-200",
+    "owasp": "A06:2021",
+    "impact": (
+        "Nuclei detected a known vulnerability or misconfiguration matching a public template. "
+        "Impact depends on the specific finding — see evidence for CVE details."
+    ),
+    "remediation": (
+        "Apply the vendor patch for the identified CVE. Update affected software to the latest "
+        "version. Review nuclei template details for specific remediation steps."
+    ),
+    "references": [
+        ("Nuclei Templates", "https://github.com/projectdiscovery/nuclei-templates"),
+    ],
+}
+
 VULN_TEMPLATES["sqli_sqlmap_confirmed"] = {
     "title": "SQL Injection (sqlmap Confirmed) on {host}",
     "severity": "critical", "cvss": "9.8", "cwe": "CWE-89",

@@ -990,6 +990,79 @@ class InjectionTester:
                 except Exception as e:
                     log("warn", f"  sqlmap error: {e}")
 
+        # 7d. dalfox XSS verification on parameterized endpoints
+        param_urls = [ep for ep in endpoints if any(
+            kw in ep["path"] for kw in ("list", "view", "search", "report")
+        )][:10]
+        if param_urls:
+            log("info", f"  Running dalfox XSS on {len(param_urls)} endpoint(s)...")
+            for ep in param_urls[:5]:
+                try:
+                    import subprocess as _sp
+                    target_url = f"{session.base_url}/{ep['path'].lstrip('/')}?search=test"
+                    result = _sp.run(
+                        ["dalfox", "url", target_url, "--silence", "--skip-bav",
+                         "--timeout", "10", "--worker", "5"],
+                        capture_output=True, text=True, timeout=60)
+                    if result.stdout.strip():
+                        for line in result.stdout.strip().split("\n")[:3]:
+                            f = {"type": "xss_dalfox_confirmed", "severity": HIGH,
+                                 "detail": f"dalfox confirmed XSS on {ep['path']}: {line[:100]}",
+                                 "url": target_url,
+                                 "evidence": line[:300]}
+                            findings.append(f)
+                            if saver:
+                                saver.save(f)
+                                saver.save_txt(f)
+                            log("vuln", f"  dalfox XSS: {line[:80]}")
+                except FileNotFoundError:
+                    log("warn", "  dalfox not installed — skipping XSS verification")
+                    break
+                except Exception:
+                    pass
+
+        # 7e. nuclei scan for common vulns on live endpoints
+        if endpoints:
+            log("info", f"  Running nuclei on {min(len(endpoints), 20)} endpoint(s)...")
+            try:
+                import subprocess as _sp
+                import tempfile
+                urls_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+                for ep in endpoints[:20]:
+                    urls_file.write(f"{session.base_url}/{ep['path'].lstrip('/')}\n")
+                urls_file.close()
+                nuclei_out = os.path.join(
+                    os.path.dirname(saver.output_dir) if saver else "/tmp",
+                    "nuclei_results.txt")
+                result = _sp.run(
+                    ["nuclei", "-l", urls_file.name,
+                     "-severity", "critical,high,medium", "-silent",
+                     "-o", nuclei_out],
+                    capture_output=True, text=True, timeout=120)
+                if os.path.isfile(nuclei_out) and os.path.getsize(nuclei_out) > 0:
+                    with open(nuclei_out) as nf:
+                        for line in nf:
+                            line = line.strip()
+                            if line:
+                                sev = CRITICAL if "critical" in line.lower() else HIGH
+                                f = {"type": "nuclei_finding", "severity": sev,
+                                     "detail": f"nuclei: {line[:150]}",
+                                     "url": session.base_url,
+                                     "evidence": line[:300]}
+                                findings.append(f)
+                                if saver:
+                                    saver.save(f)
+                                    saver.save_txt(f)
+                                log("vuln", f"  nuclei: {line[:80]}")
+                    log("ok", f"  nuclei: {sum(1 for _ in open(nuclei_out))} finding(s)")
+                else:
+                    log("info", "  nuclei: 0 findings")
+                os.unlink(urls_file.name)
+            except FileNotFoundError:
+                log("warn", "  nuclei not installed — skipping CVE scan")
+            except Exception as e:
+                log("warn", f"  nuclei error: {e}")
+
         log("ok", f"  {len(findings)} injection findings")
         return findings
 
