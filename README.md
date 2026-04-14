@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v3.0 — Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
+**v4.0 — Fully autonomous VAPT. Give it a target. Walk away. Come back to a report.**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -91,13 +91,23 @@ ollama pull gemma4:26b               # fast all-rounder brain (17GB)
 ### The Only Command You Need
 
 ```bash
-python3 vikramaditya.py                    # interactive — asks for target
-python3 vikramaditya.py example.com        # pass target directly
-python3 vikramaditya.py https://app.example.com
+# Fully autonomous — zero prompts (when Ollama is installed)
+python3 vikramaditya.py example.com
+python3 vikramaditya.py https://app.example.com --creds "user@domain.com:password"
 python3 vikramaditya.py 10.0.0.0/24
+
+# With fix verification
+python3 vikramaditya.py https://app.example.com --creds "user:pass" --verify-fix "CSRF fixed via ols token"
 ```
 
-That's it. No flags, no script selection, no manual configuration. It will:
+When Ollama is installed, **zero prompts** — brain drives everything:
+- Auto-fingerprints, auto-selects engine, auto-enables brain + active scanner
+- Auto-generates report when done
+- Only asks for credentials if login detected and `--creds` not provided
+
+Without Ollama, falls back to interactive mode with prompts.
+
+It will:
 
 1. Ask for a target (URL, domain, IP, or CIDR)
 2. Auto-fingerprint the target (tech stack, login pages, API endpoints, JS bundles, OpenAPI specs)
@@ -689,6 +699,13 @@ Then open a pull request describing what you added and why it's useful.
 ---
 
 ## Changelog
+
+### v4.0 (2026-04-14)
+- **feat:** Fully autonomous mode — zero prompts when Ollama is installed
+- **feat:** `--creds user:pass` CLI flag — no interactive password prompt needed
+- **feat:** `--verify-fix "claim"` CLI flag for fix verification
+- **feat:** Brain supervisor + brain active scanner auto-enabled
+- **feat:** Auto-generates report when scan completes
 
 ### v3.0 (2026-04-14)
 - **feat:** Auto-verification with specialized tools — sqlmap (SQLi), dalfox (XSS), nuclei (CVEs)
