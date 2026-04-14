@@ -152,10 +152,10 @@ $ python3 vikramaditya.py app.example.com
 For unauthenticated domain scans, it asks about scope:
 
 ```
-$ python3 vikramaditya.py is.rediff.com
+$ python3 vikramaditya.py app.example.com
 
   Scope lock? (scan this exact host only, no subdomain expansion) [y/N]: y
-  [scans is.rediff.com only — no www.rediff.com, no ishare.rediff.com]
+  [scans app.example.com only — no www.example.com, no api.example.com]
 ```
 
 ### Brain Active Scanner
@@ -176,7 +176,7 @@ python3 brain_scanner.py --target https://example.com --audit-code \
     --code-file /path/to/source.php
 ```
 
-The `--verify-fix` mode is what caught the Rediffmail Pro OR-logic flaw: developers claimed they fixed the file upload, but the brain read the actual PHP code, spotted `if (mime_ok OR ext_ok)` (should be AND), and wrote the bypass PoC that regained RCE.
+The `--verify-fix` mode is built for the classic OR-logic upload bypass: developers claim they fixed the file upload, but the brain reads the actual PHP code, spots `if (mime_ok OR ext_ok)` (should be AND), and writes the bypass PoC that regains RCE.
 
 ### Direct Engine Access (Advanced)
 
