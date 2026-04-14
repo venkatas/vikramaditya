@@ -637,17 +637,11 @@ def main():
         # ── Step 6: Post-scan ─────────────────────────────────────────────
         if result and result.get("findings"):
             findings = result["findings"]
-            print(f"\n  {G}Scan complete.{N} {len(findings)} finding(s).\n")
-
-            # Findings directory for reporter
+            print(f"\n  {G}Autopilot complete.{N} {len(findings)} finding(s).\n")
             findings_dir = os.path.join(output_dir, "autopilot")
-
-            if confirm("Generate report?", default_yes=False):
-                client = prompt("Client name", "")
-                consultant = prompt("Consultant name", "")
-                run_report(findings_dir, client, consultant)
         else:
-            print(f"\n  {D}Scan complete. No findings.{N}\n")
+            print(f"\n  {D}Autopilot complete. No findings.{N}\n")
+            findings_dir = None
 
     elif creds:
         # Has creds but no clear API — try API VAPT on the URL itself
@@ -665,15 +659,11 @@ def main():
 
         if result and result.get("findings"):
             findings = result["findings"]
-            print(f"\n  {G}Scan complete.{N} {len(findings)} finding(s).\n")
+            print(f"\n  {G}Autopilot complete.{N} {len(findings)} finding(s).\n")
             findings_dir = os.path.join(output_dir, "autopilot")
-
-            if confirm("Generate report?", default_yes=False):
-                client = prompt("Client name", "")
-                consultant = prompt("Consultant name", "")
-                run_report(findings_dir, client, consultant)
         else:
-            print(f"\n  {D}Scan complete. No findings.{N}\n")
+            print(f"\n  {D}Autopilot complete. No findings.{N}\n")
+            findings_dir = None
 
     elif not creds:
         # No creds — run hunt.py for unauthenticated scan
@@ -720,6 +710,17 @@ def main():
             mode="scan",
             output_dir=os.path.join(brain_out, "brain_active"),
         )
+
+    # ── Report generation (after ALL testing is complete) ─────────────────
+    try:
+        if findings_dir and os.path.isdir(findings_dir):
+            print()
+            if confirm("Generate report?", default_yes=False):
+                client = prompt("Client name", "")
+                consultant = prompt("Consultant name", "")
+                run_report(findings_dir, client, consultant)
+    except NameError:
+        pass  # findings_dir not set (e.g., hunt.py path handles its own report)
 
     print(f"\n  {D}Done.{N}\n")
 
