@@ -15,6 +15,32 @@ __pycache__/
 *.pyc
 *.pyo
 
+# ── Engagement reports / scan output ──────────────────────────────────────────
+FINAL_VAPT_REPORT.md
+POC_EXECUTION_REPORT_*.md
+final_security_assessment.md
+test[0-9]_har_analysis.md
+test[0-9][0-9]_har_analysis.md
+vapt_results_*.json
+vulnerability_report_*.json
+har_vapt_results_*.json
+har_vapt_*.json
+cookies.txt
+course_ids.txt
+all_courses.txt
+*.har
+
+# ── Ad-hoc / per-engagement test scripts (NOT core tool code) ────────────────
+authenticated_rce_test.py
+check_upload_logic.py
+comprehensive_vuln_test.py
+detailed_sql_test.py
+focused_sqli_test.py
+quick_rce_test.sh
+test_har_sessions.py
+test_rce_upload_fix.py
+verify_fix_status.py
+
 # ── Agent traces and session files ────────────────────────────────────────────
 *.jsonl
 agent_session.json
