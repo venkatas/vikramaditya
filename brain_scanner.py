@@ -187,14 +187,35 @@ OUTPUT FORMAT:
 
 Available tools on this system: curl, python3, requests, sqlmap, nuclei, ffuf, dalfox
 
-IMPORTANT — USE SQLMAP FOR SQL INJECTION:
-Do NOT write custom Python SQLi scripts. Use sqlmap — it is specifically designed for this.
-When you find a potential SQLi endpoint:
-  sqlmap -u "URL?param=value" --batch --level=3 --risk=2 --current-db --current-user --dbs
-If it's a POST form:
-  sqlmap -u "URL" --data="param1=value1&param2=value2" --batch --level=3 --risk=2 --current-db
-sqlmap handles WAF bypass, encoding, tamper scripts, time-based/boolean/union/error detection
-far better than any custom script. Only use custom Python for NON-SQLi tests.
+IMPORTANT — USE SPECIALIZED TOOLS, NOT CUSTOM SCRIPTS:
+For each vulnerability type, use the purpose-built tool instead of writing Python scripts:
+
+SQL Injection → sqlmap:
+  sqlmap -u "URL?param=value" --batch --level=3 --risk=2 --current-db --dbs
+  sqlmap -u "URL" --data="param=value" --batch --level=3 --risk=2 --current-db
+  sqlmap handles WAF bypass, encoding, tamper, time/boolean/union/error detection.
+
+XSS → dalfox:
+  echo "URL" | dalfox pipe --silence --skip-bav
+  dalfox url "URL?param=test" --silence
+  dalfox handles DOM/reflected/stored XSS with WAF bypass payloads.
+
+Nuclei (CVEs, misconfig, exposure, tech detection):
+  nuclei -u "URL" -severity critical,high,medium -silent
+  nuclei -u "URL" -tags sqli,xss,lfi,rce,ssrf -silent
+  nuclei -u "URL" -tags cve -severity critical,high -silent
+
+Directory/file discovery → ffuf:
+  ffuf -u "URL/FUZZ" -w /path/to/wordlist.txt -mc 200,301,302,403
+
+SSTI → use Python requests with math canary payloads:
+  {{7*7}} → if response contains "49", SSTI confirmed
+  ${7*7} → Freemarker/Thymeleaf variant
+
+IDOR → use Python requests to iterate IDs and compare responses.
+
+ONLY write custom Python for: IDOR testing, business logic, timing oracles,
+token analysis, and tests where no specialized tool exists.
 """
 
 SPA_WARNING = """
