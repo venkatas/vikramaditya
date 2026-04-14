@@ -61,7 +61,55 @@ recon/<target>/sessions/<timestamp_id>/
 └── reports/             # vapt_report.html / vapt_report.md
 ```
 
+## HAR-Based Authenticated Testing (NEW)
+
+Comprehensive authenticated vulnerability testing using browser session data.
+
+### HAR Testing Tools
+
+| File | Role |
+|------|------|
+| `har_analyzer.py` | **HAR analysis** — extract endpoints, sessions, attack surface |
+| `har_vapt_engine.py` | **Authenticated VAPT** — comprehensive vulnerability testing |
+| `har_vapt.py` | **Standalone HAR VAPT** — complete workflow in one tool |
+| `vapt_companion.py` | **Integration helper** — combine infrastructure + HAR testing |
+| `vapt_suite.py` | **Unified interface** — interactive menu for all tools |
+
+### HAR Testing Usage
+
+```bash
+# Complete HAR-based VAPT
+python3 har_vapt.py session.har
+
+# Individual components
+python3 har_analyzer.py session.har                    # Analysis only
+python3 har_vapt_engine.py session_analysis.json       # Testing only
+
+# Combined workflow (infrastructure + authenticated)
+python3 vapt_companion.py --full example.com
+
+# Interactive suite with all tools
+python3 vapt_suite.py
+```
+
+### HAR Capture Guide
+
+1. **Browser Setup**: Open Developer Tools (F12) → Network tab
+2. **User Actions**: Login and navigate authenticated areas
+3. **Capture Session**: Right-click → Save as HAR file  
+4. **Run Assessment**: `python3 har_vapt.py captured_session.har`
+
+### HAR Testing Capabilities
+
+- ✅ **SQL Injection** — authentication bypass, parameter injection
+- ✅ **File Upload RCE** — malicious file uploads with bypass techniques
+- ✅ **Authentication Bypass** — admin panel access without credentials
+- ✅ **IDOR** — user enumeration and unauthorized data access
+- ✅ **XSS** — cross-site scripting across all parameters
+- ✅ **Session Management** — token security and session controls
+
 ## Rules
 - All targets must have written client authorization
 - Never test outside defined scope
 - Use `--scope-lock` to restrict to exact target only
+- HAR files may contain sensitive session data — handle securely
