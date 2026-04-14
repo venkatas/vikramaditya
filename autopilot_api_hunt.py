@@ -92,10 +92,29 @@ class BrainScanContext:
 
 
 def _pick_fast_model() -> str:
-    """Pick fastest available Ollama model for per-phase decisions."""
+    """Pick fastest available Ollama model for per-phase supervisor decisions."""
     try:
         import ollama
         for m in ["baron-llm:latest", "gemma4:e4b", "qwen3:8b", "qwen3:14b"]:
+            try:
+                ollama.show(m)
+                return m
+            except Exception:
+                continue
+    except ImportError:
+        pass
+    return ""
+
+
+def _pick_deep_model() -> str:
+    """Pick best model for deep security analysis (code audit, exploit writing).
+
+    Priority: bugtraceai-apex (security-tuned, <thinking> blocks, 0% refusal)
+    Fallback: gemma4:26b (fast all-rounder)
+    """
+    try:
+        import ollama
+        for m in ["bugtraceai-apex", "gemma4:26b", "qwen3:14b"]:
             try:
                 ollama.show(m)
                 return m
@@ -1572,7 +1591,7 @@ def _brain_validate_findings(findings: list[dict], output_dir: str = None) -> li
 
     # For JSON validation, prefer non-thinking models (Gemma 4 puts output in thinking field)
     model = None
-    for candidate in ["qwen3-coder-64k:latest", "vapt-qwen25:latest",
+    for candidate in ["bugtraceai-apex", "qwen3-coder-64k:latest", "vapt-qwen25:latest",
                       "qwen2.5-coder:32b", "baron-llm:latest", "qwen3:8b"]:
         try:
             ollama.show(candidate)
@@ -1702,10 +1721,9 @@ def _run_brain_analysis(findings: list[dict], output_dir: str = None):
         # Try models in priority order: Gemma 4 27B → vapt-qwen25 → qwen2.5:32b → qwen3:8b
         model = None
         # Tested priority order (benchmark: quality + speed):
-        # qwen3-coder-64k (4/4, 10 tok/s) > vapt-qwen25 (4/4, 4 tok/s) >
-        # gemma4:26b (untested) > deepseek-r1:32b (4/4, 3.9 tok/s) >
-        # baron-llm (2/4, 14 tok/s) > qwen3:8b (fallback)
-        for candidate in ["gemma4:26b", "qwen3-coder-64k:latest",
+        # bugtraceai-apex (4/4, 57 tok/s, security-tuned) > gemma4:26b (4/4, 66 tok/s) >
+        # qwen3-coder-64k (4/4, 10 tok/s) > baron-llm (2/4, 14 tok/s)
+        for candidate in ["bugtraceai-apex", "gemma4:26b", "qwen3-coder-64k:latest",
                           "vapt-qwen25:latest", "deepseek-r1:32b",
                           "baron-llm:latest", "qwen3:8b"]:
             try:

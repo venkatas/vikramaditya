@@ -64,10 +64,14 @@ def log(level: str, msg: str):
 
 
 def pick_model() -> str:
-    """Pick the best available Ollama model."""
+    """Pick the best available Ollama model for security tasks.
+
+    Priority: bugtraceai-apex (security-tuned, <thinking> blocks, 0% refusal)
+    Fallback: gemma4:26b (fast all-rounder)
+    """
     try:
         import ollama
-        for m in ["gemma4:26b", "qwen3:14b", "qwen3:8b", "gemma4:e4b"]:
+        for m in ["bugtraceai-apex", "gemma4:26b", "qwen3:14b", "qwen3:8b", "gemma4:e4b"]:
             try:
                 ollama.show(m)
                 return m
