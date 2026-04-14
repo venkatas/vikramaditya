@@ -333,6 +333,132 @@ VULN_TEMPLATES["business_logic"] = {
     ],
 }
 
+## ── Autopilot-specific finding types ──────────────────────────────────────────
+
+VULN_TEMPLATES["django_debug"] = {
+    "title": "Django DEBUG Mode Enabled on {host}",
+    "severity": "critical", "cvss": "7.5", "cwe": "CWE-215",
+    "owasp": "A05:2021",
+    "impact": (
+        "Django DEBUG=True exposes full stack traces, database settings, SECRET_KEY, "
+        "installed apps, URL patterns, and middleware to any user who triggers an error. "
+        "An attacker can use this to map the entire application, extract credentials, "
+        "and craft targeted exploits."
+    ),
+    "remediation": (
+        "Set DEBUG=False in production settings. Use ALLOWED_HOSTS to restrict valid hostnames. "
+        "Configure proper error handling with custom 404/500 pages. "
+        "Ensure settings.py does not contain hardcoded secrets — use environment variables."
+    ),
+    "references": [
+        ("Django Deployment Checklist", "https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/"),
+    ],
+}
+
+VULN_TEMPLATES["score_manipulation"] = {
+    "title": "Score/Grade Manipulation on {host}",
+    "severity": "high", "cvss": "8.1", "cwe": "CWE-20",
+    "owasp": "A04:2021",
+    "impact": (
+        "The server accepts client-supplied scores, grades, or test results without validation. "
+        "An attacker can submit tampered values (e.g., correct_answers=999, total_score=99999) "
+        "to inflate their grades, pass assessments without study, or manipulate other users' "
+        "academic records if combined with an IDOR vulnerability."
+    ),
+    "remediation": (
+        "Never trust client-submitted scores. Calculate all grades, totals, and results "
+        "server-side from the actual answer submissions. Validate that values are within "
+        "expected ranges (e.g., correct_answers <= total_questions)."
+    ),
+    "references": [
+        ("OWASP Input Validation", "https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html"),
+    ],
+}
+
+VULN_TEMPLATES["refresh_token_bypass"] = {
+    "title": "Token Refresh Logic Bypass on {host}",
+    "severity": "high", "cvss": "7.5", "cwe": "CWE-613",
+    "owasp": "A07:2021",
+    "impact": (
+        "The application accepts an invalid/expired access token when a valid refresh token "
+        "is present, silently re-authenticating the user. This extends the window for session "
+        "hijacking — an attacker who steals a refresh token can maintain persistent access "
+        "even after the access token expires."
+    ),
+    "remediation": (
+        "Validate access tokens independently of refresh tokens. When an access token is expired "
+        "or invalid, require an explicit token refresh request — do not silently re-authenticate. "
+        "Implement refresh token rotation (invalidate old refresh token on each use)."
+    ),
+    "references": [
+        ("OWASP Session Management", "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html"),
+    ],
+}
+
+VULN_TEMPLATES["timing_oracle_user_enum"] = {
+    "title": "User Enumeration via Timing Oracle on {host}",
+    "severity": "medium", "cvss": "5.3", "cwe": "CWE-208",
+    "owasp": "A07:2021",
+    "impact": (
+        "The password reset endpoint responds significantly slower for valid email addresses "
+        "than for invalid ones (e.g., 6.8s vs 0.1s). An attacker can enumerate valid user "
+        "accounts by measuring response times, then target those accounts for credential "
+        "stuffing or phishing attacks."
+    ),
+    "remediation": (
+        "Return the same response in constant time regardless of whether the email exists. "
+        "Use background task queues for sending reset emails so the HTTP response time is "
+        "independent of the email lookup and SMTP send."
+    ),
+    "references": [
+        ("OWASP Authentication Testing", "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/04-Authentication_Testing/"),
+    ],
+}
+
+VULN_TEMPLATES["missing_rate_limit"] = {
+    "title": "Missing Rate Limiting on {host}",
+    "severity": "medium", "cvss": "5.3", "cwe": "CWE-307",
+    "owasp": "A07:2021",
+    "impact": (
+        "The endpoint accepts unlimited rapid requests without throttling, CAPTCHA, or lockout. "
+        "An attacker can brute-force credentials, spam OTPs, or exhaust resources."
+    ),
+    "remediation": (
+        "Implement rate limiting (e.g., 5 attempts per minute) on authentication endpoints. "
+        "Use progressive delays or account lockout after repeated failures. "
+        "Add CAPTCHA after 3-5 failed attempts."
+    ),
+    "references": [
+        ("OWASP Brute Force", "https://owasp.org/www-community/attacks/Brute_force_attack"),
+    ],
+}
+
+VULN_TEMPLATES["server_version"] = {
+    "title": "Server Version Disclosure on {host}",
+    "severity": "low", "cvss": "2.5", "cwe": "CWE-200",
+    "impact": "The server discloses its software version in HTTP headers, aiding attackers in finding known CVEs.",
+    "remediation": "Remove or obfuscate the Server header. For nginx: server_tokens off; For Apache: ServerSignature Off.",
+    "references": [],
+}
+
+VULN_TEMPLATES["exploit_chain"] = {
+    "title": "Exploit Chain on {host}",
+    "severity": "critical", "cvss": "9.0", "cwe": "CWE-284",
+    "owasp": "A01:2021",
+    "impact": (
+        "Multiple individual vulnerabilities can be chained together to achieve a higher-impact "
+        "attack than any single finding alone. The chain escalates from information gathering "
+        "to data breach or account takeover."
+    ),
+    "remediation": (
+        "Fix each individual vulnerability in the chain. Defense in depth — even if one control "
+        "fails, the others should prevent escalation."
+    ),
+    "references": [
+        ("OWASP Broken Access Control", "https://owasp.org/Top10/A01_2021-Broken_Access_Control/"),
+    ],
+}
+
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 SEVERITY_COLOR = {
     "critical": "#dc3545",
@@ -445,21 +571,81 @@ def load_findings(findings_dir: str) -> list:
                 sev = data.get("severity", "medium").lower()
                 vtype = data.get("type", "misconfig")
                 tmpl = VULN_TEMPLATES.get(vtype, VULN_TEMPLATES.get("misconfig", {}))
-                raw_line = f"[{sev.upper()}] {data.get('detail', '')} {data.get('url', '')}"
+                evidence = data.get("evidence", "")
+                detail = data.get("detail", "")
+                url = data.get("url", "N/A")
+
+                # Generate developer-friendly PoC with curl commands
+                poc_lines = [f"Finding: {detail}", f"URL: {url}", f"Evidence: {evidence}", ""]
+                if vtype == "idor" and url != "N/A":
+                    poc_lines.append("# Step 1: Login to get session cookie")
+                    poc_lines.append("curl -sk -X POST '" + url.rsplit("/", 2)[0] + "/login-view/' \\")
+                    poc_lines.append("  -d 'email=YOUR_EMAIL&password=YOUR_PASS' -c cookies.txt")
+                    poc_lines.append("")
+                    poc_lines.append("# Step 2: Access another user's data (change id to any number)")
+                    poc_lines.append(f"curl -sk -X POST '{url}' -b cookies.txt -d 'id=1'")
+                    poc_lines.append(f"curl -sk -X POST '{url}' -b cookies.txt -d 'id=2'")
+                    poc_lines.append(f"curl -sk -X POST '{url}' -b cookies.txt -d 'id=3'")
+                    poc_lines.append("")
+                    poc_lines.append("# Expected: Should return 403 for other users' data")
+                    poc_lines.append("# Actual: Returns full PII (name, email, phone) for ANY id")
+                elif vtype == "score_manipulation" and url != "N/A":
+                    poc_lines.append("# Step 1: Login and get cookie")
+                    poc_lines.append("# Step 2: Submit tampered score values")
+                    poc_lines.append(f"curl -sk -X POST '{url}' -b cookies.txt \\")
+                    poc_lines.append("  -d 'correct_answers=999&wrong_answers=-5&total_score=99999"
+                                     "&learner_id=1&live_test_id=1&total_question=10&total_marks=100'")
+                    poc_lines.append("")
+                    poc_lines.append("# Expected: Server should reject impossible values")
+                    poc_lines.append("# Actual: Server accepts tampered scores")
+                elif vtype == "django_debug" and url != "N/A":
+                    poc_lines.append("# No authentication needed — visit any non-existent URL:")
+                    poc_lines.append(f"curl -sk '{url}'")
+                    poc_lines.append("")
+                    poc_lines.append("# The response contains: full URL patterns, SECRET_KEY,")
+                    poc_lines.append("# DATABASE settings, installed apps, middleware stack")
+                elif vtype == "missing_rate_limit" and url != "N/A":
+                    poc_lines.append("# Send 15 rapid failed login attempts:")
+                    poc_lines.append(f"for i in $(seq 1 15); do")
+                    poc_lines.append(f"  curl -sk -X POST '{url}' -d 'email=test@test.com&password=wrong'")
+                    poc_lines.append(f"done")
+                    poc_lines.append("")
+                    poc_lines.append("# Expected: 429 Too Many Requests after 5 attempts")
+                    poc_lines.append("# Actual: All 15 return 200 — no rate limit")
+                elif vtype == "timing_oracle_user_enum" and url != "N/A":
+                    poc_lines.append("# Compare response times for valid vs invalid emails:")
+                    poc_lines.append(f"time curl -sk -X POST '{url}' -d 'email=VALID_USER@domain.com'")
+                    poc_lines.append(f"time curl -sk -X POST '{url}' -d 'email=nonexistent@fake.com'")
+                    poc_lines.append("")
+                    poc_lines.append("# Expected: Same response time for both")
+                    poc_lines.append(f"# Actual: {evidence}")
+                elif vtype == "refresh_token_bypass" and url != "N/A":
+                    poc_lines.append("# Step 1: Login normally to get tokens (cf_at + cf_rt cookies)")
+                    poc_lines.append("# Step 2: Tamper the access token (cf_at) — change a character")
+                    poc_lines.append("# Step 3: Make an API request with tampered cf_at + valid cf_rt")
+                    poc_lines.append(f"curl -sk -X POST '{url}' \\")
+                    poc_lines.append("  --cookie 'cf_at=TAMPERED_TOKEN; cf_rt=VALID_REFRESH_TOKEN' -d '{}'")
+                    poc_lines.append("")
+                    poc_lines.append("# Expected: 401 Unauthorized (invalid access token)")
+                    poc_lines.append("# Actual: 200 OK — server silently re-authenticates using refresh token")
+
+                poc_text = "\n".join(poc_lines)
+                raw_line = f"[{sev.upper()}] {detail} {url}"
+
                 finding = {
                     "severity": sev,
                     "vtype": vtype,
-                    "url": data.get("url", "N/A"),
+                    "url": url,
                     "raw": raw_line,
                     "name": tmpl.get("name", vtype.replace("_", " ").title()),
-                    "detail": data.get("detail", ""),
-                    "evidence": data.get("evidence", ""),
-                    "poc": data.get("evidence", ""),
+                    "detail": detail,
+                    "evidence": evidence,
+                    "poc": poc_text,
                     "cvss": tmpl.get("cvss", "N/A"),
                     "cwe": tmpl.get("cwe", ""),
                     "owasp": tmpl.get("owasp", ""),
                     "remediation": tmpl.get("remediation", ""),
-                    "description": tmpl.get("description", data.get("detail", "")),
+                    "description": tmpl.get("description", detail),
                     "impact": tmpl.get("impact", ""),
                     "attack_id": "",
                 }
