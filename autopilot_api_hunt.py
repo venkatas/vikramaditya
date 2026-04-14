@@ -1584,6 +1584,113 @@ def _auto_detect_login_url(session: AuthSession, username: str, password: str) -
             except Exception:
                 continue
 
+    # ── CGI/legacy form login (parse HTML form and submit) ──────────────
+    # For apps like Rediffmail Pro that use non-standard field names
+    # (custom_input, domain, FormName, etc.)
+    CGI_LOGIN_PAGES = [
+        # (page to GET for form, fallback action URL)
+        ("action/login/" + (domain_part if domain_part else ""), "cgi-bin/progold/loginepro.cgi"),
+        ("cgi-bin/progold/loginepro.cgi", "cgi-bin/progold/loginepro.cgi"),
+        ("cgi-bin/login.cgi", "cgi-bin/login.cgi"),
+        ("admin/login/", "admin/login/"),
+        ("login.php", "login.php"),
+        ("login.asp", "login.asp"),
+        ("Login.jsp", "Login.jsp"),
+        ("j_security_check", "j_security_check"),
+    ]
+    # Map empty hidden field values to sensible defaults
+    HIDDEN_FIELD_DEFAULTS = {
+        "FormName": "existing", "reqsig": "PCWEB", "newBuilt": "1",
+        "submit": "Login", "action": "login",
+    }
+    import re as _re
+    user_part = username.split("@")[0] if "@" in username else username
+    domain_part = username.split("@")[1] if "@" in username else ""
+
+    for page_path, fallback_action in CGI_LOGIN_PAGES:
+        try:
+            # Fetch the login page to discover form fields
+            login_page_url = f"{base}/{page_path.lstrip('/')}"
+            page_resp = _req.get(login_page_url, verify=False, timeout=10,
+                                  allow_redirects=True)
+            if page_resp.status_code not in (200, 301, 302):
+                continue
+
+            html = page_resp.text
+            # Find form action
+            action_match = _re.search(r'<form[^>]*action=["\']([^"\']+)["\']', html, _re.I)
+            action_url = action_match.group(1) if action_match else f"{base}/{fallback_action}"
+            if action_url.startswith("/"):
+                action_url = f"{_re.match(r'https?://[^/]+', base).group(0)}{action_url}"
+
+            # Extract all input fields with their names and default values
+            inputs = _re.findall(
+                r'<input[^>]*name=["\']?([^"\'\s>]+)["\']?[^>]*(?:value=["\']?([^"\'\s>]*)["\']?)?',
+                html, _re.I)
+            form_data = {}
+            for name, value in inputs:
+                name = name.strip()
+                val = value.strip() if value else ""
+                # Map known field patterns to credentials
+                if name.lower() in ("password", "passwd", "pwd", "pass", "user_password"):
+                    form_data[name] = password
+                elif name.lower() in ("username", "user", "login", "email", "user_id",
+                                       "userid", "custom_input"):
+                    form_data[name] = user_part
+                elif name.lower() == "domain":
+                    form_data[name] = domain_part
+                elif val:
+                    form_data[name] = val
+                elif name in HIDDEN_FIELD_DEFAULTS:
+                    form_data[name] = HIDDEN_FIELD_DEFAULTS[name]
+                else:
+                    form_data[name] = val
+
+            if not form_data:
+                continue
+
+            log("info", f"  Trying CGI login: {path} ({len(form_data)} fields)")
+            resp = _req.post(action_url, data=form_data, verify=False,
+                              timeout=15, allow_redirects=False,
+                              cookies=dict(page_resp.cookies))
+
+            # Check for successful login (redirect with session cookies)
+            cookies_set = resp.headers.get("Set-Cookie", "")
+            if resp.status_code in (200, 301, 302):
+                # Look for session cookies in response
+                session_cookies = {}
+                # Parse Set-Cookie headers from raw response
+                for cookie_header in resp.raw.headers.getlist("Set-Cookie") if hasattr(resp.raw.headers, "getlist") else [cookies_set]:
+                    for ck in _re.findall(r'(\w+)=([^;]+)', cookie_header):
+                        if ck[0] in ("Rm", "Rsc", "Rl", "Rt", "Rh", "JSESSIONID", "session_id",
+                                      "sessionid", "sid", "token", "cf_at", "IDPT4"):
+                            session_cookies[ck[0]] = ck[1]
+                # Also check resp.cookies
+                for c in resp.cookies:
+                    if c.name in ("Rm", "Rsc", "Rl", "Rt", "JSESSIONID", "cf_at", "token"):
+                        session_cookies[c.name] = c.value
+
+                if session_cookies:
+                    # Set cookies on the session
+                    for k, v in session_cookies.items():
+                        session._session.cookies.set(k, v)
+                    token = session_cookies.get("Rm") or session_cookies.get("cf_at") or \
+                            session_cookies.get("token") or session_cookies.get("JSESSIONID") or \
+                            "cookie-auth"
+                    session.token = token
+                    log("ok", f"  CGI login successful: {path} ({len(session_cookies)} cookies)")
+                    return token, path
+
+                # Check for redirect to post-login page (success indicator)
+                location = resp.headers.get("Location", "")
+                if "postlogin" in location or "dashboard" in location or "inbox" in location:
+                    session.token = "cookie-auth"
+                    log("ok", f"  CGI login successful (redirect): {path}")
+                    return "cookie-auth", path
+
+        except Exception:
+            continue
+
     return "", ""
 
 
