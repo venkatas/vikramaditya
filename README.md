@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v2.3 — Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
+**v2.6 — Autonomous VAPT platform. One command. Give it a target — it figures out the rest.**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -689,6 +689,15 @@ Then open a pull request describing what you added and why it's useful.
 ---
 
 ## Changelog
+
+### v2.6 (2026-04-14)
+- **fix:** Detailed exploit chain PoCs with step-by-step curl commands (was "Chain: X + Y")
+
+### v2.5 (2026-04-14)
+- **fix:** Reports saved to project location (`reports/TARGET/sessions/SESSION/`)
+
+### v2.4 (2026-04-14)
+- **fix:** Tool name + repo URL in report footer
 
 ### v2.3 (2026-04-14)
 - **fix:** Proper vulnerability names in reports (was "Security Misconfiguration" for everything)
