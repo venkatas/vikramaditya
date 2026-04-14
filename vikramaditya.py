@@ -653,7 +653,7 @@ def main():
         print(f"\n  {D}Done.{N}\n")
         return
 
-    if creds and fp["api_detected"]:
+    if creds:
         # Authenticated API VAPT
         output_dir = make_output_dir(urlparse(url).netloc)
         log("info", f"Output: {output_dir}")
@@ -668,28 +668,6 @@ def main():
         )
 
         # ── Step 6: Post-scan ─────────────────────────────────────────────
-        if result and result.get("findings"):
-            findings = result["findings"]
-            print(f"\n  {G}Autopilot complete.{N} {len(findings)} finding(s).\n")
-            findings_dir = os.path.join(output_dir, "autopilot")
-        else:
-            print(f"\n  {D}Autopilot complete. No findings.{N}\n")
-            findings_dir = None
-
-    elif creds:
-        # Has creds but no clear API — try API VAPT on the URL itself
-        output_dir = make_output_dir(urlparse(url).netloc)
-        log("info", f"Output: {output_dir}")
-        print()
-
-        result = run_api_vapt(
-            base_url=url.rstrip("/"),
-            creds=creds,
-            creds_b=creds_b,
-            with_brain=with_brain,
-            output_dir=output_dir,
-        )
-
         if result and result.get("findings"):
             findings = result["findings"]
             print(f"\n  {G}Autopilot complete.{N} {len(findings)} finding(s).\n")
