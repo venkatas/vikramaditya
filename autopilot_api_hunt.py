@@ -943,6 +943,53 @@ class InjectionTester:
                 except Exception:
                     pass
 
+        # 7c. sqlmap verification on confirmed SQLi candidates
+        sqli_urls = [f["url"] for f in findings if "sqli" in f["type"]]
+        if sqli_urls:
+            log("info", f"  Running sqlmap on {len(sqli_urls)} confirmed SQLi candidate(s)...")
+            for sqli_url in sqli_urls[:3]:  # Max 3 to avoid long waits
+                try:
+                    import subprocess as _sp
+                    sqlmap_out = os.path.join(
+                        os.path.dirname(saver.output_dir) if saver else "/tmp",
+                        "sqlmap_verify")
+                    os.makedirs(sqlmap_out, exist_ok=True)
+                    result = _sp.run([
+                        "sqlmap", "-u", sqli_url,
+                        "--batch", "--level=3", "--risk=2",
+                        "--random-agent", "--timeout=15",
+                        "--current-db", "--current-user",
+                        "--output-dir", sqlmap_out,
+                    ], capture_output=True, text=True, timeout=120)
+                    output = result.stdout
+                    # Check if sqlmap confirmed injection
+                    if "is vulnerable" in output or "Type:" in output:
+                        # Extract DB info
+                        db_info = ""
+                        for line in output.split("\n"):
+                            if "current database:" in line.lower() or "current user:" in line.lower():
+                                db_info += line.strip() + "; "
+                            if "Type:" in line:
+                                db_info += line.strip() + "; "
+                        f = {"type": "sqli_sqlmap_confirmed", "severity": CRITICAL,
+                             "detail": f"sqlmap CONFIRMED SQLi on {sqli_url} — {db_info[:200]}",
+                             "url": sqli_url,
+                             "evidence": f"sqlmap --level=3 --risk=2 confirmed injection. {db_info[:300]}"}
+                        findings.append(f)
+                        if saver:
+                            saver.save(f)
+                            saver.save_txt(f)
+                        log("vuln", f"  sqlmap CONFIRMED: {sqli_url}")
+                    else:
+                        log("info", f"  sqlmap could not confirm: {sqli_url}")
+                except FileNotFoundError:
+                    log("warn", "  sqlmap not installed — skipping verification")
+                    break
+                except _sp.TimeoutExpired:
+                    log("warn", f"  sqlmap timed out on {sqli_url}")
+                except Exception as e:
+                    log("warn", f"  sqlmap error: {e}")
+
         log("ok", f"  {len(findings)} injection findings")
         return findings
 

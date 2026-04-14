@@ -186,6 +186,15 @@ OUTPUT FORMAT:
 - After seeing results, analyze and decide next step
 
 Available tools on this system: curl, python3, requests, sqlmap, nuclei, ffuf, dalfox
+
+IMPORTANT — USE SQLMAP FOR SQL INJECTION:
+Do NOT write custom Python SQLi scripts. Use sqlmap — it is specifically designed for this.
+When you find a potential SQLi endpoint:
+  sqlmap -u "URL?param=value" --batch --level=3 --risk=2 --current-db --current-user --dbs
+If it's a POST form:
+  sqlmap -u "URL" --data="param1=value1&param2=value2" --batch --level=3 --risk=2 --current-db
+sqlmap handles WAF bypass, encoding, tamper scripts, time-based/boolean/union/error detection
+far better than any custom script. Only use custom Python for NON-SQLi tests.
 """
 
 SPA_WARNING = """
