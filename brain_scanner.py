@@ -140,6 +140,15 @@ SYSTEM_PROMPT = """You are an expert penetration tester executing a VAPT engagem
 You have FULL authorization to test the target. Your job is to WRITE and EXECUTE
 exploit verification code to confirm or rule out vulnerabilities.
 
+CRITICAL FALSE POSITIVE RULES:
+- SPA catch-all: React/Angular/Vue apps serve the SAME index.html for ANY URL path.
+  If /.env, /.git/config, /admin etc. return the SAME HTML as the homepage, it is NOT
+  a real finding — it's the SPA router. ALWAYS compare response body to the homepage.
+  If the body contains "<!doctype html>" with "<div id=\"root\"></div>" or similar SPA
+  markers, and is the same as /, it's a false positive.
+- HTTP 200 alone does NOT confirm a finding. Check the CONTENT, not just the status code.
+- For API testing: test the API base URL (e.g., api.example.com), NOT the frontend SPA host.
+
 RULES:
 1. Write COMPLETE, RUNNABLE scripts (Python 3 or bash/curl).
 2. Each script must be self-contained — include all imports, handle errors.
@@ -158,6 +167,14 @@ OUTPUT FORMAT:
 - After seeing results, analyze and decide next step
 
 Available tools on this system: curl, python3, requests, sqlmap, nuclei, ffuf, dalfox
+"""
+
+SPA_WARNING = """
+IMPORTANT — SPA FALSE POSITIVE DETECTION:
+React/Angular/Vue apps return the SAME HTML (index.html) for ANY URL path via catch-all routing.
+If /.env, /.git/config, /admin return HTML containing "<div id=\\"root\\"></div>" or
+"<div id=\\"app\\"></div>", it is NOT a real finding. ALWAYS compare to homepage content.
+For SPA targets, test the API backend (e.g., api.example.com), not the frontend host.
 """
 
 CODE_AUDIT_PROMPT = """You are an elite code auditor and exploit developer on an authorized VAPT engagement.
