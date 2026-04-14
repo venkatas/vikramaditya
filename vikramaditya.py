@@ -704,10 +704,19 @@ def main():
 
     # ── Brain active scanner follow-up ───────────────────────────────────
     if use_brain_scanner and has_ollama:
-        log("info", "Launching brain active scanner — LLM writes + executes exploit code...")
+        # Use the API base if detected (not the SPA frontend)
+        brain_target = url
+        try:
+            if fp and fp.get("api_base"):
+                brain_target = fp["api_base"]
+            elif api_base and api_base != url:
+                brain_target = api_base
+        except NameError:
+            pass
+        log("info", f"Launching brain active scanner on {brain_target}...")
         brain_out = make_output_dir(urlparse(url).netloc)
         run_brain_scan(
-            target=url,
+            target=brain_target,
             mode="scan",
             output_dir=os.path.join(brain_out, "brain_active"),
         )
