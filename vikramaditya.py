@@ -569,10 +569,14 @@ def main():
 
     if fp["error"]:
         print(f"  {R}Error reaching target: {fp['error']}{N}")
-        if not autonomous and not confirm("Try recon-only scan anyway?"):
+        if cli["creds"]:
+            # Creds provided — try autopilot anyway (server may respond to API calls)
+            log("info", "Credentials provided — will attempt autopilot despite fingerprint failure")
+        else:
+            if not autonomous and not confirm("Try recon-only scan anyway?"):
+                return
+            run_hunt(urlparse(url).netloc)
             return
-        run_hunt(urlparse(url).netloc)
-        return
 
     show_summary(target_info, fp)
 
