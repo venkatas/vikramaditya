@@ -3,9 +3,12 @@
 Vikramaditya — One command to rule them all.
 
 Interactive VAPT orchestrator. Give it a target, it figures out the rest.
+Accepts URLs, domains, IPs, CIDRs, and HAR files (browser session exports).
 
 Usage:
     python3 vikramaditya.py
+    python3 vikramaditya.py <target>
+    python3 vikramaditya.py <session.har>
 """
 from __future__ import annotations
 
@@ -81,8 +84,12 @@ def log(level: str, msg: str):
 # ── Target Classification ─────────────────────────────────────────────────────
 
 def classify_target(target: str) -> dict:
-    """Classify target as cidr, ip, domain, or url."""
+    """Classify target as har, cidr, ip, domain, or url."""
     target = target.strip()
+
+    # HAR file (browser session export)
+    if target.lower().endswith(".har") and os.path.isfile(target):
+        return {"type": "har", "value": target, "original": target}
 
     # CIDR
     if "/" in target:
@@ -398,6 +405,114 @@ def show_summary(target_info: dict, fingerprint: dict = None):
     print(f"  {W}{'─' * 56}{N}\n")
 
 
+# ── HAR File Processing ───────────────────────────────────────────────────────
+
+def process_har_file(har_file: str) -> dict:
+    """Analyze a HAR file and return the analysis dict. Returns None on failure."""
+    try:
+        from har_analyzer import HARAnalyzer
+    except ImportError as e:
+        log("err", f"har_analyzer module not available: {e}")
+        return None
+
+    log("info", f"Analyzing HAR file: {har_file}")
+    try:
+        analysis = HARAnalyzer(har_file).analyze()
+    except Exception as e:
+        log("err", f"HAR analysis failed: {e}")
+        return None
+
+    if isinstance(analysis, dict) and analysis.get("error"):
+        log("err", f"HAR analysis failed: {analysis['error']}")
+        return None
+    return analysis
+
+
+def show_har_summary(analysis: dict):
+    """Display HAR analysis summary (endpoints, auth, tech stack, recommendations)."""
+    config = analysis.get("config", {})
+
+    print(f"\n  {W}{'─' * 70}{N}")
+    print(f"  {W}  HAR FILE ANALYSIS{N}")
+    print(f"  {W}{'─' * 70}{N}")
+
+    print(f"  {C}  Target Domain  :{N} {config.get('target_domain', 'unknown')}")
+    print(f"  {C}  Total Endpoints:{N} {config.get('total_endpoints', 0)}")
+    print(f"  {C}  Admin Endpoints:{N} {config.get('admin_endpoints', 0)}")
+    print(f"  {C}  API Endpoints  :{N} {config.get('api_endpoints', 0)}")
+    print(f"  {C}  File Uploads   :{N} {config.get('file_upload_endpoints', 0)}")
+
+    auth = config.get("authentication", {})
+    auth_type = auth.get("type", "unknown")
+    print(f"  {C}  Auth Method    :{N} {auth_type}")
+    if auth_type == "bearer_token":
+        token = auth.get("token", "")
+        token_disp = (token[:20] + "...") if len(token) > 20 else token
+        print(f"  {C}  Bearer Token   :{N} {token_disp}")
+    elif auth_type == "cookies":
+        print(f"  {C}  Cookies        :{N} {len(auth.get('data', {}))} cookies extracted")
+
+    tech = config.get("technology_stack", [])
+    if tech:
+        print(f"  {C}  Technology     :{N} {', '.join(tech)}")
+
+    high_value = config.get("high_value_endpoints", 0)
+    if high_value:
+        print(f"  {G}  High-Value     :{N} {high_value} critical endpoints identified")
+
+    tests = config.get("recommended_tests", [])
+    if tests:
+        shown = ", ".join(tests[:5])
+        print(f"  {O}  Recommended    :{N} {shown}")
+        if len(tests) > 5:
+            print(f"  {D}                    + {len(tests) - 5} more tests{N}")
+
+    print(f"  {W}{'─' * 70}{N}\n")
+
+
+def run_har_vapt(analysis: dict, output_dir: str) -> str:
+    """Run HAR-based authenticated VAPT. Returns path to results JSON, or None."""
+    try:
+        from har_vapt_engine import HARVAPTEngine
+    except ImportError as e:
+        log("err", f"har_vapt_engine module not available: {e}")
+        return None
+
+    log("info", "Starting HAR-based authenticated VAPT...")
+
+    target_domain = analysis.get("config", {}).get("target_domain", "unknown")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_file = os.path.join(output_dir, f"har_vapt_{target_domain}_{ts}.json")
+
+    try:
+        results = HARVAPTEngine(analysis).run_comprehensive_scan()
+    except Exception as e:
+        log("err", f"HAR VAPT engine failed: {e}")
+        return None
+
+    try:
+        with open(result_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, default=str)
+    except Exception as e:
+        log("err", f"Failed to save HAR VAPT results: {e}")
+        return None
+
+    log("ok", f"Results: {result_file}")
+
+    vs = results.get("vulnerability_summary", {})
+    print(f"\n  {W}{'─' * 56}{N}")
+    print(f"  {W}  HAR VAPT RESULTS{N}")
+    print(f"  {W}{'─' * 56}{N}")
+    print(f"  {C}  Total   :{N} {vs.get('total_vulnerabilities', 0)}")
+    print(f"  {R}  Critical:{N} {vs.get('critical', 0)}")
+    print(f"  {Y}  High    :{N} {vs.get('high', 0)}")
+    print(f"  {O}  Medium  :{N} {vs.get('medium', 0)}")
+    print(f"  {D}  Low     :{N} {vs.get('low', 0)}")
+    print(f"  {W}{'─' * 56}{N}\n")
+
+    return result_file
+
+
 # ── Ollama Detection ──────────────────────────────────────────────────────────
 
 def ollama_available() -> bool:
@@ -519,7 +634,7 @@ def main():
     # ── Step 1: Get target ────────────────────────────────────────────────
     target_raw = cli["target"]
     if not target_raw:
-        target_raw = prompt("Enter target (URL, domain, IP, or CIDR)")
+        target_raw = prompt("Enter target (URL, domain, IP, CIDR, or .har file)")
     else:
         log("info", f"Target: {target_raw}")
     if not target_raw:
@@ -533,6 +648,40 @@ def main():
         return
 
     # ── Step 2: Route based on target type ────────────────────────────────
+
+    # --- HAR file → authenticated VAPT using captured browser session ---
+    if target_info["type"] == "har":
+        analysis = process_har_file(target_info["value"])
+        if not analysis:
+            return
+        show_har_summary(analysis)
+
+        if not autonomous and not confirm("Proceed with HAR-based VAPT?"):
+            print(f"  {D}Aborted.{N}")
+            return
+
+        target_domain = analysis.get("config", {}).get("target_domain", "har_target")
+        output_dir = make_output_dir(target_domain)
+        log("info", f"Output: {output_dir}")
+
+        # Persist the analysis alongside the results
+        try:
+            with open(os.path.join(output_dir, "har_analysis.json"), "w") as f:
+                json.dump(analysis, f, indent=2, default=str)
+        except Exception as e:
+            log("warn", f"Could not save analysis: {e}")
+
+        result_file = run_har_vapt(analysis, output_dir)
+        if result_file:
+            want_report = autonomous or confirm("Generate HTML report?", default_yes=False)
+            if want_report:
+                try:
+                    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "reporter.py"), result_file]
+                    subprocess.run(cmd, cwd=SCRIPT_DIR)
+                except Exception as e:
+                    log("warn", f"Report generation failed: {e}")
+        print(f"\n  {D}Done.{N}\n")
+        return
 
     # --- CIDR / IP → hunt.py directly ---
     if target_info["type"] in ("cidr", "ip"):
