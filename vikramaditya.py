@@ -862,23 +862,44 @@ def main():
         run_hunt(domain, full=True, scope_lock=scope_lock)
 
         # Post-scan: check if there are findings to report
-        # hunt.py manages its own output, so just offer the report prompt
+        # hunt.py stores findings in findings/<domain>/sessions/<id>/ (not recon/)
         print()
         if confirm("Generate report from scan results?", default_yes=False):
-            # Find the latest session dir
-            sessions_base = os.path.join(SCRIPT_DIR, "recon", domain, "sessions")
-            if os.path.isdir(sessions_base):
-                sessions = sorted(os.listdir(sessions_base), reverse=True)
-                if sessions:
-                    findings_dir = os.path.join(sessions_base, sessions[0], "findings")
-                    if os.path.isdir(findings_dir):
-                        client = prompt("Client name", "")
-                        consultant = prompt("Consultant name", "")
-                        run_report(findings_dir, client, consultant)
-                    else:
-                        print(f"  {Y}No findings directory found at {findings_dir}{N}")
+            # Try both findings/ and recon/ paths (hunt.py uses findings/)
+            found_dir = None
+            for base_name in ["findings", "recon"]:
+                sessions_base = os.path.join(SCRIPT_DIR, base_name, domain, "sessions")
+                if os.path.isdir(sessions_base):
+                    sessions = sorted(os.listdir(sessions_base), reverse=True)
+                    for sess in sessions:
+                        candidate = os.path.join(sessions_base, sess)
+                        # Check for findings in the session root or a findings/ subdirectory
+                        if os.path.isdir(os.path.join(candidate, "findings")):
+                            found_dir = os.path.join(candidate, "findings")
+                            break
+                        # Also check for finding_*.json or subdirs with .txt files directly in session
+                        has_data = any(
+                            f.endswith('.json') or f.endswith('.txt')
+                            for f in os.listdir(candidate)
+                            if os.path.isfile(os.path.join(candidate, f))
+                        ) or any(
+                            os.path.isdir(os.path.join(candidate, d))
+                            for d in os.listdir(candidate)
+                            if d in ('exploits', 'sqli', 'xss', 'cors', 'secrets', 'cves', 'sqlmap')
+                        )
+                        if has_data:
+                            found_dir = candidate
+                            break
+                if found_dir:
+                    break
+
+            if found_dir:
+                client = prompt("Client name", "")
+                consultant = prompt("Consultant name", "")
+                run_report(found_dir, client, consultant)
             else:
-                print(f"  {Y}No scan sessions found for {domain}{N}")
+                print(f"  {Y}No findings directory found for {domain}{N}")
+                print(f"  {D}Searched: findings/{domain}/sessions/ and recon/{domain}/sessions/{N}")
 
     # ── Brain active scanner follow-up ───────────────────────────────────
     if use_brain_scanner and has_ollama:
