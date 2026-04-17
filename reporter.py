@@ -668,9 +668,9 @@ def load_findings(findings_dir: str) -> list:
             except Exception:
                 pass
 
-    # Method 1c: HAR VAPT engine results (har_vapt_*.json)
+    # Method 1c: HAR VAPT / Legacy crawler results (har_vapt_*.json / legacy_vapt_*.json)
     for fn in sorted(os.listdir(findings_dir)):
-        if fn.startswith("har_vapt_") and fn.endswith(".json"):
+        if (fn.startswith("har_vapt_") or fn.startswith("legacy_vapt_")) and fn.endswith(".json"):
             try:
                 with open(os.path.join(findings_dir, fn)) as f:
                     har_data = _json.load(f)
