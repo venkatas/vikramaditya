@@ -640,6 +640,54 @@ def load_findings(findings_dir: str) -> list:
                             break
                     results.append(finding)
 
+    # Method 1b: CVE database matches (cves/ subdirectory)
+    cve_path = os.path.join(findings_dir, "cves")
+    if os.path.isdir(cve_path):
+        for fn in sorted(os.listdir(cve_path)):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(cve_path, fn), errors="replace") as f:
+                    cve_data = _json.load(f)
+                if isinstance(cve_data, list):
+                    for item in cve_data:
+                        cve_id = item.get("cve_id", item.get("id", ""))
+                        desc = item.get("description", item.get("summary", ""))
+                        sev = item.get("severity", "medium").lower()
+                        score = item.get("cvss_score", item.get("score", ""))
+                        product = item.get("product", item.get("software", ""))
+                        if cve_id:
+                            results.append({
+                                "severity": sev,
+                                "vtype": "cves",
+                                "title": f"{cve_id} — {product}" if product else cve_id,
+                                "detail": desc[:300] if desc else f"Known CVE: {cve_id}",
+                                "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                                "poc": f"CVE: {cve_id}\nCVSS: {score}\nProduct: {product}\n{desc[:500]}",
+                            })
+            except Exception:
+                pass
+
+    # Method 1c: HAR VAPT engine results (har_vapt_*.json)
+    for fn in sorted(os.listdir(findings_dir)):
+        if fn.startswith("har_vapt_") and fn.endswith(".json"):
+            try:
+                with open(os.path.join(findings_dir, fn)) as f:
+                    har_data = _json.load(f)
+                for vuln in har_data.get("vulnerabilities", []):
+                    results.append({
+                        "severity": vuln.get("severity", "medium"),
+                        "vtype": vuln.get("type", "misconfig").lower().replace(" ", "_"),
+                        "title": vuln.get("type", "Finding"),
+                        "detail": vuln.get("details", ""),
+                        "url": vuln.get("endpoint", vuln.get("full_url", "N/A")),
+                        "poc": f"Parameter: {vuln.get('parameter','')}\n"
+                               f"Payload: {vuln.get('payload','')}\n"
+                               f"Evidence: {vuln.get('evidence','')}",
+                    })
+            except Exception:
+                pass
+
     # Method 2: Flat JSON findings (autopilot_api_hunt.py output)
     # Reads finding_*.json files directly in the findings dir
     if not results:
