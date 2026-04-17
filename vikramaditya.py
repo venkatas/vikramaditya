@@ -169,6 +169,10 @@ def fingerprint_webapp(url: str) -> dict:
         "Express":  [r'X-Powered-By.*Express'],
         "WordPress":[r'wp-content', r'wp-json'],
         "Drupal":   [r'drupal', r'/sites/default/'],
+        "PHP":      [r'\.php[\?"\'>\s]', r'PHPSESSID', r'\.phtml'],
+        "CGI":      [r'/cgi-bin/', r'\.cgi[\?"\'>\s]'],
+        "JSP":      [r'\.jsp[\?"\'>\s]', r'JSESSIONID'],
+        "ASP.NET":  [r'\.aspx?[\?"\'>\s]', r'ASP\.NET_SessionId', r'__VIEWSTATE'],
     }
     for tech, patterns in tech_signals.items():
         for pat in patterns:
@@ -539,6 +543,45 @@ def run_hunt(target: str, full: bool = False, scope_lock: bool = False):
     subprocess.run(cmd, cwd=SCRIPT_DIR)
 
 
+def run_legacy_crawl(target_url: str, creds: str, creds_b: str = None,
+                     output_dir: str = None) -> dict:
+    """Route to legacy_crawler.py for PHP/CGI/JSP app crawling + fuzzing."""
+    sys.path.insert(0, SCRIPT_DIR)
+    from legacy_crawler import LegacyCrawler
+    crawler = LegacyCrawler(
+        target_url=target_url, creds=creds, creds_b=creds_b,
+        output_dir=output_dir,
+    )
+    results = crawler.run_comprehensive_scan()
+
+    # Save results
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    from urllib.parse import urlparse as _up
+    domain = _up(target_url).netloc.replace(":", "_")
+    out_file = os.path.join(output_dir or ".", f"legacy_vapt_{domain}_{ts}.json")
+    try:
+        with open(out_file, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        log("ok", f"Results: {out_file}")
+    except Exception as e:
+        log("warn", f"Could not save results: {e}")
+
+    vs = results.get("vulnerability_summary", {})
+    print(f"\n  {W}{'─' * 56}{N}")
+    print(f"  {W}  LEGACY CRAWLER RESULTS{N}")
+    print(f"  {W}{'─' * 56}{N}")
+    print(f"  {C}  Pages   :{N} {results.get('scan_info', {}).get('pages_crawled', 0)}")
+    print(f"  {C}  Forms   :{N} {results.get('scan_info', {}).get('forms_discovered', 0)}")
+    print(f"  {C}  Payloads:{N} {results.get('scan_info', {}).get('payloads_tested', 0)}")
+    print(f"  {R}  Critical:{N} {vs.get('critical', 0)}")
+    print(f"  {Y}  High    :{N} {vs.get('high', 0)}")
+    print(f"  {O}  Medium  :{N} {vs.get('medium', 0)}")
+    print(f"  {D}  Low     :{N} {vs.get('low', 0)}")
+    print(f"  {W}{'─' * 56}{N}\n")
+
+    return results
+
+
 def run_api_vapt(base_url: str, creds: str, creds_b: str = None,
                  with_brain: bool = True, output_dir: str = None):
     """Route to autopilot_api_hunt.run_autopilot() for authenticated API VAPT."""
@@ -595,7 +638,7 @@ def make_output_dir(target: str) -> str:
 
 def parse_cli_args() -> dict:
     """Parse command-line arguments. Minimal — most decisions are automatic."""
-    args = {"target": "", "creds": "", "creds_b": "", "verify_fix": "", "code_url": ""}
+    args = {"target": "", "creds": "", "creds_b": "", "verify_fix": "", "code_url": "", "legacy": False}
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
@@ -607,6 +650,8 @@ def parse_cli_args() -> dict:
             args["verify_fix"] = argv[i + 1]; i += 2
         elif argv[i] == "--code-url" and i + 1 < len(argv):
             args["code_url"] = argv[i + 1]; i += 2
+        elif argv[i] == "--legacy":
+            args["legacy"] = True; i += 1
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -807,18 +852,53 @@ def main():
         return
 
     if creds:
-        # Authenticated API VAPT
         output_dir = make_output_dir(urlparse(url).netloc)
         log("info", f"Output: {output_dir}")
         print()
 
-        result = run_api_vapt(
-            base_url=api_base,
-            creds=creds,
-            creds_b=creds_b,
-            with_brain=with_brain,
-            output_dir=output_dir,
-        )
+        # Detect legacy app: no JS bundles, no API, PHP/CGI/JSP indicators
+        is_legacy = cli.get("legacy", False)
+        if not is_legacy and fp:
+            legacy_tech = any(t in str(fp.get("tech", [])).lower()
+                             for t in ["php", "cgi", "jsp", "asp", "coldfusion"])
+            no_spa = fp.get("js_chunks", 0) == 0
+            no_api = not fp.get("api_detected", False)
+            has_login = fp.get("login_detected", False)
+            is_legacy = legacy_tech or (no_spa and no_api and has_login)
+
+        if is_legacy:
+            log("ok", "Legacy app detected — using browser-based crawler + fuzzer")
+            try:
+                result = run_legacy_crawl(
+                    target_url=url,
+                    creds=creds,
+                    creds_b=creds_b,
+                    output_dir=output_dir,
+                )
+                findings_dir = output_dir
+                if result and result.get("vulnerabilities"):
+                    print(f"\n  {G}Legacy crawler complete.{N} {len(result['vulnerabilities'])} finding(s).\n")
+                else:
+                    print(f"\n  {D}Legacy crawler complete. No findings.{N}")
+                    findings_dir = None
+            except ImportError:
+                log("warn", "playwright not installed — falling back to API autopilot")
+                log("info", "  Install: pip install playwright && playwright install chromium")
+                is_legacy = False
+            except Exception as e:
+                log("err", f"Legacy crawler failed: {e}")
+                log("info", "Falling back to API autopilot...")
+                is_legacy = False
+
+        if not is_legacy:
+            # Authenticated API VAPT (modern SPA/REST apps)
+            result = run_api_vapt(
+                base_url=api_base,
+                creds=creds,
+                creds_b=creds_b,
+                with_brain=with_brain,
+                output_dir=output_dir,
+            )
 
         # ── Step 6: Post-scan ─────────────────────────────────────────────
         if result and result.get("findings"):
