@@ -127,14 +127,21 @@ class LegacyCrawler:
         html = await page.content()
 
         # Strategy 1: fill visible username + password fields
+        # Use full email for fields that expect it (useremail, email, login)
         filled = False
-        for user_sel in ['input[name="useremail"]', 'input[name="username"]', 'input[name="user"]',
-                         'input[name="email"]', 'input[name="login"]', 'input[type="email"]',
-                         'input[type="text"]:not([type="hidden"])']:
+        for user_sel, fill_val in [
+            ('input[name="useremail"]', user),  # Rediffmail Pro style
+            ('input[name="username"]', user),
+            ('input[name="email"]', user),
+            ('input[name="login"]', user),
+            ('input[name="user"]', user.split('@')[0] if '@' in user else user),
+            ('input[type="email"]', user),
+            ('input[type="text"]:visible', user),
+        ]:
             try:
                 el = await page.query_selector(user_sel)
                 if el and await el.is_visible():
-                    await el.fill(user)
+                    await el.fill(fill_val)
                     filled = True
                     break
             except Exception:
@@ -175,7 +182,10 @@ class LegacyCrawler:
                 continue
 
         if submitted:
-            await page.wait_for_load_state('networkidle')
+            try:
+                await page.wait_for_load_state('networkidle', timeout=15000)
+            except Exception:
+                await page.wait_for_timeout(3000)
 
         cookies = await context.cookies()
         cookie_dict = {c['name']: c['value'] for c in cookies}
@@ -202,7 +212,13 @@ class LegacyCrawler:
 
     async def _crawl(self, page) -> None:
         """BFS crawl from current page, extracting forms."""
-        queue = [self.target_url]
+        # Start with target URL + current page URL + common admin paths
+        queue = [self.target_url, page.url]
+        # Add common subpaths for legacy apps
+        for subpath in ['/admin', '/admin/', '/dashboard', '/index.php', '/main',
+                        '/scriptsNew/adminIndex.phtml', '/ajaxprism/home',
+                        '/ajaxprism/container']:
+            queue.append(f"{self.base_url}{subpath}")
         # Also find links from the current page
         try:
             links = await page.evaluate('''() => {
@@ -587,15 +603,34 @@ class LegacyCrawler:
             page, info = await self._login(context_a)
             self._sync_cookies(info['cookies'])
 
+            # Handle post-login navigation (META redirects, JS redirects)
+            for _ in range(3):
+                try:
+                    await page.wait_for_load_state('domcontentloaded', timeout=8000)
+                    break
+                except Exception:
+                    await page.wait_for_timeout(2000)
+
+            # Re-sync cookies after all redirects
+            self._sync_cookies(await context_a.cookies())
+
             # Handle post-login interstitials (privacy policy, etc.)
-            content = await page.content()
+            try:
+                content = await page.content()
+            except Exception:
+                await page.wait_for_timeout(3000)
+                content = await page.content()
+
             for accept_sel in ['#btn_accept', 'button:has-text("Accept")',
                                'button:has-text("I Accept")', 'a:has-text("Skip")']:
                 try:
                     btn = await page.query_selector(accept_sel)
                     if btn and await btn.is_visible():
                         await btn.click()
-                        await page.wait_for_load_state('networkidle')
+                        try:
+                            await page.wait_for_load_state('networkidle', timeout=10000)
+                        except Exception:
+                            await page.wait_for_timeout(3000)
                         _log_line('ok', f"Dismissed interstitial ({accept_sel})")
                         self._sync_cookies(await context_a.cookies())
                         break
