@@ -1,5 +1,24 @@
 # Changelog
 
+## v7.1.1 — README refresh for v5.x → v7.x features (2026-04-18)
+
+**Docs-only.** The README had drifted badly — TOC, "What's New", file structure, and vulnerability coverage sections all still described v4.1, even though nine releases had landed since. This patch refreshes those sections to reflect the actual current feature set.
+
+### Changed
+- **TOC link bar** — swapped "What's New in v4.1" for "What's New in v7.x" + "Engagement Privacy".
+- **"What's New" section** — replaced the v4.1 HAR block with a v5.0 → v7.1 rollup: CVSS 4.0, HackerOne MCP, CI/CD scanner, `/pickup`, credential store, bb-methodology, `/intel`, meme-coin/Solana/DEX LP domain, `/remember` + `/surface` + recon-ranker, `/autopilot`, sneaky_bits, 229-test suite, engagement privacy proxy. The legacy v2.0 and v4.1 sections are preserved below for historical context.
+- **File Structure tree** — added `validate.py`, `credential_store.py`, `intel_engine.py`, `token_scanner.py`, `sneaky_bits.py`, `cicd_scanner.sh`, `llm_anon/`, `mcp/hackerone-mcp/`, refreshed `skills/`, `agents/`, `commands/` rosters, noted `tests/` at 270 tests.
+- **Vulnerability Coverage section** — new tables for web3 meme-coin, CI/CD / supply chain, LLM red-team, and Engagement Privacy domains.
+- **New "Engagement Privacy" section** — copy-paste-ready two-terminal quickstart showing what Claude sees (surrogates) vs what the operator sees (real data).
+
+### Why this was necessary (noted by the user)
+"You are not updating readme." Correct — I'd only been updating the single-line version string on line 12 of README.md, which meant the body still advertised v4.1 capabilities to anyone browsing the repo. All the v5.x – v7.x work was effectively invisible unless someone read `CHANGELOG.md`. Fixed.
+
+### Ported from
+N/A — original content.
+
+---
+
 ## v7.1.0 — Claude Code anonymization reverse proxy (2026-04-18)
 
 Builds the FastAPI reverse proxy on top of the v7.0 core. Point `ANTHROPIC_BASE_URL` at the proxy and Claude Code becomes content-safe for engagement work.
