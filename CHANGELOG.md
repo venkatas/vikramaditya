@@ -1,5 +1,28 @@
 # Changelog
 
+## v5.4.0 — secure credential store (2026-04-18)
+
+### Added
+- `credential_store.py` — loads credentials from `.env`, exposes `.get()`, `.has()`, `.keys()`, `.get_masked()`, and `.as_headers(key, header_type=bearer|cookie|api_key)`. Never logs raw values; `__str__` auto-masks.
+
+### Why
+Hunt artifacts in `findings/<target>/session*.json` have historically captured raw cookies and Bearer tokens. CredentialStore provides a single import surface for `auth_utils.py`, `autopilot_api_hunt.py`, and HAR-based flows so secrets live in a `.gitignored` `.env` instead of being passed as CLI args (which end up in shell history).
+
+### Usage
+```python
+from credential_store import CredentialStore
+
+store = CredentialStore(".env")
+headers = store.as_headers("TARGET_COOKIE", header_type="cookie")
+# -> {"Cookie": "session=xyz"}
+print(store)  # CredentialStore(TARGET_COOKIE=ses***)
+```
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `tools/credential_store.py` (PR #10).
+
+---
+
 ## v5.3.0 — /pickup session resume + auto-logged summaries (2026-04-18)
 
 ### Added
