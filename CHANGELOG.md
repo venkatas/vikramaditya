@@ -1,5 +1,23 @@
 # Changelog
 
+## v6.1.0 — /remember + /surface + recon-ranker (2026-04-18)
+
+### Added
+- `commands/remember.md` — `/remember` turns the current hunt's findings into reusable patterns (writes to both `journal.jsonl` and `patterns.jsonl`).
+- `commands/surface.md` — `/surface` produces a P1 / P2 / Kill-List prioritization of the attack surface from the existing `recon/` cache.
+- `agents/recon-ranker.md` — the agent `/surface` dispatches to. Reads recon + memory, ranks, justifies each tier.
+
+### Why
+Vikramaditya has a massive `recon/` cache from 20+ engagements and a growing `hunt-memory/journal.jsonl` from v5.3.0 — but no prioritization step between "I ran recon" and "I started hunting." This trio closes that gap: `/surface` ranks, `/remember` captures learnings, and the ranker agent coordinates them with the existing `prioritize.py`.
+
+### Conflict resolution
+Vikramaditya's existing `prioritize.py` continues to do raw scoring; recon-ranker sits *on top*, consuming its output and layering in hunt-memory context.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `commands/remember.md`, `commands/surface.md`, `agents/recon-ranker.md`.
+
+---
+
 ## v6.0.0 — meme-coin / Solana / DEX LP security (2026-04-18)
 
 **Major:** adds an entire new web3 sub-domain to Vikramaditya.
