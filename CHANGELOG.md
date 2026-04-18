@@ -1,5 +1,20 @@
 # Changelog
 
+## v5.3.0 — /pickup session resume + auto-logged summaries (2026-04-18)
+
+### Added
+- `memory/schemas.py::make_session_summary_entry()` — builds a validated `session_summary` journal entry for auto-logging at session end.
+- `memory/hunt_journal.py::log_session_summary()` — safe wrapper that appends one, swallows errors so auto-logging never crashes the hunt loop.
+- `commands/pickup.md` — `/pickup <target>` slash command that reads the journal and surfaces untested endpoints, prior findings, and warm-restart context for a target.
+
+### Why
+Vikramaditya already has rich `findings/` and `recon/` history across 20+ engagements (adani, rediff, scm.ap.gov.in, mailpoc.in, etc.) but no resume UX. `/pickup target.com` gives a 30-second warm restart instead of re-reading stale md files. Auto-summaries close the loop by populating memory without needing a manual `/remember`.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `commands/pickup.md` + `memory/hunt_journal.py::log_session_summary()` (PR #9 auto-memory follow-up).
+
+---
+
 ## v5.2.0 — CI/CD workflow scanner (2026-04-18)
 
 ### Added
