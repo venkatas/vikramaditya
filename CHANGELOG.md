@@ -1,5 +1,34 @@
 # Changelog
 
+## v7.1.5 — recon.sh filename reconciliation (two silent-skip bugs) (2026-04-18)
+
+Re-running v7.1.4 on testfire.net immediately surfaced the next layer: the new `_collect_openapi_post_endpoints` feed was starved because **Phase 6.5 had been skipping for weeks without anyone noticing** — `recon.sh` hunted for `openapi_audit.py` while the actual file is `api_audit.py`. The test I wrote to catch this also flagged a **second** mismatch: `refresh_priority()` wanted `tech_priority.py`; the actual file is `prioritize.py`.
+
+Both scripts were correctly guarded with `[ -f "$script" ]`, so they failed silent-skip-mode with a single warning line buried in hundreds of lines of scan output. Phase 4 priority-scoring and Phase 6.5 OpenAPI discovery therefore both ran as no-ops on every Vikramaditya invocation.
+
+### Fixes
+- `recon.sh::Phase 6.5` — `OPENAPI_AUDIT` now prefers `api_audit.py` with `openapi_audit.py` as fallback. `api_audit.py --help` already accepts `--recon-dir --max-hosts --max-ops` exactly as recon.sh calls it.
+- `recon.sh::refresh_priority()` — `priority_script` now prefers `prioritize.py` with `tech_priority.py` as fallback. Same two-positional CLI (`httpx_full.txt → prioritized_hosts.txt`), drop-in.
+
+### Regression guard — `tests/test_recon_sh_refs.py`
+Parametrised over every `$SCRIPT_DIR/<name>.(py|sh)` reference in `recon.sh` + `scanner.sh`. Each must exist at repo root or have a sibling fallback in the same shell. Subdir references (e.g. `tools/XSStrike/xsstrike.py` for externally-cloned helpers) are skipped because they're meant to be optional and properly guarded.
+
+### Impact
+Phase 4 and Phase 6.5 are both restored — the `api_specs/` dir will now populate with harvested OpenAPI specs, which flows straight into v7.1.4's `_collect_openapi_post_endpoints` → sqlmap pipeline. In other words, the *actual* end-to-end SQLi detection chain for `/api/login`-style endpoints is alive for the first time.
+
+### Verified
+```
+$ python3 -m pytest tests/test_recon_sh_refs.py -v
+5 passed in 0.01s
+$ python3 -m pytest tests/
+388 passed in 1.06s
+```
+
+### Found by
+Re-running v7.1.4 on testfire.net — Monitor fired `api_audit.py not found or no live hosts — skipping OpenAPI discovery` within 30 s, which turned out to be the actual root cause for why Phase 6.5 never populated `api_specs/`. v7.1.3 had patched the SyntaxError in the file; v7.1.5 now patches the callers that never reached the file.
+
+---
+
 ## v7.1.4 — SQLi plumbing fixes found via testfire.net dogfooding (2026-04-18)
 
 Four bugs surfaced while running Vikramaditya end-to-end on `https://testfire.net/`. None of them throw an error; they silently degrade coverage. Fixes are all in `hunt.py::run_sqlmap_targeted` and `brain.py::triage_finding`.
