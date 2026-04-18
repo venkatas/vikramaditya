@@ -1,5 +1,50 @@
 # Changelog
 
+## v7.1.2 — HAR engine: auth-bypass FP fix + finding dedup (2026-04-18)
+
+Found running `vikramaditya.py` against a real rediff-platform HAR capture (233 entries, 172 endpoints). Report had **75 findings including 3 HIGH "Authentication Bypass" entries that were all false positives** — the endpoints correctly rejected unauthenticated requests with `{"success":false,"error":true,"code":440,"message":"invalid session."}`, but the detector's substring heuristic `'"success"' in text` matched the field name even in the error body.
+
+### Bug 1 — `har_vapt_engine.py::test_auth_bypass`
+**Root cause:** The old detector used a substring match on `"success"` to decide if an endpoint returned genuine success data. That substring appears in both `{"success":true}` (real hit) and `{"success":false,"error":true,...}` (error). Every error body that mentioned the field name was misclassified as an authenticated-data leak.
+
+**Fix:** New helper `HARVAPTEngine._is_success_response(resp)` parses the JSON body and requires **all of**:
+- HTTP status `200` (no 3xx/4xx/5xx)
+- No common session-error phrases in body (`invalid session`, `not authenticated`, `please log in`, `unauthorized`, `session expired`)
+- `error != true`
+- `status != false` and `status not in ("error","fail","failure")`
+- `code not in (401, 403, 440)`
+- `success == true` (explicit — field presence alone is no longer enough)
+
+Falls back to the stricter token `"success":true` when the body isn't parseable JSON. Non-JSON HTML landing pages no longer pass.
+
+### Bug 2 — `har_vapt_engine.py::_log` duplicate emissions
+**Root cause:** The file-upload tester probes each endpoint with multiple shell extensions (`shell.php`, `shell.phtml`, `shell.jsp`, etc.) against each candidate field (`file`, `upload`, `upfile`, `upfile1`). Every attempt emitted its own "Accepted, Unverified" MEDIUM — so a single (endpoint, field) pair would appear ~4× in the report.
+
+**Fix:** `_log` now tracks emitted `(type, endpoint_path, parameter)` tuples in `self._emitted_keys`. First emission wins; subsequent attempts against the same triple are silent. Query-string is stripped from the endpoint key so `?a=1` vs `?a=2` don't split the same finding.
+
+### Before / after on `test.har`
+| | v7.1.1 | v7.1.2 |
+|---|---|---|
+| Total findings | 75 | **22** (-71 %) |
+| HIGH (auth bypass) | 3 (all FPs) | **0** ✓ |
+| MEDIUM file-upload | 48 | 12 (1 per unique field) |
+| MEDIUM HTTP TRACE | 3 | 3 |
+| MEDIUM insecure cookie | 1 | 1 |
+| LOW missing headers | 20 | 6 |
+| Unique (type, endpoint, param) = total | N/A | 22 = 22 ✓ |
+
+### Tests
+New `tests/test_har_vapt_engine.py` — 16 regression tests:
+- 12 × `_is_success_response` (the exact rediff-platform FP payload is pinned as `test_invalid_session_payload_is_not_success`)
+- 4 × `_log` dedup (multiple shells collapse, different fields split, different types never collide, query-string doesn't split)
+
+Full-suite baseline: **286 passing tests** (was 270).
+
+### Credit
+Bug found while dogfooding Vikramaditya on a real HAR during a VAPT session — "test our tool" exercise exposed the detector's noise issue.
+
+---
+
 ## v7.1.1 — README refresh for v5.x → v7.x features (2026-04-18)
 
 **Docs-only.** The README had drifted badly — TOC, "What's New", file structure, and vulnerability coverage sections all still described v4.1, even though nine releases had landed since. This patch refreshes those sections to reflect the actual current feature set.
