@@ -294,10 +294,20 @@ def collect_candidate_hosts(recon_dir: Path, max_hosts: int) -> list[str]:
     return dedupe(hosts)[:max_hosts]
 
 
-def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
+        list[dict[str, Any]], list[dict[str, Any]], list[str],
+        list[tuple[str, dict[str, Any]]]]:
+    """Discover OpenAPI/Swagger specs from recon candidate hosts.
+
+    v7.1.9 — also returns ``raw_specs`` so callers can persist parsed specs
+    to disk. sqlmap's OpenAPI→POST feed needs the schema ``$ref`` expansion
+    (username, password, etc.) which gets erased in ``operations.json`` —
+    keeping the raw JSON around lets hunt.py resolve body shapes per op.
+    """
     candidates = collect_candidate_hosts(recon_dir, max_hosts)
     discovered_specs = []
     operations = []
+    raw_specs: list[tuple[str, dict[str, Any]]] = []
     visited = set()
     queued_links = []
 
@@ -315,9 +325,11 @@ def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[list[dict[str, Any]
             spec_meta, ops = extract_operations(parsed, resp["final_url"])
             spec_meta["format"] = fmt
             spec_meta["content_type"] = resp["content_type"]
-            spec_meta["saved_as"] = safe_name(resp["final_url"])
+            saved_as = safe_name(resp["final_url"])
+            spec_meta["saved_as"] = saved_as
             discovered_specs.append(spec_meta)
             operations.extend(ops)
+            raw_specs.append((saved_as, parsed))
             return
 
         body_lower = resp["body"].lower()
@@ -332,7 +344,7 @@ def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[list[dict[str, Any]
     for extra in dedupe(queued_links):
         probe(extra)
 
-    return discovered_specs, operations, candidates
+    return discovered_specs, operations, candidates, raw_specs
 
 
 def audit_public_operations(operations: list[dict[str, Any]], max_ops: int) -> list[dict[str, Any]]:
@@ -375,6 +387,7 @@ def write_outputs(
     discovered_specs: list[dict[str, Any]],
     operations: list[dict[str, Any]],
     findings: list[dict[str, Any]],
+    raw_specs: list[tuple[str, dict[str, Any]]] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -386,6 +399,15 @@ def write_outputs(
     (output_dir / "discovered_specs.json").write_text(json.dumps(discovered_specs, indent=2))
     (output_dir / "operations.json").write_text(json.dumps(operations, indent=2))
     (output_dir / "unauth_findings.json").write_text(json.dumps(findings, indent=2))
+    # v7.1.9 — persist each parsed spec as ``<saved_as>.json`` so
+    # hunt.py's sqlmap feed can walk ``$ref``/``properties`` and emit
+    # accurate bodies (``{"username":"test","password":"test"}``) instead
+    # of stubs (``{"test":"1"}``). Without this, sqlmap can't find the
+    # injectable parameter because the field name is wrong.
+    for saved_as, parsed in (raw_specs or []):
+        (output_dir / f"{saved_as}.json").write_text(
+            json.dumps(parsed, separators=(",", ":"))
+        )
     (output_dir / "spec_urls.txt").write_text("\n".join(spec_urls) + ("\n" if spec_urls else ""))
     (output_dir / "all_operations.txt").write_text(
         "\n".join(op["sample_url"] for op in operations) + ("\n" if operations else "")
@@ -450,9 +472,10 @@ def main() -> int:
         return 1
 
     output_dir = recon_dir / "api_specs"
-    discovered_specs, operations, _ = discover_specs(recon_dir, max_hosts=max(1, args.max_hosts))
+    discovered_specs, operations, _, raw_specs = discover_specs(
+        recon_dir, max_hosts=max(1, args.max_hosts))
     findings = [] if args.discover_only else audit_public_operations(operations, max_ops=max(1, args.max_ops))
-    write_outputs(output_dir, discovered_specs, operations, findings)
+    write_outputs(output_dir, discovered_specs, operations, findings, raw_specs=raw_specs)
 
     print(f"[*] OpenAPI specs discovered: {len(discovered_specs)}")
     print(f"[*] Parsed operations:        {len(operations)}")

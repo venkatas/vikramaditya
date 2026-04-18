@@ -1508,6 +1508,62 @@ def _collect_openapi_post_endpoints(recon_dir: str, *,
             return {name: "test" for name in props}
         return {}
 
+    # v7.1.9 — pre-load every raw OpenAPI spec in the dir into an index
+    # keyed by (path, method). api_audit.py's ``operations.json`` drops
+    # the body schema (it only remembers ``in:body`` / ``name:body``),
+    # which is useless to sqlmap — we need the real property names so
+    # ``--data='{"username":"…","password":"…"}'`` actually reaches the
+    # injectable field. The raw specs DO carry the schema via ``$ref``,
+    # so index them up front and look up body params per operation.
+    _spec_op_index: dict[tuple[str, str], dict] = {}
+    for spec_path in _glob.glob(os.path.join(specs_dir, "*.json")):
+        base = os.path.basename(spec_path)
+        if base in ("discovered_specs.json", "operations.json",
+                    "unauth_findings.json"):
+            continue
+        try:
+            raw_spec = json.load(open(spec_path))
+        except Exception:
+            continue
+        if not isinstance(raw_spec, dict) or "paths" not in raw_spec:
+            continue
+        defs = raw_spec.get("definitions") or {}
+        if not defs:
+            defs = (raw_spec.get("components") or {}).get("schemas") or {}
+        for op_path, ops_dict in (raw_spec.get("paths") or {}).items():
+            if not isinstance(ops_dict, dict):
+                continue
+            for m, meta in ops_dict.items():
+                if isinstance(meta, dict):
+                    _spec_op_index[(op_path, m.lower())] = {
+                        "meta": meta, "definitions": defs,
+                    }
+
+    def _body_from_spec(path: str, method: str) -> dict:
+        """Resolve the ``$ref`` body schema for ``(path, method)``."""
+        entry = _spec_op_index.get((path, method.lower()))
+        if not entry:
+            return {}
+        meta, defs = entry["meta"], entry["definitions"]
+        # Swagger 2.0 ``parameters[in=body]`` + OpenAPI 3 ``requestBody.content``.
+        for p in (meta.get("parameters") or []):
+            if isinstance(p, dict) and p.get("in") == "body":
+                return _sample_body(p.get("schema") or {}, defs)
+        if isinstance(meta.get("requestBody"), dict):
+            rb = meta["requestBody"].get("content") or {}
+            for _ct, val in rb.items():
+                if isinstance(val, dict):
+                    body = _sample_body(val.get("schema") or {}, defs)
+                    if body:
+                        return body
+        # formData fallback (non-JSON multipart/urlencoded APIs)
+        form = {p.get("name"): "test"
+                for p in (meta.get("parameters") or [])
+                if isinstance(p, dict)
+                and p.get("in") == "formData"
+                and p.get("name")}
+        return form
+
     # ── Path 1: operations.json (api_audit.py's pre-parsed output) ─────
     ops_json = os.path.join(specs_dir, "operations.json")
     if os.path.isfile(ops_json):
@@ -1528,15 +1584,17 @@ def _collect_openapi_post_endpoints(recon_dir: str, *,
                 key = (method, url)
                 if key in seen_targets:
                     continue
-                # operations.json lists parameters flat; filter to body-like ones.
-                body = {}
-                for p in (op.get("parameters") or []):
-                    if isinstance(p, dict) and p.get("in") in ("body", "formData"):
-                        name = p.get("name") or ""
-                        if name:
-                            body[name] = "test"
-                # If no body params listed, fall back to a single stub so the
-                # downstream sqlmap invocation still has --data content.
+                # v7.1.9 — resolve body schema from the raw spec first; it has
+                # the $ref expansion that operations.json dropped.
+                body = _body_from_spec(op.get("path", ""), method)
+                # Legacy fallback: operations.json parameters flat listing
+                # (unlikely to have body field names, but cheap to try).
+                if not body:
+                    for p in (op.get("parameters") or []):
+                        if isinstance(p, dict) and p.get("in") in ("body", "formData"):
+                            name = p.get("name") or ""
+                            if name and name != "body":
+                                body[name] = "test"
                 if not body:
                     body = {"test": "1"}
                 endpoints.append({
