@@ -120,11 +120,23 @@ class HARVAPTEngine:
 
     def _log(self, severity: str, vuln_type: str, url: str, detail: str,
              evidence: str = "", param: str = "", payload: str = ""):
+        # Dedup on (type, endpoint, parameter). The file-upload tester probes
+        # the same (url, field) with multiple shell extensions; emitting 12
+        # copies of the same "Accepted, Unverified" per endpoint drowns the
+        # report. Keep the first hit, count the rest silently.
+        endpoint_key = url.split('?')[0]
+        dup_key = (vuln_type, endpoint_key, param)
+        if not hasattr(self, '_emitted_keys'):
+            self._emitted_keys = set()
+        if dup_key in self._emitted_keys:
+            return
+        self._emitted_keys.add(dup_key)
+
         v = {
             'timestamp': datetime.now().isoformat(),
             'type': vuln_type,
             'severity': severity,
-            'endpoint': url.split('?')[0],
+            'endpoint': endpoint_key,
             'full_url': url[:500],
             'details': detail,
             'evidence': evidence[:500],
@@ -133,7 +145,7 @@ class HARVAPTEngine:
         }
         self.vulnerabilities.append(v)
         icon = {'critical': '🔴', 'high': '🟠', 'medium': '🟡', 'low': '🔵'}.get(severity, '⚪')
-        print(f"   {icon} [{severity.upper()}] {vuln_type}: {url.split('?')[0]}")
+        print(f"   {icon} [{severity.upper()}] {vuln_type}: {endpoint_key}")
         print(f"      {detail[:120]}")
 
     # ── Collect fuzzable targets from HAR ─────────────────────────────────
@@ -440,6 +452,52 @@ class HARVAPTEngine:
 
     # ── Authentication Bypass ─────────────────────────────────────────────
 
+    @staticmethod
+    def _is_success_response(resp) -> bool:
+        """True iff the response body signals a genuine authenticated success.
+
+        The previous heuristic ``'"success"' in text`` matched both
+        ``{"success":true}`` (real hit) and ``{"success":false,"error":true,
+        "code":440,"message":"invalid session."}`` (unauth error) — producing
+        false-positive HIGH 'Authentication Bypass' findings for any error
+        payload that mentioned the field name. Now we parse the JSON and
+        require ``success == True`` with no error markers.
+        """
+        if resp.status_code >= 400 or resp.status_code in (301, 302):
+            return False
+        # Reject the common "session expired / invalid" error codes even if 200.
+        for marker in ("invalid session", "invalid_session",
+                       "session expired", "not authenticated",
+                       "authentication required", "unauthorized",
+                       "please log in", "please login"):
+            if marker in resp.text.lower():
+                return False
+        body = resp.text
+        if not body:
+            return False
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            # Non-JSON body — fall back to the old heuristic but require the
+            # explicit ``"success":true`` rather than bare field presence.
+            return '"success":true' in body.lower() or '"success": true' in body.lower()
+        if not isinstance(parsed, dict):
+            return False
+        # Explicit error markers win — e.g. {"success":false,"error":true}
+        if parsed.get('error') is True:
+            return False
+        status_val = parsed.get('status')
+        if isinstance(status_val, bool) and status_val is False:
+            return False
+        if isinstance(status_val, str) and status_val.lower() in ('error', 'fail', 'failure'):
+            return False
+        if parsed.get('code') in (401, 403, 440):
+            return False
+        if parsed.get('success') is True:
+            return True
+        # Body lacks any success flag — treat as ambiguous, not a bypass.
+        return False
+
     def test_auth_bypass(self) -> Dict:
         print("\n🧪 Authentication Bypass (dynamic endpoints only)...")
         results = {'tested': 0, 'vulnerable': []}
@@ -453,32 +511,36 @@ class HARVAPTEngine:
 
         for ep in auth_eps:
             url = ep['url']
-            path = ep.get('path', '')
             results['tested'] += 1
 
-            # Get authenticated baseline
+            # Get authenticated baseline.
             try:
                 auth_r = self.session.post(url, data=ep.get('post_params', {}), timeout=15)
                 auth_size = len(auth_r.text)
-                auth_has_data = '"Success"' in auth_r.text or '"success"' in auth_r.text
+                auth_has_data = self._is_success_response(auth_r)
             except Exception:
                 continue
 
             if not auth_has_data:
-                continue  # endpoint doesn't return success with auth — skip
+                continue  # endpoint doesn't return a genuine success with auth — skip
 
-            # Test without cookies
+            # Test without cookies.
             try:
                 noauth_r = unauth.post(url, data=ep.get('post_params', {}), timeout=15)
-                if '"Success"' in noauth_r.text or '"success"' in noauth_r.text:
-                    # Verify it's not just a generic success page
-                    if abs(len(noauth_r.text) - auth_size) < 50:
-                        self._log('high', 'Authentication Bypass', url,
-                                  f"Endpoint returns authenticated data without session cookies",
-                                  evidence=noauth_r.text[:200])
-                        results['vulnerable'].append(url)
             except Exception:
-                pass
+                continue
+
+            if not self._is_success_response(noauth_r):
+                continue  # server correctly rejected — not a bypass
+            # Response body must also be shape-similar to the authenticated one —
+            # a generic 200 landing page would size-diverge sharply.
+            if abs(len(noauth_r.text) - auth_size) >= 50:
+                continue
+
+            self._log('high', 'Authentication Bypass', url,
+                      "Endpoint returns authenticated data without session cookies",
+                      evidence=noauth_r.text[:200])
+            results['vulnerable'].append(url)
 
         self.test_results['auth_bypass'] = results
         return results
