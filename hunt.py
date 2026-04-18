@@ -1462,14 +1462,25 @@ def _collect_urls_from_file(path: str, *, require_query: bool = False,
 def _collect_openapi_post_endpoints(recon_dir: str, *,
                                      limit: int = 30) -> list[dict]:
     """Extract ``{url, method, json_body}`` for every POST/PUT/PATCH operation
-    in ``recon_dir/api_specs/*.json`` OpenAPI / Swagger specs.
+    api_audit.py has already discovered in ``recon_dir/api_specs/``.
 
-    Added in v7.1.4 after the testfire.net dogfood: the Swagger-discovered
-    ``/api/login`` was never handed to sqlmap because the candidate
-    aggregator only ingested GET URLs from paramspider / wayback / gau.
+    Two parse paths (v7.1.7):
+
+    1. **Primary** — ``operations.json`` (list of pre-parsed op dicts).
+       api_audit.py writes this with ``{method, path, sample_url,
+       parameters, requires_auth, ...}`` already extracted across every
+       spec it found. Cheaper + correct — no need to re-walk specs.
+
+    2. **Fallback** — raw OpenAPI/Swagger spec files saved as
+       ``<host>_<hash>.json``. Only used when ``operations.json`` is
+       absent; skips files that aren't actually spec dicts (the other
+       ``*.json`` artefacts in the dir — ``discovered_specs.json``,
+       ``unauth_findings.json`` — are both lists, which in v7.1.6 caused
+       ``AttributeError: 'list' object has no attribute 'get'`` and
+       crashed the whole SQLMAP phase).
 
     The body-schema walker is intentionally dumb — it generates a flat
-    ``"string"`` value for every property so sqlmap has material to fuzz.
+    ``"test"`` value for every property so sqlmap has material to fuzz.
     Pinning a richer schema walk would be nice but "param-present" is all
     the boolean-blind detection actually needs.
     """
@@ -1482,39 +1493,102 @@ def _collect_openapi_post_endpoints(recon_dir: str, *,
     endpoints: list[dict] = []
     seen_targets: set[tuple[str, str]] = set()
 
-    def _sample_body(schema: dict, definitions: dict) -> dict:
+    def _sample_body(schema, definitions):
         # Follow a single $ref hop. Anything deeper falls through to an
         # empty object — sqlmap still gets "something" to inject into.
+        if not isinstance(schema, dict):
+            return {}
         if "$ref" in schema:
             ref = schema["$ref"].split("/")[-1]
-            schema = definitions.get(ref, {})
+            schema = definitions.get(ref, {}) if isinstance(definitions, dict) else {}
+            if not isinstance(schema, dict):
+                return {}
         props = schema.get("properties") or {}
-        if props:
+        if isinstance(props, dict) and props:
             return {name: "test" for name in props}
         return {}
 
+    # ── Path 1: operations.json (api_audit.py's pre-parsed output) ─────
+    ops_json = os.path.join(specs_dir, "operations.json")
+    if os.path.isfile(ops_json):
+        try:
+            ops = json.load(open(ops_json))
+        except Exception:
+            ops = []
+        if isinstance(ops, list):
+            for op in ops:
+                if not isinstance(op, dict):
+                    continue
+                method = str(op.get("method", "")).upper()
+                if method not in ("POST", "PUT", "PATCH"):
+                    continue
+                url = op.get("sample_url") or op.get("url") or ""
+                if not url.startswith(("http://", "https://")):
+                    continue
+                key = (method, url)
+                if key in seen_targets:
+                    continue
+                # operations.json lists parameters flat; filter to body-like ones.
+                body = {}
+                for p in (op.get("parameters") or []):
+                    if isinstance(p, dict) and p.get("in") in ("body", "formData"):
+                        name = p.get("name") or ""
+                        if name:
+                            body[name] = "test"
+                # If no body params listed, fall back to a single stub so the
+                # downstream sqlmap invocation still has --data content.
+                if not body:
+                    body = {"test": "1"}
+                endpoints.append({
+                    "url": url,
+                    "method": method,
+                    "json_body": body,
+                })
+                seen_targets.add(key)
+                if len(endpoints) >= limit:
+                    return endpoints
+
+    # ── Path 2: raw spec files (only if operations.json was empty) ─────
+    if endpoints:
+        return endpoints
+
     for path in sorted(_glob.glob(os.path.join(specs_dir, "*.json"))):
+        if os.path.basename(path) in (
+            "discovered_specs.json",   # list of meta dicts, not a spec
+            "unauth_findings.json",    # list
+            "operations.json",         # already consumed above
+        ):
+            continue
         try:
             spec = json.load(open(path))
         except Exception:
             continue
+        # Defensive: skip any payload that isn't an OpenAPI-shaped dict.
+        # The v7.1.7 AttributeError came from exactly this.
+        if not isinstance(spec, dict) or "paths" not in spec:
+            continue
         host = spec.get("host") or ""
         base_path = spec.get("basePath") or ""
-        scheme = (spec.get("schemes") or ["https"])[0]
+        schemes_val = spec.get("schemes")
+        scheme = schemes_val[0] if isinstance(schemes_val, list) and schemes_val else "https"
         defs = spec.get("definitions") or {}
-        # OpenAPI 3 uses servers + components.schemas
-        if not host and spec.get("servers"):
-            server0 = spec["servers"][0].get("url", "")
-            from urllib.parse import urlparse as _up
-            p = _up(server0)
-            if p.netloc:
-                host = p.netloc
-                base_path = p.path or ""
-                scheme = p.scheme or scheme
-        defs = defs or (spec.get("components") or {}).get("schemas") or {}
+        if not host and isinstance(spec.get("servers"), list) and spec["servers"]:
+            server0 = spec["servers"][0]
+            if isinstance(server0, dict):
+                from urllib.parse import urlparse as _up
+                p = _up(server0.get("url", ""))
+                if p.netloc:
+                    host = p.netloc
+                    base_path = p.path or ""
+                    scheme = p.scheme or scheme
+        defs = defs or ((spec.get("components") or {}).get("schemas") or {})
 
         for op_path, ops in (spec.get("paths") or {}).items():
-            for method, meta in (ops or {}).items():
+            if not isinstance(ops, dict):
+                continue
+            for method, meta in ops.items():
+                if not isinstance(meta, dict):
+                    continue
                 if method.lower() not in ("post", "put", "patch"):
                     continue
                 full = f"{scheme}://{host}{base_path}{op_path}"
@@ -1523,15 +1597,16 @@ def _collect_openapi_post_endpoints(recon_dir: str, *,
                     continue
                 body = {}
                 for p in (meta.get("parameters") or []):
-                    if p.get("in") == "body":
+                    if isinstance(p, dict) and p.get("in") == "body":
                         body = _sample_body(p.get("schema") or {}, defs)
                         break
-                if not body and meta.get("requestBody"):
+                if not body and isinstance(meta.get("requestBody"), dict):
                     rb = meta["requestBody"].get("content") or {}
                     for _ct, val in rb.items():
-                        body = _sample_body(val.get("schema") or {}, defs)
-                        if body:
-                            break
+                        if isinstance(val, dict):
+                            body = _sample_body(val.get("schema") or {}, defs)
+                            if body:
+                                break
                 endpoints.append({
                     "url": full,
                     "method": method.upper(),
