@@ -1,5 +1,29 @@
 # Changelog
 
+## v7.1.3 — syntax regression guard + duplicate `__future__` import fix (2026-04-18)
+
+### Problem
+Running Vikramaditya end-to-end against testfire.net surfaced a `SyntaxError: from __future__ imports must occur at the beginning of the file` in `api_audit.py` (Phase 6.5 Swagger discovery trigger). Follow-up scan of `agent.py` showed the same anti-pattern. Both files had a duplicated `from __future__ import annotations` — line 2 (valid) *and* a second copy after the module docstring (invalid — PEP 236 requires `__future__` imports before any statement except the docstring, and two statements around the docstring form is still OK, but declaring it twice trips the parser).
+
+### Files patched
+- `api_audit.py` — removed the duplicate at line 11.
+- `agent.py` — removed the duplicate at line 41; added `# noqa: E402` to the single remaining import to silence lint.
+
+### Regression guard
+- `tests/test_repo_syntax.py` — parametrised over every `.py` file at repo root (59 files at time of writing); each one must `py_compile.compile(doraise=True)` cleanly. Fails per-file so the culprit names itself in the report line.
+
+### Verified
+```
+$ python3 -m pytest tests/test_repo_syntax.py
+59 passed in 0.15s
+```
+Full-suite baseline: 286 (v7.1.2) + 59 (v7.1.3 syntax tests) = **345 passing**.
+
+### Found by
+Dogfooding — the user asked to run Vikramaditya on `https://testfire.net/` and the scan log caught the `SyntaxError` line via the Monitor filter. Without this fix, Phase 6.5 (OpenAPI discovery) silently fails on any target that triggers an api_audit import.
+
+---
+
 ## v7.1.2 — HAR engine: auth-bypass FP fix + finding dedup (2026-04-18)
 
 Found running `vikramaditya.py` against a real rediff-platform HAR capture (233 entries, 172 endpoints). Report had **75 findings including 3 HIGH "Authentication Bypass" entries that were all false positives** — the endpoints correctly rejected unauthenticated requests with `{"success":false,"error":true,"code":440,"message":"invalid session."}`, but the detector's substring heuristic `'"success"' in text` matched the field name even in the error body.
