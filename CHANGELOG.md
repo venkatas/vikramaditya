@@ -1,5 +1,26 @@
 # Changelog
 
+## v5.2.0 — CI/CD workflow scanner (2026-04-18)
+
+### Added
+- `cicd_scanner.sh` — sisakulint wrapper for GitHub Actions workflow auditing. Single repo, org batch, and URL modes. Detects `pwn_request`, unpinned actions, script injection, missing `permissions:`, reusable-workflow privilege escalation.
+- `commands/cicd.md` — `/cicd` slash command exposing the scanner with the full option set.
+
+### Output
+Findings land in `findings/<target>/cicd/{scan_results.txt, summary.txt}` — same layout as other Vikramaditya scanners.
+
+### Why
+Vikramaditya had zero GitHub Actions / CI-pipeline auditing. `pwn_request` + unpinned-action supply-chain bugs have paid 5-figure bounties on H1 / Intigriti / Immunefi over the last 2 years — a surface the existing web2/web3 scanners don't touch.
+
+### Prerequisites (runtime)
+- `sisakulint` — `go install github.com/ultra-supara/sisakulint/cmd/sisakulint@latest`
+- `gh` CLI authenticated — needed for `org:` batch mode to enumerate repos
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `tools/cicd_scanner.sh` (PR #13).
+
+---
+
 ## v5.1.0 — HackerOne MCP server (2026-04-18)
 
 ### Added
