@@ -1,5 +1,25 @@
 # Changelog
 
+## v6.3.0 — sneaky_bits LLM prompt-injection toolkit (2026-04-18)
+
+### Added
+- `sneaky_bits.py` — encoder/decoder for invisible-Unicode prompt injection. Uses U+2062 (invisible times) = 0 and U+2064 (invisible plus) = 1 plus Variant Selector encoding. Modes: `encode`, `decode`, `wrap --visible X --hidden Y`, `variant-encode`.
+
+### Why
+Vikramaditya tests LLM/AI features via `hai_probe.py`, `hai_payload_builder.py`, and `brain.py` but had no dedicated invisible-Unicode smuggling tool. The technique behind this (embracethered / ASCII Smuggler) is now the reference payload for indirect prompt injection in LLM red-team engagements.
+
+### Smoke test
+```
+$ python3 sneaky_bits.py encode "test"
+[*] Encoded (sneaky): 32 chars
+[*] Visible appearance: ⁢⁤⁤⁤⁢⁤⁢⁢⁢⁤⁤⁢⁢⁤⁢⁤⁢⁤⁤⁤⁢⁢⁤⁤⁢⁤⁤⁤⁢⁤⁢⁢
+```
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `tools/sneaky_bits.py`.
+
+---
+
 ## v6.2.0 — /autopilot orchestrator (agent + command) (2026-04-18)
 
 ### Added
