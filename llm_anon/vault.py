@@ -42,6 +42,16 @@ class Vault:
         self._engagement = engagement_id
         self._ensure_schema()
 
+    @property
+    def engagement_id(self) -> str:
+        """Current engagement identifier — used by health endpoints + logs."""
+        return self._engagement
+
+    @property
+    def db_path(self) -> str:
+        """Filesystem path of the SQLite database (for introspection only)."""
+        return self._db_path
+
     # ------------------------------------------------------------------ DDL
 
     def _connect(self) -> sqlite3.Connection:

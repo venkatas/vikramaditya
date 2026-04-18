@@ -1,5 +1,65 @@
 # Changelog
 
+## v7.1.0 — Claude Code anonymization reverse proxy (2026-04-18)
+
+Builds the FastAPI reverse proxy on top of the v7.0 core. Point `ANTHROPIC_BASE_URL` at the proxy and Claude Code becomes content-safe for engagement work.
+
+### Added
+- `llm_anon/proxy.py` (~230 lines) — FastAPI app. Handles:
+  - JSON request bodies (recursive string walk, every leaf anonymised).
+  - JSON response bodies (recursive deanonymise).
+  - **Server-Sent Events** for `text/event-stream` responses — each `data:` line parsed as JSON, `text_delta` payloads rewritten, stream passes through line-by-line so Claude Code stays interactive.
+  - Binary passthrough (images / octet streams never touched).
+  - `/health` endpoint reporting engagement + vault path + entity histogram.
+  - Injectable `http_client_factory` so tests can swap in `httpx.ASGITransport` for a fake upstream.
+- `commands/anon.md` — `/anon` slash command doc with start / health / vault commands.
+- `tests/test_llm_anon_proxy.py` — 14 tests:
+  - Body transforms: anonymise JSON / plain text / binary / empty bodies, deanonymise round-trip.
+  - SSE handling: comment / event / `[DONE]` / malformed / real `text_delta` deanonymised.
+  - End-to-end integration: proxy talks to a stub upstream via ASGI transport; verifies the upstream sees only surrogates and the response reaching the client has originals restored — for both non-streaming and streaming paths.
+
+### Verified
+```
+$ python3 -m pytest tests/test_llm_anon.py tests/test_llm_anon_proxy.py -v
+41 passed in 0.32s
+```
+Full-suite baseline now **270 passing tests**.
+
+### How to use
+
+```bash
+# Terminal 1 — start the proxy
+export ENGAGEMENT_ID=acme-2026-vapt
+export ANTHROPIC_API_KEY=sk-ant-...     # real key — forwarded to upstream as-is
+python3 -m llm_anon.proxy
+
+# Terminal 2 — point Claude Code at the proxy
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ENGAGEMENT_ID=acme-2026-vapt
+claude
+```
+
+### Threat model (explicit)
+- Prevents *content-based* correlation — Claude never sees real IPs / hashes / credentials / hostnames / emails / AWS keys / JWTs.
+- Does **not** prevent correlation via query patterns, tool-call sequences, or timing.
+- Binds to `127.0.0.1` only. Do not expose on public interfaces.
+- The SQLite vault contains the real↔surrogate mapping — keep it local, keep it encrypted at rest.
+
+### Lessons during the port
+- FastAPI treats un-annotated handler parameters as query string fields → the stub upstream initially returned 422 until `req: Request` was explicitly typed. Updated tests use the imported type name directly (no aliases) so FastAPI's introspection recognises it.
+- Module-level monkey-patching of `httpx.AsyncClient` inside the proxy module leaks into the test's own httpx calls (same module object). Refactored to accept a `http_client_factory` so tests inject the transport cleanly.
+- Vault helper attributes `engagement_id` / `db_path` promoted from underscore-private to public properties so the `/health` endpoint can report per-app state without reading a global env var.
+
+### Still not ported
+- Ollama-backed LLM detection layer (v7.2).
+- Self-improvement feedback loop (v7.3).
+- Upstream's SSH-tunnel + Docker orchestration scripts (out of scope for core repo).
+
+### Design credit
+Same as v7.0: [zeroc00I/LLM-anonymization](https://github.com/zeroc00I/LLM-anonymization) design spec.
+
+---
+
 ## v7.0.0 — VAPT anonymization core (2026-04-18)
 
 **Major:** adds a new security-first domain to Vikramaditya — anonymize real client data before any LLM call, restore on the way back. Shipped as the foundational library (v7.0); the FastAPI reverse proxy that wires it into Claude Code follows in v7.1.
