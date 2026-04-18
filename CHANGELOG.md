@@ -1,5 +1,52 @@
 # Changelog
 
+## v6.4.0 — 229-test suite for core modules (2026-04-18)
+
+### Added
+- `tests/conftest.py` — shared fixtures (`tmp_hunt_dir`, `journal_path`, `patterns_path`, sample entries, scope domains). Patched to resolve Vikramaditya's flat layout (repo root) instead of upstream's `tools/`.
+- 12 ported test modules — total **229 new passing tests**:
+  - `test_audit_log.py` — audit log + rate limiter + circuit breaker
+  - `test_autopilot_guard.py` — AutopilotGuard safety envelope
+  - `test_credential_store.py` — .env loading, masking, header builders
+  - `test_hackerone_mcp.py` + `test_hackerone_server.py` — MCP server behavior
+  - `test_hunt_journal.py` — journal append, query, concurrent writes
+  - `test_intel_engine.py` — CVE/intel orchestration, memory cross-ref
+  - `test_pattern_db.py` — pattern recall + ranking
+  - `test_safe_method_policy.py` — GET-only / dangerous-method gating
+  - `test_schemas.py` — validate_journal_entry / audit / session_summary
+  - `test_scope_checker.py` — anchored subdomain match
+  - `test_token_scanner.py` — rug-vector regex coverage
+
+### Patched during port
+- `from tools.credential_store` → `from credential_store` (root layout)
+- `from tools.token_scanner` → `from token_scanner` (root layout)
+- `sys.path.insert(0, "../tools")` → `sys.path.insert(0, "..")` in `conftest.py`
+
+### Baseline
+```
+$ python3 -m pytest tests/test_audit_log.py tests/test_autopilot_guard.py \
+    tests/test_credential_store.py tests/test_hackerone_mcp.py \
+    tests/test_hackerone_server.py tests/test_hunt_journal.py \
+    tests/test_intel_engine.py tests/test_pattern_db.py \
+    tests/test_safe_method_policy.py tests/test_schemas.py \
+    tests/test_scope_checker.py tests/test_token_scanner.py
+229 passed in 0.68s
+```
+
+### Why
+Before this port, Vikramaditya had 3 test files — `test_browser_agent.py`, `test_reporter_manual.py`, `test_request_guard.py`. Everything else (memory, MCP, credential store, scope checker, token scanner, intel engine) was uncovered. Now every ported module from v5.1.0 onward has test coverage, which makes future refactors safer.
+
+### Deliberately skipped
+- `test_recon_adapter.py` — `recon_adapter.py` doesn't exist in Vikramaditya (test expects a class that was never implemented).
+- `test_report_generator_templates.py` — `report_generator.py` API differs from Vikramaditya's `reporter.py`.
+- `test_hunt_target_types.py` — `hunt.py` differs between forks.
+- `test_vuln_scanner_review_fixes.py` — `vuln_scanner.sh` exists only in upstream; Vikramaditya ships `scanner.sh`.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `tests/` (batches from PR #9, #10, #16).
+
+---
+
 ## v6.3.0 — sneaky_bits LLM prompt-injection toolkit (2026-04-18)
 
 ### Added
