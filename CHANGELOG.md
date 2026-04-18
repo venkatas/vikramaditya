@@ -1,5 +1,29 @@
 # Changelog
 
+## v6.0.0 — meme-coin / Solana / DEX LP security (2026-04-18)
+
+**Major:** adds an entire new web3 sub-domain to Vikramaditya.
+
+### Added
+- `token_scanner.py` (root, 783 lines) — deterministic regex scanner for rug-vector patterns in EVM + Solana token contracts. Detects: unrestricted mint, unbounded fee/tax, trading toggles, hidden transfer hooks, blacklist/whitelist, owner privileges, paused/freezable, honeypot logic. `--chain evm|solana` + `--recursive` + `--json` + `--output` modes.
+- `web3/10-meme-coin-bugs.md` — 8 meme-coin-specific bug classes with grep arsenal and Immunefi paid examples.
+- `web3/11-solana-token-audit.md` — SPL / Token-2022 / freeze-authority / transfer-hook attack surface.
+- `web3/12-dex-lp-attacks.md` — LP / AMM / concentrated-liquidity attacks + sandwich/JIT vectors.
+- `skills/meme-coin-audit/SKILL.md` — workflow skill for auditing meme coin launches.
+- `agents/token-auditor.md` — specialist agent that runs token_scanner.py + routes findings to the appropriate skill.
+- `commands/token-scan.md` — `/token-scan <contract>` slash command.
+
+### Why
+Vikramaditya's web3 coverage stopped at generic DeFi (contracts/ roles / oracles / reentrancy). Meme coin launches, Solana SPL tokens, Token-2022 transfer hooks, and DEX LP concentrated-liquidity bugs pay 5–7 figures on Immunefi and are not reachable via the existing skill set. This bundle closes the gap.
+
+### Verified
+`token_scanner.py` detected `critical` unrestricted-mint, `critical` unbounded-fee, and `medium` trading-toggle + pause-authority patterns on a handcrafted rug contract — regex arsenal intact.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `tools/token_scanner.py`, `web3/10/11/12.md`, `skills/meme-coin-audit/`, `agents/token-auditor.md`, `commands/token-scan.md` (PR #9).
+
+---
+
 ## v5.6.0 — /intel engine (2026-04-18)
 
 ### Added
