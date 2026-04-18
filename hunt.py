@@ -1459,6 +1459,17 @@ def _collect_urls_from_file(path: str, *, require_query: bool = False,
     return urls
 
 
+def _glob_results_csvs(sqli_dir: str) -> list[str]:
+    """All sqlmap ``results-*.csv`` files in ``sqli_dir``.
+
+    v7.1.10 — sqlmap writes CSV summaries on each invocation; scanning
+    them gives a reliable "was anything injectable" signal regardless of
+    whether stdout was captured cleanly by ``run_cmd``.
+    """
+    import glob as _glob
+    return _glob.glob(os.path.join(sqli_dir, "results-*.csv"))
+
+
 def _collect_openapi_post_endpoints(recon_dir: str, *,
                                      limit: int = 30) -> list[dict]:
     """Extract ``{url, method, json_body}`` for every POST/PUT/PATCH operation
@@ -4828,20 +4839,52 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     # v7.1.4 — run each OpenAPI POST operation with its synthesised JSON body.
     # The original candidate aggregator missed these entirely, which is how
     # the testfire.net SQLi on /api/login escaped detection.
+    #
+    # v7.1.10 — sqlmap invocation hardening. Three flags were missing:
+    #
+    #   --headers "Content-Type: application/json"  — JSON APIs reject the
+    #      default text/plain body with HTTP 400; sqlmap's Boolean oracle
+    #      then sees only 400s and can't establish a baseline. Attach
+    #      whenever the body looks like JSON.
+    #   --technique BEU  — skip stacked-query & time-based probes that don't
+    #      work on most REST backends. BEU covers Boolean/Error/Union which
+    #      is what actually finds app-layer SQLi through JSON APIs.
+    #   --smart          — let sqlmap skip non-numeric params heuristically
+    #      so /api/feedback/submit's "message" field doesn't burn 5 minutes.
     for op in openapi_posts:
         body = json.dumps(op["json_body"] or {"test": "1"}, separators=(",", ":"))
         safe_name = (op["url"].replace("https://", "").replace("http://", "")
                       .replace("/", "_").replace(":", "_"))[:60]
         out_file = os.path.join(sqli_dir, f"post_{safe_name}.txt")
         log("info", f"sqlmap {op['method']} → {op['url']}  body={body[:80]}")
+
+        # Detect JSON body → attach Content-Type header so the target's
+        # JSON parser accepts the payload. Otherwise most APIs 400 out and
+        # sqlmap's detection fails before it starts.
+        is_json_body = body.startswith("{") or body.startswith("[")
+        json_header = ' --headers="Content-Type: application/json"' if is_json_body else ''
+
         ok_p, out_p = run_cmd(
             f'sqlmap -u "{op["url"]}" --data=\'{body}\' '
             f'--method {op["method"]} --batch --level=3 --risk=2 '
-            f'--random-agent --timeout=10 {cookie_opt} '
-            f'--output-dir="{sqli_dir}" -o "{out_file}"',
+            f'--technique=BEU --smart '
+            f'--random-agent --timeout=10 {cookie_opt}{json_header} '
+            f'--output-dir="{sqli_dir}"',
             timeout=600,
         )
-        if "injectable" in (out_p or "").lower():
+        # v7.1.10 — sqlmap writes its results-CSV to the output dir; re-read
+        # the most recent one (the -o flag used before was a boolean, not a
+        # path, and silently did nothing). A hit has a non-empty Technique(s)
+        # column on the row matching this op's URL.
+        combined_out = (out_p or "")
+        try:
+            for csv_path in sorted(_glob_results_csvs(sqli_dir)):
+                with open(csv_path, errors="ignore") as fh:
+                    combined_out += "\n" + fh.read()
+        except Exception:
+            pass
+        if ("injectable" in combined_out.lower()
+                or "parameter:" in combined_out.lower()):
             log("crit", f"API SQLi FOUND: {op['method']} {op['url']}")
 
     if os.path.exists(sqli_out):

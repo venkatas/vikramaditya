@@ -1,5 +1,58 @@
 # Changelog
 
+## v7.1.10 — sqlmap invocation hardening (JSON APIs) (2026-04-19)
+
+v7.1.9 landed with Vikramaditya reaching testfire's `/api/login` with `{"username":"test","password":"test"}` — the URL and body were finally correct. sqlmap still didn't flag `injectable`. Inspection of sqlmap's `testfire.net/log` showed *zero* `Parameter:` lines across all 6 POST operations. Three separate flags missing.
+
+### Bug 10 — sqlmap missing JSON Content-Type header
+**Root cause:** `run_sqlmap_targeted`'s POST branch passed `--data='{"username":"test"}'` without an explicit Content-Type header. testfire's API (like most JSON REST APIs) rejects requests with the default `text/plain` body; every probe returned HTTP 400. sqlmap's Boolean oracle needs at least one 200 in the baseline set to establish a pattern — it never got one.
+
+**Fix:** auto-attach `--headers "Content-Type: application/json"` when the body starts with `{` or `[`.
+
+### Bug 11 — sqlmap wasted time on unreachable techniques
+**Root cause:** no `--technique` flag → sqlmap ran Boolean + Error + Union + Stacked + Time-based. Time-based needs `SLEEP()` or `pg_sleep()` — useless against an app-layer SQL concat. Stacked queries fail against almost every modern DB driver. Each probe burned seconds; 600 s timeout hit before Boolean got a fair shot.
+
+**Fix:** `--technique=BEU` — Boolean + Error + Union only. These are the three techniques that reach app-layer SQLi through JSON APIs.
+
+### Bug 12 — sqlmap detection output wasn't being read
+**Root cause:** the original invocation had `-o "post_<name>.txt"`. sqlmap's `-o` is a **boolean** enable-output flag, not a file-path argument; the path was silently dropped. The `run_cmd` stdout was captured but sqlmap's batch mode suppresses most of the "injectable" announcements that show up in interactive mode. Result: even if sqlmap *had* found something, hunt.py wouldn't know.
+
+**Fix:** read sqlmap's own `results-*.csv` files from the output dir and scan them for `Parameter:` / `injectable` lines. New helper `_glob_results_csvs()` collects the per-run CSVs.
+
+### Bonus — `--smart`
+Added `--smart` so sqlmap skips params whose values don't look numeric / SQL-injectable heuristically. On `/api/feedback/submit` this avoids burning 5 min on the `message` field.
+
+### Tests
+`tests/test_sqlmap_invocation_hardening.py` — 7 new tests:
+- 3 × `_glob_results_csvs` helper (empty dir, naming match, missing dir safe).
+- 4 × JSON-header inline heuristic (object body triggers, array body triggers, form body + empty body don't).
+
+Live-path "sqlmap actually detects the SQLi" is too slow to unit-test (10 min per probe, needs live testfire); pinning via ongoing monitor run instead.
+
+### Verified
+Full-suite baseline: 425 → **432 passing**.
+
+### The cascade — 12 fixed, zero known remaining
+```
+v7.1.2 — HAR engine FP                            ✓
+v7.1.3 — api_audit SyntaxError                    ✓
+v7.1.4 — no OpenAPI→sqlmap feed                   ✓
+v7.1.5 — wrong script filenames                   ✓
+v7.1.6 — wrong Swagger probe paths                ✓
+v7.1.7 — collector crashed on list JSON           ✓
+v7.1.8 — basePath dropped in sample_url           ✓
+v7.1.9 — body schema not expanded from $ref       ✓
+v7.1.9 — confirm() EOFError on non-TTY            ✓
+v7.1.10 — no Content-Type: application/json       ✓  ← here
+v7.1.10 — technique mis-selection (all 5)         ✓  ← here
+v7.1.10 — -o flag treated as boolean, log unread  ✓  ← here
+```
+
+### Found by
+Inspecting `findings/testfire.net/sessions/<S>/sqlmap/testfire.net/log` after the v7.1.9 run completed — empty log + zero `Parameter:` lines pointed directly at sqlmap receiving the request but the target rejecting it. Manual reproduction with `curl -H "Content-Type: application/json" -d '{"username":"admin","password":"x"}' https://testfire.net/api/login` returned the same body-reflection pattern I'd exploited manually earlier, confirming the header was the missing piece.
+
+---
+
 ## v7.1.9 — body-schema $ref expansion + non-TTY EOFError fix (2026-04-19)
 
 v7.1.8 got sqlmap hitting the right URLs (`/api/login`). But sqlmap couldn't find the SQLi because the **body was wrong**:
