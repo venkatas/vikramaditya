@@ -1,5 +1,42 @@
 # Changelog
 
+## v7.0.0 — VAPT anonymization core (2026-04-18)
+
+**Major:** adds a new security-first domain to Vikramaditya — anonymize real client data before any LLM call, restore on the way back. Shipped as the foundational library (v7.0); the FastAPI reverse proxy that wires it into Claude Code follows in v7.1.
+
+### Added
+- `llm_anon/` package (5 modules, ~440 lines):
+  - `regex_detector.py` — deterministic patterns for IPv4/IPv6/CIDR, MAC, email, URL, FQDN, AWS access keys, API tokens (`sk_live_`, `ghp_`, `xoxb-`), JWT, MD5/SHA1/SHA256/NTLM hashes. Overlap-resolution logic ensures NTLM `LM:NT` doesn't lose to two adjacent MD5 matches and CIDR beats bare IPv4.
+  - `surrogates.py` — deterministic surrogate factory. RFC 5737 TEST-NET IPv4, RFC 3849 IPv6 doc prefix, `.pentest.local` FQDN suffix, locally-administered MACs, preserved-length hashes.
+  - `vault.py` — SQLite-backed per-engagement mapping store. Round-trip `get_surrogate` / `get_original`, entity histogram, `clear()` between engagements, isolation across `engagement_id` values.
+  - `anonymizer.py` — façade combining detection + vault + surrogate generation with an idempotent `anonymize()` / `deanonymize()` round-trip.
+  - `__init__.py` — public surface (`Anonymizer`, `RegexDetector`, `SurrogateGenerator`, `Vault`, `Detection`).
+- `tests/test_llm_anon.py` — 27 tests. Includes the critical **`test_must_not_leak_pentest_fixture`** that asserts no original IP / NTLM hash / email / AWS key survives anonymization of a CrackMapExec-style output block.
+
+### Verified
+```
+$ python3 -m pytest tests/test_llm_anon.py -v
+27 passed in 0.13s
+```
+Full-suite baseline: 229 (v6.4) + 27 (v7.0) = **256 passing tests**.
+
+### Design note — why v7 is **core only**, not the proxy
+A production FastAPI reverse proxy for Anthropic's SSE streams is 4–8 hours of careful engineering: content-type negotiation, streaming chunk boundaries, partial-line buffering, tool-use JSON structure preservation, error-stream deanonymization. Shipping a shaky proxy as a "major" in one drop masks bugs and makes rollback ugly. The core library ships first — it's covered by 27 tests and usable standalone. v7.1 adds the proxy on top.
+
+### Design credit
+Architecture and dual-layer design inspired by [zeroc00I/LLM-anonymization](https://github.com/zeroc00I/LLM-anonymization) — a README-only design spec with 97 stars and no license file (so direct code reuse wasn't an option). Regex arsenal, surrogate format (RFC 5737 / `.pentest.local`), per-engagement SQLite vault, and the 0%-leak test philosophy all follow that spec. Implementation is entirely original from the public description.
+
+### Next (v7.1)
+- `llm_anon/proxy.py` — FastAPI reverse proxy + SSE stream handler.
+- `scripts/run_anon_proxy.sh` — one-command start.
+- `commands/anon.md` — `/anon start | stop | status | vault-stats`.
+
+### Not yet ported
+- Ollama-backed LLM detection layer for entities regex can't see (bare `DC01`, `CONTOSO\user`, cleartext passwords without obvious structure). Deferred to v7.2.
+- Self-improvement feedback loop (`auto_improve.py`, `feedback_loop.py`). Deferred to v7.3.
+
+---
+
 ## v6.4.0 — 229-test suite for core modules (2026-04-18)
 
 ### Added
