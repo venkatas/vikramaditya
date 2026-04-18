@@ -1,5 +1,54 @@
 # Changelog
 
+## v5.0.0 — CVSS 4.0 scoring (2026-04-18)
+
+**Breaking:** replaces CVSS 3.1 with CVSS 4.0 in `validate.py`.
+
+### Changed
+- `calculate_cvss(av, ac, pr, ui, s, c, i, a)` → `calculate_cvss40(av, ac, at, pr, ui, vc, vi, va, sc, si, sa)` — 11 params, macro-vector lookup, CVSS:4.0/... vector strings.
+- Interactive `score_cvss()` now prompts for the 4.0 metrics:
+  - **AT** (Attack Requirements) — new in 4.0
+  - **UI** {N/P/A} — Passive vs Active (was N/R in 3.1)
+  - **VC/VI/VA** (Vulnerable System CIA) + **SC/SI/SA** (Subsequent System CIA)
+  - **SI/SA** support "S" (Safety) impact
+- Report skeleton default vector: `CVSS:3.1/...` → `CVSS:4.0/...`
+- Every scored report links to https://www.first.org/cvss/calculator/4.0 for verification.
+
+### Why
+CVSS 3.1 is deprecated. Modern programs (H1, Bugcrowd, Intigriti) reward 4.0 scoring with AT/SC/SI/SA supply-chain and downstream impact axes. Self-XSS submissions that used to score MEDIUM in 3.1 now correctly show LOW in 4.0.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` PR #10 (CVSS 4.0 scoring, recon adapter, TODO fixes).
+
+---
+
+## v4.1 — HAR-based authenticated VAPT (prior release, undocumented)
+
+See commit log `bc6b025`..`c57f448`:
+- HAR file support for authenticated testing
+- Legacy app crawler for PHP/CGI/JSP targets
+- False-positive elimination in HAR VAPT engine
+- Empty HTML report fix (issue #2)
+
+## v4.0 — Fully autonomous mode (prior release, undocumented)
+
+See commit log `003b3a1`..`afdc74d`:
+- Zero prompts when LLM present
+- `--creds` always routes to autopilot
+- Dual-model brain (BugTraceAI + gemma4)
+- Google Magika file classifier
+
+## v3.0 — Auto-verification with specialized tools (prior release, undocumented)
+
+See commit log `aedcfea`..`180c765`:
+- sqlmap / dalfox / nuclei auto-verification on confirmed candidates
+- SQLi false positive guard
+- Cross-origin API detection
+- Pattern-based URL dedup
+- katana + arjun timeout caps
+
+---
+
 ## v2.0.0 — ECC-Style Plugin Architecture (Mar 2026)
 
 Major restructure into a full Claude Code plugin with multi-component architecture.
