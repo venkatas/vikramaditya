@@ -57,17 +57,29 @@ def banner():
 
 
 def prompt(text: str, default: str = "") -> str:
-    """Prompt user for input with optional default."""
-    if default:
-        raw = input(f"{C}  {text} [{default}]: {N}").strip()
-        return raw or default
-    return input(f"{C}  {text}: {N}").strip()
+    """Prompt user for input with optional default.
+
+    v7.1.9 — when stdin isn't a TTY (background run, CI, piped input)
+    ``input()`` raises EOFError the moment it sees EOF. Swallow that and
+    return the default so a 3-hour autonomous scan doesn't crash at the
+    final report prompt.
+    """
+    try:
+        if default:
+            raw = input(f"{C}  {text} [{default}]: {N}").strip()
+            return raw or default
+        return input(f"{C}  {text}: {N}").strip()
+    except EOFError:
+        return default
 
 
 def confirm(text: str, default_yes: bool = True) -> bool:
-    """Yes/no confirmation."""
+    """Yes/no confirmation. Returns the configured default when stdin is closed."""
     hint = "Y/n" if default_yes else "y/N"
-    raw = input(f"{C}  {text} [{hint}]: {N}").strip().lower()
+    try:
+        raw = input(f"{C}  {text} [{hint}]: {N}").strip().lower()
+    except EOFError:
+        return default_yes
     if not raw:
         return default_yes
     return raw in ("y", "yes")

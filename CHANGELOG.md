@@ -1,5 +1,65 @@
 # Changelog
 
+## v7.1.9 — body-schema $ref expansion + non-TTY EOFError fix (2026-04-19)
+
+v7.1.8 got sqlmap hitting the right URLs (`/api/login`). But sqlmap couldn't find the SQLi because the **body was wrong**:
+
+```
+sqlmap POST → https://testfire.net/api/login  body={"test":"1"}   ← pre-v7.1.9
+```
+
+testfire's vulnerable parameter is `username` — sqlmap can only inject into fields it sees in the body, and `{"test":"1"}` has no `username`.
+
+### Bug 8 — body-schema $ref expansion
+**Root cause:** `operations.json` (api_audit.py's pre-parsed output) drops the body schema during `extract_operations`. Only `parameters[in=body, name=body]` survives — the actual property list (`username`, `password`) is lost. Worse: api_audit.py never persisted the raw parsed spec files at all, so hunt.py had no way to recover the schema.
+
+**Fix (two files):**
+- `api_audit.py::discover_specs` — now also returns the raw parsed spec alongside metadata.
+- `api_audit.py::write_outputs` — persists each parsed spec as `<saved_as>.json` (e.g. `testfire.net_b80b3ac7.json`) next to `operations.json`.
+- `hunt.py::_collect_openapi_post_endpoints` — pre-indexes every raw spec by `(path, method)` at startup. When an op is found in `operations.json`, resolves its body by looking up `(path, method)` in the index and walking the `$ref` chain (Swagger 2.0 `definitions` + OpenAPI 3 `components.schemas`). Falls back to the stub `{"test":"1"}` only when the raw spec is truly missing.
+
+**Impact on testfire (live verified):**
+```
+POST /api/login              body={"username":"test","password":"test"}
+POST /api/transfer           body={"toAccount":"test","fromAccount":"test","transferAmount":"test"}
+POST /api/admin/addUser      body={"firstname":"test","lastname":"test","username":"test","password1":"test","password2":"test"}
+POST /api/admin/changePassword body={"username":"test","password1":"test","password2":"test"}
+POST /api/feedback/submit    body={"name":"test","email":"test","subject":"test","message":"test"}
+POST /api/account/1/transactions body={"startDate":"test","endDate":"test"}
+```
+Every body now has real field names. sqlmap will inject into `username` this time.
+
+### Bug 9 — `EOFError` crash at final report prompt
+**Root cause:** Vikramaditya's `confirm("Generate report from scan results?")` calls `input()` at the end of every scan. When the process runs non-TTY (backgrounded, CI pipeline), `input()` raises `EOFError` immediately. 3-hour autonomous scan crashes at the finish line instead of saving the report.
+
+**Fix:** `confirm()` and `prompt()` wrap `input()` in `try/except EOFError` — return `default_yes` / `default` respectively.
+
+### Tests
+`tests/test_body_schema_expansion.py` — 9 new tests:
+- 7 × body-schema resolution (login/transfer/addUser/feedback via $ref; stub fallback; OpenAPI 3 `requestBody.content`; Swagger 2.0 formData)
+- 2 × non-TTY EOFError handling for `confirm()` + `prompt()`
+
+Pins the exact testfire spec shape as a regression test: if future refactors drop the raw spec again, `test_login_body_has_username_and_password` fails loudly.
+
+### Verified
+Full-suite baseline: 416 → **425 passing**.
+
+### The cascade (9 layers, now structurally complete)
+```
+v7.1.2 — HAR engine FP                      ✓
+v7.1.3 — api_audit SyntaxError              ✓
+v7.1.4 — no OpenAPI→sqlmap feed             ✓
+v7.1.5 — wrong script filenames             ✓
+v7.1.6 — wrong probe paths                  ✓
+v7.1.7 — collector crashed on list JSON     ✓
+v7.1.8 — basePath dropped in sample_url     ✓
+v7.1.9 — body schema not expanded from $ref ✓  ← here
+v7.1.9 — confirm() EOFError on non-TTY     ✓   ← bonus
+```
+Vikramaditya can now, from a single `vikramaditya.py https://target/` invocation, discover Swagger specs, extract POST endpoints with full body-param fidelity, and run sqlmap against them with correct URLs, correct bodies, and correct cookies. No more silent misses.
+
+---
+
 ## v7.1.8 — build_base_url drops basePath when host is absent (2026-04-19)
 
 v7.1.7 restored the full Vikramaditya → OpenAPI → sqlmap chain on testfire.net. Run completed with:
