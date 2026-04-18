@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v7.1 — VAPT anonymization reverse proxy for Claude Code (SSE-aware) + anonymization core + 270-test suite + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
+**v7.1.1 — VAPT anonymization reverse proxy for Claude Code (SSE-aware) + anonymization core + 270-test suite + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -19,7 +19,7 @@
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
 
-[Quick Start](#quick-start) · [HAR-based Testing](#har-based-authenticated-testing) · [What's New in v4.1](#whats-new-in-v41) · [How It Works](#how-it-works) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
+[Quick Start](#quick-start) · [What's New in v7.x](#whats-new-in-v7x) · [Engagement Privacy](#engagement-privacy-v70v71) · [HAR-based Testing](#har-based-authenticated-testing) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
 
 ---
 
@@ -31,30 +31,83 @@
 
 ---
 
-## What's New in v4.1
+## What's New in v7.x
 
-### **🚀 HAR-Based Authenticated VAPT (New)**
+v5 → v7 added **10 releases, 270 passing tests, 1 new security domain (client-data anonymization), 1 new web3 sub-domain (meme-coin / Solana / DEX LP), and a HackerOne MCP server.** Full changelog in [`CHANGELOG.md`](CHANGELOG.md).
+
+### **🛡️ Engagement Privacy — anonymization proxy for Claude Code (v7.0 / v7.1)**
 
 | Feature | Description |
 |:--------|:------------|
-| **HAR File Support** | Load browser session data (HAR files) for authenticated testing |
-| **Automatic Endpoint Discovery** | Extract all authenticated endpoints from captured browser traffic |
-| **Session Token Analysis** | Automatically extract Bearer tokens, cookies, and API keys |
-| **Deep Vulnerability Testing** | SQL injection, file upload RCE, auth bypass, IDOR, XSS with real sessions |
-| **Attack Surface Mapping** | Identify admin panels, file uploads, APIs from actual usage patterns |
-| **Comprehensive POC Scripts** | Ready-to-run proof-of-concept code for all vulnerability types |
+| **Reverse proxy** (`llm_anon/proxy.py`) | FastAPI on `127.0.0.1:8080`. Point `ANTHROPIC_BASE_URL` at it; Claude Code never sees real client data. |
+| **Regex detector** (`llm_anon/regex_detector.py`) | IPv4/IPv6/CIDR, MAC, email, URL, FQDN, AWS keys, API tokens, JWT, MD5/SHA1/SHA256/NTLM hashes. NTLM `lm:nt` pair beats two adjacent MD5s; CIDR beats bare IPv4. |
+| **Deterministic surrogates** (`llm_anon/surrogates.py`) | RFC 5737 TEST-NET IPs, `.pentest.local` FQDNs, locally-administered MACs, length-preserving fake hashes. Same original → same surrogate within an engagement. |
+| **SQLite vault** (`llm_anon/vault.py`) | Per-engagement mapping store. Engagement isolation — client A and client B never share surrogates. |
+| **SSE-aware** | Anthropic's streaming `text_delta` events are parsed line-by-line; deanonymized in place; pass straight through to Claude Code so streaming stays live. |
 
-### **Enhanced Platform Capabilities**
+Design credit: [zeroc00I/LLM-anonymization](https://github.com/zeroc00I/LLM-anonymization) (README-only spec — implementation is entirely original).
 
-| Feature | v4.0 | v4.1 |
-|:--------|:-----|:-----|
-| **Testing Approach** | Infrastructure + unauthenticated web | + **HAR-based authenticated testing** |
-| **Session Data** | Manual credential input | + **Browser session extraction** |
-| **Endpoint Discovery** | Static JS analysis | + **Dynamic user interaction analysis** |
-| **Vulnerability Testing** | Standard automated scans | + **Authenticated context testing** |
-| **Admin Panel Testing** | External enumeration | + **Authenticated admin function testing** |
-| **File Upload Testing** | Basic file upload detection | + **Real session file upload RCE testing** |
-| **Integration** | Single platform | + **Standalone + integrated workflows** |
+### **🪙 Web3 meme-coin / Solana / DEX LP security domain (v6.0)**
+
+| Module | Catches |
+|:-------|:--------|
+| `token_scanner.py` (783 lines, EVM + Solana) | Unrestricted mint, unbounded fee/tax, trading toggles, hidden transfer hooks, blacklists, owner privileges, pause authority, honeypot logic |
+| `web3/10-meme-coin-bugs.md` | 8 meme-coin bug classes + Immunefi paid examples |
+| `web3/11-solana-token-audit.md` | SPL / Token-2022 / freeze-authority / transfer-hook attacks |
+| `web3/12-dex-lp-attacks.md` | AMM / concentrated-liquidity / JIT |
+| `skills/meme-coin-audit/SKILL.md` | Launch-audit workflow |
+| `/token-scan <contract>` | Slash command |
+
+### **🔧 Hunting workflow upgrades (v5.1 – v6.3)**
+
+| Release | Addition |
+|:--------|:---------|
+| **v5.0** | CVSS 4.0 scoring (AT + VC/VI/VA + SC/SI/SA + Safety axis) — modern programs reward this |
+| **v5.1** | HackerOne MCP server — live Hacktivity + program stats + safe-harbor lookup |
+| **v5.2** | sisakulint CI/CD scanner — `pwn_request` / unpinned actions / script injection across whole orgs |
+| **v5.3** | `/pickup` session resume + auto-logged session summaries — warm-restart over 20+ existing engagement histories |
+| **v5.4** | `credential_store.py` — `.env`-backed auth headers, never logs raw values |
+| **v5.5** | `bb-methodology` master skill — 5-phase non-linear hunting orchestrator |
+| **v5.6** | `intel_engine.py` + `/intel` — cross-references CVEs against hunt memory to flag untested surface |
+| **v6.1** | `/remember`, `/surface`, recon-ranker agent — fill the gap between "I ran recon" and "I started hunting" |
+| **v6.2** | `/autopilot` agent — ties the existing autopilot engine to scope checking + checkpoint modes |
+| **v6.3** | `sneaky_bits.py` — invisible-Unicode prompt injection encoder for LLM red-teaming |
+| **v6.4** | **229-test suite** ported from upstream (audit log, hunt journal, scope checker, token scanner, intel engine, credential store, HackerOne MCP) |
+
+### **📜 Original v4.1 capabilities (preserved)**
+
+HAR-based authenticated testing, autonomous VAPT, multi-provider AI, Burp-style HTML reports — [see below](#har-based-authenticated-testing).
+
+---
+
+## Engagement Privacy (v7.0 / v7.1)
+
+When the NDA says "don't send client data to third-party AI services" but you still want Claude Code's reasoning on real `nmap` / `crackmapexec` / `mimikatz` / Burp output:
+
+```bash
+# Terminal 1 — start the anonymization proxy
+export ENGAGEMENT_ID=acme-2026-vapt
+export ANTHROPIC_API_KEY=sk-ant-...            # forwarded to upstream as-is
+python3 -m llm_anon.proxy                      # listens on 127.0.0.1:8080
+
+# Terminal 2 — run Claude Code through the proxy
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ENGAGEMENT_ID=acme-2026-vapt            # must match Terminal 1
+claude
+```
+
+**What Claude actually sees:**
+```
+nmap scan of 203.0.113.47 on xkqpzt.pentest.local returned OpenSSH 8.2
+```
+**What your terminal shows:**
+```
+nmap scan of 10.20.0.10 on dc01.acmecorp.local returned OpenSSH 8.2
+```
+
+Mappings persist in `~/.vikramaditya/anon_vault.db`, scoped by `ENGAGEMENT_ID`. Run `/anon` for command reference. See [`llm_anon/`](llm_anon/) and [`commands/anon.md`](commands/anon.md).
+
+**Threat model:** prevents content-based correlation. Does **not** prevent query-pattern or timing correlation. Binds to `127.0.0.1` only. Not a compliance certification — review your contract.
 
 ---
 
@@ -329,21 +382,48 @@ graph TB
 
 ```
 vikramaditya/
-├── vikramaditya.py              # Main orchestrator (unchanged)
+├── vikramaditya.py              # Main orchestrator
 ├── hunt.py                      # Infrastructure VAPT
-├── autopilot_api_hunt.py        # Web/API VAPT  
-├── har_analyzer.py              # 🔥 HAR file analysis
-├── har_vapt_engine.py           # 🔥 HAR-based vulnerability testing
-├── har_vapt.py                  # 🔥 Complete HAR VAPT workflow
-├── vapt_companion.py            # 🔥 Combined infrastructure + HAR
-├── vapt_suite.py                # 🔥 Interactive unified interface
-├── brain_scanner.py             # AI exploit generation
-├── reporter.py                  # HTML/PDF report generation
-├── brain.py                     # AI analysis engine
+├── autopilot_api_hunt.py        # Web/API VAPT
+├── har_analyzer.py              # HAR file analysis
+├── har_vapt_engine.py           # HAR-based vulnerability testing
+├── har_vapt.py                  # Complete HAR VAPT workflow
+├── vapt_companion.py            # Combined infrastructure + HAR
+├── vapt_suite.py                # Interactive unified interface
+├── brain.py / brain_scanner.py  # AI analysis + exploit generation
 ├── agent.py                     # Autonomous ReAct agent
-├── recon.sh                     # Subdomain enumeration
-├── scanner.sh                   # Vulnerability scanning
-└── poc_*.py                     # 🔥 Proof-of-concept scripts
+├── reporter.py                  # HTML/PDF report generation
+├── recon.sh / scanner.sh        # Recon + vuln scanning pipelines
+├── poc_*.py                     # Proof-of-concept scripts
+├── validate.py                  # Finding validation (CVSS 4.0 — v5.0)
+├── credential_store.py          # .env-backed auth store (v5.4)
+├── intel_engine.py              # CVE + HackerOne + hunt-memory intel (v5.6)
+├── token_scanner.py             # EVM + Solana meme-coin red flags (v6.0)
+├── sneaky_bits.py               # LLM prompt-injection encoder (v6.3)
+├── cicd_scanner.sh              # sisakulint GitHub Actions auditor (v5.2)
+│
+├── llm_anon/                    # 🛡️ Engagement privacy (v7.0 / v7.1)
+│   ├── proxy.py                 # FastAPI reverse proxy for Claude Code
+│   ├── regex_detector.py        # IP/hash/credential/FQDN/JWT patterns
+│   ├── surrogates.py            # RFC 5737 / .pentest.local generator
+│   ├── vault.py                 # SQLite per-engagement mapping store
+│   └── anonymizer.py            # Facade for anonymize() / deanonymize()
+│
+├── mcp/hackerone-mcp/           # H1 GraphQL MCP server (v5.1)
+├── memory/                      # Hunt journal, audit log, pattern DB
+├── skills/                      # bug-bounty, bb-methodology, meme-coin-audit,
+│                                #   report-writing, triage-validation,
+│                                #   security-arsenal, web2-*, web3-audit
+├── agents/                      # recon-agent, chain-builder, validator,
+│                                #   report-writer, web3-auditor,
+│                                #   token-auditor (v6.0), recon-ranker (v6.1),
+│                                #   autopilot (v6.2)
+├── commands/                    # /recon /hunt /validate /report /triage /chain
+│                                #   /scope /web3-audit /cicd (v5.2)
+│                                #   /pickup (v5.3) /intel (v5.6)
+│                                #   /token-scan (v6.0) /remember /surface (v6.1)
+│                                #   /autopilot (v6.2) /anon (v7.1)
+└── tests/                       # 270 tests — pytest + pytest-asyncio
 ```
 
 ---
@@ -368,6 +448,38 @@ vikramaditya/
 | **File Upload** | RCE, Path traversal, Filter bypass | ✅ Malicious uploads, Bypass techniques |
 | **XSS** | Reflected, Stored, DOM-based | ✅ Parameter-based testing |
 | **Session** | Token security, Hijacking | ✅ Bearer token analysis, Cookie security |
+
+### **Web3 Meme-Coin / SPL / DEX LP (v6.0)**
+
+| Category | What `token_scanner.py` flags | Reference |
+|:---------|:-------------------------------|:----------|
+| **Mint abuse** | Unrestricted mint, `onlyOwner` mint without cap | `web3/10-meme-coin-bugs.md` |
+| **Fee traps** | Unbounded `setFee()`/`setTax()`, missing `MAX_FEE` | `web3/10` |
+| **Trading toggles** | Reversible `enableTrading`, pause / unpause loops | `web3/10` |
+| **Transfer hooks** | Hidden pre/post-transfer logic, fee-on-transfer accounting | `web3/10`, `web3/11` |
+| **Blacklists / freeze authority** | Owner can blacklist/freeze user funds | `web3/11` (Solana) |
+| **LP / AMM attacks** | Concentrated-liquidity, JIT sandwich, LP-share accounting | `web3/12` |
+
+### **CI/CD & Supply Chain (v5.2)**
+
+| Category | Tools | Detected |
+|:---------|:------|:---------|
+| **GitHub Actions** | `cicd_scanner.sh` (sisakulint wrapper) | `pwn_request`, script injection in `run:`, unpinned 3rd-party actions, missing `permissions:`, reusable-workflow privilege chains |
+| **Org-wide batch** | `./cicd_scanner.sh "org:<name>" --recursive` | Scan every public repo in an organization |
+
+### **LLM / AI Red-Team**
+
+| Category | Tool | Use case |
+|:---------|:-----|:---------|
+| **Invisible Unicode injection** | `sneaky_bits.py` | U+2062 / U+2064 / Variant Selector encoding for indirect prompt-injection payloads |
+| **HAR-based chatbot IDOR** | `har_vapt_engine.py` | Replay authenticated LLM app sessions against injection, tool-call abuse, context leaks |
+
+### **Engagement Privacy (v7.0 / v7.1)**
+
+| Category | Tool | Purpose |
+|:---------|:-----|:--------|
+| **Client-data anonymization** | `llm_anon/` | Transparent reverse proxy — real IPs / hashes / credentials / FQDNs never reach Anthropic |
+| **Per-engagement vault** | `llm_anon/vault.py` | SQLite mapping store scoped by `ENGAGEMENT_ID` — no cross-client correlation |
 
 ### **AI-Powered Analysis**
 
