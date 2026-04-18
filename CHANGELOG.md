@@ -1,5 +1,18 @@
 # Changelog
 
+## v5.5.0 — bb-methodology master skill (2026-04-18)
+
+### Added
+- `skills/bb-methodology/SKILL.md` — master orchestrator skill (352 lines). Describes the 5-phase non-linear hunting flow, developer-psychology framing, and "What If" framework for lateral thinking.
+
+### Why
+Vikramaditya has focused skills (`bug-bounty`, `triage-validation`, `report-writing`, `security-arsenal`, `web2-recon`, `web2-vuln-classes`, `web3-audit`) but no *where do I start / what's next* router. bb-methodology fills that gap — it decides which skill to invoke at each phase of a hunt.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `skills/bb-methodology/` (PR #12).
+
+---
+
 ## v5.4.0 — secure credential store (2026-04-18)
 
 ### Added
