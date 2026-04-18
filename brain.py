@@ -1371,6 +1371,19 @@ IF DROP: What would need to change for this to become viable?"""
 
         result = self._stream_fast(prompt, "Finding Triage", 1000)
 
+        # v7.1.4 — baron-llm cold-start cosmetic bug: first invocation
+        # sometimes returns a generic task description ("You have been tasked
+        # with validating the quality of a penetration test report…") instead
+        # of running the gate. Detect the miss (no VERDICT: token anywhere)
+        # and retry once with a stricter prompt that forbids meta-narration.
+        if "VERDICT:" not in (result or ""):
+            strict_prompt = (
+                "DO NOT describe the task. DO NOT summarise the finding in prose.\n"
+                "Start your response with the literal token 'VERDICT:'.\n\n"
+                + prompt
+            )
+            result = self._stream_fast(strict_prompt, "Finding Triage (retry)", 1000)
+
         verdict = "UNKNOWN"
         for line in result.splitlines():
             if line.startswith("VERDICT:"):
