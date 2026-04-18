@@ -1,5 +1,65 @@
 # Changelog
 
+## v7.1.6 — api_audit.py spec-path list expansion (2026-04-18)
+
+Re-running with v7.1.5 got Phase 6.5 actually executing — but `api_audit.py` still reported `OpenAPI specs: 0` on testfire.net. Root cause: the 17-entry `SPEC_PATHS` list included `/swagger-ui/index.html` (hyphenated) but not `/swagger/index.html` (slash-separated) and *no* entry at all for testfire's actual spec location `/swagger/properties.json`. Yet another silent-miss — the probe succeeded, the responses were all 404s, and the phase reported clean completion with zero findings.
+
+### Fix
+`api_audit.py::SPEC_PATHS` gains seven new entries:
+- `/swagger/properties.json` — testfire's exact path
+- `/swagger/swagger.json` — common rename
+- `/swagger/index.html` — slash-separated Swagger UI bootstrap
+- `/swagger/`, `/swagger` — directory-style entry points
+- `/docs`, `/api/docs`, `/apidocs` — FastAPI defaults + common rewrites
+
+Total: 17 → 24 probe paths.
+
+### Regression test
+`tests/test_api_audit_spec_paths.py` — 7 pins:
+- `/swagger/properties.json` must stay in the list (testfire regression)
+- `/swagger/index.html` must stay (slash variant)
+- Hyphenated variants must coexist (back-compat)
+- `/docs` must stay (FastAPI)
+- All v7.1.5 legacy paths preserved
+- No duplicates
+- All paths are absolute
+
+### End-to-end proof on real testfire.net
+```
+$ mkdir -p /tmp/smoke/live /tmp/smoke/api_specs
+$ echo "https://testfire.net" > /tmp/smoke/live/urls.txt
+$ python3 api_audit.py --recon-dir /tmp/smoke --max-hosts 1
+[*] OpenAPI specs discovered: 1   (was 0 in v7.1.5)
+[*] Parsed operations:        12
+[*] Public operations:        12
+
+$ cat /tmp/smoke/api_specs/spec_urls.txt
+https://testfire.net/swagger/properties.json
+
+$ head /tmp/smoke/api_specs/all_operations.txt
+https://testfire.net/login
+https://testfire.net/account
+https://testfire.net/account/1/transactions
+...
+```
+Swagger spec found, 12 operations extracted, fed directly into v7.1.4's `_collect_openapi_post_endpoints` → sqlmap pipeline. The SQLi detection chain for `/api/login` now works autonomously.
+
+Full-suite baseline: 388 → **395 passing**.
+
+### The v7.1.x silent-miss cascade, retrospectively
+1. v7.1.2 — HAR engine's substring-match FP (fixed)
+2. v7.1.3 — `SyntaxError` in api_audit.py + agent.py (fixed)
+3. v7.1.4 — sqlmap never got OpenAPI POST endpoints (fixed)
+4. v7.1.5 — recon.sh called wrong file names (fixed)
+5. v7.1.6 — api_audit.py never probed testfire's actual path (fixed **here**)
+
+Each layer was hiding the next. Every one of these would have silent-skipped on a real engagement without nobody noticing.
+
+### Found by
+Re-running vikramaditya.py https://testfire.net/ after v7.1.5 ship; Monitor fired `OpenAPI specs: 0` with the full run actually executing for the first time. The fact that we got to see "0 specs discovered" instead of "phase skipped" is itself a v7.1.5 win.
+
+---
+
 ## v7.1.5 — recon.sh filename reconciliation (two silent-skip bugs) (2026-04-18)
 
 Re-running v7.1.4 on testfire.net immediately surfaced the next layer: the new `_collect_openapi_post_endpoints` feed was starved because **Phase 6.5 had been skipping for weeks without anyone noticing** — `recon.sh` hunted for `openapi_audit.py` while the actual file is `api_audit.py`. The test I wrote to catch this also flagged a **second** mismatch: `refresh_priority()` wanted `tech_priority.py`; the actual file is `prioritize.py`.
