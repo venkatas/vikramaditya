@@ -28,6 +28,7 @@ except Exception:
 
 
 SPEC_PATHS = [
+    # Raw JSON/YAML spec paths — highest-signal hits.
     "/swagger.json",
     "/openapi.json",
     "/openapi.yaml",
@@ -42,8 +43,20 @@ SPEC_PATHS = [
     "/v3/api-docs",
     "/swagger/v1/swagger.json",
     "/swagger/v2/swagger.json",
+    # v7.1.6 — testfire.net serves spec at /swagger/properties.json; the
+    # previous list only had hyphen-prefixed /swagger-ui/* paths.
+    "/swagger/properties.json",
+    "/swagger/swagger.json",
+    # HTML Swagger UI bootstraps — follow-up logic parses the HTML body
+    # for ``url:"..."`` config lines and re-probes the real spec.
     "/swagger-ui/index.html",
     "/swagger-ui.html",
+    "/swagger/index.html",   # v7.1.6 — testfire shape (slash, no hyphen)
+    "/swagger/",
+    "/swagger",
+    "/docs",                 # v7.1.6 — FastAPI default, nginx /docs rewrites
+    "/api/docs",
+    "/apidocs",
     "/redoc",
 ]
 
