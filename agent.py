@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 """
 agent.py — LangGraph-style ReAct hunting agent for bug bounty automation.
 
@@ -38,7 +37,7 @@ From hunt.py:
   hunt.py --target x --agent --langgraph  # with real LangGraph
 """
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: E402 — must follow module docstring
 
 import argparse
 import json
