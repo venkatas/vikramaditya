@@ -188,6 +188,16 @@ def extract_html_spec_links(base_url: str, body: str) -> list[str]:
 
 
 def build_base_url(spec: dict[str, Any], source_url: str) -> str:
+    """Resolve the API base URL for a parsed Swagger/OpenAPI spec.
+
+    v7.1.8 — the Swagger-2.0 fallback branch (no ``host`` field) used to
+    return just ``scheme://netloc`` and drop ``basePath`` entirely. On
+    testfire.net the spec declares ``basePath:"/api"`` but no ``host`` —
+    so every extracted ``sample_url`` pointed at the apex, not the real
+    API prefix. sqlmap then POST'd to ``/login`` instead of ``/api/login``
+    and missed the boolean-blind SQLi that ``admin' OR 1=1--`` trivially
+    bypasses.
+    """
     parsed_source = urlparse(source_url)
     source_root = f"{parsed_source.scheme}://{parsed_source.netloc}"
 
@@ -198,12 +208,17 @@ def build_base_url(spec: dict[str, Any], source_url: str) -> str:
             return urljoin(source_root, server_url.strip())
 
     host = spec.get("host")
-    base_path = spec.get("basePath", "")
+    base_path = spec.get("basePath", "") or ""
     schemes = spec.get("schemes") or []
     if host:
         scheme = schemes[0] if isinstance(schemes, list) and schemes else (parsed_source.scheme or "https")
         return f"{scheme}://{host}{base_path}"
 
+    # v7.1.8 — no explicit host but basePath is still meaningful; apply
+    # it to the spec's own origin so /api/login resolves correctly.
+    if base_path:
+        suffix = base_path if base_path.startswith("/") else "/" + base_path
+        return source_root + suffix.rstrip("/")
     return source_root
 
 

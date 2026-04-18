@@ -1,5 +1,67 @@
 # Changelog
 
+## v7.1.8 — build_base_url drops basePath when host is absent (2026-04-19)
+
+v7.1.7 restored the full Vikramaditya → OpenAPI → sqlmap chain on testfire.net. Run completed with:
+```
+sqlmap: 6 POST candidate(s) from OpenAPI specs
+sqlmap POST → https://testfire.net/login                 body={"test":"1"}
+sqlmap POST → https://testfire.net/account/1/transactions
+sqlmap POST → https://testfire.net/transfer
+sqlmap POST → https://testfire.net/feedback/submit
+sqlmap POST → https://testfire.net/admin/addUser
+sqlmap POST → https://testfire.net/admin/changePassword
+```
+All 6 OpenAPI operations ran through sqlmap. But no `API SQLi FOUND` fired — because the URLs are wrong. testfire's real SQLi endpoint is `https://testfire.net/api/login`, not `https://testfire.net/login`.
+
+### Root cause
+`api_audit.build_base_url()` had a 3-way dispatch:
+1. OpenAPI 3.0 `servers[0].url` → honoured.
+2. Swagger 2.0 with `host` field → `scheme://host/basePath` — honoured.
+3. Swagger 2.0 **without** `host` → `scheme://netloc` — **basePath dropped on the floor**.
+
+testfire.net hits branch 3. The spec at `/swagger/properties.json` declares `basePath: "/api"` but no `host` (it relies on the caller's origin). The old code returned just `https://testfire.net` and every extracted `sample_url` for every op came out lacking the `/api` prefix.
+
+### Fix
+Branch 3 now applies `basePath` to the source-URL origin:
+```python
+if base_path:
+    suffix = base_path if base_path.startswith("/") else "/" + base_path
+    return source_root + suffix.rstrip("/")
+return source_root
+```
+Defensive on the input — trailing `/` stripped, missing leading `/` auto-added.
+
+### Tests
+`tests/test_build_base_url.py` — 9 new tests:
+- 7 × `build_base_url` shape matrix (host-only, basePath-only, both, neither, OpenAPI3 servers, trailing slash, missing leading slash).
+- 2 × `extract_operations` end-to-end on the exact testfire spec shape → proves `sample_url` is now `https://testfire.net/api/login` for POST `/login` and `https://testfire.net/api/account/1/transactions` for GET/POST on the path-param route.
+
+### Verified
+```
+>>> build_base_url({"swagger":"2.0","basePath":"/api"},
+...                "https://testfire.net/swagger/properties.json")
+'https://testfire.net/api'    # was 'https://testfire.net' before
+```
+Full-suite baseline: 407 → **416 passing**.
+
+### The cascade, finally resolved (7 layers)
+```
+v7.1.2 — HAR engine FP                   ✓
+v7.1.3 — api_audit SyntaxError           ✓
+v7.1.4 — no OpenAPI→sqlmap feed          ✓
+v7.1.5 — wrong script filenames          ✓
+v7.1.6 — wrong probe paths               ✓
+v7.1.7 — collector crashed on list JSON  ✓
+v7.1.8 — basePath dropped in sample_url  ✓   ← the last one
+```
+Each layer was hiding the next. The detection chain is now structurally complete end-to-end. Next re-run should finally fire `API SQLi FOUND` on `/api/login`.
+
+### Found by
+Re-running under v7.1.7 produced `sqlmap POST → https://testfire.net/login body={"test":"1"}` in the scan log. Manual reproduction with `curl -X POST https://testfire.net/login` returns 404 — that was the entire miss. testfire only serves the SQLi on `/api/login`.
+
+---
+
 ## v7.1.7 — OpenAPI collector crash fix + operations.json primary path (2026-04-18)
 
 v7.1.6 got Phase 6.5 finding specs (testfire → 2 specs / 24 ops). Then SQLMAP phase fired and immediately crashed:
