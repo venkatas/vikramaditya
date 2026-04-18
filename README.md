@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v5.6 — /intel engine + bb-methodology + credential store + /pickup + CI/CD scanner + HackerOne MCP + CVSS 4.0 + autonomous VAPT + HAR auth testing**
+**v6.0 — meme-coin / Solana / DEX LP security domain + /intel + bb-methodology + credential store + /pickup + CI/CD scanner + HackerOne MCP + CVSS 4.0 + autonomous VAPT + HAR auth testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
