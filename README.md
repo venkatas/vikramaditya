@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v7.1.4 — OpenAPI→sqlmap feed + payload-URL filter + sqlmap cookies + brain-triage retry + 360-test suite + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
+**v7.1.5 — recon.sh filename reconciliation (Phase 6.5 + Phase 4 silent-skip fix) + shell-ref regression guard + OpenAPI→sqlmap feed + payload-URL filter + sqlmap cookies + brain-triage retry + 388-test suite + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya

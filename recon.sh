@@ -156,7 +156,11 @@ phase_done() {
 
 refresh_priority() {
     local context="${1:-latest recon artifacts}"
-    local priority_script="$SCRIPT_DIR/tech_priority.py"
+    # v7.1.5 — the script is named prioritize.py in this fork; older naming
+    # tech_priority.py is kept as a fallback so external automations that
+    # still reference the old name continue to work.
+    local priority_script="$SCRIPT_DIR/prioritize.py"
+    [ -f "$priority_script" ] || priority_script="$SCRIPT_DIR/tech_priority.py"
 
     if [ ! -f "$priority_script" ] || [ ! -s "$RECON_DIR/live/httpx_full.txt" ]; then
         return 1
@@ -935,9 +939,12 @@ echo ""
 log_info "Phase 6.5: OpenAPI / Swagger Discovery"
 if phase_done "$RECON_DIR/api_specs/summary.md"; then true; else
 
-OPENAPI_AUDIT="$SCRIPT_DIR/openapi_audit.py"
+# v7.1.5 — script file is api_audit.py; older naming openapi_audit.py kept as
+# a fallback so freshly-renamed forks still find it.
+OPENAPI_AUDIT="$SCRIPT_DIR/api_audit.py"
+[ -f "$OPENAPI_AUDIT" ] || OPENAPI_AUDIT="$SCRIPT_DIR/openapi_audit.py"
 if [ -f "$OPENAPI_AUDIT" ] && [ -s "$RECON_DIR/live/urls.txt" ]; then
-    log_step "Discovering Swagger / OpenAPI specs and probing public GET operations..."
+    log_step "Discovering Swagger / OpenAPI specs and probing public GET operations... ($(basename "$OPENAPI_AUDIT"))"
     python3 "$OPENAPI_AUDIT" --recon-dir "$RECON_DIR" --max-hosts 20 --max-ops 40 2>/dev/null || true
 
     if [ -s "$RECON_DIR/api_specs/all_operations.txt" ]; then
@@ -953,7 +960,7 @@ if [ -f "$OPENAPI_AUDIT" ] && [ -s "$RECON_DIR/live/urls.txt" ]; then
     [ -s "$RECON_DIR/api_specs/unauth_api_findings.txt" ] && \
         log_warn "Unauth API findings from specs: $(file_lines "$RECON_DIR/api_specs/unauth_api_findings.txt")"
 else
-    log_warn "openapi_audit.py not found or no live hosts — skipping OpenAPI discovery"
+    log_warn "api_audit.py (or openapi_audit.py) not found or no live hosts — skipping OpenAPI discovery"
 fi
 
 fi
