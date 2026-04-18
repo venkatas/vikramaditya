@@ -47,7 +47,8 @@ agent_session.json
 agent_bump.txt
 
 # ── Config with secrets ───────────────────────────────────────────────────────
-config.json
+# Root-only — subdir config.json files (e.g. mcp/*/config.json) are safe to commit.
+/config.json
 .env
 *.key
 *.pem

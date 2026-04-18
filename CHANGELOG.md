@@ -1,5 +1,25 @@
 # Changelog
 
+## v5.1.0 — HackerOne MCP server (2026-04-18)
+
+### Added
+- `mcp/hackerone-mcp/server.py` — MCP server exposing HackerOne public GraphQL endpoints as Claude Code tools. No API key required.
+- `mcp/hackerone-mcp/config.json` — reference config for `.claude/settings.json`.
+- `.claude/settings.json` — registers the MCP server at project level (was absent before; only `settings.local.json` for permissions existed).
+
+### Tools exposed via MCP
+- `search_disclosed_reports` — Hacktivity search by keyword/program (⚠️ currently broken upstream — HackerOne renamed `hacktivity_items` in their public schema; tracked for upstream fix)
+- `get_program_stats` — bounty ranges, response times, resolved counts
+- `get_program_policy` — safe harbor, response SLA, excluded vuln classes ✅ verified working (returns real policy text)
+
+### Why
+Vikramaditya's `/triage`, `/validate`, `/scope` flows previously had no way to consult live HackerOne data (program scope, safe-harbor policy, response SLA). With the MCP registered, Claude can now fetch program context on-demand during hunting. Unlocks future port of `intel_engine.py` which layers this with `learn.py` + hunt memory.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `mcp/hackerone-mcp/` (v3.0 Bionic Hunter release).
+
+---
+
 ## v5.0.0 — CVSS 4.0 scoring (2026-04-18)
 
 **Breaking:** replaces CVSS 3.1 with CVSS 4.0 in `validate.py`.
