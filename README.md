@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v5.0 — CVSS 4.0 scoring + fully autonomous VAPT + HAR-based authenticated testing**
+**v5.1 — HackerOne MCP + CVSS 4.0 scoring + fully autonomous VAPT + HAR-based authenticated testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
