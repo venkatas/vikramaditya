@@ -1,5 +1,78 @@
 # Changelog
 
+## v7.1.7 — OpenAPI collector crash fix + operations.json primary path (2026-04-18)
+
+v7.1.6 got Phase 6.5 finding specs (testfire → 2 specs / 24 ops). Then SQLMAP phase fired and immediately crashed:
+
+```
+File "hunt.py", line 1501, in _collect_openapi_post_endpoints
+    host = spec.get("host") or ""
+AttributeError: 'list' object has no attribute 'get'
+```
+
+### Root cause
+`_collect_openapi_post_endpoints` (added v7.1.4) walked every `*.json` in `api_specs/` assuming each was an OpenAPI spec. api_audit.py actually writes **three non-spec JSON files** there:
+
+- `discovered_specs.json` — list of spec-metadata dicts
+- `operations.json` — list of parsed operation dicts
+- `unauth_findings.json` — list (often empty)
+
+All three are `list` objects, not dicts. Calling `.get()` on a list = `AttributeError`, which aborted the entire SQLMAP phase with no retry.
+
+### Fix
+Two-path refactor of `_collect_openapi_post_endpoints`:
+
+1. **Primary** — read `operations.json` directly. api_audit.py has already parsed every operation across every spec; we just filter to POST/PUT/PATCH + build a sample JSON body from each op's `parameters` (`in: body` + `in: formData`). Simpler + correct.
+
+2. **Fallback** — walk raw `<host>_<hash>.json` spec files but **skip** the three known non-spec siblings (`discovered_specs.json`, `operations.json`, `unauth_findings.json`) and any payload that isn't a dict with a `paths` key. Every `.get()` call in the schema walker is type-guarded now.
+
+### Tests
+`tests/test_openapi_collector_hardening.py` — **12 new tests**:
+- 4 × crash regressions (list payloads, malformed JSON, non-dict top-level, string top-level) all return `[]` instead of raising.
+- 6 × `operations.json` primary path (reads ops, skips GETs, dedups, respects limit, handles empty-body + formData parameters, skips invalid URLs).
+- 2 × raw-spec fallback (walks specs when `operations.json` absent; coexists with non-spec siblings).
+
+The v7.1.4 tests in `tests/test_hunt_sqlmap_plumbing.py` still pass — the fallback path preserves exactly their expected behaviour.
+
+### Verified
+```
+$ python3 -c "from hunt import _collect_openapi_post_endpoints; \
+  [print(e['method'], e['url']) for e in \
+  _collect_openapi_post_endpoints('/tmp/vapt_run/api_audit_smoke2')]"
+
+POST https://testfire.net/login
+POST https://testfire.net/account/1/transactions
+POST https://testfire.net/transfer
+POST https://testfire.net/feedback/submit
+POST https://testfire.net/admin/addUser
+POST https://testfire.net/admin/changePassword
+```
+6 POST endpoints harvested from real testfire `operations.json` — including `/login` (the SQLi target) and `/admin/addUser` (auth-bypass chain candidate).
+
+Full-suite baseline: 395 → **407 passing**.
+
+### The cascade resolved (6 layers now)
+```
+v7.1.2 — HAR engine FP            ✓
+v7.1.3 — api_audit SyntaxError    ✓
+v7.1.4 — no OpenAPI→sqlmap feed   ✓
+v7.1.5 — wrong script filenames   ✓
+v7.1.6 — wrong probe paths        ✓
+v7.1.7 — collector crashed on list JSON  ✓   ← here
+```
+Each layer uncovered the next. This should be the last — the collector now reads `operations.json` which is the exact format api_audit.py produces, with defensive skip for every non-spec JSON sibling.
+
+### Known v7.1.8-eligible polish (not shipped yet)
+- api_audit.py's extracted `sample_url` drops `basePath` — testfire's `/login` should be `/api/login`. Needs an `extract_operations` patch, not a collector patch.
+- operations.json doesn't preserve body-param names beyond `body` itself. Parsing from the raw spec would recover `username`/`password` etc; current fallback stub `{"test":"1"}` works for sqlmap boolean-blind detection but gives less precise payload targeting.
+
+Both are polish. Not shipping until seen in a real engagement.
+
+### Found by
+`Traceback (most recent call last):` fired in the Monitor on the v7.1.6 run at the SQLMAP phase boundary. The stack trace pointed directly at line 1501 of hunt.py, making the fix site unambiguous.
+
+---
+
 ## v7.1.6 — api_audit.py spec-path list expansion (2026-04-18)
 
 Re-running with v7.1.5 got Phase 6.5 actually executing — but `api_audit.py` still reported `OpenAPI specs: 0` on testfire.net. Root cause: the 17-entry `SPEC_PATHS` list included `/swagger-ui/index.html` (hyphenated) but not `/swagger/index.html` (slash-separated) and *no* entry at all for testfire's actual spec location `/swagger/properties.json`. Yet another silent-miss — the probe succeeded, the responses were all 404s, and the phase reported clean completion with zero findings.

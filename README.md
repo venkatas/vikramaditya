@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v7.1.6 — api_audit.py SPEC_PATHS expansion (testfire, FastAPI, slash-separated Swagger UI) + 395-test suite + full v7.1.x restore of OpenAPI→sqlmap detection chain + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
+**v7.1.7 — OpenAPI collector crash fix (consumes api_audit's operations.json cleanly, skips non-spec siblings) + 407-test suite + full v7.1.x restore of OpenAPI→sqlmap detection chain + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
