@@ -1,5 +1,19 @@
 # Changelog
 
+## v6.2.0 — /autopilot orchestrator (agent + command) (2026-04-18)
+
+### Added
+- `agents/autopilot.md` — autonomous hunt-loop agent. Runs scope → recon → rank → hunt → validate → report without stopping for per-step approval. Enforces `ScopeChecker` on every outbound request and appends every request to `audit.jsonl`. Supports `--paranoid` / `--normal` / `--yolo` checkpoint modes.
+- `commands/autopilot.md` — `/autopilot <target>` slash command.
+
+### Why
+Vikramaditya already shipped the *engine* (`autopilot_api_hunt.py`, 107 KB) plus all the safety primitives (`RateLimiter`, `CircuitBreaker`, `SafeMethodPolicy`, `AutopilotGuard` in `memory/audit_log.py`). What was missing was the agent-level orchestrator that wires them together with scope checks and checkpoint discipline. This PR supplies exactly that glue.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `agents/autopilot.md` + `commands/autopilot.md`.
+
+---
+
 ## v6.1.0 — /remember + /surface + recon-ranker (2026-04-18)
 
 ### Added
