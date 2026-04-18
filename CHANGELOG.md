@@ -1,5 +1,50 @@
 # Changelog
 
+## v7.1.4 — SQLi plumbing fixes found via testfire.net dogfooding (2026-04-18)
+
+Four bugs surfaced while running Vikramaditya end-to-end on `https://testfire.net/`. None of them throw an error; they silently degrade coverage. Fixes are all in `hunt.py::run_sqlmap_targeted` and `brain.py::triage_finding`.
+
+### Bug 3 — `/api/*` POST endpoints never handed to sqlmap
+**Root cause:** `run_sqlmap_targeted` aggregates candidates from nuclei-sqli, paramspider, `with_params.txt`, and `arjun.json`. None of those feed the `api_specs/*.json` output from Phase 6.5 (OpenAPI discovery). So every Swagger-documented POST operation — including `/api/login` which had a textbook boolean-based blind SQLi on testfire — was silently skipped.
+
+**Fix:** new helper `_collect_openapi_post_endpoints(recon_dir)` walks both Swagger-2.0 (`host` + `basePath` + `paths` + `definitions/$ref`) and OpenAPI-3.0 (`servers[0].url` + `requestBody.content["application/json"].schema` + `components.schemas/$ref`) specs. For each POST/PUT/PATCH, generates a synthesised JSON body (first-level properties → `"test"` value) and runs `sqlmap -u <url> --data='{...}' --method POST` individually. `sqlmap -m` can't do this because it treats each URL as a standalone GET.
+
+**Impact:** the testfire SQLi on `/api/login` would now be caught in a single `hunt.py --target testfire.net` pass.
+
+### Bug 4 — cross-phase payload contamination in SQLi candidates
+**Root cause:** `urls/with_params.txt` includes dalfox's and historical scanners' XSS PoCs pulled back through wayback/gau (e.g. `search.jsp?query=<body bgcolor="red">...<a href="evil.com">...`). `run_sqlmap_targeted` happily fed these to sqlmap, which then spent minutes trying to inject around the existing `<body>` HTML.
+
+**Fix:** new `_looks_like_payload_url(url)` + opt-in `filter_payloads=True` flag on `_collect_urls_from_file`. Matches ~17 JS-sink / XSS / SQLi substrings plus a regex for URL-encoded `<tag` openers (`%3C[a-z/]`). The SQLMAP phase now defaults to `filter_payloads=True`.
+
+### Bug 5 — sqlmap always ran unauthenticated
+**Root cause:** the GET-candidates branch of `run_sqlmap_targeted` called `sqlmap -m $cand_file --batch --level=3 --risk=2 --random-agent` with no `--cookie`. Any candidate requiring a session redirected to `/login`, sqlmap saw the 302, and flagged the target non-injectable. Authenticated engagements (cfgold, foctta) would have missed every post-auth SQLi.
+
+**Fix:** `cookie_opt = f'--cookie="{cookies}"' if cookies else ""` threaded into both the GET branch and the new OpenAPI POST branch.
+
+### Bug 6 — baron-llm triage cold-start occasionally describes the task instead of running it
+**Root cause:** first call to the 8B triage model on a fresh Ollama process sometimes returns generic prose like *"You have been tasked with validating the quality of a penetration test report…"* — no `VERDICT:` line, no 7-question gate answers. Second call on the same prompt returns proper structured output.
+
+**Fix:** `brain.py::triage_finding` now detects a missing `VERDICT:` token and retries once with a stricter prompt prefix: *"DO NOT describe the task. DO NOT summarise the finding in prose. Start your response with the literal token 'VERDICT:'."* Covers the cold-start case without changing the happy-path behaviour.
+
+### Tests
+`tests/test_hunt_sqlmap_plumbing.py` — 15 new regression tests:
+- 8 × `_looks_like_payload_url` / `_collect_urls_from_file(filter_payloads=True)` — including the exact testfire dalfox PoC as a pinned regression case.
+- 7 × `_collect_openapi_post_endpoints` — Swagger 2.0 + OpenAPI 3.0 specs, malformed-JSON passthrough, limit enforcement, GET-op skip.
+
+Bug 5 and Bug 6 are exercised at integration time (subprocess + LLM stub respectively).
+
+### Verified
+```
+$ python3 -m pytest tests/test_hunt_sqlmap_plumbing.py -v
+15 passed in 0.15s
+```
+Full-suite baseline: 345 → **360 passing**.
+
+### Found by
+Dogfooding — `"test our tool on https://testfire.net/"`. The tool missed the SQLi I'd already confirmed manually because of Bugs 3–5; the noisy brain output during the scan surfaced Bug 6. Everything was fixable in ~60 lines + one new helper.
+
+---
+
 ## v7.1.3 — syntax regression guard + duplicate `__future__` import fix (2026-04-18)
 
 ### Problem

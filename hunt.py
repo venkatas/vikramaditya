@@ -1393,8 +1393,40 @@ def _read_text(path: str) -> str:
         return ""
 
 
+# Signals that an URL's query-string already contains a payload left by a
+# previous tester / crawler (dalfox PoCs frequently land in gau/wayback).
+# Feeding these to sqlmap wastes probes trying to inject around them. (v7.1.4)
+_PAYLOAD_QUERY_SIGNALS: tuple[str, ...] = (
+    "<script", "</script", "onerror=", "onauxclick=", "onclick=", "onload=",
+    "onbegin=", "ontoggle=", "onstart=", "srcdoc=", "javascript:", "alert(",
+    "confirm(", "prompt(", "<iframe", "<svg", "<img", "javascript%3a",
+)
+
+# Matches an URL-encoded ``<tag`` sequence (``%3C`` = ``<``) — catches arbitrary
+# HTML tags left in query values, not just the few listed above. Case-insensitive
+# via inline ``(?i)`` because URL encodings mix cases in the wild.
+import re as _re_module  # local alias; hunt.py already imports re above
+_PAYLOAD_ENCODED_TAG_RE = _re_module.compile(r"(?i)%3c[a-z/]")
+
+
+def _looks_like_payload_url(url: str) -> bool:
+    """True if the URL's query or path already carries an injection payload.
+
+    Cheap heuristic — case-insensitive substring match on known JS-sink /
+    XSS / SQLi signatures, plus a regex for URL-encoded ``<tag`` openers.
+    Skipping these before feeding sqlmap avoids the cross-phase
+    contamination observed on testfire.net where dalfox PoCs crawled back
+    into ``urls/with_params.txt`` and became SQLi candidates.
+    """
+    lower = url.lower()
+    if any(sig in lower for sig in _PAYLOAD_QUERY_SIGNALS):
+        return True
+    return bool(_PAYLOAD_ENCODED_TAG_RE.search(lower))
+
+
 def _collect_urls_from_file(path: str, *, require_query: bool = False,
-                            strip_query: bool = False, limit: int | None = None) -> list[str]:
+                            strip_query: bool = False, limit: int | None = None,
+                            filter_payloads: bool = False) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
     if not os.path.isfile(path):
@@ -1406,6 +1438,8 @@ def _collect_urls_from_file(path: str, *, require_query: bool = False,
                 if not candidate.startswith(("http://", "https://")):
                     continue
                 if require_query and "?" not in candidate:
+                    continue
+                if filter_payloads and _looks_like_payload_url(candidate):
                     continue
                 parsed = urlsplit(candidate)
                 if not parsed.scheme or not parsed.netloc:
@@ -1423,6 +1457,90 @@ def _collect_urls_from_file(path: str, *, require_query: bool = False,
     except OSError:
         return urls
     return urls
+
+
+def _collect_openapi_post_endpoints(recon_dir: str, *,
+                                     limit: int = 30) -> list[dict]:
+    """Extract ``{url, method, json_body}`` for every POST/PUT/PATCH operation
+    in ``recon_dir/api_specs/*.json`` OpenAPI / Swagger specs.
+
+    Added in v7.1.4 after the testfire.net dogfood: the Swagger-discovered
+    ``/api/login`` was never handed to sqlmap because the candidate
+    aggregator only ingested GET URLs from paramspider / wayback / gau.
+
+    The body-schema walker is intentionally dumb — it generates a flat
+    ``"string"`` value for every property so sqlmap has material to fuzz.
+    Pinning a richer schema walk would be nice but "param-present" is all
+    the boolean-blind detection actually needs.
+    """
+    import glob as _glob
+
+    specs_dir = os.path.join(recon_dir, "api_specs")
+    if not os.path.isdir(specs_dir):
+        return []
+
+    endpoints: list[dict] = []
+    seen_targets: set[tuple[str, str]] = set()
+
+    def _sample_body(schema: dict, definitions: dict) -> dict:
+        # Follow a single $ref hop. Anything deeper falls through to an
+        # empty object — sqlmap still gets "something" to inject into.
+        if "$ref" in schema:
+            ref = schema["$ref"].split("/")[-1]
+            schema = definitions.get(ref, {})
+        props = schema.get("properties") or {}
+        if props:
+            return {name: "test" for name in props}
+        return {}
+
+    for path in sorted(_glob.glob(os.path.join(specs_dir, "*.json"))):
+        try:
+            spec = json.load(open(path))
+        except Exception:
+            continue
+        host = spec.get("host") or ""
+        base_path = spec.get("basePath") or ""
+        scheme = (spec.get("schemes") or ["https"])[0]
+        defs = spec.get("definitions") or {}
+        # OpenAPI 3 uses servers + components.schemas
+        if not host and spec.get("servers"):
+            server0 = spec["servers"][0].get("url", "")
+            from urllib.parse import urlparse as _up
+            p = _up(server0)
+            if p.netloc:
+                host = p.netloc
+                base_path = p.path or ""
+                scheme = p.scheme or scheme
+        defs = defs or (spec.get("components") or {}).get("schemas") or {}
+
+        for op_path, ops in (spec.get("paths") or {}).items():
+            for method, meta in (ops or {}).items():
+                if method.lower() not in ("post", "put", "patch"):
+                    continue
+                full = f"{scheme}://{host}{base_path}{op_path}"
+                key = (method.lower(), full)
+                if key in seen_targets:
+                    continue
+                body = {}
+                for p in (meta.get("parameters") or []):
+                    if p.get("in") == "body":
+                        body = _sample_body(p.get("schema") or {}, defs)
+                        break
+                if not body and meta.get("requestBody"):
+                    rb = meta["requestBody"].get("content") or {}
+                    for _ct, val in rb.items():
+                        body = _sample_body(val.get("schema") or {}, defs)
+                        if body:
+                            break
+                endpoints.append({
+                    "url": full,
+                    "method": method.upper(),
+                    "json_body": body,
+                })
+                seen_targets.add(key)
+                if len(endpoints) >= limit:
+                    return endpoints
+    return endpoints
 
 
 def _load_json(path: str, default):
@@ -4515,9 +4633,12 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
             if u.startswith("http") and "=" in u:
                 candidates.append(u)
 
-    # From recon parameterized URLs (critical fallback when live probing misses http-only hosts)
+    # From recon parameterized URLs (critical fallback when live probing misses http-only hosts).
+    # v7.1.4: ``filter_payloads=True`` drops URLs whose query already contains an XSS/SQLi
+    # PoC left behind by dalfox/gau crawls — those waste sqlmap cycles.
     with_params_file = os.path.join(recon_dir, "urls", "with_params.txt")
-    candidates.extend(_collect_urls_from_file(with_params_file, require_query=True, limit=50))
+    candidates.extend(_collect_urls_from_file(with_params_file, require_query=True,
+                                              limit=50, filter_payloads=True))
 
     # From arjun output
     arjun_file = os.path.join(recon_dir, "params", "arjun.json")
@@ -4531,27 +4652,64 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         except Exception:
             pass
 
-    candidates = list(dict.fromkeys(candidates))[:20]  # dedup, top 20
+    candidates = [c for c in dict.fromkeys(candidates) if not _looks_like_payload_url(c)]
+    candidates = candidates[:20]  # top 20 GET candidates
 
-    if not candidates:
+    # v7.1.4 — OpenAPI/Swagger POST endpoints from api_audit.py Phase 6.5.
+    # These don't go through ``sqlmap -m`` (which treats one URL per line as GET);
+    # each POST endpoint is sqlmap'd individually with --data + --method POST so
+    # request-body parameters get fuzzed properly.
+    openapi_posts = _collect_openapi_post_endpoints(recon_dir, limit=15)
+    if openapi_posts:
+        log("info", f"sqlmap: {len(openapi_posts)} POST candidate(s) from OpenAPI specs")
+
+    if not candidates and not openapi_posts:
         log("warn", "No SQLi candidates found — run recon + param discovery first")
         return False
 
-    log("info", f"sqlmap: testing {len(candidates)} candidate URL(s)...")
-    cand_file = os.path.join(sqli_dir, "candidates.txt")
-    with open(cand_file, "w") as f:
-        f.write("\n".join(candidates))
+    # v7.1.4 — thread session cookies into sqlmap so authenticated endpoints
+    # don't 302 back to the login page before sqlmap can probe them.
+    cookie_opt = f'--cookie="{cookies}"' if cookies else ""
 
     sqli_out = os.path.join(sqli_dir, "sqlmap_results.txt")
-    ok, out = run_cmd(
-        f'sqlmap -m "{cand_file}" --batch --level=3 --risk=2 '
-        f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
-        f'--random-agent --timeout=10',
-        timeout=1800,
-        watch_file=sqli_dir,
-        watch_phase="SQLMAP"
-    )
-    print(out[-3000:] if len(out) > 3000 else out)
+
+    if candidates:
+        log("info", f"sqlmap: testing {len(candidates)} GET candidate URL(s)...")
+        cand_file = os.path.join(sqli_dir, "candidates.txt")
+        with open(cand_file, "w") as f:
+            f.write("\n".join(candidates))
+
+        ok, out = run_cmd(
+            f'sqlmap -m "{cand_file}" --batch --level=3 --risk=2 '
+            f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
+            f'--random-agent --timeout=10 {cookie_opt}',
+            timeout=1800,
+            watch_file=sqli_dir,
+            watch_phase="SQLMAP"
+        )
+        print(out[-3000:] if len(out) > 3000 else out)
+    else:
+        ok = True
+        out = ""
+
+    # v7.1.4 — run each OpenAPI POST operation with its synthesised JSON body.
+    # The original candidate aggregator missed these entirely, which is how
+    # the testfire.net SQLi on /api/login escaped detection.
+    for op in openapi_posts:
+        body = json.dumps(op["json_body"] or {"test": "1"}, separators=(",", ":"))
+        safe_name = (op["url"].replace("https://", "").replace("http://", "")
+                      .replace("/", "_").replace(":", "_"))[:60]
+        out_file = os.path.join(sqli_dir, f"post_{safe_name}.txt")
+        log("info", f"sqlmap {op['method']} → {op['url']}  body={body[:80]}")
+        ok_p, out_p = run_cmd(
+            f'sqlmap -u "{op["url"]}" --data=\'{body}\' '
+            f'--method {op["method"]} --batch --level=3 --risk=2 '
+            f'--random-agent --timeout=10 {cookie_opt} '
+            f'--output-dir="{sqli_dir}" -o "{out_file}"',
+            timeout=600,
+        )
+        if "injectable" in (out_p or "").lower():
+            log("crit", f"API SQLi FOUND: {op['method']} {op['url']}")
 
     if os.path.exists(sqli_out):
         injections = sum(1 for line in open(sqli_out) if "injectable" in line.lower() or "injection" in line.lower())
