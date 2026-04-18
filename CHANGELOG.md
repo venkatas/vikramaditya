@@ -1,5 +1,23 @@
 # Changelog
 
+## v5.6.0 — /intel engine (2026-04-18)
+
+### Added
+- `intel_engine.py` — on-demand intel orchestrator. Combines `intel.py` (CVE / NVD / GitHub Advisory / Hacktivity fetchers) + HackerOne MCP (preferred when registered) + hunt-memory cross-reference. Flags untested CVEs on the current target and new endpoints since the last hunt.
+- `commands/intel.md` — `/intel <target>` slash command with tech-stack and program-handle flags.
+
+### Changed
+- `intel_engine.py` imports `intel` (Vikramaditya's module) instead of upstream's `learn`. Same function signatures, clean swap.
+- MCP import path adjusted for Vikramaditya's flat layout: `mcp/hackerone-mcp/` at repo root, not `tools/../mcp/`.
+
+### Why
+`intel.py` already fetches raw CVEs/advisories but dumps them flat. `intel_engine.py` adds the "what haven't I tested yet on this target?" layer — cross-references against hunt-memory to surface new attack surface on a warm re-engagement. Depends on v5.1.0 HackerOne MCP for richer program context.
+
+### Ported from
+Upstream `shuvonsec/claude-bug-bounty` — `tools/intel_engine.py` + `commands/intel.md` (PR #9 Bionic Hunter).
+
+---
+
 ## v5.5.0 — bb-methodology master skill (2026-04-18)
 
 ### Added
