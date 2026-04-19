@@ -1,5 +1,54 @@
 # Changelog
 
+## v7.3.0 — email_audit adapter + specialist agent (Path B) (2026-04-19)
+
+v7.2.0 shipped email_audit as a CLI wrapper. v7.3.0 adds the refactor-safe adapter layer that lets the rest of Vikramaditya consume it cleanly.
+
+### Why not a full package split?
+The monolith is 3444 lines with lots of cross-references between `audit_*` functions (shared DNS client, DER parser helpers, provider-inference). Splitting blind is high-risk without comprehensive tests. v7.3.0 takes the pragmatic route: a **thin adapter module** that re-exports the stable audit primitives and converts JSON output into Vikramaditya's standard finding shape. The monolith stays intact and CLI-capable; downstream code gets a clean import surface.
+
+### Added
+- **`email_audit_adapter.py`** — new module:
+  - Re-exports `audit_spf`, `audit_dmarc`, `audit_dkim`, `audit_mx`, `audit_mta_sts`, `audit_tls_rpt`, `audit_bimi`, `audit_dnssec`, `build_message_analysis_report`, `DNSClient`, `derive_cross_findings`, `normalize_target`, `estimate_dkim_rsa_bits` as a stable public surface.
+  - `to_finding_entries(audit_report, target)` — converts an `email_audit.py --json` report into a list of `memory/schemas.py`-compatible finding dicts. Each issue becomes a finding with `vuln_class` (`email_spf`/`email_dmarc`/…), `severity` (normalised to Vikramaditya's 4-level scale; subspace's `critical` → `high` since it's config gap, not RCE), `endpoint` (`dns:<area>:<target>`), `tags` (`["email_auth", area, "subspace_sentinel"]`), `notes` (detail + `Fix:` recommendation).
+  - `load_and_convert(path, target)` — one-shot file reader.
+  - `severity_histogram(findings)` — `{severity: count}` for log summary.
+- **`agents/email-auditor.md`** — specialist agent spec. When to invoke (scope mentions email / MX self-hosted / BEC investigation / `.eml` analysis), core tasks (domain audit / message forensics / bulk), cross-finding escalation rules (SPF+DMARC permissive = HIGH; `p=reject` + no DKIM = MEDIUM; BIMI without DMARC = MEDIUM misleading trust). Explicit guardrails (`--smtp-probe` needs authorization, MTA-STS `mode=testing` is LOW not HIGH, etc.).
+- **`hunt.py::run_email_audit`** — rewritten to use the adapter. Previous v7.2.0 distil loop replaced with `load_and_convert` + `severity_histogram` — 30 lines of custom mapping gone.
+
+### Finding-shape consistency with the rest of Vikramaditya
+Before v7.3.0, email-audit findings had their own `{severity, title, area, detail, recommendation}` shape. Now they match the journal schema exactly — same `{target, action, vuln_class, endpoint, result, severity, notes, tags}` used by every other scanner. The HTML reporter and hunt-memory journal both pick them up without custom code paths.
+
+### Tests
+`tests/test_email_audit_adapter.py` — 31 new tests:
+- 5 × severity map (critical→high; info/notice→info; unknown→info; None-safe; standard).
+- 9 × vuln_class map (8 × standard areas parametrized + 1 × unknown fallback).
+- 7 × `to_finding_entries` (1-entry-per-issue; shape-pin; detail+fix concatenation; critical downgrade; cross-finding as `email_posture`; empty-input safety; non-dict-input safety).
+- 3 × `load_and_convert` (roundtrip; missing file; malformed JSON).
+- 2 × `severity_histogram` (counts; empty iter).
+- 3 × re-exports (8 audit functions reachable; DNSClient; message_analysis).
+- 2 × agent doc ships + has required sections.
+
+### Verified
+```
+$ python3 -m pytest tests/test_email_audit_adapter.py -v
+31 passed in 0.12s
+
+$ python3 -m pytest tests/
+487 passed in 1.51s
+```
+Full-suite baseline: 455 → **487 passing**.
+
+### Deferred (future v7.3.x polish)
+- Splitting monolith into `email_audit/<check>.py` package — still possible but no longer blocking any feature work.
+- Replacing the tool's own multi-LLM dispatcher (Ollama/Claude/OpenAI/xAI/Gemini) with Vikramaditya's `brain.py`.
+- Routing `.env` reads through `credential_store.py`.
+
+### Credit
+Upstream: `venkatas/subspace-sentinel` (MIT). v7.2.0 imported the tool verbatim; v7.3.0 wraps it for Vikramaditya-native consumption without modifying the upstream code.
+
+---
+
 ## v7.2.0 — email auth audit integration (Path A drop-in) (2026-04-19)
 
 Integrates `venkatas/subspace-sentinel` (MIT, 3444 lines, single-file) into Vikramaditya as a new recon phase. Covers a real bug-bounty finding class — SPF/DMARC/DKIM misconfig — that Vikramaditya had zero coverage for before.

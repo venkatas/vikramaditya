@@ -4779,43 +4779,28 @@ def run_email_audit(domain: str, *, smtp_probe: bool = False) -> bool:
                                detail=f"target={domain} audit-errored")
         return False
 
-    # Distil the finding list into Vikramaditya's reporter shape.
+    # v7.3.0 — convert via the adapter so findings carry the standard
+    # memory/schemas.py shape and flow directly into the HTML reporter
+    # + hunt-memory journal without custom handling.
     try:
-        report = json.load(open(audit_json))
+        from email_audit_adapter import load_and_convert, severity_histogram
     except Exception as e:
-        log("warn", f"email audit JSON parse failed: {e}")
+        log("warn", f"email_audit_adapter import failed: {e}")
         _brain_phase_complete("EMAIL-AUDIT", False,
-                               detail=f"target={domain} json-parse-error")
+                               detail=f"target={domain} adapter-import-error")
         return False
 
-    findings = []
-    checks = report.get("checks") or {}
-    for area, data in checks.items():
-        if not isinstance(data, dict):
-            continue
-        for issue in data.get("issues", []):
-            if not isinstance(issue, dict):
-                continue
-            sev = (issue.get("severity") or "info").lower()
-            if sev == "critical":
-                sev = "high"   # email-auth 'critical' is usually config gap
-            findings.append({
-                "severity": sev,
-                "title": issue.get("title") or f"{area.upper()} issue",
-                "area": area,
-                "detail": issue.get("detail", ""),
-                "recommendation": issue.get("recommendation", ""),
-                "target": domain,
-            })
+    findings = load_and_convert(audit_json, domain)
 
     out_findings = os.path.join(findings_dir, "email_auth", "findings.json")
     os.makedirs(os.path.dirname(out_findings), exist_ok=True)
     with open(out_findings, "w") as fh:
         json.dump(findings, fh, indent=2)
 
-    high = sum(1 for f in findings if f["severity"] == "high")
-    med = sum(1 for f in findings if f["severity"] == "medium")
-    low = sum(1 for f in findings if f["severity"] == "low")
+    hist = severity_histogram(findings)
+    high = hist.get("high", 0)
+    med = hist.get("medium", 0)
+    low = hist.get("low", 0)
     summary = f"{domain} — {high} high / {med} medium / {low} low"
     log("info" if not high else "crit", f"email audit: {summary}")
 
