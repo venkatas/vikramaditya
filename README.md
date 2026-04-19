@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v7.1.11 — drop inherited placeholder Support URLs (Discord/docs.vikramaditya.dev/etc.) + sqlmap invocation hardening + body-schema expansion + 432-test suite + full v7.1.x OpenAPI→sqlmap chain + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
+**v7.2.0 — email auth audit integration (SPF/DMARC/DKIM/MTA-STS/BIMI/DNSSEC + live SMTP STARTTLS + .eml header analysis, ported from subspace-sentinel) + 455-test suite + sqlmap JSON API detection + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya

@@ -27,6 +27,13 @@ httpx>=0.27.0
 requests>=2.32.4
 python-dateutil>=2.8.2
 
+# ── Email auth audit (SPF/DMARC/DKIM/MTA-STS/BIMI/DNSSEC) ────────────────────
+# email_audit.py was ported in v7.2.0 from venkatas/subspace-sentinel (MIT).
+# dnspython drives the DNS queries; certifi pins CA bundle for HTTPS MTA-STS
+# policy fetches.
+dnspython>=2.6.1
+certifi>=2024.7.4
+
 # ── File type detection (AI-powered, used by file_classifier.py) ─────────────
 magika>=0.6.0
 

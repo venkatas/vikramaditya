@@ -1,5 +1,53 @@
 # Changelog
 
+## v7.2.0 — email auth audit integration (Path A drop-in) (2026-04-19)
+
+Integrates `venkatas/subspace-sentinel` (MIT, 3444 lines, single-file) into Vikramaditya as a new recon phase. Covers a real bug-bounty finding class — SPF/DMARC/DKIM misconfig — that Vikramaditya had zero coverage for before.
+
+### Added
+- **`email_audit.py`** (3444 lines, MIT) at repo root — ported verbatim from `venkatas/subspace-sentinel@2026-03-27`. Checks SPF / DMARC / DKIM / MX / DNSSEC / MTA-STS / TLS-RPT / BIMI + optional live SMTP STARTTLS + `.eml` header analysis + multi-LLM AI summary (Ollama/Claude/OpenAI/xAI/Gemini). Credit header added naming the upstream repo and planned v7.3.0 refactor.
+- **`hunt.py::run_email_audit(domain)`** — new Phase 8.7 wired into `hunt_target`. Writes raw JSON to `recon/<target>/email_auth/audit.json` and a distilled finding list to `findings/<target>/email_auth/findings.json` (HTML-reporter-compatible shape). Silently skips for IP/CIDR targets since SPF/DMARC are hostname-scoped.
+- **`commands/email-audit.md`** — `/email-audit <domain|email|.eml>` slash command. Bulk mode, DKIM selector hints, SMTP probe, `.env` AI config documented.
+- **`requirements.txt`** — two new deps: `dnspython>=2.6.1` + `certifi>=2024.7.4`. Both small, standard.
+
+### Tests
+`tests/test_email_audit_integration.py` — **22 new tests**:
+- 2 × `parse_kv_record` (DMARC/DKIM semicolon-split; SPF stays single-key).
+- 3 × `normalize_target` (domain, email, case-folded).
+- 4 × `relaxed_aligns` (exact, subdomain, different-org, None inputs).
+- 4 × `is_privateish_ip` (RFC1918, loopback, public, garbage).
+- 3 × `estimate_dkim_rsa_bits` — synthesised 1024/2048-bit RSA DER pubkeys to pin the DER walker.
+- 3 × hunt.py integration — hook is importable; IP/CIDR targets short-circuit without subprocess calls.
+- 2 × command doc — `commands/email-audit.md` ships + carries the required SPF/DMARC/DKIM/MTA-STS/DNSSEC sections.
+
+### Verified
+```
+$ python3 email_audit.py example.com --json --skip-http
+{"summary": {"target": "example.com", ...}, "checks": {"spf": {...}, "dmarc": {...}, ...}}
+
+$ python3 -m pytest tests/test_email_audit_integration.py
+22 passed in 0.15s
+```
+Full-suite baseline: 432 → **455 passing**.
+
+### Integration shape (Path A — "drop in, wire up")
+- No refactor of the 3444-line monolith. Tool retains standalone CLI use.
+- `hunt.py::run_email_audit` wraps the CLI with `--json --skip-http --timeout 6 --output <path>` and parses the JSON output into Vikramaditya's finding-list shape.
+- IP/CIDR guard via simple regex — email-auth is DNS-scoped, bypass is correct behaviour.
+- Brain integration passes through — the tool's own AI dispatcher reads the same `.env` keys Vikramaditya uses elsewhere, so no double-config.
+
+### Deferred to Path B (v7.3.0)
+- Split monolith into `email_audit/` package — `spf.py`, `dmarc.py`, `dkim.py`, `mx.py`, `mta_sts.py`, `bimi.py`, `dnssec.py`, each 200–400 lines.
+- Replace the tool's multi-LLM dispatcher with Vikramaditya's `brain.py` (single source of truth).
+- Replace the tool's own `.env` schema with `credential_store.py`.
+- Emit findings in `memory/schemas.py` shape so they flow directly into the HTML reporter without the current distil step.
+- Add `agents/email-auditor.md` for agent-driven bulk scans.
+
+### Credit
+Upstream: `https://github.com/venkatas/subspace-sentinel` (MIT). Imported verbatim; credit header added to `email_audit.py` docstring.
+
+---
+
 ## v7.1.11 — drop inherited placeholder Support URLs (2026-04-19)
 
 The README's "Professional Support" block advertised four links that never resolved:
