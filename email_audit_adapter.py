@@ -117,7 +117,7 @@ def to_finding_entries(
                 notes = f"{detail}\n\nFix: {recommendation}" if detail else f"Fix: {recommendation}"
             findings.append({
                 "target": target,
-                "action": "scan",
+                "action": "recon",
                 "vuln_class": _to_vuln_class(area),
                 "endpoint": f"dns:{area}:{target}",
                 "result": "confirmed",
@@ -166,3 +166,79 @@ def severity_histogram(findings: Iterable[dict[str, Any]]) -> dict[str, int]:
         sev = f.get("severity", "info")
         hist[sev] = hist.get(sev, 0) + 1
     return hist
+
+
+# ---------------------------------------------------------------------------
+# v7.4.0 — brain.py LLM bridge
+# ---------------------------------------------------------------------------
+# ``email_audit.py`` ships its own ~300-line multi-provider LLM dispatcher
+# (Ollama/Claude/OpenAI/xAI/Gemini) with a parallel ``.env`` schema. That's
+# duplicated work — Vikramaditya's ``brain.py`` already does exactly this
+# via ``LLMClient`` with shared env-var conventions and fallback chain.
+#
+# This bridge lets callers ask for an AI summary **through brain.py** so
+# there's one provider config to maintain. The monolith's own dispatcher
+# stays intact as a fallback for standalone-CLI users who don't want to
+# depend on brain.py. Opt-in per call.
+
+_BRAIN_SUMMARY_PROMPT = """You are a mail-security auditor. Summarise the JSON \
+email-auth report below in 6-10 bullet points.
+
+Cover: overall posture verdict (good / mixed / weak / spoofable), the 3 \
+highest-severity issues in order, any cross-finding that escalates (e.g. \
+SPF+DMARC+DKIM all permissive = spoofable), one recommendation per issue, \
+and one line on what a bug-bounty triager should care about.
+
+Be precise. Cite the actual record strings where relevant. Do not invent \
+facts not present in the JSON.
+
+REPORT:
+{report_json}
+"""
+
+
+def run_brain_summary(audit_report: dict[str, Any],
+                      *, max_tokens: int = 700,
+                      model: str | None = None) -> str | None:
+    """Summarise an audit report through Vikramaditya's brain.py LLMClient.
+
+    Returns the generated summary string, or ``None`` if ``brain.py`` isn't
+    importable or no LLM provider is reachable. Falls back silently — this
+    is an optional augmentation of the audit, not a requirement.
+
+    The summary is deterministic w.r.t. the input JSON (no hidden context)
+    — safe to cache by report hash if desired.
+
+    Preferred over ``email_audit.py``'s built-in ``--ai-provider`` flag
+    because it reads from the same env vars Vikramaditya uses elsewhere
+    (``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``, ``XAI_API_KEY``,
+    ``OLLAMA_HOST``) rather than the subspace-specific ones.
+    """
+    try:
+        from brain import LLMClient
+    except Exception:
+        return None
+
+    try:
+        client = LLMClient()
+    except Exception:
+        return None
+    if not getattr(client, "available", False):
+        return None
+
+    payload = json.dumps(audit_report, separators=(",", ":"))
+    # Clip extremely large reports — most LLMs cap at 128k context.
+    if len(payload) > 60_000:
+        payload = payload[:60_000] + "...[truncated]"
+
+    prompt = _BRAIN_SUMMARY_PROMPT.format(report_json=payload)
+    try:
+        return client.chat(
+            model=model,
+            system="You are an email security auditor. Output only the summary.",
+            user=prompt,
+            max_tokens=max_tokens,
+            temperature=0.1,
+        ) or None
+    except Exception:
+        return None

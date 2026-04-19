@@ -4730,6 +4730,44 @@ exploit
 
 
 # ── v7.2.0: email authentication & mail security audit ─────────────────────────
+def _journal_email_audit_findings(domain: str, findings: list) -> None:
+    """Append every email-auth finding to hunt-memory/journal.jsonl.
+
+    v7.4.0 — wires email_audit into the same journal pipeline that
+    /pickup <target> reads from, so next session's warm-restart surfaces
+    SPF/DMARC/DKIM findings alongside everything else the scanner caught.
+
+    Silently no-ops if the journal import or write fails — the email
+    audit itself already succeeded; a journal miss shouldn't abort it.
+    """
+    if not findings:
+        return
+    try:
+        from memory.hunt_journal import HuntJournal
+        from memory.schemas import make_journal_entry
+    except Exception:
+        return  # Memory package not available — skip cleanly.
+
+    # Hunt memory lives under the project-level hunt-memory/ dir.
+    journal_path = os.path.join(BASE_DIR, "hunt-memory", "journal.jsonl")
+    journal = HuntJournal(journal_path)
+    for f in findings:
+        try:
+            entry = make_journal_entry(
+                target=f.get("target", domain),
+                action=f.get("action", "scan"),
+                vuln_class=f.get("vuln_class", "email_unknown"),
+                endpoint=f.get("endpoint", f"dns:email:{domain}"),
+                result=f.get("result", "confirmed"),
+                severity=f.get("severity"),
+                notes=f.get("notes"),
+                tags=f.get("tags"),
+            )
+            journal.append(entry)
+        except Exception:
+            continue
+
+
 def run_email_audit(domain: str, *, smtp_probe: bool = False) -> bool:
     """Run email_audit.py against ``domain`` — SPF/DMARC/DKIM/MTA-STS/BIMI/DNSSEC.
 
@@ -4796,6 +4834,14 @@ def run_email_audit(domain: str, *, smtp_probe: bool = False) -> bool:
     os.makedirs(os.path.dirname(out_findings), exist_ok=True)
     with open(out_findings, "w") as fh:
         json.dump(findings, fh, indent=2)
+
+    # v7.4.0 — also append to the hunt-memory journal so findings show up
+    # in /pickup <target> warm-restart + /intel cross-reference. Wrapped in
+    # try so a missing journal dir never fails the scan.
+    try:
+        _journal_email_audit_findings(domain, findings)
+    except Exception as e:
+        log("warn", f"journal append (email_audit) skipped: {e}")
 
     hist = severity_histogram(findings)
     high = hist.get("high", 0)

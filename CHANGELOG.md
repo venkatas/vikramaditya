@@ -1,5 +1,61 @@
 # Changelog
 
+## v7.4.0 — email_audit polish: per-check package + brain LLM bridge + hunt_journal (2026-04-19)
+
+Three polish items for the v7.2.0 / v7.3.0 email-audit integration, bundled:
+
+### 1. Per-check package — `email_audit_checks/`
+Nine logical modules — `spf.py`, `dmarc.py`, `dkim.py`, `mx.py`, `mta_sts.py`, `tls_rpt.py`, `bimi.py`, `dnssec.py`, `message.py`. Each is ~10 lines of re-exports from the monolith. Downstream code can now `from email_audit_checks import dkim; dkim.estimate_dkim_rsa_bits(...)` without pulling in the whole 3444-line file. Tests gain targeted-import surface.
+
+**Isolation invariant:** `email_audit_checks.spf` does NOT re-export `audit_dmarc`, `audit_dkim`, etc. — each sub-module exposes only the functions relevant to its check plus the shared helpers that check needs. Pinned in `test_all_submodules_isolated`.
+
+### 2. brain.py LLM bridge — `email_audit_adapter.run_brain_summary(report)`
+Opt-in function that routes email-audit summary requests through Vikramaditya's `brain.py::LLMClient` instead of the monolith's own duplicate Ollama/Claude/OpenAI/xAI/Gemini dispatcher. Reads from the canonical env vars (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `OLLAMA_HOST`) that all other Vikramaditya AI features use. Returns `None` when no provider is reachable — graceful degradation, never raises. 60k-char payload clip built-in.
+
+The monolith's own `--ai-provider` dispatcher stays intact as a standalone-CLI fallback; v7.4.0 just gives the *Vikramaditya-embedded* path a single source of truth for LLM config.
+
+### 3. Auto-append findings to hunt_journal
+`hunt.py::run_email_audit` now also writes every email-auth finding into `hunt-memory/journal.jsonl` via `HuntJournal.append`. Schema-validated — malformed findings silently skip without aborting the loop. Net effect: next session's `/pickup <target>` warm-restart surfaces SPF/DMARC/DKIM findings alongside everything else the scanner caught previously. Also feeds `/intel` cross-reference lookups.
+
+New helper `hunt.py::_journal_email_audit_findings(domain, findings)` takes the adapter output directly — wrapped in try/except so a missing/invalid journal path never aborts the actual audit.
+
+### Schema correction
+Adapter initially emitted `action="scan"` — not in the `VALID_ACTIONS` set (`hunt, intel, recon, remember, report, resume, validate`). Changed to `action="recon"` which is semantically correct — email-audit is a recon phase that establishes attack surface, not an active exploit.
+
+### Tests
+`tests/test_email_audit_v7_4_0.py` — 15 new tests covering all three items:
+- 8 × per-check package (top-level imports + sub-module surface pins + isolation invariant).
+- 4 × brain bridge (callable, no-provider → None, missing brain import safe, large-payload safe).
+- 3 × journal append (empty findings no-op, valid findings land, invalid schema silently skipped).
+
+Existing v7.3.0 tests updated for the `action="recon"` change (2 assertions).
+
+### Verified
+Full-suite baseline: 487 → **502 passing**.
+
+### What "Path B" now looks like, structurally
+
+```
+email_audit.py                     — 3444-line monolith (untouched, CLI-capable)
+email_audit_adapter.py             — clean Python API + schema-compat findings
+                                     + v7.4.0 brain bridge
+email_audit_checks/                — v7.4.0 per-check import surface
+├── __init__.py
+├── spf.py      dmarc.py   dkim.py
+├── mx.py       mta_sts.py tls_rpt.py
+├── bimi.py     dnssec.py  message.py
+agents/email-auditor.md            — specialist agent
+commands/email-audit.md            — slash command
+hunt.py::run_email_audit           — wires Phase 8.7 + journal append
+```
+
+No code was moved out of the monolith. Everything net-new is additive. The refactor is complete in the sense that every downstream concern — clean API, schema-compat findings, per-check testing, single-source LLM config, hunt-memory integration — is covered via wrapper modules. Moving implementation bodies into `email_audit_checks/*.py` later is pure refactor; it won't affect any import site.
+
+### Credit
+Upstream: `venkatas/subspace-sentinel` (MIT, unchanged). v7.2.0 imported it, v7.3.0 wrapped it, v7.4.0 integrated it.
+
+---
+
 ## v7.3.0 — email_audit adapter + specialist agent (Path B) (2026-04-19)
 
 v7.2.0 shipped email_audit as a CLI wrapper. v7.3.0 adds the refactor-safe adapter layer that lets the rest of Vikramaditya consume it cleanly.
