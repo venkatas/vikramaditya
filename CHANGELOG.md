@@ -1,5 +1,30 @@
 # Changelog
 
+## v7.1.11 — drop inherited placeholder Support URLs (2026-04-19)
+
+The README's "Professional Support" block advertised four links that never resolved:
+- `security@vikramaditya.dev` (no such mailbox)
+- `discord.gg/vikramaditya` (invite doesn't exist)
+- `docs.vikramaditya.dev` (domain unregistered)
+- `github.com/venkatas/vikramaditya/issues` (the one real link)
+
+The block was inherited from commit `bc6b025 feat: add HAR-based authenticated VAPT capabilities` — scaffold text that was never replaced with real contact info.
+
+### Fix
+Replaced the four-line block with two real entries:
+- `venkat.9099@gmail.com` — the actual maintainer contact.
+- `github.com/venkatas/vikramaditya/issues` — the real issue tracker.
+
+Heading trimmed from "Professional Support" to just "Support" since there's no paid support tier.
+
+### Not touched (flagged for next pass)
+The "Enterprise Licensing" block directly below the one just fixed still reads like inherited template copy (*White-label deployments*, *Custom integrations*, *Professional training*, *Extended support contracts*) — there's no actual enterprise licensing programme behind it. Will rewrite or delete in a follow-up patch.
+
+### Found by
+User review — spotted the unresolvable URLs during docs pass and flagged them as potentially hallucinated. `git log -S` pinned the culprit commit; the placeholders were inherited, not produced by this session's work.
+
+---
+
 ## v7.1.10 — sqlmap invocation hardening (JSON APIs) (2026-04-19)
 
 v7.1.9 landed with Vikramaditya reaching testfire's `/api/login` with `{"username":"test","password":"test"}` — the URL and body were finally correct. sqlmap still didn't flag `injectable`. Inspection of sqlmap's `testfire.net/log` showed *zero* `Parameter:` lines across all 6 POST operations. Three separate flags missing.

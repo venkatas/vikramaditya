@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v7.1.10 — sqlmap invocation hardening (Content-Type:application/json, --technique=BEU, --smart, CSV result re-read) + body-schema expansion + non-TTY EOFError fix + 432-test suite + full v7.1.x OpenAPI→sqlmap chain + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
+**v7.1.11 — drop inherited placeholder Support URLs (Discord/docs.vikramaditya.dev/etc.) + sqlmap invocation hardening + body-schema expansion + 432-test suite + full v7.1.x OpenAPI→sqlmap chain + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -673,12 +673,10 @@ git checkout -b feature/new-testing-module
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
-### **Professional Support**
+### **Support**
 
-- 📧 **Email**: security@vikramaditya.dev
-- 💬 **Discord**: [Join our community](https://discord.gg/vikramaditya)
-- 📚 **Documentation**: [Full docs](https://docs.vikramaditya.dev)
-- 🐛 **Issues**: [GitHub Issues](https://github.com/venkatas/vikramaditya/issues)
+- 📧 **Email**: [venkat.9099@gmail.com](mailto:venkat.9099@gmail.com)
+- 🐛 **Issues & PRs**: [github.com/venkatas/vikramaditya/issues](https://github.com/venkatas/vikramaditya/issues)
 
 ### **Enterprise Licensing**
 
