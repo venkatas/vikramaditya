@@ -4729,6 +4729,105 @@ exploit
     return True
 
 
+# ── v7.2.0: email authentication & mail security audit ─────────────────────────
+def run_email_audit(domain: str, *, smtp_probe: bool = False) -> bool:
+    """Run email_audit.py against ``domain`` — SPF/DMARC/DKIM/MTA-STS/BIMI/DNSSEC.
+
+    New recon class ported from venkatas/subspace-sentinel in v7.2.0. Writes
+    the raw JSON report to ``recon/<target>/email_auth/audit.json`` and a
+    distilled finding list (severity + title) to ``findings/<target>/
+    email_auth/findings.json`` so the downstream HTML reporter picks it up
+    alongside the other scanner outputs.
+
+    Silently skips when ``email_audit.py`` is missing, when the binary has
+    no ``dnspython`` (one import away but optional), or when the target isn't
+    a real FQDN (IP / CIDR hunts bypass this phase).
+    """
+    log("phase", f"EMAIL-AUDIT: {domain}")
+    if _brain and _brain.enabled:
+        _brain.phase_start("EMAIL-AUDIT", f"target={domain}")
+
+    script = os.path.join(SCRIPT_DIR, "email_audit.py")
+    if not os.path.isfile(script):
+        log("warn", "email_audit.py not found — skipping email auth audit")
+        _brain_phase_complete("EMAIL-AUDIT", False,
+                               detail=f"target={domain} script missing")
+        return False
+
+    # Skip for IP / CIDR — SPF / DMARC are DNS-scoped to the hostname.
+    if re.match(r"^\d+\.\d+\.\d+\.\d+(/\d+)?$", domain):
+        log("info", f"email audit skipped — IP/CIDR target ({domain})")
+        _brain_phase_complete("EMAIL-AUDIT", True,
+                               detail=f"target={domain} ip-target-skip")
+        return True
+
+    recon_dir = _resolve_recon_dir(domain)
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    audit_dir = os.path.join(recon_dir, "email_auth")
+    os.makedirs(audit_dir, exist_ok=True)
+    audit_json = os.path.join(audit_dir, "audit.json")
+
+    smtp_flag = " --smtp-probe" if smtp_probe else ""
+    ok, out = run_cmd(
+        f'python3 "{script}" "{domain}" --json --skip-http --timeout 6'
+        f' --output "{audit_json}"{smtp_flag}',
+        timeout=180,
+    )
+    if not ok or not os.path.isfile(audit_json):
+        log("warn", f"email audit failed for {domain}")
+        _brain_phase_complete("EMAIL-AUDIT", False,
+                               detail=f"target={domain} audit-errored")
+        return False
+
+    # Distil the finding list into Vikramaditya's reporter shape.
+    try:
+        report = json.load(open(audit_json))
+    except Exception as e:
+        log("warn", f"email audit JSON parse failed: {e}")
+        _brain_phase_complete("EMAIL-AUDIT", False,
+                               detail=f"target={domain} json-parse-error")
+        return False
+
+    findings = []
+    checks = report.get("checks") or {}
+    for area, data in checks.items():
+        if not isinstance(data, dict):
+            continue
+        for issue in data.get("issues", []):
+            if not isinstance(issue, dict):
+                continue
+            sev = (issue.get("severity") or "info").lower()
+            if sev == "critical":
+                sev = "high"   # email-auth 'critical' is usually config gap
+            findings.append({
+                "severity": sev,
+                "title": issue.get("title") or f"{area.upper()} issue",
+                "area": area,
+                "detail": issue.get("detail", ""),
+                "recommendation": issue.get("recommendation", ""),
+                "target": domain,
+            })
+
+    out_findings = os.path.join(findings_dir, "email_auth", "findings.json")
+    os.makedirs(os.path.dirname(out_findings), exist_ok=True)
+    with open(out_findings, "w") as fh:
+        json.dump(findings, fh, indent=2)
+
+    high = sum(1 for f in findings if f["severity"] == "high")
+    med = sum(1 for f in findings if f["severity"] == "medium")
+    low = sum(1 for f in findings if f["severity"] == "low")
+    summary = f"{domain} — {high} high / {med} medium / {low} low"
+    log("info" if not high else "crit", f"email audit: {summary}")
+
+    _brain_phase_complete(
+        "EMAIL-AUDIT",
+        True,
+        detail=f"target={domain} high={high} medium={med} low={low}",
+        artifacts={"email_auth": audit_dir, "findings": out_findings},
+    )
+    return True
+
+
 # ── NEW: sqlmap targeted scan ───────────────────────────────────────────────────
 def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     """
@@ -5837,6 +5936,12 @@ def hunt_target(
     # ── Phase 8.5: RCE Scan (Log4Shell + Tomcat PUT + JBoss) ───────────────
     if rce_scan and not skip_has(skip_items, "rce_scan"):
         result["rce_scan"] = run_rce_scan(domain)
+
+    # ── Phase 8.7: Email Authentication Audit (v7.2.0) ─────────────────────
+    # Runs alongside web scans — SPF/DMARC/DKIM/MTA-STS/BIMI/DNSSEC posture.
+    # Disabled for IP/CIDR hunts automatically. Cheap (~20s per domain).
+    if not skip_has(skip_items, "email_audit"):
+        result["email_audit"] = run_email_audit(domain)
 
     # ── Phase 9: POST parameter discovery + sqlmap POST ─────────────────────
     if post_param_discover and not skip_has(skip_items, "post_params"):
