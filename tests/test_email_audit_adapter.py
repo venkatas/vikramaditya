@@ -121,7 +121,7 @@ class TestToFindingEntries:
         findings = adapter.to_finding_entries(sample_audit_report, "target.com")
         spf = next(f for f in findings if f["area"] == "spf")
         assert spf["target"] == "target.com"
-        assert spf["action"] == "scan"
+        assert spf["action"] == "recon"
         assert spf["vuln_class"] == "email_spf"
         assert spf["severity"] == "high"
         assert spf["endpoint"] == "dns:spf:target.com"
