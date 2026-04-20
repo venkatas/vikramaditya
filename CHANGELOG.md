@@ -1,5 +1,82 @@
 # Changelog
 
+## v7.4.4 — reporter subdir coverage: issue #2 root cause (2026-04-20)
+
+GitHub issue [#2](https://github.com/venkatas/vikramaditya/issues/2) (reporter @Harry53) was closed as COMPLETED on 2026-04-17 after the initial fix (commit 6573cdd) addressed CVE-dir loading + path resolution. User re-reported on 2026-04-20: "issue is same" with attached screenshot showing the HTML report still empty despite fresh scans producing findings. Root cause now found.
+
+### Root cause (the third layer)
+`scanner.sh` writes findings into 12 subdirs. `reporter.py::SUBDIR_VTYPE` only knew 7 of them:
+
+```
+scanner.sh writes             reporter SUBDIR_VTYPE knew
+├── sqli/        ✓             sqli ✓
+├── xss/         ✓             xss ✓
+├── ssti/        ✓             ssti ✓
+├── upload/      ✓             upload ✓
+├── metasploit/  ✓             metasploit ✓
+├── cves/        ✓             cves ✓
+├── rce/         ✓             rce ✓
+│
+├── mfa/         ✗ SILENT DROP    ← v5.2 MFA bypass class
+├── saml/        ✗ SILENT DROP    ← v5.2 SAML/SSO class
+├── deserialize/ ✗ SILENT DROP
+├── import_export/ ✗ SILENT DROP
+└── supply_chain/ ✗ SILENT DROP
+```
+
+Every finding in those 5 dirs was discarded — the reporter's loader literally iterated `SUBDIR_VTYPE.items()` and never looked inside unmapped dirs. A scan could flag a CRITICAL MFA bypass on `/api/login` and the HTML report would show "0 findings, clean report". That's exactly Harry's observation.
+
+### Fix
+
+**`reporter.py::SUBDIR_VTYPE`** — extended with 8 new mappings:
+```python
+"deserialize": "deserialization",
+"import_export": "business_logic",
+"mfa":        "auth_bypass",   # MFA bypass = auth-bypass variant
+"saml":       "auth_bypass",   # SAML/SSO misconfig = auth-bypass
+"supply_chain": "supply_chain",
+"jwt":        "jwt",           # hunt.py JWT audit output
+"graphql":    "graphql",
+"smuggling":  "smuggling",     # HTTP request smuggling
+```
+
+**`reporter.py::VULN_TEMPLATES`** — added 5 complete template entries (`deserialization`, `supply_chain`, `jwt`, `graphql`, `smuggling`) with severity / CVSS / CWE / impact / remediation / references. The MFA/SAML subdirs route into the existing `auth_bypass` template (correct semantic match).
+
+**`load_findings` warning log** — any unmapped subdir that contains `.txt` or `.json` payloads now emits:
+```
+[reporter] WARNING: findings subdir 'xyz/' is not in SUBDIR_VTYPE —
+its contents will be IGNORED. Add to reporter.py::SUBDIR_VTYPE +
+VULN_TEMPLATES.
+```
+Meta dirs (`summary/`, `brain/`, `screenshots/`, `exploits/`, etc.) allowlisted so the warning stays signal not noise. This converts future drift from "silent dropped findings" to "explicit developer warning" — the exact thing that would have caught issue #2 at its first hit rather than the third.
+
+### Tests
+`tests/test_reporter_subdir_coverage.py` — **23 new tests**:
+- 12 × parametrized "every scanner.sh output dir is mapped" — pins each of the 12 known subdirs individually so the failure names the missing one.
+- 2 × schema-consistency: every `SUBDIR_VTYPE` value has a `VULN_TEMPLATES` entry + new templates carry the full field set.
+- 5 × end-to-end: seed a fake findings dir with each formerly-dropped subdir and assert `load_findings` actually produces entries with the right `vtype`.
+- 4 × warning log: unknown subdir with payload warns; meta dirs stay silent; mapped dirs stay silent; empty unknown dirs stay silent.
+
+### Verified
+```
+$ python3 -m pytest tests/test_reporter_subdir_coverage.py -v
+23 passed in 0.03s
+
+$ python3 -m pytest tests/
+541 passed in 1.28s
+```
+
+### Issue #2 status
+Reopening with a comment pointing at this commit. Harry should:
+1. `git pull origin main`
+2. Re-run the same `reporter.py` command he posted
+3. Report should now include any MFA / SAML / deserialization / supply-chain / import-export findings from the prior scan's subdirs.
+
+### Found by
+User prompt: "check this https://github.com/venkatas/vikramaditya/issues/2" after seeing Harry's 2026-04-20 comment that the previous fix didn't resolve it. Scanner-vs-reporter subdir diff made the 5-class gap immediately visible.
+
+---
+
 ## v7.4.3 — README honesty pass (drop inherited template copy) (2026-04-20)
 
 Docs-only patch sweeping six overclaimed or placeholder blocks out of the README. Parent pass to v7.1.11 which caught the fake Support URLs; this one catches the rest. User prompt "fix the issues in our code and push" triggered a systematic sweep.

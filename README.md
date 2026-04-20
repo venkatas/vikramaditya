@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v7.4.3 — README honesty pass (drop inherited Enterprise Licensing / "our team of consultants" marketing copy, clone URL placeholder, aspirational framework-compliance claims) + NAT64 false-positive fix + severity-spelling fix + email_audit per-check package + brain.py LLM bridge + hunt_journal auto-append + 518-test suite + email-auditor agent + sqlmap JSON API detection + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
+**v7.4.4 — reporter subdir coverage: 5 silently-dropped finding classes restored (mfa, saml, deserialize, import_export, supply_chain) + unknown-subdir warning log + README honesty pass + NAT64 FP fix + severity-spelling fix + email_audit per-check package + brain.py LLM bridge + hunt_journal auto-append + 541-test suite + email-auditor agent + sqlmap JSON API detection + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
