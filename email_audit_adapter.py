@@ -45,14 +45,20 @@ from email_audit import (  # noqa: F401 — re-exports
 )
 
 
-# Map email_audit.py severity strings to Vikramaditya's 4-level scale.
+# Map email_audit.py severity strings to Vikramaditya's journal schema.
+# v7.4.1 — schema spelling is "informational" (full word); "info" was
+# getting silently rejected by ``validate_journal_entry`` and two
+# info-severity email_audit findings per run were not reaching the
+# hunt journal. Spelling fixed so /pickup surfaces the full picture.
 _SEVERITY_MAP = {
     "critical": "high",       # subspace "critical" = config gap, not RCE
     "high": "high",
     "medium": "medium",
     "low": "low",
-    "info": "info",
-    "notice": "info",
+    "info": "informational",
+    "informational": "informational",
+    "notice": "informational",
+    "none": "informational",
 }
 
 # Map email_audit.py check areas to Vikramaditya's ``vuln_class`` taxonomy.
@@ -69,9 +75,11 @@ _AREA_TO_VULN_CLASS = {
 
 
 def _to_schema_severity(raw: str | None) -> str:
+    # v7.4.1 — schema spelling is "informational"; both None/unknown paths
+    # now return the correct value so validate_journal_entry accepts them.
     if not raw:
-        return "info"
-    return _SEVERITY_MAP.get(raw.lower(), "info")
+        return "informational"
+    return _SEVERITY_MAP.get(raw.lower(), "informational")
 
 
 def _to_vuln_class(area: str) -> str:

@@ -1,5 +1,58 @@
 # Changelog
 
+## v7.4.1 — severity-spelling fix: 2 hidden findings per email audit unlocked (2026-04-20)
+
+v7.4.0 landed the hunt_journal auto-append, but the `/pickup` demo exposed that **only 6 of 8 findings per email audit actually made it into the journal**. Two were silently dropped on every run.
+
+### Root cause
+`email_audit_adapter._SEVERITY_MAP` translated subspace-sentinel's `info` → Vikramaditya's `info`. But `memory/schemas.py::VALID_SEVERITIES` spells it `informational` (full word). Every INFO-severity finding — typically *"No DKIM selectors found"* and *"No BIMI record"* — was rejected by `validate_journal_entry` with:
+```
+Journal entry: 'severity' must be one of
+['critical', 'high', 'informational', 'low', 'medium', 'none'],
+got 'info'
+```
+The `_journal_email_audit_findings` helper catches the exception and skips the entry silently (by design — malformed findings shouldn't abort the loop) so nothing surfaced in the logs. Two data points per scan lost.
+
+### Fix
+- `_SEVERITY_MAP`: `"info"` and `"notice"` now map to `"informational"`. Added `"informational"` and `"none"` as identity passes through.
+- `_to_schema_severity` default-case fallback: returns `"informational"` instead of `"info"` for None / unknown severities.
+- Test assertions updated to pin the correct schema value.
+
+### Verified
+```
+$ # Before v7.4.1 — 2 info findings silently dropped
+$ python -c "..."
+adapter produced: 8 findings
+journaled: 6
+
+$ # After v7.4.1
+adapter produced: 8 findings
+journaled: 8
+
+$ python3 -m pytest tests/
+502 passed in 1.26s
+```
+
+### What a real `/pickup` now shows (full 8 findings on testfire.net)
+```
+=== /pickup testfire.net — email auth section (8 entries) ===
+severity hist: {'low': 5, 'medium': 1, 'informational': 2}
+
+  [       MEDIUM] mx         — no MX record; SMTP delivery may fall back to A/AAAA
+  [          LOW] dmarc      — adkim=r (relaxed alignment)
+  [          LOW] dmarc      — aspf=r (relaxed alignment)
+  [          LOW] dnssec     — no DS record in parent zone
+  [          LOW] mta_sts    — no _mta-sts TXT record
+  [          LOW] tls_rpt    — no TLS-RPT record
+  [INFORMATIONAL] dkim       — no DKIM selectors discoverable      ← unlocked
+  [INFORMATIONAL] bimi       — no BIMI record                      ← unlocked
+```
+
+### Found by
+End-of-v7.4.0 `/pickup` demo output mismatch — 8 findings entered the adapter, 6 entered the journal. `make_journal_entry` exception message surfaced the spelling via a debug trace.
+
+---
+
 ## v7.4.0 — email_audit polish: per-check package + brain LLM bridge + hunt_journal (2026-04-19)
 
 Three polish items for the v7.2.0 / v7.3.0 email-audit integration, bundled:
