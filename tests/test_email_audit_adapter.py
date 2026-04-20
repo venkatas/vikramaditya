@@ -33,14 +33,16 @@ class TestSeverityMap:
         assert adapter._to_schema_severity("low") == "low"
 
     def test_info_and_notice_normalised(self) -> None:
-        assert adapter._to_schema_severity("info") == "info"
-        assert adapter._to_schema_severity("notice") == "info"
+        # v7.4.1: schema wants the full word "informational", not "info".
+        assert adapter._to_schema_severity("info") == "informational"
+        assert adapter._to_schema_severity("notice") == "informational"
+        assert adapter._to_schema_severity("informational") == "informational"
 
-    def test_unknown_falls_back_to_info(self) -> None:
-        assert adapter._to_schema_severity("chartreuse") == "info"
+    def test_unknown_falls_back_to_informational(self) -> None:
+        assert adapter._to_schema_severity("chartreuse") == "informational"
 
     def test_none_input_safe(self) -> None:
-        assert adapter._to_schema_severity(None) == "info"
+        assert adapter._to_schema_severity(None) == "informational"
 
 
 class TestVulnClassMap:
@@ -183,10 +185,10 @@ class TestSeverityHistogram:
     def test_counts_per_severity(self) -> None:
         findings = [
             {"severity": "high"}, {"severity": "high"}, {"severity": "medium"},
-            {"severity": "low"}, {"severity": "info"},
+            {"severity": "low"}, {"severity": "informational"},
         ]
         hist = adapter.severity_histogram(findings)
-        assert hist == {"high": 2, "medium": 1, "low": 1, "info": 1}
+        assert hist == {"high": 2, "medium": 1, "low": 1, "informational": 1}
 
     def test_empty_iterable(self) -> None:
         assert adapter.severity_histogram([]) == {}
