@@ -2,43 +2,37 @@
 
 ## v7.4.6 — diagnostic-section polish: scope-lock hint always fires, hidden dirs filtered (2026-04-20)
 
-v7.4.5 shipped the "Scan Diagnostics" section. Running it end-to-end on the real `selvasportal.com` session surfaced two rough edges:
+v7.4.5 shipped the "Scan Diagnostics" section. Running it end-to-end on a real-world session surfaced two rough edges:
 
-### 1. Scope-lock hint was silently skipped for `selvas` targets
+### 1. Scope-lock hint was silently skipped for some targets
 ```python
 # v7.4.5 — buggy
-if diag["subdomains"] <= 1 and "selvas" not in target.lower():
+if diag["subdomains"] <= 1 and "<substring>" not in target.lower():
     diag["hints"].append("Scope-locked to the apex host — ...")
 ```
-The `selvas` string was dev-time scaffolding left in by accident. Real effect: when running against `selvasportal.com` — the very target that motivated v7.4.5 — the scope-lock hint didn't fire even though `subdomains=1`. Any operator running a single-subdomain scan on `selvas*` targets silently lost the most actionable hint. Removed the carve-out; hint now fires on *every* single-subdomain scan regardless of target name.
+A target-name substring check was left in by accident from dev-time scaffolding. Real effect: any operator whose target name matched that substring lost the scope-lock hint even when `subdomains=1`. Removed the carve-out; hint now fires on *every* single-subdomain scan regardless of target name.
 
 ### 2. Hidden directories leaked into finding-class table
 `os.listdir(findings_dir)` returned `.tmp`, `.cache`, etc. alongside real finding subdirs (`sqli`, `xss`, ...). The HTML report's "Finding Classes" table ended up listing `.tmp/` as a legitimate class with `0 entries` — visually noisy and a mild information leak about scanner scratch dirs. Fix: skip any entry starting with `.`.
 
 ### Tests
-`tests/test_reporter_empty_diagnostics.py::TestDiagnosticsCollector::test_hidden_subdirs_are_ignored` — new test seeds `.tmp`, `.cache`, `.git` in the findings dir and asserts none appear in `subdir_payload_counts`. Existing `test_zero_subdomains_triggers_scope_hint` test still passes (used a non-selvas target, so never caught the carve-out).
+`tests/test_reporter_empty_diagnostics.py::TestDiagnosticsCollector::test_hidden_subdirs_are_ignored` — new test seeds `.tmp`, `.cache`, `.git` in the findings dir and asserts none appear in `subdir_payload_counts`. Existing `test_zero_subdomains_triggers_scope_hint` test still passes (used a non-matching target string, so never caught the carve-out).
 
-### Verified on real data
-```
-$ python3 -c "from reporter import _collect_scan_diagnostics; \
-    d = _collect_scan_diagnostics('findings/selvasportal.com/sessions/…', 'selvasportal.com'); \
-    print(d['hints'])"
-
-Before v7.4.6: 2 hints (default-swagger + manual-paths)
-After  v7.4.6: 3 hints (+ scope-locked-to-apex)
-```
+### Verified
+Before v7.4.6: 2 hints (default-swagger + manual-paths) on an apex-locked session; scope-lock hint suppressed.
+After  v7.4.6: 3 hints — scope-lock hint now fires.
 
 ### Suite
 `553 passed in 1.40s` (was 552, +1 new).
 
 ### Found by
-Dogfooding v7.4.5 on Harry53's actual target before pushing. The commit would have shipped with a silent hint-suppression bug that only manifested on the one operator's one target. Running reporter end-to-end — not just on the fixture tests — caught it.
+End-to-end validation of v7.4.5 before declaring it done. The commit would otherwise have shipped with a silent hint-suppression bug only caught by fixture tests. Running reporter against a real session — not just synthetic fixtures — surfaced it.
 
 ---
 
 ## v7.4.5 — empty-findings diagnostic section: "Scan Diagnostics" appendix (2026-04-20)
 
-Dogfooding v7.4.4 on `selvasportal.com` (same operator who filed [issue #2](https://github.com/venkatas/vikramaditya/issues/2)) surfaced the **fourth** layer of the same UX bug. v7.4.4 fixed the silently-dropped finding classes — but a target that *legitimately* has zero findings (thin API root, scope-locked host, no credentials) still renders a one-line "No findings." report. Operators reading that page reasonably conclude the tool is broken. Harry's first three reopens of issue #2 were all "empty report" — two were real (subdir drops), one was target-shape. The report never explained which.
+Validating v7.4.4 against a real-world session (same operator who filed [issue #2](https://github.com/venkatas/vikramaditya/issues/2)) surfaced the **fourth** layer of the same UX bug. v7.4.4 fixed the silently-dropped finding classes — but a target that *legitimately* has zero findings (thin API root, scope-locked host, no credentials) still renders a one-line "No findings." report. Operators reading that page reasonably conclude the tool is broken. The first three reopens of issue #2 were all "empty report" — two were real (subdir drops), one was target-shape. The report never explained which.
 
 ### The fix — always emit a "Scan Diagnostics" appendix
 
@@ -111,7 +105,7 @@ v7.4.5 closes the UX loop. Future "empty report" comments now carry diagnostic c
 
 ### Found by
 
-User prompt: *"test that portal and see if there are any other issues and I do not want him to come back to us with another issue"* — referring to `selvasportal.com` (Harry's real target). Scanned, got "No findings." — exactly the same symptom as the bug we'd just fixed, but from a different root cause. Hence the fourth fix.
+User prompt: *"test that portal and see if there are any other issues and I do not want him to come back to us with another issue"* — after v7.4.4 shipped, a 0-findings scenario still rendered the same one-line "No findings." page as the bugs we'd just fixed, from a different root cause. Hence the fourth fix.
 
 ---
 

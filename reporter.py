@@ -1327,8 +1327,9 @@ def _collect_scan_diagnostics(report_dir: str, target: str) -> dict:
             "<code>/api-docs</code>, <code>/swagger</code>, <code>/v1</code>, "
             "<code>/api/v1</code>. If docs are auth-gated, add credentials."
         )
-    # v7.4.6 — previous gate carved out "selvas" as dev-time scaffolding. Removed.
-    # Scope-lock hint fires for every single-subdomain scan regardless of target.
+    # v7.4.6 — previous gate carved out a target-name substring as dev-time
+    # scaffolding. Removed. Scope-lock hint now fires for every single-
+    # subdomain scan regardless of target name.
     if diag["subdomains"] <= 1:
         diag["hints"].append(
             "Scope-locked to the apex host — you may be missing findings on "
