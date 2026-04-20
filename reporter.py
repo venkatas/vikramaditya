@@ -1276,6 +1276,9 @@ def _collect_scan_diagnostics(report_dir: str, target: str) -> dict:
     # produced nothing vs which never ran at all.
     if os.path.isdir(findings_dir):
         for entry in sorted(os.listdir(findings_dir)):
+            # v7.4.6 — skip hidden + scratch dirs (.tmp, .cache, etc.).
+            if entry.startswith("."):
+                continue
             full = os.path.join(findings_dir, entry)
             if not os.path.isdir(full):
                 continue
@@ -1324,7 +1327,9 @@ def _collect_scan_diagnostics(report_dir: str, target: str) -> dict:
             "<code>/api-docs</code>, <code>/swagger</code>, <code>/v1</code>, "
             "<code>/api/v1</code>. If docs are auth-gated, add credentials."
         )
-    if diag["subdomains"] <= 1 and "selvas" not in target.lower():
+    # v7.4.6 — previous gate carved out "selvas" as dev-time scaffolding. Removed.
+    # Scope-lock hint fires for every single-subdomain scan regardless of target.
+    if diag["subdomains"] <= 1:
         diag["hints"].append(
             "Scope-locked to the apex host — you may be missing findings on "
             "<code>api.</code>, <code>admin.</code>, or <code>staging.</code> "
