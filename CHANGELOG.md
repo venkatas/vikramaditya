@@ -1,5 +1,84 @@
 # Changelog
 
+## v7.4.5 — empty-findings diagnostic section: "Scan Diagnostics" appendix (2026-04-20)
+
+Dogfooding v7.4.4 on `selvasportal.com` (same operator who filed [issue #2](https://github.com/venkatas/vikramaditya/issues/2)) surfaced the **fourth** layer of the same UX bug. v7.4.4 fixed the silently-dropped finding classes — but a target that *legitimately* has zero findings (thin API root, scope-locked host, no credentials) still renders a one-line "No findings." report. Operators reading that page reasonably conclude the tool is broken. Harry's first three reopens of issue #2 were all "empty report" — two were real (subdir drops), one was target-shape. The report never explained which.
+
+### The fix — always emit a "Scan Diagnostics" appendix
+
+`reporter.py::_collect_scan_diagnostics(report_dir, target)` — reads the recon artefacts siblings of the findings dir:
+
+```
+recon/<target>/sessions/<id>/
+├── live/urls.txt              → live_hosts
+├── urls/all.txt               → total_urls
+├── urls/with_params.txt       → params_urls
+├── urls/js_files.txt          → js_files
+├── api_specs/spec_urls.txt    → api_specs
+├── api_specs/all_operations.txt → api_operations
+├── subdomains/all.txt         → subdomains
+└── ports/open_ports.txt       → ports_open
+```
+
+Then classifies the target shape (API-only / webapp / apex-locked) and emits context-appropriate hints:
+
+```python
+if few_urls and few_js and one_live_host:
+    hint("Target looks like an authenticated REST API. "
+         "Re-run with --creds user:pass to get past the login wall.")
+
+if api_specs == 0 and total_urls > 0:
+    hint("No OpenAPI specs auto-discovered. Try manual paths: "
+         "/api-docs, /swagger, /v1/openapi.json, /swagger.json")
+
+if subdomains <= 1:
+    hint("Scope-locked to the apex host — you may be missing findings on "
+         "api./admin./staging. subdomains. Re-run without --scope-lock.")
+```
+
+`_render_scan_diagnostics_html(diag)` renders the **Scan Diagnostics** HTML section: a **Recon Surface** table (with counts), a **Finding Classes** table (payload line counts per subdir, or "No finding subdirs" when empty), and an **Interpretation + Next Steps** list populated from the hints. Stable `id="scan-diagnostics"` anchor so operators can deep-link from followups.
+
+`render_html_report` unconditionally calls both and inserts the section between the upload-evasion matrix and `Appendix A: Tools Used`. A 0-findings report is now:
+
+- **Before v7.4.5**: `No findings.` — one line. Operator: "broken?"
+- **After v7.4.5**: `No findings.` + "*We probed 1 live host, crawled 12 URLs, found 0 API specs. Target looks like an authenticated REST API — re-run with --creds user:pass.*"
+
+### Tests
+
+`tests/test_reporter_empty_diagnostics.py` — **11 new tests**:
+
+- **TestDiagnosticsCollector (3)**: reads recon counts correctly; missing files don't crash (zero defaults); `findings/` path input resolves to `recon/` sibling.
+- **TestHintGeneration (4)**: API-shape triggers creds hint; webapp-shape skips API hint; no specs + with URLs triggers manual-path hint; apex-only triggers scope-lock hint.
+- **TestHTMLRenderer (3)**: renders on empty recon (still shows "No finding subdirs" cell); counts bubble through to rendered table; `id="scan-diagnostics"` anchor stable.
+- **TestFullReportWithDiagnostics (1)**: end-to-end — build a fake session with recon + empty findings, call `render_html_report(findings=[])`, assert the HTML contains both the diagnostics section AND the canonical `No findings.` line.
+
+### Verified
+
+```
+$ python3 -m pytest tests/test_reporter_empty_diagnostics.py -v
+11 passed in 0.05s
+
+$ python3 -m pytest tests/
+552 passed in 1.38s
+```
+
+### Issue #2 lineage — four layers
+
+| Layer | Version | Failure mode | User-visible symptom |
+|-------|---------|--------------|----------------------|
+| 1 | pre-v7.4.4 | CVE-dir loader path mismatch | empty report on mixed layouts |
+| 2 | pre-v7.4.4 | Findings dir path resolution | empty report on canonical layout |
+| 3 | v7.4.4 | `SUBDIR_VTYPE` missing 5 classes | empty report when scanner found MFA/SAML/etc. |
+| 4 | v7.4.5 | No diagnostic section | empty report when target legitimately had no findings — **looks identical to layers 1–3** |
+
+v7.4.5 closes the UX loop. Future "empty report" comments now carry diagnostic counts — the operator can tell in one glance whether it's a tool bug or a scope/target-shape issue.
+
+### Found by
+
+User prompt: *"test that portal and see if there are any other issues and I do not want him to come back to us with another issue"* — referring to `selvasportal.com` (Harry's real target). Scanned, got "No findings." — exactly the same symptom as the bug we'd just fixed, but from a different root cause. Hence the fourth fix.
+
+---
+
 ## v7.4.4 — reporter subdir coverage: issue #2 root cause (2026-04-20)
 
 GitHub issue [#2](https://github.com/venkatas/vikramaditya/issues/2) (reporter @Harry53) was closed as COMPLETED on 2026-04-17 after the initial fix (commit 6573cdd) addressed CVE-dir loading + path resolution. User re-reported on 2026-04-20: "issue is same" with attached screenshot showing the HTML report still empty despite fresh scans producing findings. Root cause now found.

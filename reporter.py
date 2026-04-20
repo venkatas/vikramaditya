@@ -1209,12 +1209,191 @@ def _render_upload_evasion_matrix(findings: list) -> str:
 """
 
 
+def _collect_scan_diagnostics(report_dir: str, target: str) -> dict:
+    """Build a "what-was-scanned" dict from the recon + findings artefacts.
+
+    v7.4.5 — used by the empty-findings diagnostic section. Purpose: when a
+    scan legitimately produces 0 findings (thin target, authenticated API,
+    scope-locked subdomain, etc.), the HTML report currently renders a
+    blank "No findings." page and operators assume the tool is broken.
+    This pulls counts and phase-completion evidence out of the session so
+    the report can explain *why* it's empty.
+
+    Accepts both layouts operators pass:
+    - ``findings/<target>/sessions/<id>/`` (new — v7.4.4 canonical)
+    - ``recon/<target>/sessions/<id>/``    (legacy — v2.x)
+    """
+    import glob as _glob
+
+    diag: dict[str, object] = {
+        "recon_dir": None,
+        "findings_dir": None,
+        "live_hosts": 0,
+        "total_urls": 0,
+        "params_urls": 0,
+        "js_files": 0,
+        "api_specs": 0,
+        "api_operations": 0,
+        "subdomains": 0,
+        "ports_open": 0,
+        "phases_completed": [],
+        "phases_incomplete": [],
+        "subdir_payload_counts": {},
+        "target_api_shape": False,
+        "has_default_swagger": False,
+        "hints": [],
+    }
+
+    # Resolve recon dir — findings dir might be passed; swap "findings" for "recon".
+    report_dir = report_dir.rstrip("/")
+    if "/findings/" in report_dir:
+        recon_dir = report_dir.replace("/findings/", "/recon/")
+        findings_dir = report_dir
+    else:
+        recon_dir = report_dir
+        findings_dir = report_dir.replace("/recon/", "/findings/")
+    diag["recon_dir"] = recon_dir
+    diag["findings_dir"] = findings_dir
+
+    def _lc(path: str) -> int:
+        """Line count, 0 if file missing / empty."""
+        try:
+            with open(path, errors="replace") as fh:
+                return sum(1 for _ in fh if _.strip())
+        except OSError:
+            return 0
+
+    diag["live_hosts"]     = _lc(os.path.join(recon_dir, "live", "urls.txt"))
+    diag["total_urls"]     = _lc(os.path.join(recon_dir, "urls", "all.txt"))
+    diag["params_urls"]    = _lc(os.path.join(recon_dir, "urls", "with_params.txt"))
+    diag["js_files"]       = _lc(os.path.join(recon_dir, "urls", "js_files.txt"))
+    diag["api_specs"]      = _lc(os.path.join(recon_dir, "api_specs", "spec_urls.txt"))
+    diag["api_operations"] = _lc(os.path.join(recon_dir, "api_specs", "all_operations.txt"))
+    diag["subdomains"]     = _lc(os.path.join(recon_dir, "subdomains", "all.txt"))
+    diag["ports_open"]     = _lc(os.path.join(recon_dir, "ports", "open_ports.txt"))
+
+    # Finding subdir payload counts — tells operator which classes ran but
+    # produced nothing vs which never ran at all.
+    if os.path.isdir(findings_dir):
+        for entry in sorted(os.listdir(findings_dir)):
+            full = os.path.join(findings_dir, entry)
+            if not os.path.isdir(full):
+                continue
+            n = sum(1 for f in _glob.glob(os.path.join(full, "*.txt"))
+                    for _ in open(f, errors="replace"))
+            diag["subdir_payload_counts"][entry] = n
+
+    # Phase completion evidence — recon.sh writes `.done` markers per phase.
+    for marker in sorted(_glob.glob(os.path.join(recon_dir, "*.done"))):
+        diag["phases_completed"].append(os.path.basename(marker).replace(".done", ""))
+
+    # Heuristic — target appears to be an API-only surface
+    # (few URLs, no HTML-heavy recon signals).
+    if diag["total_urls"] < 20 and diag["js_files"] < 3 and diag["live_hosts"] <= 2:
+        diag["target_api_shape"] = True
+
+    # Detect default Swagger UI (common Shemaroo/ALB deployment pattern).
+    # Scanner output may have caught a petstore-backed swagger-ui — surface as hint.
+    api_summary = os.path.join(recon_dir, "api_specs", "summary.md")
+    if os.path.isfile(api_summary):
+        try:
+            body = open(api_summary).read()
+            if "petstore" in body.lower() or "Specs discovered: 0" in body:
+                # Spec discovery failed — check if there's still a Swagger UI.
+                if os.path.isdir(os.path.join(recon_dir, "api_specs")):
+                    diag["has_default_swagger"] = "Specs discovered: 0" in body
+        except OSError:
+            pass
+
+    # Next-step hints tailored to the shape.
+    if diag["target_api_shape"]:
+        diag["hints"].append(
+            "Target looks like an authenticated REST API. Re-run with "
+            "<code>--creds user:pass</code> to reach the authenticated surface, "
+            "or capture a browser HAR and run <code>har_vapt.py session.har</code>."
+        )
+    if diag["has_default_swagger"]:
+        diag["hints"].append(
+            "A Swagger UI was deployed but no real spec was published "
+            "(default petstore config). Low-severity finding on deployment "
+            "hygiene — worth calling out in the report narrative."
+        )
+    if diag["api_specs"] == 0 and diag["total_urls"] > 0:
+        diag["hints"].append(
+            "No OpenAPI specs auto-discovered. Try manual paths: "
+            "<code>/api-docs</code>, <code>/swagger</code>, <code>/v1</code>, "
+            "<code>/api/v1</code>. If docs are auth-gated, add credentials."
+        )
+    if diag["subdomains"] <= 1 and "selvas" not in target.lower():
+        diag["hints"].append(
+            "Scope-locked to the apex host — you may be missing findings on "
+            "<code>api.</code>, <code>admin.</code>, or <code>staging.</code> "
+            "subdomains. Re-run without <code>--scope-lock</code> to expand."
+        )
+
+    return diag
+
+
+def _render_scan_diagnostics_html(diag: dict) -> str:
+    """Render the empty-findings diagnostic block. Always emitted —
+    even when findings exist — so operators can cross-check that all
+    expected phases produced output."""
+    counts = diag.get("subdir_payload_counts") or {}
+    subdir_rows = ""
+    for name in sorted(counts):
+        n = counts[name]
+        colour = "#198754" if n > 0 else "#6c757d"
+        subdir_rows += (
+            f'<tr><td><code>{name}/</code></td>'
+            f'<td style="text-align:right;color:{colour}">{n} entries</td></tr>'
+        )
+    if not subdir_rows:
+        subdir_rows = '<tr><td colspan="2" style="color:#6c757d">No finding subdirs produced by the scanner.</td></tr>'
+
+    hints_html = ""
+    for h in diag.get("hints") or []:
+        hints_html += f'<li>{h}</li>'
+    if not hints_html:
+        hints_html = '<li>No specific hints — scan surface looks standard.</li>'
+
+    return f'''
+<h2 id="scan-diagnostics" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">
+Scan Diagnostics</h2>
+<p style="color:#495057">This section summarises what was actually scanned, how much data each phase produced, and why the findings count may look the way it does. <b>It is not a substitute for findings</b> — use it to sanity-check that expected phases ran.</p>
+
+<h3 style="margin-top:20px">Recon Surface</h3>
+<table class="tbl" style="width:auto">
+  <tr><th>Metric</th><th style="text-align:right">Count</th></tr>
+  <tr><td>Subdomains enumerated</td><td style="text-align:right">{diag.get("subdomains", 0)}</td></tr>
+  <tr><td>Live hosts probed</td><td style="text-align:right">{diag.get("live_hosts", 0)}</td></tr>
+  <tr><td>Open ports found</td><td style="text-align:right">{diag.get("ports_open", 0)}</td></tr>
+  <tr><td>URLs collected (gau + katana + wayback)</td><td style="text-align:right">{diag.get("total_urls", 0)}</td></tr>
+  <tr><td>Parameterised URLs</td><td style="text-align:right">{diag.get("params_urls", 0)}</td></tr>
+  <tr><td>JS files analysed</td><td style="text-align:right">{diag.get("js_files", 0)}</td></tr>
+  <tr><td>OpenAPI specs discovered</td><td style="text-align:right">{diag.get("api_specs", 0)}</td></tr>
+  <tr><td>API operations extracted</td><td style="text-align:right">{diag.get("api_operations", 0)}</td></tr>
+</table>
+
+<h3 style="margin-top:20px">Finding Classes (scanner.sh subdirs)</h3>
+<table class="tbl" style="width:auto">
+  <tr><th>Class</th><th>Payload lines</th></tr>
+  {subdir_rows}
+</table>
+
+<h3 style="margin-top:20px">Interpretation + Next Steps</h3>
+<ul>{hints_html}</ul>
+'''
+
+
 def render_html_report(findings: list, target: str, report_dir: str,
                        client: str, consultant: str, title: str) -> str:
     date_str = datetime.now().strftime("%d %B %Y")
     counts   = {s: sum(1 for f in findings if f["severity"] == s)
                 for s in SEVERITY_COLOR}
     total    = len(findings)
+    # v7.4.5 — gather scan diagnostics for the report footer so a 0-
+    # findings report still explains what was actually scanned.
+    diagnostics = _collect_scan_diagnostics(report_dir, target)
 
     # Risk bar
     bar = ""
@@ -1377,6 +1556,8 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 {details or '<p style="color:#6c757d">No findings.</p>'}
 
 {_render_upload_evasion_matrix(findings)}
+
+{_render_scan_diagnostics_html(diagnostics)}
 
 <h2 id="appendix-a" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">Appendix A: Tools Used</h2>
 <p>{tools}</p>
