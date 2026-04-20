@@ -100,6 +100,25 @@ class TestDiagnosticsCollector:
         # Finding payloads come from the findings/ path.
         assert diag["subdir_payload_counts"].get("xss") == 1
 
+    def test_hidden_subdirs_are_ignored(self, tmp_path) -> None:
+        """v7.4.6 regression — .tmp / .cache / .git must not appear as finding classes."""
+        findings = tmp_path / "findings" / "x.com" / "sessions" / "sess01"
+        recon = tmp_path / "recon" / "x.com" / "sessions" / "sess01"
+        _seed_recon(recon)
+        findings.mkdir(parents=True)
+        for hidden in (".tmp", ".cache", ".git"):
+            (findings / hidden).mkdir()
+            (findings / hidden / "junk.txt").write_text("noise\n")
+        (findings / "xss").mkdir()
+        (findings / "xss" / "dalfox.txt").write_text("HIGH https://x/?q=1\n")
+
+        diag = _collect_scan_diagnostics(str(findings), "x.com")
+        for hidden in (".tmp", ".cache", ".git"):
+            assert hidden not in diag["subdir_payload_counts"], (
+                f"hidden dir {hidden!r} leaked into finding-class table"
+            )
+        assert "xss" in diag["subdir_payload_counts"]
+
 
 # ---------------------------------------------------------------------------
 # Hint generation — three target-shape patterns
