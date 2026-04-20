@@ -44,6 +44,104 @@ ATTACK_IDS = {
 }
 
 VULN_TEMPLATES = {
+    # v7.4.4 — classes surfaced by scanner.sh that previously rendered
+    # without a dedicated template. Severity / CVSS / CWE pinned to
+    # conservative defaults; reporters are free to override per-finding.
+    "deserialization": {
+        "title": "Insecure Deserialization on {host}",
+        "severity": "high", "cvss": "8.8", "cwe": "CWE-502",
+        "impact": (
+            "Untrusted data is deserialized into native objects, enabling "
+            "remote code execution via gadget chains (ysoserial, marshalsec) "
+            "or object-injection attacks that bypass authentication and "
+            "authorization controls."
+        ),
+        "remediation": (
+            "Avoid deserializing untrusted input. If unavoidable, sign payloads "
+            "with a server-side HMAC, constrain the deserializer to an allowlist "
+            "of types, and upgrade deserialization libraries to versions that "
+            "enforce safe defaults."
+        ),
+        "references": [
+            ("OWASP Deserialization Cheat Sheet",
+             "https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"),
+            ("CWE-502", "https://cwe.mitre.org/data/definitions/502.html"),
+        ],
+    },
+    "supply_chain": {
+        "title": "Supply-Chain / Third-Party Component Exposure on {host}",
+        "severity": "high", "cvss": "7.5", "cwe": "CWE-1357",
+        "impact": (
+            "Outdated or vulnerable third-party components (JS libraries, "
+            "CDN-hosted scripts, exposed package manifests) let attackers "
+            "chain known CVEs in the dependency set or substitute the fetched "
+            "artefact through a compromised registry."
+        ),
+        "remediation": (
+            "Pin dependency versions and checksum-verify them. Subscribe to "
+            "CVE feeds for every package in the tree. Serve vendored JS from "
+            "same-origin rather than third-party CDNs."
+        ),
+        "references": [
+            ("OWASP A06:2021 Vulnerable and Outdated Components",
+             "https://owasp.org/Top10/A06_2021-Vulnerable_and_Outdated_Components/"),
+        ],
+    },
+    "jwt": {
+        "title": "JWT Handling Flaw on {host}",
+        "severity": "high", "cvss": "8.1", "cwe": "CWE-347",
+        "impact": (
+            "Weak signature handling (alg=none, algorithm confusion, weak HMAC "
+            "secret, missing expiry validation) lets an attacker forge JWTs and "
+            "impersonate arbitrary users or escalate privileges."
+        ),
+        "remediation": (
+            "Pin the expected algorithm server-side. Use asymmetric signatures "
+            "(RS256/EdDSA). Enforce aud/iss/exp claim validation. Rotate secrets."
+        ),
+        "references": [
+            ("OWASP JWT Cheat Sheet",
+             "https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html"),
+        ],
+    },
+    "graphql": {
+        "title": "GraphQL Exposure on {host}",
+        "severity": "medium", "cvss": "6.5", "cwe": "CWE-915",
+        "impact": (
+            "Introspection enabled in production exposes the full schema. "
+            "Unbounded queries or unbatched aliases enable DoS. Missing "
+            "field-level authorization exposes internal objects via the "
+            "resolver graph."
+        ),
+        "remediation": (
+            "Disable introspection in production. Add query-depth and "
+            "complexity limits. Enforce field-level authZ, not just "
+            "object-level. Rate-limit mutations."
+        ),
+        "references": [
+            ("OWASP GraphQL Cheat Sheet",
+             "https://cheatsheetseries.owasp.org/cheatsheets/GraphQL_Cheat_Sheet.html"),
+        ],
+    },
+    "smuggling": {
+        "title": "HTTP Request Smuggling on {host}",
+        "severity": "high", "cvss": "9.0", "cwe": "CWE-444",
+        "impact": (
+            "Disagreement between front-end and back-end on request framing "
+            "(Content-Length vs Transfer-Encoding) allows an attacker to "
+            "smuggle a second request that bypasses WAF rules, poisons the "
+            "cache, or hijacks another user's session."
+        ),
+        "remediation": (
+            "Normalize Transfer-Encoding and Content-Length handling across "
+            "all proxies. Reject ambiguous combinations. Upgrade front/back "
+            "to matching HTTP/1.1 semantics."
+        ),
+        "references": [
+            ("PortSwigger Smuggling Research",
+             "https://portswigger.net/research/http-desync-attacks-request-smuggling-reborn"),
+        ],
+    },
     "sqli": {
         "title": "SQL Injection on {host}",
         "severity": "critical", "cvss": "9.8", "cwe": "CWE-89",
@@ -559,6 +657,17 @@ SUBDIR_VTYPE = {
     "browser/auth_bypass": "auth_bypass", "browser/open_redirect": "open_redirect",
     "misconfig": "misconfig",
     "upload_type_bypass": "upload_type_bypass",
+    # v7.4.4 — scanner.sh writes to these five dirs but the reporter
+    # silently ignored them, causing empty HTML reports even when real
+    # findings existed. Reported as issue #2 (Harry53); mapped here:
+    "deserialize": "deserialization",
+    "import_export": "business_logic",
+    "mfa": "auth_bypass",            # MFA bypass is an auth-bypass variant
+    "saml": "auth_bypass",           # SAML/SSO misconfig → auth-bypass class
+    "supply_chain": "supply_chain",
+    "jwt": "jwt",                    # hunt.py JWT audit
+    "graphql": "graphql",            # upstream graphql findings dir
+    "smuggling": "smuggling",        # HTTP request smuggling
 }
 
 
@@ -614,6 +723,35 @@ def _load_poc_blocks(poc_path: str) -> dict:
 def load_findings(findings_dir: str) -> list:
     import json as _json
     results = []
+
+    # v7.4.4 — surface any finding subdirs that aren't mapped. Previously,
+    # scanner.sh would write findings to dirs like ``mfa/``, ``saml/``,
+    # ``deserialize/``, ``supply_chain/``, ``import_export/`` that the
+    # reporter had no entry for, and every finding silently vanished.
+    # Warn loudly when a known-finding-shaped dir isn't recognised so
+    # future drift is obvious instead of invisible (tracked: issue #2).
+    try:
+        known_tops = {s.split("/")[0] for s in SUBDIR_VTYPE}
+        # Meta dirs that are never findings — suppress from the warning.
+        meta_dirs = {"summary", "manual_review", "ordered_scan_targets", "brain",
+                      "exploits", "screenshots", ".async", ".tmp"}
+        for entry in sorted(os.listdir(findings_dir)):
+            full = os.path.join(findings_dir, entry)
+            if not os.path.isdir(full):
+                continue
+            if entry in known_tops or entry in meta_dirs:
+                continue
+            # Only warn when the dir actually contains .txt/.json files.
+            has_payload = any(
+                f.endswith(".txt") or f.endswith(".json")
+                for f in os.listdir(full)
+            )
+            if has_payload:
+                print(f"[reporter] WARNING: findings subdir '{entry}/' is not "
+                      f"in SUBDIR_VTYPE — its contents will be IGNORED. "
+                      f"Add to reporter.py::SUBDIR_VTYPE + VULN_TEMPLATES.")
+    except OSError:
+        pass
 
     # Method 1: Subdirectory-based findings (scanner.sh output)
     for subdir, vtype in SUBDIR_VTYPE.items():
