@@ -9,7 +9,7 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v7.4.2 — NAT64 false-positive fix (RFC 6052 64:ff9b::/96 now correctly classified as routable) + severity-spelling fix + email_audit per-check package + brain.py LLM bridge + hunt_journal auto-append + 518-test suite + email-auditor agent + sqlmap JSON API detection + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
+**v7.4.3 — README honesty pass (drop inherited Enterprise Licensing / "our team of consultants" marketing copy, clone URL placeholder, aspirational framework-compliance claims) + NAT64 false-positive fix + severity-spelling fix + email_audit per-check package + brain.py LLM bridge + hunt_journal auto-append + 518-test suite + email-auditor agent + sqlmap JSON API detection + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -585,20 +585,18 @@ docker run -v $(pwd)/results:/app/results vikramaditya:latest example.com
 5. **Reporting** — Generate client-ready reports
 6. **Remediation Support** — Fix verification and retesting
 
-### **Enterprise Features**
+### **Scan Capabilities**
 
-- **Multi-target scanning** — Subnet and domain range support
-- **Authenticated testing** — HAR-based session analysis
-- **Compliance reporting** — OWASP, NIST, ISO 27001 mapping
-- **Integration APIs** — JSON output for SIEM/GRC platforms
-- **Team collaboration** — Shared findings database
+- **Multi-target scanning** — Subnet, CIDR, and domain-range support (`hunt.py --target 10.0.0.0/24`)
+- **Authenticated testing** — HAR-based session analysis and JSON-API auth replay
+- **Structured output** — JSON findings files under `findings/<target>/` for downstream tooling
+- **Hunt memory** — JSONL journal (`hunt-memory/journal.jsonl`) picked up by `/pickup <target>` on warm restart
 
 ### **Quality Assurance**
 
-- **False positive reduction** — AI-powered validation
-- **Manual verification** — Security expert review process
-- **Reproducible testing** — Detailed PoC documentation
-- **Evidence collection** — Screenshots, request/response data
+- **False positive reduction** — AI triage gate + regex dedup rules (see v7.1.2 and v7.4.2 for fixes that removed real FP classes)
+- **Reproducible testing** — sqlmap command log + per-phase watchdog traces saved per session
+- **Evidence collection** — request/response pairs, screenshots (via gowitness), scan logs
 
 ---
 
@@ -611,12 +609,15 @@ docker run -v $(pwd)/results:/app/results vikramaditya:latest example.com
 - ✅ **Stay within defined scope** — use `--scope-lock` for strict boundaries
 - ✅ **Follow responsible disclosure** for any findings
 
-### **Professional Standards**
+### **Methodology Alignment**
 
-- **CERT-In empanelled** testing methodology
-- **OWASP Testing Guide** compliance
-- **NIST Cybersecurity Framework** alignment
-- **ISO 27001** security controls validation
+The tool does not carry any certification on its own. The operator is responsible for conducting engagements under the frameworks their client requires — typical choices:
+
+- **OWASP Testing Guide v4.2** — the recon → param discovery → vuln scan → exploit chain Vikramaditya implements follows the OTG structure. Section references appear in report metadata when `--emit-otg-refs` is enabled.
+- **NIST Cybersecurity Framework** — the scan→find→triage→report flow maps to Identify-Protect-Detect-Respond-Recover at the engagement level.
+- **CERT-In VAPT format** — `tools/report_generator.py` supports the Indian CERT-In empanelled template when `--format cert-in` is passed.
+
+Claim alignment only where it's honestly supported by your configuration.
 
 ### **Data Protection**
 
@@ -635,7 +636,7 @@ We welcome contributions! Here's how to get involved:
 
 ```bash
 # Fork the repository
-git clone https://github.com/yourusername/vikramaditya.git
+git clone https://github.com/venkatas/vikramaditya.git
 cd vikramaditya
 
 # Create a feature branch
@@ -678,21 +679,11 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - 📧 **Email**: [venkat.9099@gmail.com](mailto:venkat.9099@gmail.com)
 - 🐛 **Issues & PRs**: [github.com/venkatas/vikramaditya/issues](https://github.com/venkatas/vikramaditya/issues)
 
-### **Enterprise Licensing**
-
-Commercial licenses available for:
-- **White-label deployments**
-- **Custom integrations**
-- **Professional training**
-- **Extended support contracts**
-
 ---
 
 ## Security Notice
 
-This tool is designed for authorized security testing only. The developers assume no liability for misuse. Always ensure you have explicit permission before testing any systems.
-
-**Professional Security Consulting**: If you need expert VAPT services, our team of CERT-In empanelled consultants is available for engagements.
+This tool is designed for authorized security testing only. The developers assume no liability for misuse. Always ensure you have explicit written permission before testing any systems.
 
 ---
 

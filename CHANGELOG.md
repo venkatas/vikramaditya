@@ -1,5 +1,38 @@
 # Changelog
 
+## v7.4.3 — README honesty pass (drop inherited template copy) (2026-04-20)
+
+Docs-only patch sweeping six overclaimed or placeholder blocks out of the README. Parent pass to v7.1.11 which caught the fake Support URLs; this one catches the rest. User prompt "fix the issues in our code and push" triggered a systematic sweep.
+
+### Removed / rewritten
+- **Line 638 — Development clone URL** placeholder `yourusername/vikramaditya.git` → real repo `venkatas/vikramaditya.git`.
+- **"Enterprise Licensing" section** (6 lines) — claimed "Commercial licenses available for white-label deployments / custom integrations / professional training / extended support contracts." No such programme exists. Deleted.
+- **"Professional Security Consulting" sentence** — "our team of CERT-In empanelled consultants is available for engagements." The operator IS CERT-In empanelled solo; the phrasing implies a team/company that doesn't exist. Deleted.
+- **"Enterprise Features" list** — dropped two unbacked claims:
+  - *"Compliance reporting — OWASP, NIST, ISO 27001 mapping"* — the tool does not produce compliance reports against any of those frameworks.
+  - *"Team collaboration — Shared findings database"* — no shared DB exists; findings are per-user JSONL.
+  Kept the real ones (multi-target scanning, HAR auth, structured JSON output, hunt memory). Section renamed **"Scan Capabilities"** since nothing in it is Enterprise-specific.
+- **"Quality Assurance" list** — dropped *"Manual verification — Security expert review process"*. There is no review process built into the tool. Kept the three real items (AI triage gate + regex dedup, reproducible testing, evidence collection) and added explicit references to the v7.1.2 / v7.4.2 FP fixes as proof the QA claim is actually backed.
+- **"Professional Standards" section** — claimed "CERT-In empanelled testing methodology / OWASP Testing Guide compliance / NIST Cybersecurity Framework alignment / ISO 27001 security controls validation" as if the **tool** carried those certifications. It does not. Rewrote as **"Methodology Alignment"** — explicitly states the tool carries no certification of its own; operator is responsible for engagement-level framework alignment; gives concrete, honest pointers: OWASP Testing Guide v4.2 structure of scan phases, NIST CSF map to flow, CERT-In format supported by `report_generator.py --format cert-in` when operator opts in.
+
+### Rationale
+Bug-bounty / VAPT engagement reports frequently get cross-read against the tool's own claims. Marketing copy that overstates what the tool actually does is worse than missing documentation — it invites scope-creep from clients, sets unrealistic expectations, and exposes the operator to liability when the tool fails to deliver something the README implied.
+
+### Diff
+```
+ 1 file changed, 18 insertions(+), 27 deletions(-)
+```
+
+Net −9 lines of placeholder / overclaim, +18 lines of honest capability description.
+
+### Not touched
+Examples throughout the README continue to use `example.com`, `user@domain.com`, etc. — those are legitimate documentation placeholders meant to be adapted by the reader, not hallucinated contact info.
+
+### Found by
+User prompt: "fix the issues in our code and push" after v7.4.2 shipped. Systematic sweep caught everything by grepping for known template markers (`yourusername`, `White-label`, `Professional Security Consulting`) and cross-checking "Enterprise Features" / "Quality Assurance" / "Professional Standards" claims against actual tool behaviour.
+
+---
+
 ## v7.4.2 — NAT64 false-positive: 6 HIGH FPs per NAT64-hosted target (2026-04-20)
 
 Dogfooding on `gov.in` produced 6 HIGH findings — all false positives.
