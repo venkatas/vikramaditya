@@ -946,10 +946,33 @@ def parse_mailto_domains(value: str) -> List[str]:
 
 
 def is_privateish_ip(value: str) -> bool:
+    """True if ``value`` is not publicly routable.
+
+    v7.4.2 — carves out the RFC 6052 NAT64 well-known prefix ``64:ff9b::/96``.
+    Python's ``is_reserved`` flag marks it True because IANA reserved the
+    prefix, but NAT64 addresses are **publicly routable on the IPv6
+    internet** — they translate to a real IPv4 address on the way out. A
+    previous version of this check flagged every NAT64-hosted MX as a HIGH
+    "non-public IP" finding (see gov.in engagement on 2026-04-20, where
+    ``mx.mgovcloud.in`` → ``64:ff9b::a994:8e4b`` = public IPv4
+    ``169.148.142.75``). The carve-out decodes the embedded IPv4 from the
+    low 32 bits and answers based on that address's routability instead.
+    """
     try:
         parsed = ip_address(value)
     except ValueError:
         return False
+
+    # RFC 6052 NAT64 well-known prefix — routable despite ``is_reserved``.
+    if parsed.version == 6 and int(parsed) >> 32 == 0x0064FF9B_00000000_00000000_00000000 >> 32:
+        embedded_v4 = ip_address(int(parsed) & 0xFFFFFFFF)
+        return (
+            embedded_v4.is_private
+            or embedded_v4.is_loopback
+            or embedded_v4.is_link_local
+            or embedded_v4.is_multicast
+            or embedded_v4.is_unspecified
+        )
 
     return (
         parsed.is_private

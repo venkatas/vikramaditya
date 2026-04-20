@@ -1,5 +1,63 @@
 # Changelog
 
+## v7.4.2 — NAT64 false-positive: 6 HIGH FPs per NAT64-hosted target (2026-04-20)
+
+Dogfooding on `gov.in` produced 6 HIGH findings — all false positives.
+
+### Root cause
+`email_audit.py::is_privateish_ip` marked every address where Python's `ipaddress.is_reserved` was True as non-public. But RFC 6052's **NAT64 well-known prefix `64:ff9b::/96`** sits inside IANA-reserved space and is simultaneously **publicly routable on the IPv6 internet** — that's its entire purpose. gov.in's MX hosts (`mx`, `mx2`, `mx3` @ mgovcloud.in) sit behind NAT64 with embedded public IPv4 `169.148.142.75`; the tool flagged 6 HIGH "non-public IP" entries that would have embarrassed a real report.
+
+```
+64:ff9b::a994:8e4b → embedded IPv4 169.148.142.75
+   is_private:  False
+   is_global:   True       ← publicly routable
+   is_reserved: True       ← old code tripped on this alone
+```
+
+### Fix
+Special-case the NAT64 prefix in `is_privateish_ip`: decode the embedded IPv4 from the low 32 bits and answer based on *that* address's routability — same semantics a real NAT64 gateway implements.
+
+```python
+if parsed.version == 6 and int(parsed) >> 32 == <NAT64 prefix>:
+    embedded_v4 = ip_address(int(parsed) & 0xFFFFFFFF)
+    return (embedded_v4.is_private
+            or embedded_v4.is_loopback
+            or embedded_v4.is_link_local
+            or embedded_v4.is_multicast
+            or embedded_v4.is_unspecified)
+```
+
+Other reserved ranges (documentation `2001:db8::/32`, IPv4-mapped `::ffff:0:0/96`, etc.) stay flagged — the carve-out is specific to NAT64.
+
+### Impact on gov.in (live re-audit)
+| | v7.4.1 | v7.4.2 |
+|---|---|---|
+| Total findings | 13 | **7** |
+| HIGH | **6 (all FPs)** | **0** |
+| MEDIUM | 2 | 2 |
+| LOW + INFO | 5 | 5 |
+
+Real findings preserved: `sp=none` subdomain weakening and 1024-bit DKIM key on `zmail` selector.
+
+### Tests
+`tests/test_nat64_classification.py` — 16 new tests:
+- 7 × NAT64 carve-out (public IPv4 via NAT64 → False; RFC1918 / 172/12 / loopback embedded → still True; exact gov.in IPs pinned).
+- 9 × unchanged behaviour invariants (RFC1918, loopback, link-local, documentation, multicast, unspecified, garbage input, public IPv4, public IPv6).
+
+### Verified
+```
+$ python3 -m pytest tests/test_nat64_classification.py -v
+16 passed in 0.07s
+
+$ python3 -m pytest tests/
+518 passed in 1.23s
+```
+
+### Found by
+User asked "any bugs?" after the gov.in audit. Manual decoding of `64:ff9b::a994:8e4b` → `169.148.142.75` revealed the embedded IP was public, contradicting the tool's HIGH verdict.
+
+---
+
 ## v7.4.1 — severity-spelling fix: 2 hidden findings per email audit unlocked (2026-04-20)
 
 v7.4.0 landed the hunt_journal auto-append, but the `/pickup` demo exposed that **only 6 of 8 findings per email audit actually made it into the journal**. Two were silently dropped on every run.
