@@ -45,6 +45,7 @@ import signal
 import subprocess
 import sys
 import shutil
+import shlex
 import threading
 import ipaddress
 import time
@@ -1352,7 +1353,6 @@ def _lightpanda_fetch_forms(url: str, cookies: str = "",
 def check_tools() -> tuple[list, list]:
     installed, missing = [], []
     for name, binary, _ in TOOL_REGISTRY:
-        (_installed if _which(binary) else missing).append(name) if False else None
         if _which(binary):
             installed.append(name)
         else:
@@ -1837,7 +1837,6 @@ def _classify_exposed_file(url: str, domain: str, session_id: str | None = None,
                 f"→ true type: {result.true_type} ({result.mime}), "
                 f"claimed: {result.claimed_mime or 'unknown'}")
     return None
-    return status, content_type
 
 
 def _update_known_exposed_paths_from_file(state: dict, path: str) -> None:
