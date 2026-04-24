@@ -648,13 +648,43 @@ def make_output_dir(target: str) -> str:
 
 # ── CLI Argument Parsing ──────────────────────────────────────────────────────
 
+CLI_USAGE = """Usage:
+  python3 vikramaditya.py [target] [options]
+
+Targets:
+  domain, URL, IP, CIDR, or .har file
+
+Options:
+  -h, --help              Show this help message and exit
+  --creds USER:PASS       Primary test credentials
+  --creds-b USER:PASS     Secondary test credentials for access-control checks
+  --verify-fix PATH       Verify a deployed fix or source path
+  --code-url URL          Source repository or code URL for audit context
+  --legacy                Route through the legacy hunt.py flow
+"""
+
+
+def print_cli_usage() -> None:
+    print(CLI_USAGE.strip())
+
+
 def parse_cli_args() -> dict:
     """Parse command-line arguments. Minimal — most decisions are automatic."""
-    args = {"target": "", "creds": "", "creds_b": "", "verify_fix": "", "code_url": "", "legacy": False}
+    args = {
+        "target": "",
+        "creds": "",
+        "creds_b": "",
+        "verify_fix": "",
+        "code_url": "",
+        "legacy": False,
+        "help": False,
+    }
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
-        if argv[i] == "--creds" and i + 1 < len(argv):
+        if argv[i] in ("-h", "--help"):
+            args["help"] = True; i += 1
+        elif argv[i] == "--creds" and i + 1 < len(argv):
             args["creds"] = argv[i + 1]; i += 2
         elif argv[i] == "--creds-b" and i + 1 < len(argv):
             args["creds_b"] = argv[i + 1]; i += 2
@@ -677,9 +707,13 @@ def main():
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+    cli = parse_cli_args()
+    if cli["help"]:
+        print_cli_usage()
+        return
+
     banner()
 
-    cli = parse_cli_args()
     has_ollama = ollama_available()
 
     # Autonomous mode: LLM present → no prompts, brain makes all decisions
