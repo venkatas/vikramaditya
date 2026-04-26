@@ -1,5 +1,39 @@
 # Changelog
 
+## v7.4.7 — autonomous pipeline robustness: paramspider/arjun/js_analysis/kiterunner/wordlist URLs (2026-04-26)
+
+Five bugs caught and fixed during four end-to-end autonomous hunts. Each was reproduced before patching; each fix was verified in a subsequent run.
+
+### 1. ParamSpider 2.x dropped `-o` flag
+ParamSpider's CLI changed: it no longer accepts `-o` and instead writes to `./results/{domain}.txt` relative to CWD. Old invocation:
+```python
+paramspider -d "{domain}" -o "{ps_out_base}"
+```
+Returned `rc=2` in 0.3 s every run. Fix: invoke with `cwd=param_dir`, then move `results/{domain}.txt` → `paramspider.txt`.
+**Verified**: 23 URLs (1642 B) produced.
+
+### 2. Arjun timeout at 905 s (rc=-9)
+20 URLs × 25 k-param `large.txt` × `--stable` blew through `PARAM_TIMEOUT`. First attempt (cap 8 URLs, `-t 10 -T 10`) still hit the 900 s SIGKILL because `--stable` triples runtime. Final fix: cap to 5 URLs, drop `--stable`, switch to bundled `small.txt` (835 params).
+**Verified**: rc=0 in 13.1 s, 2 hidden params found.
+
+### 3. JS Analysis silently failing with `[FAIL]`
+`run_js_analysis` greped `\.js$` from `live/urls.txt` — but `live/urls.txt` only has base hosts, no crawled paths. Recon already populates `urls/js_files.txt` with the actual JS URLs (20 entries observed); that file was being ignored, so the step always returned False and the autonomous gate stamped the whole hunt `[FAIL]` despite all phases ✓. Fix: prefer `urls/js_files.txt`, fall back to grep only if missing.
+
+### 4. Kiterunner false failure
+`kiterunner scan ... --kite-file routes-large.kite || kiterunner brute ... -w routes-large.kite` — relative filename never resolved/downloaded, both invocations failed every run with `END API FUZZ rc=1 duration=0.7s`. Fix: probe `WORDLIST_DIR`/`SCRIPT_DIR` for `routes-large.kite` / `routes-small.kite` and skip cleanly with a warning if neither exists.
+
+### 5. Broken SecLists wordlist URLs
+Four upstream paths returned 404 (SecLists reorganized the `Fuzzing/` tree):
+- `Fuzzing/SQLi/Generic-SQLi.txt` → `Fuzzing/Databases/SQLi/Generic-SQLi.txt`
+- `Fuzzing/XSS/XSS-Jhaddix.txt` → `Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt`
+- `Fuzzing/redirect/...` → `cujanovic/Open-Redirect-Payloads`
+- `Fuzzing/SSRF/SSRF-list.txt` → `cujanovic/SSRF-Testing/cloud-metadata.txt`
+
+Also: `setup_wordlists` now uses `curl -sfL` (HTTP errors return non-zero), removes empty stub files left behind by 404s, tracks failures, and emits a `warn` summary instead of always claiming "Wordlists ready".
+
+### Found by
+Four sequential `hunt.py --autonomous --full` runs against a real-world apex target. Each run surfaced one new bug, was patched, then rerun to verify. The autonomous pipeline now produces an `[OK]` verdict end-to-end.
+
 ## v7.4.6 — diagnostic-section polish: scope-lock hint always fires, hidden dirs filtered (2026-04-20)
 
 v7.4.5 shipped the "Scan Diagnostics" section. Running it end-to-end on a real-world session surfaced two rough edges:
