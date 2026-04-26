@@ -2917,11 +2917,11 @@ def setup_wordlists() -> None:
         "subdomains-top1m.txt":     "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt",
         # ── Vulnerability payloads — SecLists (fallback) ───────────────────
         "lfi-payloads.txt":         "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/LFI/LFI-Jhaddix.txt",
-        "sqli-payloads.txt":        "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/SQLi/Generic-SQLi.txt",
-        "xss-payloads.txt":         "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/XSS/XSS-Jhaddix.txt",
-        "redirect-payloads.txt":    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/redirect/open-redirects-payloads.txt",
+        "sqli-payloads.txt":        "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/Databases/SQLi/Generic-SQLi.txt",
+        "xss-payloads.txt":         "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
+        "redirect-payloads.txt":    "https://raw.githubusercontent.com/cujanovic/Open-Redirect-Payloads/master/Open-Redirect-payloads.txt",
         "jwt-secrets.txt":          "https://raw.githubusercontent.com/wallarm/jwt-secrets/master/jwt.secrets.list",
-        "ssrf-payloads.txt":        "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/SSRF/SSRF-list.txt",
+        "ssrf-payloads.txt":        "https://raw.githubusercontent.com/cujanovic/SSRF-Testing/master/cloud-metadata.txt",
         # ── Web-Fuzzing-Box (gh0stkey) — higher coverage ────────────────────
         "sqli_params.txt":          "https://raw.githubusercontent.com/gh0stkey/Web-Fuzzing-Box/main/Vuln/Sql_Injection/Sql_Params.txt",
         "sqli_payloads.txt":        "https://raw.githubusercontent.com/gh0stkey/Web-Fuzzing-Box/main/Vuln/Sql_Injection/Sql_Payload.txt",
@@ -2937,19 +2937,29 @@ def setup_wordlists() -> None:
         "wooyun_jsp.txt":           "https://raw.githubusercontent.com/gh0stkey/Web-Fuzzing-Box/main/Dir/Wooyun/Jsp.txt",
         "wooyun_php.txt":           "https://raw.githubusercontent.com/gh0stkey/Web-Fuzzing-Box/main/Dir/Wooyun/Php.txt",
     }
+    failed: list[str] = []
     for name, url in wordlists.items():
         filepath = os.path.join(WORDLIST_DIR, name)
         if os.path.exists(filepath) and os.path.getsize(filepath) > 100:
             log("ok", f"Wordlist exists: {name}")
             continue
         log("info", f"Downloading {name}...")
-        ok, _ = run_cmd(f'curl -sL "{url}" -o "{filepath}"', timeout=60)
+        ok, _ = run_cmd(f'curl -sfL "{url}" -o "{filepath}"', timeout=60)
         if ok and os.path.exists(filepath) and os.path.getsize(filepath) > 100:
             lines = sum(1 for _ in open(filepath))
             log("ok", f"Downloaded {name} ({lines} entries)")
         else:
-            log("err", f"Failed: {name}")
-    log("ok", f"Wordlists ready: {WORDLIST_DIR}")
+            try:
+                if os.path.exists(filepath) and os.path.getsize(filepath) <= 100:
+                    os.remove(filepath)
+            except OSError:
+                pass
+            log("err", f"Failed: {name} (404 or empty)")
+            failed.append(name)
+    if failed:
+        log("warn", f"Wordlists ready with {len(failed)} missing: {', '.join(failed)} → {WORDLIST_DIR}")
+    else:
+        log("ok", f"Wordlists ready: {WORDLIST_DIR}")
 
 
 # ── Target selection ───────────────────────────────────────────────────────────
@@ -3229,18 +3239,27 @@ def run_js_analysis(domain: str) -> bool:
     if _brain and _brain.enabled:
         _brain.phase_start("JS ANALYSIS", f"target={domain}")
 
+    # Prefer the JS list recon already produced (recon.sh populates
+    # urls/js_files.txt from katana/wayback). Fall back to greping
+    # live/urls.txt only if that's missing — live/urls.txt typically
+    # contains base hosts only, not crawled paths, so the grep yields
+    # nothing and used to abort this phase with [FAIL].
+    js_urls_file = os.path.join(js_dir, "js_urls.txt")
+    recon_js_file = os.path.join(recon_dir, "urls", "js_files.txt")
     urls_file = os.path.join(recon_dir, "live", "urls.txt")
-    if not os.path.isfile(urls_file):
-        log("warn", f"No urls.txt for {domain} — run recon first")
-        _brain_phase_complete("JS ANALYSIS", False, detail=f"target={domain} missing urls.txt")
+
+    if os.path.isfile(recon_js_file) and os.path.getsize(recon_js_file) > 0:
+        run_cmd(f'sort -u "{recon_js_file}" > "{js_urls_file}"', timeout=30)
+    elif os.path.isfile(urls_file):
+        run_cmd(
+            f'grep -iE "\\.js(\\?|$)" "{urls_file}" | sort -u > "{js_urls_file}"',
+            timeout=30
+        )
+    else:
+        log("warn", f"No urls source for {domain} — run recon first")
+        _brain_phase_complete("JS ANALYSIS", False, detail=f"target={domain} missing urls source")
         return False
 
-    # ── Extract JS URLs ──
-    js_urls_file = os.path.join(js_dir, "js_urls.txt")
-    run_cmd(
-        f'grep -iE "\\.js(\\?|$)" "{urls_file}" | sort -u > "{js_urls_file}"',
-        timeout=30
-    )
     if not os.path.isfile(js_urls_file) or os.path.getsize(js_urls_file) == 0:
         log("warn", "No JS files found in URLs")
         _brain_phase_complete("JS ANALYSIS", False, detail=f"target={domain} no JS URLs found")
@@ -3403,21 +3422,25 @@ def run_param_discovery(domain: str) -> bool:
         _brain_phase_complete("PARAM DISCOVERY", False, detail=f"target={domain} missing URL sources")
         return False
 
-    # ParamSpider: historic URLs with parameters from Wayback
+    # ParamSpider: historic URLs with parameters from Wayback.
+    # ParamSpider 2.x dropped the -o flag and always writes to ./results/<domain>.txt
+    # relative to CWD. We run it inside param_dir, then normalize the output path.
     if _which("paramspider"):
-        ps_out_base = os.path.join(param_dir, "paramspider")
+        result_file = os.path.join(param_dir, "paramspider.txt")
         ok, out = run_cmd(
-            f'paramspider -d "{domain}" -o "{ps_out_base}" 2>/dev/null',
+            f'paramspider -d "{domain}"',
+            cwd=param_dir,
             timeout=PARAM_TIMEOUT,
             watch_file=param_dir,
             watch_phase="PARAM DISCOVERY"
         )
-        # ParamSpider 2.x appends .txt automatically to the output path
-        result_file = f"{ps_out_base}.txt"
-        if not os.path.exists(result_file) and os.path.exists(ps_out_base):
-            # Fallback for versions that don't append .txt
-            shutil.move(ps_out_base, result_file)
-        
+        produced = os.path.join(param_dir, "results", f"{domain}.txt")
+        if os.path.exists(produced):
+            try:
+                shutil.move(produced, result_file)
+            except OSError:
+                pass
+
         if os.path.exists(result_file):
             count = sum(1 for _ in open(result_file) if _.strip())
             log("ok", f"ParamSpider: {count} parameterized URLs → {result_file}")
@@ -3426,23 +3449,36 @@ def run_param_discovery(domain: str) -> bool:
     else:
         log("warn", "paramspider not in PATH")
 
-    # Arjun: find hidden GET/POST parameters on top live URLs
+    # Arjun: find hidden GET/POST parameters on top live URLs.
+    # Even 8 URLs against the default 25k-param wordlist with --stable
+    # exceeds PARAM_TIMEOUT (observed rc=-9 at 905s twice). We use the
+    # bundled small.txt wordlist (~835 params) and drop --stable; arjun
+    # scales linearly with wordlist size and --stable triples runtime.
     if _which("arjun"):
         top_urls_file = os.path.join(param_dir, "top_urls.txt")
-        arjun_inputs = _collect_urls_from_file(live_file, limit=20)
-        if len(arjun_inputs) < 20:
-            for url in _collect_urls_from_file(with_params_file, strip_query=True, limit=40):
+        ARJUN_MAX_URLS = 5
+        arjun_inputs = _collect_urls_from_file(live_file, limit=ARJUN_MAX_URLS)
+        if len(arjun_inputs) < ARJUN_MAX_URLS:
+            for url in _collect_urls_from_file(with_params_file, strip_query=True, limit=ARJUN_MAX_URLS * 2):
                 if url not in arjun_inputs:
                     arjun_inputs.append(url)
-                if len(arjun_inputs) >= 20:
+                if len(arjun_inputs) >= ARJUN_MAX_URLS:
                     break
 
         if arjun_inputs:
             with open(top_urls_file, "w") as fh:
                 fh.write("\n".join(arjun_inputs) + "\n")
             arjun_out = os.path.join(param_dir, "arjun.json")
+            # Locate the bundled small wordlist; fall back to default if not found
+            try:
+                import arjun as _arjun_pkg
+                arjun_small = os.path.join(os.path.dirname(_arjun_pkg.__file__), "db", "small.txt")
+            except Exception:
+                arjun_small = ""
+            wl_flag = f' -w "{arjun_small}"' if arjun_small and os.path.isfile(arjun_small) else ""
             ok, out = run_cmd(
-                f'arjun -i "{top_urls_file}" -oJ "{arjun_out}" --stable 2>/dev/null',
+                f'arjun -i "{top_urls_file}" -oJ "{arjun_out}"{wl_flag} '
+                f'-t 10 -T 10 2>/dev/null',
                 timeout=PARAM_TIMEOUT,
                 watch_file=param_dir,
                 watch_phase="PARAM DISCOVERY"
@@ -3516,21 +3552,33 @@ def run_api_fuzz(domain: str) -> bool:
 
     # Kiterunner API route brute-force
     if _which(kiterunner):
-        kr_out = os.path.join(api_dir, "kiterunner.txt")
-        # Use built-in routes wordlist
-        ok, out = run_cmd(
-            f'{kiterunner} scan "https://{domain}" --output "{kr_out}" '
-            f'--kite-file routes-large.kite 2>/dev/null || '
-            f'{kiterunner} brute "https://{domain}" -w routes-large.kite -o "{kr_out}" 2>/dev/null',
-            timeout=API_FUZZ_TIMEOUT,
-            watch_file=api_dir,
-            watch_phase="API FUZZ"
-        )
-        if os.path.exists(kr_out):
-            count = sum(1 for _ in open(kr_out) if _.strip())
-            log("ok", f"Kiterunner: {count} API routes found → {kr_out}")
+        # Resolve a usable .kite routes file before invoking — otherwise we
+        # waste a process and surface a misleading "rc=1" END API FUZZ entry.
+        kite_candidates = [
+            os.path.join(WORDLIST_DIR, "routes-large.kite"),
+            os.path.join(WORDLIST_DIR, "routes-small.kite"),
+            os.path.join(SCRIPT_DIR, "routes-large.kite"),
+            os.path.join(SCRIPT_DIR, "routes-small.kite"),
+        ]
+        kite_file = next((p for p in kite_candidates if os.path.isfile(p)), None)
+        if kite_file:
+            kr_out = os.path.join(api_dir, "kiterunner.txt")
+            ok, out = run_cmd(
+                f'{kiterunner} scan "https://{domain}" --output "{kr_out}" '
+                f'--kite-file "{kite_file}"',
+                timeout=API_FUZZ_TIMEOUT,
+                watch_file=api_dir,
+                watch_phase="API FUZZ"
+            )
+            if os.path.exists(kr_out):
+                count = sum(1 for _ in open(kr_out) if _.strip())
+                log("ok", f"Kiterunner: {count} API routes found → {kr_out}")
+            else:
+                log("warn", "Kiterunner produced no output")
         else:
-            log("warn", f"Kiterunner no output (routes file may need download)")
+            log("warn",
+                "Kiterunner skipped: no .kite routes file found "
+                f"(expected one of routes-large.kite / routes-small.kite under {WORDLIST_DIR})")
     else:
         log("warn", "kiterunner not in PATH")
 
