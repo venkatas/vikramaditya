@@ -176,27 +176,65 @@ awk '!seen[$0]++' "$ORDERED_SCAN" > "${ORDERED_SCAN}.tmp" && mv "${ORDERED_SCAN}
 if ! skip_has upload; then
     log_info "Check 0: Upload Surface Discovery"
     CATCHALL_HOSTS=""
+    # Per-host body-hash fingerprint of the soft-404 response (kept in a tmp
+    # file because bash 3.2 on macOS lacks associative arrays). Each line:
+    #   <host>\t<md5>
+    # SPA catchalls return the same HTML shell for every path with HTTP 200
+    # and no "404" marker, so a status-only check is not enough.
+    SOFT404_FILE=$(mktemp -t scanner_soft404.XXXXXX 2>/dev/null \
+        || mktemp /tmp/scanner_soft404_XXXXXX 2>/dev/null \
+        || echo "/tmp/scanner_soft404_$$_$RANDOM.txt")
+    : > "$SOFT404_FILE"
     log_step "Detecting catchall behavior..."
-    head -10 "$ORDERED_SCAN" | while read -r host; do
+    # Process substitution (not pipe) so loop body runs in the parent shell —
+    # otherwise CATCHALL_HOSTS mutations evaporate.
+    while read -r host; do
         [ -z "$host" ] && continue
-        if [ "$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "${host}/non_existent_$(date +%s)")" -eq 200 ]; then
-            log_warn "Catchall detected: $host"
+        PROBE_URL="${host%/}/non_existent_$(date +%s)_$$"
+        RESP=$(curl -sk --max-time 10 -o - -w "\nHTTP_CODE:%{http_code}" "$PROBE_URL" 2>/dev/null)
+        CODE=$(echo "$RESP" | tail -1 | sed 's/HTTP_CODE://')
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" = "200" ]; then
+            BODY_LEN=$(echo -n "$BODY" | wc -c | tr -d ' ')
+            BODY_HASH=$(echo -n "$BODY" | md5 2>/dev/null || echo -n "$BODY" | md5sum | awk '{print $1}')
+            log_warn "Catchall detected: $host (random path → 200, ${BODY_LEN} B fingerprint)"
             CATCHALL_HOSTS="${CATCHALL_HOSTS},${host}"
+            printf '%s\t%s\n' "$host" "$BODY_HASH" >> "$SOFT404_FILE"
         fi
-    done
+    done < <(head -10 "$ORDERED_SCAN")
+
     PROBE_PATHS=("/upload.php" "/uploader.php" "/upload/index.php" "/filemanager/index.php" "/ckfinder/core/connector/php/connector.php" "/fckeditor/editor/filemanager/connectors/php/connector.php" "/elfinder.php" "/admin/upload")
-    head -30 "$ORDERED_SCAN" | while read -r host; do
+    while read -r host; do
         [ -z "$host" ] && continue
+        # Hard skip: don't probe hosts that proved to be catchalls — the
+        # baseline body would mask any real upload sink anyway.
         [[ "$CATCHALL_HOSTS" == *"$host"* ]] && continue
+        EXPECTED_HASH=$(awk -v h="$host" -F '\t' '$1==h{print $2; exit}' "$SOFT404_FILE" 2>/dev/null)
         for path in "${PROBE_PATHS[@]}"; do
             U="${host%/}${path}"
-            if [ "$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "$U")" -eq 200 ]; then
-                log_vuln "Found upload path: $U"
-                echo "[UPLOAD-CANDIDATE] $U" >> "$FINDINGS_DIR/upload/active_upload_probe.txt"
-                verify_upload_poc "$U"
+            RESP=$(curl -sk --max-time 5 -o - -w "\nHTTP_CODE:%{http_code}" "$U" 2>/dev/null)
+            CODE=$(echo "$RESP" | tail -1 | sed 's/HTTP_CODE://')
+            [ "$CODE" != "200" ] && continue
+            BODY=$(echo "$RESP" | sed '$d')
+            # Skip explicit soft-404 markers in the body.
+            if echo "$BODY" | grep -qiE "404|not[ -]?found|page.*does.*not.*exist|page n[ao]t found|nothing found"; then
+                continue
             fi
+            # Skip suspiciously short bodies (empty stubs / forbidden templates).
+            BODY_LEN=$(echo -n "$BODY" | wc -c | tr -d ' ')
+            [ "$BODY_LEN" -lt 200 ] && continue
+            # Skip if body matches the soft-404 fingerprint of this host (SPA
+            # catchall returning the same shell for every path).
+            if [ -n "$EXPECTED_HASH" ]; then
+                BODY_HASH=$(echo -n "$BODY" | md5 2>/dev/null || echo -n "$BODY" | md5sum | awk '{print $1}')
+                [ "$BODY_HASH" = "$EXPECTED_HASH" ] && continue
+            fi
+            log_vuln "Found upload path: $U"
+            echo "[UPLOAD-CANDIDATE] $U" >> "$FINDINGS_DIR/upload/active_upload_probe.txt"
+            verify_upload_poc "$U"
         done
-    done
+    done < <(head -30 "$ORDERED_SCAN")
+    rm -f "$SOFT404_FILE"
 fi
 
 # ── Check 2: SQL Injection ──────────────────────────────────────────────
