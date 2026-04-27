@@ -69,7 +69,15 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$SCRIPT_DIR"
 SESSION_ID=$(basename "$RECON_DIR")
-TARGET=$(basename "$(dirname "$(dirname "$RECON_DIR")")")
+# Support two invocation styles:
+#   1. Session path:  recon/<target>/sessions/<id>   → parent's parent basename = <target>
+#   2. Parent path:   recon/<target>                  → own basename = <target>
+if [[ "$(basename "$(dirname "$RECON_DIR")")" == "sessions" ]]; then
+    TARGET=$(basename "$(dirname "$(dirname "$RECON_DIR")")")
+else
+    TARGET=$(basename "$RECON_DIR")
+    SESSION_ID="$(date +%Y%m%d_%H%M%S)"
+fi
 FINDINGS_DIR="${FINDINGS_OUT_DIR:-$BASE_DIR/findings/$TARGET/sessions/$SESSION_ID}"
 
 export PATH="$HOME/go/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
@@ -245,7 +253,10 @@ if ! skip_has xss; then
         DAL_MAX_TIME=$([ "$QUICK_MODE" = "--quick" ] && echo 300 || echo 900)
         # Deduplicate by base-URL + sorted param keys to avoid scanning the same
         # endpoint N times with different random values (e.g. ?rand=1.234 variants)
-        DAL_DEDUP_FILE=$(mktemp /tmp/dalfox_dedup_XXXXXX.txt)
+        DAL_DEDUP_FILE=$(mktemp -t dalfox_dedup.XXXXXX 2>/dev/null \
+            || mktemp /tmp/dalfox_dedup_XXXXXX 2>/dev/null \
+            || echo "/tmp/dalfox_dedup_$$_$RANDOM.txt")
+        : > "$DAL_DEDUP_FILE"
         python3 - "$PARAMS_FILE" "$DAL_DEDUP_FILE" <<'PYEOF' 2>/dev/null || cp "$PARAMS_FILE" "$DAL_DEDUP_FILE"
 import sys
 from urllib.parse import urlparse, parse_qs
@@ -663,7 +674,7 @@ log_info "Scan Complete. Consolidating..."
 {
     echo "Scan Date : $(date)"
     echo "Target    : $TARGET"
-    echo "Verified SQLi PoCs   : $(grep -c "SQLI-POC-VERIFIED" "$FINDINGS_DIR/sqli/timebased_candidates.txt" 2>/dev/null || echo 0)"
+    echo "Verified SQLi PoCs   : $({ grep -c "SQLI-POC-VERIFIED" "$FINDINGS_DIR/sqli/timebased_candidates.txt" 2>/dev/null || echo 0; } | head -1)"
     echo "Verified RCE PoCs    : $(count_vuln "$FINDINGS_DIR/upload/verified_rce_pocs.txt")"
     echo "Verified Upload Only : $(count_vuln "$FINDINGS_DIR/upload/verified_upload_pocs.txt")"
     echo "XSS (dalfox)         : $(count_vuln "$FINDINGS_DIR/xss/dalfox_results.txt")"

@@ -1,5 +1,38 @@
 # Changelog
 
+## v7.4.8 — scanner.sh hardening: 3 bugs caught on a real-world full-scope run (2026-04-27)
+
+Live test against pranapr.com (9 subdomains, 14 live HTTP hosts, 5 IPs) surfaced three scanner.sh bugs. Each was reproduced, patched, and verified across two re-runs.
+
+### 1. macOS BSD `mktemp` failure on dalfox dedup
+`mktemp /tmp/dalfox_dedup_XXXXXX.txt` is unreliable on macOS BSD `mktemp` — the suffix after the X's caused `mkstemp failed: File exists`. `$DAL_DEDUP_FILE` came back empty, which then cascaded:
+```
+mktemp: mkstemp failed on /tmp/dalfox_dedup_XXXXXX.txt: File exists
+scanner.sh: line 267: : No such file or directory
+... Running dalfox on up to 100 URLs (deduped from 50 → 0, ...)
+head: : No such file or directory
+```
+Fix: use `mktemp -t dalfox_dedup.XXXXXX` (macOS-friendly form), with two fallbacks (`mktemp /tmp/dalfox_dedup_XXXXXX`, then a PID/$RANDOM-stamped path) so `$DAL_DEDUP_FILE` is always set; `: > "$file"` guarantees the file exists for the dedup writer. Verified: dedup printed `50 → 50` (vs broken `50 → 0`).
+
+### 2. Wrong `Target` name in consolidated summary
+`TARGET=$(basename "$(dirname "$(dirname "$RECON_DIR")")")` assumed the path was always `recon/<target>/sessions/<id>`. When invoked with the parent recon path documented in `CLAUDE.md` (`bash scanner.sh recon/pranapr.com`), the math walked one level too far up and printed the repo dir basename: `Target : obsidian`. Fix: detect whether `$(basename "$(dirname "$RECON_DIR")")` equals `sessions`; if so, walk two levels (legacy session-path); otherwise the dir's own basename is the target. Verified: `Target : pranapr.com`.
+
+### 3. Stray `0` printed under "Verified SQLi PoCs"
+```
+Verified SQLi PoCs   : 0
+0
+```
+`grep -c "SQLI-POC-VERIFIED" file 2>/dev/null || echo 0` — when the file exists but has no matches, `grep -c` writes `0` to stdout *and* exits 1, so the `|| echo 0` branch fires and a second `0` gets captured. Fix: `$({ grep -c ... 2>/dev/null || echo 0; } | head -1)` collapses to a single integer across all four cases (empty file, file with no matches, file with matches, missing file).
+
+### HAR engine drive-bys
+- `har_vapt.py`: force line-buffered stdout/stderr so `nohup ... > log 2>&1` shows progress instead of looking hung.
+- `har_vapt.py`: dropped the always-failing `subprocess.run([sys.executable, "reporter.py", results_file])` — reporter expects a recon/findings tree, not a single JSON.
+- `har_vapt_engine.py`: when an upload is accepted but storage cannot be verified at standard paths, ask `brain_scanner` to write a Python script that fuzzes for the uploaded shell and attempts RCE. ImportError-safe.
+- `har_vapt.py`: read `endpoints_fuzzed` (current key) before `endpoints_tested` (legacy fallback); print `Endpoints Fuzzed: tested / total`.
+
+### Found by
+Single end-to-end full-scope scan against pranapr.com — initial run hit bug #1 (mid-Check 3); first verify run hit bug #2 (summary footer); second verify run hit bug #3 (summary footer). Third run printed clean across all 13 checks. Real-target findings: 14 WordPress hosts (xmlrpc + plugin-CVE surface), 8 upload-candidate paths on `kalki.pranapr.com`, 12 unauth API endpoints on `radar-testing.pranapr.com` (incl. a 1 MB CSV data dump).
+
 ## v7.4.7 — autonomous pipeline robustness: paramspider/arjun/js_analysis/kiterunner/wordlist URLs (2026-04-26)
 
 Five bugs caught and fixed during four end-to-end autonomous hunts. Each was reproduced before patching; each fix was verified in a subsequent run.

@@ -444,6 +444,16 @@ class HARVAPTEngine:
                                 self._log('medium', 'File Upload (Accepted, Unverified)', url,
                                           f"Server accepted '{fname}' via '{param}' — cannot verify storage",
                                           param=param)
+                                
+                                # Ask the brain to try harder to find it and get RCE by writing a script
+                                try:
+                                    from brain_scanner import run_brain_scanner
+                                    print(f"\n   🧠 [BRAIN] Asking AI to write a script to find the uploaded shell '{fname}' on '{url}'")
+                                    cookies_str = "; ".join([f"{c.name}={c.value}" for c in self.session.cookies])
+                                    briefing = f"File upload accepted at {url}. File: {fname}. Parameter: {param}. I cannot find the uploaded file at standard paths like /upload/{fname}. Write a script to fuzz directories and find the uploaded shell, and try to get RCE. You must write a complete Python script that searches for the uploaded file and executes a command."
+                                    run_brain_scanner(target=url, briefing=briefing, cookies=cookies_str, mode='scan', max_iterations=2)
+                                except ImportError:
+                                    pass
                     except Exception:
                         pass
 
