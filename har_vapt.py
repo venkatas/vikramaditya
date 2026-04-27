@@ -13,6 +13,16 @@ import argparse
 import json
 import os
 import sys
+
+# Force line-buffered stdout/stderr so progress is visible when output is
+# redirected to a file (e.g. `nohup ... > log 2>&1`). Without this, Python
+# block-buffers piped stdout and the run looks hung for many minutes.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
 from datetime import datetime
 from har_analyzer import HARAnalyzer
 from har_vapt_engine import HARVAPTEngine
@@ -150,7 +160,13 @@ def run_vapt_tests(analysis_file: str) -> str:
         scan_info = results.get('scan_info', {})
         duration = scan_info.get('duration_seconds', 0)
         print(f"\n  {C}Scan Duration        :{N} {duration:.2f} seconds")
-        print(f"  {C}Endpoints Tested     :{N} {scan_info.get('endpoints_tested', 0)}")
+        # The engine writes endpoints_fuzzed (param-bearing endpoints actually probed)
+        # plus endpoints_total. endpoints_tested was an old field name; keep the
+        # fallback for forward-compat but read the live key first.
+        tested = scan_info.get('endpoints_fuzzed',
+                               scan_info.get('endpoints_tested', 0))
+        total = scan_info.get('endpoints_total', 0)
+        print(f"  {C}Endpoints Fuzzed     :{N} {tested} / {total}")
         print(f"  {W}{'─' * 50}{N}")
 
         return results_file
@@ -180,15 +196,11 @@ def full_workflow(har_file: str) -> str:
         print(f"  📁 Analysis: {analysis_file}")
         print(f"  📊 Results: {results_file}")
 
-        # Optional: Generate HTML report
-        try:
-            import subprocess
-            if os.path.exists("reporter.py"):
-                print(f"\n{C}Generating HTML report...{N}")
-                subprocess.run([sys.executable, "reporter.py", results_file], check=True)
-                log("ok", "HTML report generated")
-        except Exception:
-            log("warn", "Could not generate HTML report (reporter.py not found or failed)")
+        # NOTE: reporter.py expects a recon/findings directory tree (see
+        # CLAUDE.md), not the single JSON we produce here. We previously
+        # attempted to invoke it with the JSON path and it failed every run
+        # with "reporter.py not found or failed". Dropped — the JSON is
+        # self-contained and rendered inline above.
 
     return results_file
 
