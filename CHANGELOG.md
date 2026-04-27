@@ -1,5 +1,26 @@
 # Changelog
 
+## v7.4.9 — Check 0 false-positive elimination: SPA soft-404 fingerprinting (2026-04-27)
+
+Reading the v7.4.8 scan output, the user spotted that `kalki.pranapr.com` was returning 200 with a "404 page" body, and Check 0 was happily logging four `[VULN] Found upload path` lines for paths that didn't exist. Tracing through `scanner.sh:170-189` exposed three layered bugs:
+
+### 1. Catchall-detection result was being thrown away (subshell scope)
+```bash
+head -10 "$ORDERED_SCAN" | while read -r host; do
+    ...
+    CATCHALL_HOSTS="${CATCHALL_HOSTS},${host}"
+done
+```
+The `head | while` pipe forces the loop body into a subshell, so `CATCHALL_HOSTS` mutations never escape. The downstream `[[ "$CATCHALL_HOSTS" == *"$host"* ]] && continue` gate was effectively dead code: every "detected" catchall was probed anyway. Fix: replace pipes with process substitution `done < <(head -10 ...)` so the loop runs in the parent shell.
+
+### 2. Status-only check missed SPA soft-404s
+The original detection compared only the HTTP code; many WordPress / nginx / SPA setups return **200 OK** with a "404 / page-not-found" body, or worse (the case here), the **same HTML shell** for every URL. Status-only logic let all of those through. Fix: also check (a) for explicit "404 / not found" body markers and (b) compute a per-host MD5 fingerprint of the random-URL response, then reject any probe whose body hash matches the baseline.
+
+### 3. Bash 3.2 has no `declare -A`
+First soft-404 fix used `declare -A SOFT404_HASH` to map host → fingerprint. macOS ships bash 3.2 (associative arrays only exist in bash 4+), so the script bombed instantly with `declare: -A: invalid option` and (because of `set -u`) `https: unbound variable` from the index expansion. Fix: persist the mapping in a tmp file (`<host>\t<md5>` per line) and look it up with `awk -F '\t' '$1==h{print $2; exit}'`. Same `mktemp -t` + double-fallback pattern used for the dalfox dedup file.
+
+Verified end-to-end: catchall correctly logged for `kalki.pranapr.com`, **zero** `Found upload path` lines (vs. 4 false positives in v7.4.8), no `declare:` / `unbound variable` noise, all 13 checks complete clean.
+
 ## v7.4.8 — scanner.sh hardening: 3 bugs caught on a real-world full-scope run (2026-04-27)
 
 Live test against pranapr.com (9 subdomains, 14 live HTTP hosts, 5 IPs) surfaced three scanner.sh bugs. Each was reproduced, patched, and verified across two re-runs.
