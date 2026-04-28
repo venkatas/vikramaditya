@@ -1,7 +1,7 @@
 # Vikramaditya Whitebox VAPT — Cloud Integration Design
 
 **Date:** 2026-04-28
-**Author:** Venkata Satish (CERT-In empanelled VAPT consultant) with Claude
+**Author:** Venkata Satish Guttula
 **Status:** Draft — pending user review
 
 ## Summary
@@ -14,7 +14,7 @@ The whitebox layer ships as a self-contained `whitebox/` Python package, integra
 
 - **Targets:** `clienta.com` (AWS profile `client-a`, account `000000000001`), `clientb.com` (AWS profile `client-b`, account `000000000002`).
 - **AWS access:** Both profiles authenticated as `venkata.satish-audit` with `ReadOnlyAccess` + `SecurityAudit` managed policies.
-- **Authorization:** CERT-In empanelled VAPT engagement with written client authorization.
+- **Authorization:** VAPT engagement conducted on behalf of a CERT-In empanelled company with written client authorization.
 - **Account-to-domain model:** **Multi-domain per account** — Route53 zones are enumerated per account, every zone in an account is treated as in-scope automatically. Both accounts may host multiple domains; tool tags every finding with source account ID.
 
 ## Decisions Locked During Brainstorming
