@@ -62,3 +62,15 @@ def test_probe_permissions_lazy_flags_default_false():
     assert probe["simulate_principal_policy"] is False
     assert probe["secretsmanager_list"] is False
     assert probe["logs_describe"] is False
+
+
+def test_normalize_to_iam_arn_strips_assumed_role_session():
+    from whitebox.profiles import _normalize_to_iam_arn
+    sts_arn = "arn:aws:sts::123456789012:assumed-role/AdminRole/i-0abc"
+    assert _normalize_to_iam_arn(sts_arn) == "arn:aws:iam::123456789012:role/AdminRole"
+
+
+def test_normalize_to_iam_arn_passes_through_iam_user():
+    from whitebox.profiles import _normalize_to_iam_arn
+    iam_arn = "arn:aws:iam::123456789012:user/audit"
+    assert _normalize_to_iam_arn(iam_arn) == iam_arn
