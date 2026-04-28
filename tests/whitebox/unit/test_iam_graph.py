@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from whitebox.iam.graph import IAMGraph
 
@@ -48,3 +49,23 @@ def test_load_graph_from_pmapper_storage_dir(tmp_path):
     (tmp_path / "graph" / "edges.json").write_text("[]")
     g = IAMGraph.load(tmp_path)
     assert "arn:aws:iam::111:role/r" in g.nodes
+
+
+def test_blast_radius_separates_users_from_roles(tmp_path):
+    """A graph with a user as a reachable principal should not put it in assumable_roles."""
+    (tmp_path / "graph.json").write_text(json.dumps({
+        "nodes": [
+            {"arn": "arn:aws:iam::111:role/start", "id_value": "start", "is_admin": False},
+            {"arn": "arn:aws:iam::111:role/r1",    "id_value": "r1",    "is_admin": False},
+            {"arn": "arn:aws:iam::111:user/u1",    "id_value": "u1",    "is_admin": False},
+        ],
+        "edges": [
+            {"source": "arn:aws:iam::111:role/start", "destination": "arn:aws:iam::111:role/r1"},
+            {"source": "arn:aws:iam::111:role/start", "destination": "arn:aws:iam::111:user/u1"},
+        ],
+    }))
+    g = IAMGraph.load(tmp_path / "graph.json")
+    br = g.blast_radius("arn:aws:iam::111:role/start")
+    assert "arn:aws:iam::111:role/r1" in br.assumable_roles
+    assert "arn:aws:iam::111:user/u1" in br.assumable_users
+    assert "arn:aws:iam::111:user/u1" not in br.assumable_roles

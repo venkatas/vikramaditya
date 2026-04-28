@@ -46,7 +46,8 @@ def test_blast_radius_aggregates():
     b = BlastRadius(
         principal_arn="arn:aws:iam::1:role/r",
         s3_buckets=["a", "b"], kms_keys=["k1"],
-        lambdas=[], assumable_roles=["arn:role/admin"], regions=["us-east-1"],
+        lambdas=[], assumable_roles=["arn:role/admin"], assumable_users=[],
+        regions=["us-east-1"],
     )
     assert b.total_resources() == 4
 
@@ -88,7 +89,7 @@ def test_to_dict_labels_nested_chain_severity():
 def test_blast_radius_total_excludes_regions():
     b = BlastRadius(
         principal_arn="arn:r",
-        s3_buckets=["a"], kms_keys=[], lambdas=[], assumable_roles=[],
+        s3_buckets=["a"], kms_keys=[], lambdas=[], assumable_roles=[], assumable_users=[],
         regions=["us-east-1", "ap-south-1", "eu-west-1"],
     )
     assert b.total_resources() == 1  # regions intentionally excluded
