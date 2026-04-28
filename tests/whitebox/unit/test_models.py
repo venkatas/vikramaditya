@@ -55,3 +55,40 @@ def test_asset_internet_reachable_default_false():
     a = Asset(arn="arn:aws:ec2:...", service="ec2", account_id="1",
               region="us-east-1", name="i-0abc", tags={})
     assert a.tags.get("internet_reachable") is None
+
+
+def test_finding_rejects_whitespace_rule_id():
+    with pytest.raises(ValueError, match="rule_id"):
+        Finding(
+            id="f1", source="prowler", rule_id="   ",
+            severity=Severity.HIGH, title="t", description="d",
+            asset=None, evidence_path=Path("/tmp/x"),
+        )
+
+
+def test_to_dict_labels_nested_chain_severity():
+    chain = Chain(
+        trigger_finding_id="f1", cloud_asset_arn="arn:ec2:i-1",
+        iam_path=["arn:role/web", "arn:role/admin"],
+        promoted_severity=Severity.CRITICAL,
+        promotion_rule="chain.test",
+        narrative="",
+    )
+    f = Finding(
+        id="f1", source="chain", rule_id="chain.test",
+        severity=Severity.MEDIUM, title="t", description="d",
+        asset=None, evidence_path=Path("/tmp/x"),
+        chain=chain,
+    )
+    d = f.to_dict()
+    assert d["severity"] == "Medium"
+    assert d["chain"]["promoted_severity"] == "Critical"
+
+
+def test_blast_radius_total_excludes_regions():
+    b = BlastRadius(
+        principal_arn="arn:r",
+        s3_buckets=["a"], kms_keys=[], lambdas=[], assumable_roles=[],
+        regions=["us-east-1", "ap-south-1", "eu-west-1"],
+    )
+    assert b.total_resources() == 1  # regions intentionally excluded
