@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import os
 import time
 from pathlib import Path
 
@@ -18,12 +19,31 @@ class PhaseCache:
         if not self.path.exists():
             return {}
         try:
-            return json.loads(self.path.read_text())
+            raw = json.loads(self.path.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
+        # Validate top-level shape
+        if not isinstance(raw, dict):
+            return {}
+        # Validate each phase entry — drop malformed records (treated as stale)
+        clean: dict = {}
+        for phase, meta in raw.items():
+            if not isinstance(meta, dict):
+                continue
+            status = meta.get("status")
+            if status not in ("complete", "failed"):
+                continue
+            if status == "complete":
+                ts = meta.get("completed_at")
+                if not isinstance(ts, (int, float)):
+                    continue
+            clean[phase] = meta
+        return clean
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self._data, indent=2, default=str))
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self._data, indent=2, default=str))
+        os.replace(tmp, self.path)
 
     def mark_complete(self, phase: str, artifacts: dict | None = None) -> None:
         self._data[phase] = {

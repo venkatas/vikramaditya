@@ -42,3 +42,26 @@ def test_failed_phase_is_not_fresh(tmp_path):
     cache.mark_failed("prowler", error="subprocess crashed")
     assert not cache.is_fresh("prowler")
     assert cache.get("prowler")["status"] == "failed"
+
+
+def test_invalid_top_level_shape_invalidates(tmp_path):
+    (tmp_path / "manifest.json").write_text("[]")
+    cache = PhaseCache(tmp_path, ttl_seconds=3600)
+    assert not cache.is_fresh("anything")
+
+
+def test_malformed_phase_entry_dropped(tmp_path):
+    import time as _time
+    now = _time.time()
+    manifest = {
+        "good":           {"status": "complete", "completed_at": now},
+        "missing_ts":     {"status": "complete"},
+        "bad_ts":         {"status": "complete", "completed_at": "yesterday"},
+        "unknown_status": {"status": "weird"},
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    cache = PhaseCache(tmp_path, ttl_seconds=10**9)  # huge TTL
+    assert cache.is_fresh("good")
+    assert not cache.is_fresh("missing_ts")
+    assert not cache.is_fresh("bad_ts")
+    assert not cache.is_fresh("unknown_status")
