@@ -90,3 +90,8 @@ nuclei_output*
 
 # ── Worktrees ─────────────────────────────────────────────────────────────────
 .worktrees/
+
+# Whitebox VAPT — never commit secret evidence or per-machine config
+recon/*/sessions/*/cloud/*/secrets/
+whitebox_config.local.yaml
+*.pmapper-graph.json

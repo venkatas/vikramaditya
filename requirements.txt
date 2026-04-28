@@ -40,3 +40,12 @@ magika>=0.6.0
 # ── Report PDF export (optional, system package) ─────────────────────────────
 # macOS:  brew install wkhtmltopdf
 # Linux:  apt install wkhtmltopdf
+
+# ── Whitebox VAPT (AWS cloud integration) ────────────────────────────────────
+boto3>=1.34.0
+botocore>=1.34.0
+prowler-cloud==4.5.0
+principalmapper>=1.1.5
+PyYAML>=6.0
+# Test-only (already in dev environments, but pinned here for whitebox)
+moto[all]>=5.0.0
