@@ -2,6 +2,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 import boto3
+import logging
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,7 +39,20 @@ def validate(profile: CloudProfile) -> CloudProfile:
 
 
 def probe_permissions(session, principal_arn: str) -> dict:
-    """Soft-probe each optional permission. Never raises."""
+    """Soft-probe each optional permission. Never raises.
+
+    Returns a dict with five keys:
+      - simulate_principal_policy: probed eagerly via IAM SimulatePrincipalPolicy
+      - secretsmanager_list:       probed eagerly via SecretsManager ListSecrets
+      - logs_describe:             probed eagerly via CloudWatch Logs DescribeLogGroups
+      - secretsmanager_get_value:  initialised False; downstream secrets/secretsmanager.py
+                                   updates this on first GetSecretValue attempt.
+      - kms_decrypt:               initialised False; downstream secret-decrypt code
+                                   updates this lazily per KMS key.
+
+    Lazy keys reflect "not yet probed" until set; consumers MUST treat False
+    as "unknown / no decrypt yet attempted", not "definitively denied".
+    """
     probe = {
         "simulate_principal_policy": False,
         "secretsmanager_list": False,
@@ -50,16 +66,16 @@ def probe_permissions(session, principal_arn: str) -> dict:
             ActionNames=["iam:ListUsers"],
         )
         probe["simulate_principal_policy"] = True
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("probe simulate_principal_policy failed: %s", e)
     try:
         session.client("secretsmanager").list_secrets(MaxResults=1)
         probe["secretsmanager_list"] = True
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("probe secretsmanager_list failed: %s", e)
     try:
         session.client("logs").describe_log_groups(limit=1)
         probe["logs_describe"] = True
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("probe logs_describe failed: %s", e)
     return probe
