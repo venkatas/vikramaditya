@@ -55,23 +55,59 @@ from urllib.parse import urlsplit
 
 # ── Whitebox integration (Task 22) ────────────────────────────────────────────
 
-def _enrich_targets_with_whitebox_asset_feed(targets, session_dir):
-    """If a whitebox asset feed exists for this session, prepend internet-reachable
-    cloud-discovered assets so blackbox scans the actually-exposed surface first.
-    No-op when no feed exists."""
+def _whitebox_cloud_dir(recon_dir) -> "Path | None":
+    """Return the cloud audit directory for this target, or None if not run.
+
+    Walks candidate paths from the given recon_dir upward so the lookup
+    works whether recon_dir is a session path (.../sessions/<id>/) or the
+    target-level root (.../recon/<domain>/).
+    """
+    from pathlib import Path as _P
+    p = _P(recon_dir)
+    # Try target-level (p itself, p.parent, p.parent.parent) for a 'cloud' subdir
+    for candidate_root in (p, p.parent, p.parent.parent):
+        sub = candidate_root / "cloud"
+        if sub.is_dir():
+            return sub
+    return None
+
+
+def _enrich_targets_with_whitebox_asset_feed(targets, recon_dir, target_domain: str | None = None):
+    """Prepend internet-reachable cloud assets to the scan list, filtered to engagement scope.
+
+    Resolves the asset feed via a candidate-path walk so this works whether
+    recon_dir is a session path or the target-level root.
+
+    Only DNS names within the target_domain tree are added.  Public IPs are
+    added only when target_domain is None (caller opts in to IP-scope-bypass).
+    """
     try:
         import json as _json
         from pathlib import Path as _P
-        asset_feed = _P(session_dir) / "cloud" / "correlation" / "asset_feed.json"
+        cloud_dir = _whitebox_cloud_dir(recon_dir)
+        if cloud_dir is None:
+            return targets
+        asset_feed = cloud_dir / "correlation" / "asset_feed.json"
         if not asset_feed.exists():
             return targets
         extra: list[str] = []
         for a in _json.loads(asset_feed.read_text()):
             tags = a.get("tags") or {}
-            if tags.get("internet_reachable"):
-                for h in (a.get("public_dns"), a.get("public_ip")):
-                    if h:
-                        extra.append(h)
+            if not tags.get("internet_reachable"):
+                continue
+            dns = a.get("public_dns")
+            ip = a.get("public_ip")
+            # Scope filter: only include DNS within the engagement target's domain tree
+            if target_domain and dns:
+                d = dns.lower().rstrip(".")
+                t = target_domain.lower().rstrip(".")
+                if d == t or d.endswith("." + t):
+                    extra.append(dns)
+            elif not target_domain and dns:
+                extra.append(dns)
+            # Public IPs only when no domain filter (explicit out-of-scope-safe default)
+            if not target_domain and ip:
+                extra.append(ip)
         if not extra:
             return targets
         # Prepend cloud-prioritized targets, deduplicating
@@ -6010,7 +6046,7 @@ def hunt_target(
     if _recon_dir:
         import os as _os
         _live_urls_file = _os.path.join(_recon_dir, "live", "urls.txt")
-        _extra_hosts = _enrich_targets_with_whitebox_asset_feed([], _recon_dir)
+        _extra_hosts = _enrich_targets_with_whitebox_asset_feed([], _recon_dir, target_domain=domain)
         if _extra_hosts:
             try:
                 _os.makedirs(_os.path.dirname(_live_urls_file), exist_ok=True)
