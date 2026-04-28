@@ -37,6 +37,44 @@ N = "\033[0m"          # Reset
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+# ── Whitebox integration (Task 22) ────────────────────────────────────────────
+
+def _maybe_run_whitebox_for_target(target: str, session_dir) -> None:
+    """If whitebox_config.yaml maps the target to any AWS profiles, offer
+    to run the cloud whitebox audit alongside the blackbox flow.
+    Silent no-op when no config exists or no profile matches."""
+    try:
+        from pathlib import Path as _Path
+        config_path = _Path("whitebox_config.yaml")
+        if not config_path.exists():
+            return
+        try:
+            import yaml as _yaml
+        except ImportError:
+            return
+        cfg = _yaml.safe_load(config_path.read_text()) or {}
+        profiles_map = (cfg.get("profiles") or {})
+        matched = [name for name, meta in profiles_map.items()
+                   if target in (meta.get("domains") or [])]
+        if not matched:
+            return
+        print(f"[whitebox] target {target} matched profiles: {matched}")
+        try:
+            ans = input("Run cloud whitebox audit alongside blackbox? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans in ("", "y", "yes"):
+            from whitebox.cloud_hunt import main as _cloud_main
+            argv = []
+            for p in matched:
+                argv += ["--profile", p]
+            argv += ["--session-dir", str(session_dir), "--allowlist", target]
+            _cloud_main(argv)
+    except Exception as _e:
+        # Whitebox is optional — never break the blackbox flow
+        print(f"[whitebox] integration skipped: {_e}")
+
+
 def banner():
     # Indian flag: saffron (top), white (middle), green (bottom)
     # Ashoka Chakra blue for the tagline
@@ -823,6 +861,9 @@ def main():
     if not autonomous and not confirm("Proceed?"):
         print(f"  {D}Aborted.{N}")
         return
+
+    # ── Whitebox: offer cloud audit if target matches a configured profile ─
+    _maybe_run_whitebox_for_target(urlparse(url).netloc, os.path.join(SCRIPT_DIR, "recon", urlparse(url).netloc))
 
     # ── Step 3: Credentials ───────────────────────────────────────────────
     creds = cli["creds"] or None
