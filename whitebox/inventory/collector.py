@@ -52,15 +52,28 @@ def collect_service(profile: CloudProfile, service_key: str, out_dir: Path) -> d
         try:
             kwargs = {} if scope == "global" else {"region_name": region}
             client = profile._session.client(client_name, **kwargs)
-            data = getattr(client, method)()
-            # Strip ResponseMetadata for cleanliness
-            data.pop("ResponseMetadata", None)
+            if client.can_paginate(method):
+                paginator = client.get_paginator(method)
+                pages = list(paginator.paginate())
+                # Merge pages by concatenating all top-level list values
+                merged: dict = {}
+                for page in pages:
+                    page.pop("ResponseMetadata", None)
+                    for k, v in page.items():
+                        if isinstance(v, list):
+                            merged.setdefault(k, []).extend(v)
+                        else:
+                            merged.setdefault(k, v)
+                data = merged
+            else:
+                data = getattr(client, method)()
+                data.pop("ResponseMetadata", None)
             (svc_dir / f"{region}.json").write_text(
                 json.dumps(data, indent=2, default=str)
             )
             region_results[region] = "ok"
         except Exception as e:
-            region_results[region] = f"error: {e!s}"
+            region_results[region] = f"error({type(e).__name__}): {e!s}"
 
     return {"service": service_key, "regions": region_results}
 
