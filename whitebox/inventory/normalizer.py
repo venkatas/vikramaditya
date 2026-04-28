@@ -21,10 +21,18 @@ def from_inventory_dir(account_id: str, inventory_dir: Path) -> list[Asset]:
             data = json.loads(f.read_text())
             for resv in data.get("Reservations", []):
                 for inst in resv.get("Instances", []):
+                    tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+                    iam_profile = inst.get("IamInstanceProfile") or {}
+                    iam_arn = iam_profile.get("Arn", "")
+                    if iam_arn:
+                        if ":instance-profile/" in iam_arn:
+                            tags["iam_role_arn"] = iam_arn.replace(":instance-profile/", ":role/", 1)
+                        else:
+                            tags["iam_role_arn"] = iam_arn
                     assets.append(Asset(
                         arn=f"arn:aws:ec2:{region}:{account_id}:instance/{inst['InstanceId']}",
                         service="ec2", account_id=account_id, region=region,
-                        name=inst["InstanceId"], tags={t["Key"]: t["Value"] for t in inst.get("Tags", [])},
+                        name=inst["InstanceId"], tags=tags,
                         public_dns=inst.get("PublicDnsName") or None,
                         public_ip=inst.get("PublicIpAddress") or None,
                     ))
