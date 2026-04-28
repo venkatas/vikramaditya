@@ -1,0 +1,91 @@
+## Patch — fix unescaped CSV-cell rendering in eval-viewer HTML
+##
+## Pattern: a single-page viewer parses a CSV via Papa.parse and writes row
+## fields into the DOM via `innerHTML`. Common unescaped sinks:
+##   1. A "highlightText"/"highlight" helper that returns input unchanged when
+##      no highlight matches → flows into innerHTML.
+##   2. Numeric-looking ID fields (NewsId, RecordId, ItemId) interpolated raw,
+##      because devs assume they're always numbers.
+##   3. <option> dropdown construction that escapes one field but not the
+##      adjacent one.
+##
+## Three changes in the inline JavaScript of the viewer template.
+
+--- a/templates/view.html
++++ b/templates/view.html
+@@ -800,11 +800,18 @@
+     function escapeHtml(str) {
+       return String(str)
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#39;");
+     }
++
++    // Coerce numeric-ID-like values to a safe string for HTML interpolation.
++    // Backend should already reject non-numeric IDs, but defence-in-depth.
++    function safeId(v) {
++      const n = Number(v);
++      return Number.isFinite(n) ? String(n) : "";
++    }
+@@ -815,18 +822,20 @@
+     function highlightText(text, kwMap) {
+-      if (!text) return "(no text)";
++      if (!text) return escapeHtml("(no text)");
++      const safe = escapeHtml(String(text));
+       const keys = Object.keys(kwMap).filter(k => k.length > 0);
+-      if (!keys.length) return String(text);
++      if (!keys.length) return safe;
+
+       keys.sort((a, b) => b.length - a.length);
+       const parts = keys.map(k => wordBoundaryPattern(k)).filter(Boolean);
+-      if (!parts.length) return String(text);
++      if (!parts.length) return safe;
+       const regex = new RegExp("\\b(" + parts.join("|") + ")\\b", "gi");
+
+-      const input = String(text);
++      // Highlight on already-escaped text. Keyword phrases are alphanumeric
++      // tokens (no <, >, &, ", '), so escaping is safe to apply first.
++      const input = safe;
+       return input.replace(regex, (match) => {
+         // ... existing wrapping logic ...
+       });
+     }
+@@ -1085,7 +1094,7 @@
+             selectEl.innerHTML = rows
+               .map((r, idx) => {
+                 const h = (r.<HEADLINE_FIELD> || "").slice(0, 80);
+                 const fn = Number(r.FN || 0);
+-                return `<option value="${idx}">FN:${fn} | ${r.<ID_FIELD>} — ${escapeAttr(h)}</option>`;
++                return `<option value="${idx}">FN:${fn} | ${safeId(r.<ID_FIELD>)} — ${escapeAttr(h)}</option>`;
+               })
+               .join("");
+@@ -935,12 +944,12 @@
+       pane.innerHTML = `
+         ${selectedEntityKeywordsHtml}
+         <div class="section">
+           <div class="section-header">
+             <div>
+               <div class="section-title">Article</div>
+               <div class="section-subtitle">...</div>
+             </div>
+-            <div class="pill"><ID_LABEL> ${row.<ID_FIELD>}</div>
++            <div class="pill"><ID_LABEL> ${safeId(row.<ID_FIELD>)}</div>
+           </div>
+           <div class="headline-text">${highlightText(headline || "(no headline)", kwMap)}</div>
+-          <div class="news-id-detail"><ID_LABEL>: ${row.<ID_FIELD>}</div>
++          <div class="news-id-detail"><ID_LABEL>: ${safeId(row.<ID_FIELD>)}</div>
+           <div class="body-text" style="margin-top:8px;">${highlightText(body || "(no body text provided)", kwMap)}</div>
+         </div>
+
+## Verification
+
+1. Apply patch.
+2. Rebuild + redeploy.
+3. Upload a CSV / data file with an HTML payload in the headline column:
+   `<img src=x onerror="document.title='XSS-PROOF'">`.
+4. Visit the viewer URL.
+5. Page title must NOT change. Inspect DOM:
+   `document.querySelector('.headline-text').innerHTML` should contain
+   `&lt;img...` not `<img...`.

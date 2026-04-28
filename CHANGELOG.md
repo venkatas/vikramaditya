@@ -1,8 +1,62 @@
 # Changelog
 
+## v7.4.10 — Check 0 expansion + remediation-pack templates (2026-04-28)
+
+Two threads of work, both driven by a real-world engagement.
+
+### Check 0: massive coverage expansion (`scanner.sh`)
+
+The original Check 0 probed only 8 hard-coded paths (classic PHP file-managers + `/admin/upload`). On the engagement target it found 4 false-positive "upload paths" (all SPA soft-404s) and missed every real upload sink. Rewrite now probes **~100 paths** across:
+
+- Generic upload endpoints (`/upload`, `/upload.php`, `/upload.aspx`, `/upload.jsp`, `/UploadServlet`, `/Upload.ashx`, etc.)
+- API upload endpoints (`/api/upload`, `/api/v{1,2,3}/upload`, `/api/files`, `/api/v{1,2}/files`, `/api/v{1,2}/attachments`, `/api/media`, `/api/avatar`, `/api/upload/sign`, `/api/s3/sign`, `/api/presign`, `/api/import`)
+- WordPress (`/wp-admin/async-upload.php`, `/wp-admin/media-new.php`, `/wp-json/wp/v2/media`, `/wp-content/uploads/`)
+- File managers / WYSIWYG connectors (CKFinder, FCKeditor, elFinder, KCFinder, ResponsiveFilemanager, TinyMCE)
+- Profile / avatar (`/profile/photo`, `/user/avatar`, `/me/avatar`, etc.)
+- Admin panels (Joomla `index.php?option=com_media`, Drupal `/sites/default/files/`)
+- Framework-specific (Laravel `/storage/uploads`, Rails `/active_storage/blobs`)
+- GraphQL (`/graphql`, `/api/graphql`)
+
+Plus a recon-driven extractor: pulls URL paths from `urls/with_params.txt`, `urls/api_endpoints.txt`, `urls/all.txt`, `urls/js_files.txt`, filters with `upload|file[_-]?upload|attach|avatar|photo|/media/|/import/|/files?/`, dedupes, strips static-asset extensions, caps at 80. On the test engagement this surfaced `/api/eval/upload`, `/api/keywords/import/commit`, `/api/keywords/import/validate` — three real upload endpoints completely invisible to the static list.
+
+### Check 0: POST-probe pass for endpoints that reject GET
+
+Endpoints commonly return 405 / 401 / 403 / 415 on GET but accept multipart on POST. New probe loop:
+
+- `405` (method not allowed) → POST a tiny multipart `file=@/dev/null`. `200/201/202` → upload accepted (high-value finding); `400/422` → validation reject (endpoint exists, accepts uploads with proper payload); `401/403` → recorded for later authenticated re-test.
+- The status-aware classification produces three output tiers: `[UPLOAD-CANDIDATE]` (GET 200), `[UPLOAD-CANDIDATE-POST]` (POST accepted), `[UPLOAD-CANDIDATE-VALIDATION]` (400/422 — endpoint exists, our payload was malformed), `[UPLOAD-CANDIDATE-AUTH]` (auth wall, written to `auth_required.txt`).
+
+### Check 0: multi-shape catchall detection
+
+Hosts can be catchalls in different ways: SPA returns 200 with the same HTML shell for every path; API gateway returns 401 with same body for every `/api/*` path; admin panel returns 302 to login for everything. The previous single-status detection caught only the SPA case. New detection probes **four URL shapes** (`/`, `/api`, `/admin`, `/static`), each with two random paths; if both probes for a shape agree on `(status, body_hash)`, that tuple is recorded as a per-host baseline. The probe loop then rejects any response whose `(status, body_hash)` matches any baseline for the host. This catches:
+
+- SPA-200 catchalls: `/` shape → consistent 200/SPA-shell hash → host hard-skipped.
+- API-401 catchalls: `/api` shape → consistent 401/auth-error hash → 30+ noise entries on the auth_required.txt file are now suppressed.
+- Hard-404 catchalls: per-shape 404 fingerprint → false positives eliminated.
+
+Also fixed a subshell-scope bug where `head -10 ... | while` ran the loop in a subshell, so the `CATCHALL_HOSTS` mutations were thrown away — the downstream skip gate was effectively dead code. Replaced pipes with process substitution.
+
+Bash 3.2 compat preserved: macOS bash 3.2 has no associative arrays, so the per-host baseline mapping is persisted in a tmp file (`<host>\t<code>\t<hash>` per line) and looked up with `awk -F '\t' '$1==h{print $2"|"$3}'`.
+
+### Templates: remediation-pack scaffold (`templates/remediation_pack/`)
+
+Six drop-in fix templates that map to the most common real-engagement findings:
+- `01_view_xss_fix.html.patch` — unescaped CSV-cell rendering in eval-viewer style HTML
+- `02_wordpress_cors_fix.php` — reflective CORS + credentials on `/wp-json/*`
+- `03_fastapi_auth_fix.py` — unauth admin/data routes; oversize uploads; missing rate limits
+- `04_fastapi_prod_config.py` — `/docs`, `/redoc`, `/openapi.json` exposed in production
+- `05_wp_user_enum_fix.php` — `/wp-json/wp/v2/users` + `?author=N` user enum
+- `06_aws_devops_remediation.sh` — S3 PAB, ALB HTTP→HTTPS redirect, stray SG ingress, WAF rate-rule actions, log redaction, log lifecycle
+
+All client identifiers replaced with placeholders (`<APEX_DOMAIN>`, `<API_HOST>`, `<AWS_ACCOUNT_ID>`, `<ALB_NAME>`, `<WAF_ACL_ID>`, etc.). Per-engagement instances live at `client_remediation_pack/<engagement>/` and are gitignored — they contain target hostnames, AWS identifiers, IPs and PoC artifact IDs that should never appear in a public repo.
+
+### `.gitignore`
+
+Added `client_remediation_pack/` to the always-ignore list.
+
 ## v7.4.9 — Check 0 false-positive elimination: SPA soft-404 fingerprinting (2026-04-27)
 
-Reading the v7.4.8 scan output, the user spotted that `kalki.pranapr.com` was returning 200 with a "404 page" body, and Check 0 was happily logging four `[VULN] Found upload path` lines for paths that didn't exist. Tracing through `scanner.sh:170-189` exposed three layered bugs:
+Reading the v7.4.8 scan output, the user spotted that an SPA-style host was returning 200 with a "404 page" body, and Check 0 was happily logging four `[VULN] Found upload path` lines for paths that didn't exist. Tracing through `scanner.sh:170-189` exposed three layered bugs:
 
 ### 1. Catchall-detection result was being thrown away (subshell scope)
 ```bash
@@ -19,11 +73,11 @@ The original detection compared only the HTTP code; many WordPress / nginx / SPA
 ### 3. Bash 3.2 has no `declare -A`
 First soft-404 fix used `declare -A SOFT404_HASH` to map host → fingerprint. macOS ships bash 3.2 (associative arrays only exist in bash 4+), so the script bombed instantly with `declare: -A: invalid option` and (because of `set -u`) `https: unbound variable` from the index expansion. Fix: persist the mapping in a tmp file (`<host>\t<md5>` per line) and look it up with `awk -F '\t' '$1==h{print $2; exit}'`. Same `mktemp -t` + double-fallback pattern used for the dalfox dedup file.
 
-Verified end-to-end: catchall correctly logged for `kalki.pranapr.com`, **zero** `Found upload path` lines (vs. 4 false positives in v7.4.8), no `declare:` / `unbound variable` noise, all 13 checks complete clean.
+Verified end-to-end: catchall correctly logged for the SPA host, **zero** `Found upload path` lines (vs. 4 false positives in v7.4.8), no `declare:` / `unbound variable` noise, all 13 checks complete clean.
 
 ## v7.4.8 — scanner.sh hardening: 3 bugs caught on a real-world full-scope run (2026-04-27)
 
-Live test against pranapr.com (9 subdomains, 14 live HTTP hosts, 5 IPs) surfaced three scanner.sh bugs. Each was reproduced, patched, and verified across two re-runs.
+Live test against an engagement target (9 subdomains, 14 live HTTP hosts, 5 IPs) surfaced three scanner.sh bugs. Each was reproduced, patched, and verified across two re-runs.
 
 ### 1. macOS BSD `mktemp` failure on dalfox dedup
 `mktemp /tmp/dalfox_dedup_XXXXXX.txt` is unreliable on macOS BSD `mktemp` — the suffix after the X's caused `mkstemp failed: File exists`. `$DAL_DEDUP_FILE` came back empty, which then cascaded:
@@ -36,7 +90,7 @@ head: : No such file or directory
 Fix: use `mktemp -t dalfox_dedup.XXXXXX` (macOS-friendly form), with two fallbacks (`mktemp /tmp/dalfox_dedup_XXXXXX`, then a PID/$RANDOM-stamped path) so `$DAL_DEDUP_FILE` is always set; `: > "$file"` guarantees the file exists for the dedup writer. Verified: dedup printed `50 → 50` (vs broken `50 → 0`).
 
 ### 2. Wrong `Target` name in consolidated summary
-`TARGET=$(basename "$(dirname "$(dirname "$RECON_DIR")")")` assumed the path was always `recon/<target>/sessions/<id>`. When invoked with the parent recon path documented in `CLAUDE.md` (`bash scanner.sh recon/pranapr.com`), the math walked one level too far up and printed the repo dir basename: `Target : obsidian`. Fix: detect whether `$(basename "$(dirname "$RECON_DIR")")` equals `sessions`; if so, walk two levels (legacy session-path); otherwise the dir's own basename is the target. Verified: `Target : pranapr.com`.
+`TARGET=$(basename "$(dirname "$(dirname "$RECON_DIR")")")` assumed the path was always `recon/<target>/sessions/<id>`. When invoked with the parent recon path documented in `CLAUDE.md` (`bash scanner.sh recon/<target>`), the math walked one level too far up and printed the repo dir basename. Fix: detect whether `$(basename "$(dirname "$RECON_DIR")")` equals `sessions`; if so, walk two levels (legacy session-path); otherwise the dir's own basename is the target.
 
 ### 3. Stray `0` printed under "Verified SQLi PoCs"
 ```
@@ -52,7 +106,7 @@ Verified SQLi PoCs   : 0
 - `har_vapt.py`: read `endpoints_fuzzed` (current key) before `endpoints_tested` (legacy fallback); print `Endpoints Fuzzed: tested / total`.
 
 ### Found by
-Single end-to-end full-scope scan against pranapr.com — initial run hit bug #1 (mid-Check 3); first verify run hit bug #2 (summary footer); second verify run hit bug #3 (summary footer). Third run printed clean across all 13 checks. Real-target findings: 14 WordPress hosts (xmlrpc + plugin-CVE surface), 8 upload-candidate paths on `kalki.pranapr.com`, 12 unauth API endpoints on `radar-testing.pranapr.com` (incl. a 1 MB CSV data dump).
+Single end-to-end full-scope scan against an engagement target — initial run hit bug #1 (mid-Check 3); first verify run hit bug #2 (summary footer); second verify run hit bug #3 (summary footer). Third run printed clean across all 13 checks.
 
 ## v7.4.7 — autonomous pipeline robustness: paramspider/arjun/js_analysis/kiterunner/wordlist URLs (2026-04-26)
 
