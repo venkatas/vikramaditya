@@ -43,3 +43,18 @@ def test_run_invokes_subprocess(tmp_path):
         assert "prowler" in args[0]
         assert "--profile" in args
         assert "test" in args
+
+
+def test_to_findings_slugifies_check_id_in_evidence_path():
+    raw = [{
+        "status_code": "FAIL", "severity_id": 3,
+        "finding_info": {"uid": "x", "title": "t", "desc": "d"},
+        "cloud": {"account": {"uid": "111"}, "region": "us-east-1"},
+        "resources": [{"uid": "arn:y", "type": "AWS::Y", "region": "us-east-1"}],
+        "unmapped": {"check_id": "../../etc/passwd"},
+    }]
+    findings = to_findings(raw, account_id="111")
+    assert ".." not in str(findings[0].evidence_path)
+    assert "/" not in str(findings[0].evidence_path.name)
+    # rule_id stays as the original (defensibility)
+    assert findings[0].rule_id == "../../etc/passwd"

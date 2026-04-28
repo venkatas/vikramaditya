@@ -1,6 +1,14 @@
 from __future__ import annotations
+import re
 from pathlib import Path
 from whitebox.models import Finding, Severity, CloudContext
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _slugify(s: str, max_len: int = 80) -> str:
+    s = _SLUG_RE.sub("_", s).strip("._")
+    return (s or "unknown")[:max_len]
 
 # Prowler OCSF severity_id → vikramaditya Severity
 _SEV_MAP = {
@@ -37,7 +45,7 @@ def to_findings(raw_ocsf: list[dict], account_id: str) -> list[Finding]:
             title=info.get("title", check_id),
             description=info.get("desc", ""),
             asset=None,
-            evidence_path=Path("prowler") / f"{check_id}.json",
+            evidence_path=Path("prowler") / f"{_slugify(check_id)}.json",
             cloud_context=ctx,
         ))
     return out
