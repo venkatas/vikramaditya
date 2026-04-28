@@ -1581,15 +1581,27 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 </div>
 </body></html>"""
 
-    # ── Whitebox cloud posture chapter (optional) ─────────────────────────
+    # ── Whitebox cloud posture chapter (optional, inserted BEFORE </body>) ──
+    cloud_chapter_html = ""
     try:
         from pathlib import Path as _P
         import json as _json
-        cloud_dir = _P(report_dir).parent / "cloud"
-        if cloud_dir.exists():
+        # Resolve cloud directory: cloud audits are written at the TARGET LEVEL
+        # (recon/<target>/cloud/) so they are session-agnostic.
+        # Walk candidates from report_dir upward, and also check the recon tree.
+        _rd = _P(report_dir)
+        _recon_root = _P(BASE_DIR) / "recon" / target
+        _cloud_dir_candidates = [
+            _recon_root / "cloud",                 # recon/<target>/cloud/ (primary)
+            _rd.parent / "cloud",                  # reports/<target>/sessions/<id>/../cloud/
+            _rd.parent.parent / "cloud",           # reports/<target>/sessions/../cloud/
+            _rd.parent.parent.parent / "cloud",    # walk up one more level
+        ]
+        cloud_dir = next((c for c in _cloud_dir_candidates if c.is_dir()), None)
+        if cloud_dir is not None:
             from whitebox.reporting.posture_chapter import render as _render_posture
             from whitebox.models import Finding as _F, Severity as _Sev, CloudContext as _CC
-            for acct_dir in cloud_dir.iterdir():
+            for acct_dir in sorted(cloud_dir.iterdir()):
                 if not acct_dir.is_dir() or acct_dir.name == "correlation":
                     continue
                 fjson = acct_dir / "findings.json"
@@ -1613,9 +1625,16 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
                         ))
                     except Exception:
                         continue
-                html += _render_posture(account_id=acct_dir.name, findings=cf, executive_summary="")
+                cloud_chapter_html += _render_posture(account_id=acct_dir.name, findings=cf, executive_summary="")
     except Exception:
-        pass  # whitebox enrichment optional
+        cloud_chapter_html = ""  # whitebox enrichment is optional
+
+    # Insert cloud chapter immediately before </body>; if not found, append (degraded)
+    if cloud_chapter_html:
+        if "</body>" in html:
+            html = html.replace("</body>", cloud_chapter_html + "\n</body>", 1)
+        else:
+            html += cloud_chapter_html
 
     return html
 
