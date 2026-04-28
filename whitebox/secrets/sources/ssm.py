@@ -5,7 +5,7 @@ from whitebox.profiles import CloudProfile
 from whitebox.secrets.detectors import scan_text
 
 
-def scan(profile: CloudProfile) -> list[Finding]:
+def scan(profile: CloudProfile, secrets_dir: Path | None = None) -> list[Finding]:
     findings: list[Finding] = []
     for region in profile.regions:
         try:
@@ -32,7 +32,12 @@ def scan(profile: CloudProfile) -> list[Finding]:
                     denied_count += 1
                 continue
             for hit in scan_text(f"{name}={value}", source=f"ssm:{name}"):
-                fid = f"secret-ssm-{profile.account_id}-{region}-{name.strip('/').replace('/', '_')}-{hit['detector']}"
+                fid = f"secret-ssm-{profile.account_id}-{region}-{name.strip('/').replace('/', '_')}-{hit['offset']}-{hit['detector']}"
+                if secrets_dir is not None:
+                    from whitebox.secrets.redactor import write_evidence as _we
+                    evidence = _we(secrets_dir, fid, [hit])
+                else:
+                    evidence = Path("secrets") / f"{fid}.json"
                 findings.append(Finding(
                     id=fid,
                     source="secrets",
@@ -41,7 +46,7 @@ def scan(profile: CloudProfile) -> list[Finding]:
                     title=f"Secret in SSM parameter ({name})",
                     description=f"{hit['detector']} matched in SSM {ptype} parameter {name} (region {region}, account {profile.account_id}). Preview: {hit['preview']}",
                     asset=None,
-                    evidence_path=Path("secrets") / f"{fid}.json",
+                    evidence_path=evidence,
                     cloud_context=CloudContext(
                         account_id=profile.account_id, region=region, service="ssm",
                         arn=f"arn:aws:ssm:{region}:{profile.account_id}:parameter{name}",

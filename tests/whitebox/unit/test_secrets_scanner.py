@@ -13,12 +13,12 @@ def test_run_all_dispatches_to_all_sources(tmp_path):
          patch("whitebox.secrets.scanner.s3.scan", return_value=[]) as p_s3, \
          patch("whitebox.secrets.scanner.cloudwatch_logs.scan", return_value=[]) as p_lg:
         run_all(profile, tmp_path, target_buckets=["b"], target_log_groups=["g"])
-        p_l.assert_called_once_with(profile)
-        p_s.assert_called_once_with(profile)
-        p_sm.assert_called_once_with(profile)
-        p_ud.assert_called_once_with(profile)
-        p_s3.assert_called_once_with(profile, target_buckets=["b"])
-        p_lg.assert_called_once_with(profile, target_groups=["g"])
+        p_l.assert_called_once_with(profile, secrets_dir=tmp_path)
+        p_s.assert_called_once_with(profile, secrets_dir=tmp_path)
+        p_sm.assert_called_once_with(profile, secrets_dir=tmp_path)
+        p_ud.assert_called_once_with(profile, secrets_dir=tmp_path)
+        p_s3.assert_called_once_with(profile, target_buckets=["b"], secrets_dir=tmp_path)
+        p_lg.assert_called_once_with(profile, target_groups=["g"], secrets_dir=tmp_path)
 
 
 def test_run_all_skips_optional_sources_when_no_targets(tmp_path):
