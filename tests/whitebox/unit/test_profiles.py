@@ -7,8 +7,8 @@ def test_validate_calls_sts(tmp_path):
     fake_session = MagicMock()
     fake_sts = MagicMock()
     fake_sts.get_caller_identity.return_value = {
-        "UserId": "AID", "Account": "443370705278",
-        "Arn": "arn:aws:iam::443370705278:user/venkata.satish-audit",
+        "UserId": "AID", "Account": "123456789012",
+        "Arn": "arn:aws:iam::123456789012:user/audit",
     }
     fake_session.client.return_value = fake_sts
     fake_session.get_available_regions.return_value = ["us-east-1", "ap-south-1"]
@@ -16,8 +16,8 @@ def test_validate_calls_sts(tmp_path):
     with patch("boto3.Session", return_value=fake_session):
         prof = validate(CloudProfile(name="adf-erp"))
 
-    assert prof.account_id == "443370705278"
-    assert prof.arn.endswith("venkata.satish-audit")
+    assert prof.account_id == "123456789012"
+    assert prof.arn.endswith("audit")
     assert "us-east-1" in prof.regions
 
 
