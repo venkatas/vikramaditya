@@ -68,3 +68,44 @@ def test_collect_wafv2_passes_scope_arg(tmp_path, aws_profile):
     out = collect_service(aws_profile, "wafv2", tmp_path)
     # No Scope error — moto returns ok even with empty WAFs
     assert out["regions"]["us-east-1"] == "ok"
+
+
+def test_normalizer_extracts_iam_role_from_instance_profile(tmp_path):
+    """EC2 instances with IamInstanceProfile must surface iam_role_arn in tags."""
+    import json as _json
+    from whitebox.inventory.normalizer import from_inventory_dir
+    ec2_dir = tmp_path / "ec2"
+    ec2_dir.mkdir()
+    (ec2_dir / "us-east-1.json").write_text(_json.dumps({
+        "Reservations": [{
+            "Instances": [{
+                "InstanceId": "i-0abc",
+                "PublicDnsName": "",
+                "PublicIpAddress": None,
+                "Tags": [{"Key": "Name", "Value": "web"}],
+                "IamInstanceProfile": {
+                    "Arn": "arn:aws:iam::111:instance-profile/web-prod",
+                    "Id": "AIPA",
+                },
+            }],
+        }],
+    }))
+    assets = from_inventory_dir("111", tmp_path)
+    web = next(a for a in assets if a.name == "i-0abc")
+    assert web.tags["iam_role_arn"] == "arn:aws:iam::111:role/web-prod"
+    assert web.tags["Name"] == "web"  # Resource tags preserved
+
+
+def test_normalizer_skips_iam_role_when_no_instance_profile(tmp_path):
+    import json as _json
+    from whitebox.inventory.normalizer import from_inventory_dir
+    ec2_dir = tmp_path / "ec2"
+    ec2_dir.mkdir()
+    (ec2_dir / "us-east-1.json").write_text(_json.dumps({
+        "Reservations": [{
+            "Instances": [{"InstanceId": "i-0xyz", "Tags": []}],
+        }],
+    }))
+    assets = from_inventory_dir("111", tmp_path)
+    asset = next(a for a in assets if a.name == "i-0xyz")
+    assert "iam_role_arn" not in asset.tags
