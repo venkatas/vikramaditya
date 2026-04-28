@@ -39,12 +39,21 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Whitebox integration (Task 22) ────────────────────────────────────────────
 
-def _maybe_run_whitebox_for_target(target: str, session_dir) -> None:
+def _maybe_run_whitebox_for_target(target: str, session_dir, autonomous: bool = False) -> None:
     """If whitebox_config.yaml maps the target to any AWS profiles, offer
     to run the cloud whitebox audit alongside the blackbox flow.
-    Silent no-op when no config exists or no profile matches."""
+    Silent no-op when no config exists or no profile matches.
+
+    session_dir should be the TARGET-LEVEL recon directory (recon/<domain>/)
+    so the cloud audit lives at recon/<domain>/cloud/ — session-agnostic and
+    readable by hunt.py enrichment and reporter.py regardless of session timing.
+
+    In autonomous mode the prompt is skipped; the audit runs only when
+    config.whitebox.autonomous_default is true, otherwise we skip silently.
+    """
     try:
         from pathlib import Path as _Path
+        from urllib.parse import urlparse as _urlparse
         config_path = _Path("whitebox_config.yaml")
         if not config_path.exists():
             return
@@ -54,21 +63,37 @@ def _maybe_run_whitebox_for_target(target: str, session_dir) -> None:
             return
         cfg = _yaml.safe_load(config_path.read_text()) or {}
         profiles_map = (cfg.get("profiles") or {})
-        matched = [name for name, meta in profiles_map.items()
-                   if target in (meta.get("domains") or [])]
+        # Normalize target: hostname only, lowercase, no trailing dot, no port
+        _parsed = _urlparse(target if "://" in target else f"http://{target}")
+        host = (_parsed.hostname or target).lower().rstrip(".")
+        matched = []
+        for name, meta in profiles_map.items():
+            for d in (meta.get("domains") or []):
+                d_norm = d.lower().rstrip(".")
+                if host == d_norm or host.endswith("." + d_norm):
+                    matched.append(name)
+                    break
         if not matched:
             return
-        print(f"[whitebox] target {target} matched profiles: {matched}")
-        try:
-            ans = input("Run cloud whitebox audit alongside blackbox? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "n"
+        if autonomous:
+            # Autonomous mode: skip prompt; run only when explicitly opted in via config
+            if not (cfg.get("whitebox", {}).get("autonomous_default", False)):
+                print(f"[whitebox] target {host} matched profiles {matched} but autonomous_default not set — skipping cloud audit.")
+                return
+            ans = "y"
+        else:
+            print(f"[whitebox] target {host} matched profiles: {matched}")
+            try:
+                ans = input("Run cloud whitebox audit alongside blackbox? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
         if ans in ("", "y", "yes"):
             from whitebox.cloud_hunt import main as _cloud_main
             argv = []
             for p in matched:
                 argv += ["--profile", p]
-            argv += ["--session-dir", str(session_dir), "--allowlist", target]
+            # Use target-level dir so cloud/ is session-agnostic
+            argv += ["--session-dir", str(session_dir), "--allowlist", host]
             _cloud_main(argv)
     except Exception as _e:
         # Whitebox is optional — never break the blackbox flow
@@ -863,7 +888,7 @@ def main():
         return
 
     # ── Whitebox: offer cloud audit if target matches a configured profile ─
-    _maybe_run_whitebox_for_target(urlparse(url).netloc, os.path.join(SCRIPT_DIR, "recon", urlparse(url).netloc))
+    _maybe_run_whitebox_for_target(urlparse(url).netloc, os.path.join(SCRIPT_DIR, "recon", urlparse(url).netloc), autonomous=autonomous)
 
     # ── Step 3: Credentials ───────────────────────────────────────────────
     creds = cli["creds"] or None
