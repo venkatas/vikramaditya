@@ -1,0 +1,28 @@
+[
+  {
+    "metadata": {"product": {"name": "Prowler"}, "version": "4.5.0"},
+    "finding_info": {
+      "uid": "prowler-iam_root_mfa_enabled-aws-1",
+      "title": "Root account MFA is not enabled",
+      "desc": "Root account does not have MFA enabled."
+    },
+    "severity_id": 5,
+    "severity": "Critical",
+    "status_code": "FAIL",
+    "resources": [{"uid": "arn:aws:iam::111:root", "type": "AWS::IAM::User", "region": "us-east-1"}],
+    "cloud": {"account": {"uid": "111"}, "region": "us-east-1", "provider": "aws"},
+    "unmapped": {"check_id": "iam_root_mfa_enabled"}
+  },
+  {
+    "metadata": {"product": {"name": "Prowler"}},
+    "finding_info": {"uid": "prowler-s3_bucket_public_read-aws-2",
+                     "title": "S3 bucket allows public read",
+                     "desc": "Bucket policy permits anonymous read."},
+    "severity_id": 4,
+    "severity": "High",
+    "status_code": "FAIL",
+    "resources": [{"uid": "arn:aws:s3:::leaky-bucket", "type": "AWS::S3::Bucket", "region": "global"}],
+    "cloud": {"account": {"uid": "111"}, "region": "us-east-1", "provider": "aws"},
+    "unmapped": {"check_id": "s3_bucket_public_read"}
+  }
+]
