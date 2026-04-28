@@ -1,7 +1,18 @@
 from __future__ import annotations
 import json
 from pathlib import Path
+from botocore.config import Config as _BotoConfig
 from whitebox.profiles import CloudProfile
+
+# boto3 has no socket timeout by default — a single unhealthy regional endpoint
+# can wedge the entire inventory phase indefinitely. Cap aggressively: any one
+# AWS API call that doesn't complete in 30s is treated as a region failure and
+# captured in region_results, not blocking other regions/services.
+_CLIENT_CONFIG = _BotoConfig(
+    connect_timeout=10,
+    read_timeout=30,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
 
 # Service → (boto3 client, list method, region scope)
 # region scope: "regional" iterates profile.regions; "global" calls once.
@@ -55,7 +66,9 @@ def collect_service(profile: CloudProfile, service_key: str, out_dir: Path) -> d
 
     for region in regions:
         try:
-            client_kwargs = {} if scope == "global" else {"region_name": region}
+            client_kwargs = {"config": _CLIENT_CONFIG}
+            if scope != "global":
+                client_kwargs["region_name"] = region
             client = profile._session.client(client_name, **client_kwargs)
             method_kwargs = SERVICE_KWARGS.get(service_key, {})
             if client.can_paginate(method):
