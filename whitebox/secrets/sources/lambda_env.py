@@ -20,14 +20,14 @@ def scan(profile: CloudProfile) -> list[Finding]:
                     for key, value in env_vars.items():
                         text = f"{key}={value}"
                         for hit in scan_text(text, source=f"lambda_env:{fn['FunctionName']}"):
-                            fid = f"secret-lambda-{fn['FunctionName']}-{key}-{hit['detector']}"
+                            fid = f"secret-lambda-{profile.account_id}-{region}-{fn['FunctionName']}-{key}-{hit['detector']}"
                             findings.append(Finding(
                                 id=fid,
                                 source="secrets",
                                 rule_id=f"secrets.lambda_env.{hit['detector']}",
                                 severity=Severity.HIGH,
                                 title=f"Secret in Lambda env var ({fn['FunctionName']}.{key})",
-                                description=f"{hit['detector']} matched in env var {key} of Lambda {fn['FunctionName']} (region {region}). Preview: {hit['preview']}",
+                                description=f"{hit['detector']} matched in env var {key} of Lambda {fn['FunctionName']} (region {region}, account {profile.account_id}). Preview: {hit['preview']}",
                                 asset=None,
                                 evidence_path=Path("secrets") / f"{fid}.json",
                                 cloud_context=CloudContext(
