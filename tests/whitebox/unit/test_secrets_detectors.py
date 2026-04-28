@@ -9,7 +9,7 @@ def test_scan_finds_aws_access_key():
 
 
 def test_scan_finds_aws_secret_key():
-    txt = "secret = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    txt = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
     hits = scan_text(txt, source="env")
     assert any(h["detector"] == "aws_secret_access_key" for h in hits)
 
@@ -40,3 +40,29 @@ def test_each_hit_has_offset_and_redacted_preview():
     assert "offset" in h
     assert "preview" in h
     assert "EXAMPLE" not in h["preview"]  # full value redacted
+
+
+def test_aws_secret_no_context_no_match():
+    """Bare 40-char base64 (e.g. SHA1 hex) should NOT match without AWS keyword context."""
+    txt = "commit_sha=da39a3ee5e6b4b0d3255bfef95601890afd80709aaaaaaaaaaaaa"
+    hits = scan_text(txt, source="env")
+    assert not any(h["detector"] == "aws_secret_access_key" for h in hits)
+
+
+def test_github_pat_fine_grained_detected():
+    txt = "token=github_pat_" + "A" * 82
+    hits = scan_text(txt, source="env")
+    assert any(h["detector"] == "github_pat_fine_grained" for h in hits)
+
+
+def test_stripe_restricted_key_detected():
+    txt = "key=rk_live_" + "A" * 24
+    hits = scan_text(txt, source="env")
+    assert any(h["detector"] == "stripe_restricted_key" for h in hits)
+
+
+def test_stripe_publishable_not_flagged_as_secret():
+    txt = "stripe_pub=pk_live_" + "A" * 24
+    hits = scan_text(txt, source="env")
+    # pk_live is not in DETECTORS — should not produce a stripe-named hit
+    assert not any(h["detector"].startswith("stripe_") for h in hits)
