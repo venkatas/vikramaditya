@@ -13,7 +13,7 @@ class BrainTrace:
     def log(self, decision_point: str, input_summary: dict, decision: dict,
             model: str = "ollama", rule_traced: str | None = None) -> None:
         payload = json.dumps(input_summary, sort_keys=True, default=str)
-        h = hashlib.sha256(payload.encode()).hexdigest()[:12]
+        h = hashlib.sha256(payload.encode()).hexdigest()
         entry = {
             "ts": time.time(),
             "decision_point": decision_point,
