@@ -1,0 +1,12 @@
+{
+  "metadata": {"account_id": "111", "pmapper_version": "1.1.5"},
+  "nodes": [
+    {"arn": "arn:aws:iam::111:user/alice",     "id_value": "alice",     "is_admin": false},
+    {"arn": "arn:aws:iam::111:role/web-prod",  "id_value": "web-prod",  "is_admin": false},
+    {"arn": "arn:aws:iam::111:role/admin",     "id_value": "admin",     "is_admin": true}
+  ],
+  "edges": [
+    {"source": "arn:aws:iam::111:user/alice",    "destination": "arn:aws:iam::111:role/web-prod", "reason": "can sts:AssumeRole"},
+    {"source": "arn:aws:iam::111:role/web-prod", "destination": "arn:aws:iam::111:role/admin",    "reason": "can iam:PassRole + lambda:CreateFunction"}
+  ]
+}
