@@ -4,6 +4,12 @@ findings/
 reports/
 targets/
 
+# ── Client-specific remediation packs (instances of templates/remediation_pack/) ─
+# Generic templates live in templates/remediation_pack/ (committed).
+# Per-engagement instances under client_remediation_pack/<engagement>/ contain
+# target hostnames, AWS account/bucket/ALB IDs, IPs, usernames, PoC artifact IDs.
+client_remediation_pack/
+
 # ── Engagement data — NEVER commit these ──────────────────────────────────────
 *_FINDINGS.md
 *_findings.md

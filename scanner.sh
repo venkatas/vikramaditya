@@ -190,48 +190,189 @@ if ! skip_has upload; then
     # otherwise CATCHALL_HOSTS mutations evaporate.
     while read -r host; do
         [ -z "$host" ] && continue
-        PROBE_URL="${host%/}/non_existent_$(date +%s)_$$"
-        RESP=$(curl -sk --max-time 10 -o - -w "\nHTTP_CODE:%{http_code}" "$PROBE_URL" 2>/dev/null)
-        CODE=$(echo "$RESP" | tail -1 | sed 's/HTTP_CODE://')
-        BODY=$(echo "$RESP" | sed '$d')
-        if [ "$CODE" = "200" ]; then
-            BODY_LEN=$(echo -n "$BODY" | wc -c | tr -d ' ')
-            BODY_HASH=$(echo -n "$BODY" | md5 2>/dev/null || echo -n "$BODY" | md5sum | awk '{print $1}')
-            log_warn "Catchall detected: $host (random path → 200, ${BODY_LEN} B fingerprint)"
-            CATCHALL_HOSTS="${CATCHALL_HOSTS},${host}"
-            printf '%s\t%s\n' "$host" "$BODY_HASH" >> "$SOFT404_FILE"
-        fi
+        # Probe FOUR random URL shapes with two probes each. Catchalls come in
+        # different flavors:
+        #   • SPA / WordPress: every path returns 200 with the same shell
+        #   • API gateway: every /api/<random> returns 401 with same body
+        #   • Admin panel: every /admin/<random> returns 403/login redirect
+        #   • Hard 404 page: 404 with same body (still useful as opportunistic filter)
+        # Two probes per shape; if both agree on (code, hash), record as a
+        # baseline-skip pattern for this host. Multiple shapes → multiple
+        # entries in $SOFT404_FILE for the same host (probe loop matches any).
+        SAW_CONFIRMED_CATCHALL=0
+        for shape in "" "/api" "/admin" "/static"; do
+            SIG_A=""; SIG_B=""; LAST_BODY=""
+            for n in 1 2; do
+                PROBE_URL="${host%/}${shape}/non_existent_$(date +%s%N)_${n}_$$_$RANDOM"
+                RESP=$(curl -sk --max-time 8 -o - -w "\nHTTP_CODE:%{http_code}" "$PROBE_URL" 2>/dev/null)
+                CODE_N=$(echo "$RESP" | tail -1 | sed 's/HTTP_CODE://')
+                BODY_N=$(echo "$RESP" | sed '$d')
+                HASH_N=$(echo -n "$BODY_N" | md5 2>/dev/null || echo -n "$BODY_N" | md5sum | awk '{print $1}')
+                if [ "$n" = "1" ]; then
+                    SIG_A="${CODE_N}|${HASH_N}"
+                else
+                    SIG_B="${CODE_N}|${HASH_N}"
+                    LAST_BODY="$BODY_N"
+                fi
+            done
+            if [ -n "$SIG_A" ] && [ "$SIG_A" = "$SIG_B" ]; then
+                BASE_CODE=$(echo "$SIG_A" | cut -d'|' -f1)
+                BASE_HASH=$(echo "$SIG_A" | cut -d'|' -f2)
+                BODY_LEN=$(echo -n "$LAST_BODY" | wc -c | tr -d ' ')
+                printf '%s\t%s\t%s\n' "$host" "$BASE_CODE" "$BASE_HASH" >> "$SOFT404_FILE"
+                # 200 catchall is so noisy on probes that we hard-skip the host.
+                if [ "$BASE_CODE" = "200" ]; then
+                    log_warn "Catchall-200 detected: $host (shape='${shape:-/}', ${BODY_LEN} B fingerprint)"
+                    CATCHALL_HOSTS="${CATCHALL_HOSTS},${host}"
+                    SAW_CONFIRMED_CATCHALL=1
+                # 401/403/404 catchalls just suppress noise via hash match.
+                elif [ "$BASE_CODE" = "401" ] || [ "$BASE_CODE" = "403" ] || [ "$BASE_CODE" = "404" ]; then
+                    log_warn "Catchall-${BASE_CODE} on shape '${shape:-/}': $host (${BODY_LEN} B baseline)"
+                fi
+            fi
+        done
     done < <(head -10 "$ORDERED_SCAN")
 
-    PROBE_PATHS=("/upload.php" "/uploader.php" "/upload/index.php" "/filemanager/index.php" "/ckfinder/core/connector/php/connector.php" "/fckeditor/editor/filemanager/connectors/php/connector.php" "/elfinder.php" "/admin/upload")
+    # ── Path list ────────────────────────────────────────────────────────
+    # Static seed list (~85 entries) covers generic, framework-specific,
+    # WordPress, file-manager, profile-photo and import surfaces. Then we
+    # augment with recon-derived candidates extracted from the crawled URL
+    # corpus (urls/with_params.txt, api_endpoints.txt, all.txt, js_files.txt).
+    PROBE_PATHS=(
+        # Generic upload endpoints
+        "/upload" "/upload/" "/upload.php" "/upload.aspx" "/upload.jsp" "/upload.do" "/upload.action"
+        "/uploads" "/uploads/" "/uploader" "/uploader.php" "/upload/index.php" "/upload/file"
+        "/uploadfile" "/UploadFile.aspx" "/Upload.ashx" "/UploadHandler.ashx" "/FileUpload.aspx"
+        "/file-upload" "/fileupload" "/files/upload" "/files" "/files/" "/file"
+        # API upload endpoints
+        "/api/upload" "/api/v1/upload" "/api/v2/upload" "/api/v3/upload"
+        "/api/files" "/api/files/upload" "/api/v1/files" "/api/v2/files"
+        "/api/v1/attachments" "/api/v2/attachments" "/api/attachment"
+        "/api/v1/media" "/api/v2/media" "/api/media" "/api/media/upload"
+        "/api/avatar" "/api/v1/avatar" "/api/profile/photo" "/api/profile/avatar"
+        "/api/upload/sign" "/api/s3/sign" "/api/presign" "/api/v1/presign"
+        "/api/import" "/api/v1/import" "/api/v2/import" "/api/import/file"
+        # WordPress (HIGH priority on this engagement — 14 WP hosts in scope)
+        "/wp-admin/async-upload.php" "/wp-admin/media-new.php" "/wp-admin/upload.php"
+        "/wp-json/wp/v2/media" "/wp-content/uploads/"
+        # File managers / WYSIWYG connectors
+        "/filemanager/index.php" "/filemanager/upload.php" "/filemanager/connectors/php/connector.php"
+        "/ckfinder/core/connector/php/connector.php" "/ckfinder/connector"
+        "/fckeditor/editor/filemanager/connectors/php/connector.php"
+        "/elfinder.php" "/elfinder/php/connector.minimal.php"
+        "/kcfinder/browse.php" "/kcfinder/upload.php"
+        "/responsivefilemanager/filemanager/upload.php"
+        "/tinymce/plugins/upload" "/tinymce/upload"
+        # Profile / avatar (often missed; high-value)
+        "/profile/photo" "/profile/upload" "/profile/avatar" "/avatar/upload"
+        "/user/avatar" "/account/photo" "/me/avatar" "/me/photo"
+        # Image / media services
+        "/media/upload" "/photo/upload" "/gallery/upload" "/image/upload" "/images/upload"
+        # Admin panels (Joomla / Drupal / generic)
+        "/admin/upload" "/admin/files" "/admin/media" "/admin/file-manager" "/admin/import"
+        "/administrator/index.php?option=com_media"
+        "/sites/default/files/"
+        # Framework-specific
+        "/storage/uploads" "/storage/app/public/uploads"
+        "/active_storage/blobs" "/rails/active_storage/disk"
+        "/UploadServlet" "/fileupload.jsp"
+        # GraphQL (multipart-spec uploads)
+        "/graphql" "/api/graphql"
+    )
+
+    # ── Recon-derived candidates ─────────────────────────────────────────
+    # Pull URL paths from the crawled corpus that look upload-related, dedupe,
+    # strip query strings and static-asset extensions, cap at 80.
+    if [ -d "$RECON_DIR/urls" ]; then
+        RECON_PATHS_FILE=$(mktemp -t scanner_recon_paths.XXXXXX 2>/dev/null \
+            || mktemp /tmp/scanner_recon_paths_XXXXXX 2>/dev/null \
+            || echo "/tmp/scanner_recon_paths_$$_$RANDOM.txt")
+        cat "$RECON_DIR/urls/with_params.txt" \
+            "$RECON_DIR/urls/api_endpoints.txt" \
+            "$RECON_DIR/urls/all.txt" \
+            "$RECON_DIR/urls/js_files.txt" 2>/dev/null \
+            | grep -iE "upload|file[_-]?upload|attach|avatar|photo|/media/|/import/|/files?/" \
+            | grep -ivE "\.(css|js|png|jpe?g|gif|svg|woff2?|ttf|eot|ico|map|webp|mp4|mp3|pdf)(\?|$)" \
+            | sed -E 's|^https?://[^/]+||; s|\?.*$||; s|#.*$||' \
+            | awk 'length>0 && length<200 && !seen[$0]++' \
+            | head -80 > "$RECON_PATHS_FILE"
+        RECON_COUNT=$(wc -l < "$RECON_PATHS_FILE" | tr -d ' ')
+        if [ "$RECON_COUNT" -gt 0 ]; then
+            log_step "Recon corpus contributed $RECON_COUNT additional candidate paths"
+            while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                PROBE_PATHS+=("$p")
+            done < "$RECON_PATHS_FILE"
+        fi
+        rm -f "$RECON_PATHS_FILE"
+    fi
+    log_step "Probing ${#PROBE_PATHS[@]} upload-candidate paths × hosts..."
+
+    # ── Probe loop ───────────────────────────────────────────────────────
+    AUTH_FILE="$FINDINGS_DIR/upload/auth_required.txt"
     while read -r host; do
         [ -z "$host" ] && continue
-        # Hard skip: don't probe hosts that proved to be catchalls — the
-        # baseline body would mask any real upload sink anyway.
+        # Hard skip: confirmed catchall (both random probes agreed on
+        # status+hash) — the baseline body would mask any real upload sink.
         [[ "$CATCHALL_HOSTS" == *"$host"* ]] && continue
-        EXPECTED_HASH=$(awk -v h="$host" -F '\t' '$1==h{print $2; exit}' "$SOFT404_FILE" 2>/dev/null)
+        # Look up ALL per-host baseline (code, hash) pairs — there can be one
+        # per URL shape (e.g. apex returns 404, /api/* returns 401, /admin/*
+        # returns 403 with three distinct signatures, all worth filtering).
+        # Format: "<code1>|<hash1>" newline-separated.
+        EXPECTED_TUPLES=$(awk -v h="$host" -F '\t' '$1==h{print $2"|"$3}' "$SOFT404_FILE" 2>/dev/null)
         for path in "${PROBE_PATHS[@]}"; do
             U="${host%/}${path}"
             RESP=$(curl -sk --max-time 5 -o - -w "\nHTTP_CODE:%{http_code}" "$U" 2>/dev/null)
             CODE=$(echo "$RESP" | tail -1 | sed 's/HTTP_CODE://')
-            [ "$CODE" != "200" ] && continue
             BODY=$(echo "$RESP" | sed '$d')
-            # Skip explicit soft-404 markers in the body.
-            if echo "$BODY" | grep -qiE "404|not[ -]?found|page.*does.*not.*exist|page n[ao]t found|nothing found"; then
+
+            # Universal filter: if (CODE, body_hash) matches ANY recorded
+            # baseline for this host, it's catchall noise (works for SPA-200,
+            # API-401, admin-403, hard-404 patterns).
+            if [ -n "$EXPECTED_TUPLES" ]; then
+                BODY_HASH=$(echo -n "$BODY" | md5 2>/dev/null || echo -n "$BODY" | md5sum | awk '{print $1}')
+                THIS_TUPLE="${CODE}|${BODY_HASH}"
+                if echo "$EXPECTED_TUPLES" | grep -qxF "$THIS_TUPLE"; then
+                    continue
+                fi
+            fi
+
+            # Path A — GET 200 path: classic file-manager / web-shell-able sink.
+            if [ "$CODE" = "200" ]; then
+                # Skip explicit soft-404 markers in the body.
+                if echo "$BODY" | grep -qiE "404|not[ -]?found|page.*does.*not.*exist|page n[ao]t found|nothing found"; then
+                    continue
+                fi
+                # Skip suspiciously short bodies (empty stubs / forbidden templates).
+                BODY_LEN=$(echo -n "$BODY" | wc -c | tr -d ' ')
+                [ "$BODY_LEN" -lt 200 ] && continue
+                log_vuln "Found upload path (GET 200): $U"
+                echo "[UPLOAD-CANDIDATE] $U" >> "$FINDINGS_DIR/upload/active_upload_probe.txt"
+                verify_upload_poc "$U"
                 continue
             fi
-            # Skip suspiciously short bodies (empty stubs / forbidden templates).
-            BODY_LEN=$(echo -n "$BODY" | wc -c | tr -d ' ')
-            [ "$BODY_LEN" -lt 200 ] && continue
-            # Skip if body matches the soft-404 fingerprint of this host (SPA
-            # catchall returning the same shell for every path).
-            if [ -n "$EXPECTED_HASH" ]; then
-                BODY_HASH=$(echo -n "$BODY" | md5 2>/dev/null || echo -n "$BODY" | md5sum | awk '{print $1}')
-                [ "$BODY_HASH" = "$EXPECTED_HASH" ] && continue
+
+            # Path B — POST-probe for endpoints that exist but reject GET.
+            # 405 → method not allowed (endpoint definitely exists, accepts non-GET).
+            # 401/403 → endpoint exists but auth-gated.
+            # 415 → unsupported media type (endpoint exists, expects different content).
+            if [ "$CODE" = "405" ] || [ "$CODE" = "401" ] || [ "$CODE" = "403" ] || [ "$CODE" = "415" ]; then
+                POST_CODE=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
+                    -X POST -F "file=@/dev/null;filename=test.txt;type=text/plain" "$U" 2>/dev/null)
+                # 200/201/202 = upload accepted (high-value).
+                if [ "$POST_CODE" = "200" ] || [ "$POST_CODE" = "201" ] || [ "$POST_CODE" = "202" ]; then
+                    log_vuln "POST upload accepted: $U (GET=$CODE → POST=$POST_CODE)"
+                    echo "[UPLOAD-CANDIDATE-POST] $U (GET=$CODE → POST=$POST_CODE)" >> "$FINDINGS_DIR/upload/active_upload_probe.txt"
+                    verify_upload_poc "$U"
+                # 400/422 = validation rejection — endpoint exists, accepts uploads but our payload was malformed.
+                elif [ "$POST_CODE" = "400" ] || [ "$POST_CODE" = "422" ]; then
+                    log_warn "POST upload endpoint (validation reject): $U (POST=$POST_CODE)"
+                    echo "[UPLOAD-CANDIDATE-VALIDATION] $U (POST=$POST_CODE)" >> "$FINDINGS_DIR/upload/active_upload_probe.txt"
+                # 401/403 = auth wall — record for later authenticated re-test.
+                elif [ "$POST_CODE" = "401" ] || [ "$POST_CODE" = "403" ]; then
+                    echo "[UPLOAD-CANDIDATE-AUTH] $U (GET=$CODE POST=$POST_CODE)" >> "$AUTH_FILE"
+                fi
             fi
-            log_vuln "Found upload path: $U"
-            echo "[UPLOAD-CANDIDATE] $U" >> "$FINDINGS_DIR/upload/active_upload_probe.txt"
-            verify_upload_poc "$U"
         done
     done < <(head -30 "$ORDERED_SCAN")
     rm -f "$SOFT404_FILE"
