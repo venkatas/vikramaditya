@@ -33,6 +33,29 @@ def test_scan_lambda_finds_aws_key_in_env(profile):
 
 
 @mock_aws
+def test_lambda_writes_evidence_file_when_secrets_dir_given(tmp_path, profile):
+    iam = boto3.client("iam")
+    iam.create_role(RoleName="r3", AssumeRolePolicyDocument="{}")
+    role_arn = iam.get_role(RoleName="r3")["Role"]["Arn"]
+    lam = boto3.client("lambda", region_name="us-east-1")
+    lam.create_function(
+        FunctionName="ev", Runtime="python3.11", Role=role_arn,
+        Handler="x.handler",
+        Code={"ZipFile": b"def handler(e,c):pass"},
+        Environment={"Variables": {"K": "AKIAIOSFODNN7EXAMPLE"}},
+    )
+    profile._session = boto3.Session(region_name="us-east-1")
+    findings = scan_lambda(profile, secrets_dir=tmp_path)
+    assert findings, "expected at least one finding"
+    f = findings[0]
+    assert f.evidence_path.exists(), f"expected evidence file at {f.evidence_path}"
+    assert f.evidence_path.parent == tmp_path
+    import os, stat
+    mode = stat.S_IMODE(os.stat(f.evidence_path).st_mode)
+    assert mode == 0o600
+
+
+@mock_aws
 def test_lambda_finding_id_includes_account_and_region(profile):
     iam = boto3.client("iam")
     iam.create_role(RoleName="r2", AssumeRolePolicyDocument="{}")

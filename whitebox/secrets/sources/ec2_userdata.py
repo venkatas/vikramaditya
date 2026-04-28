@@ -6,7 +6,7 @@ from whitebox.profiles import CloudProfile
 from whitebox.secrets.detectors import scan_text
 
 
-def scan(profile: CloudProfile) -> list[Finding]:
+def scan(profile: CloudProfile, secrets_dir: Path | None = None) -> list[Finding]:
     findings: list[Finding] = []
     for region in profile.regions:
         try:
@@ -26,7 +26,12 @@ def scan(profile: CloudProfile) -> list[Finding]:
                 except Exception:
                     continue
                 for hit in scan_text(text, source=f"ec2_userdata:{iid}"):
-                    fid = f"secret-userdata-{profile.account_id}-{region}-{iid}-{hit['detector']}"
+                    fid = f"secret-userdata-{profile.account_id}-{region}-{iid}-{hit['offset']}-{hit['detector']}"
+                    if secrets_dir is not None:
+                        from whitebox.secrets.redactor import write_evidence as _we
+                        evidence = _we(secrets_dir, fid, [hit])
+                    else:
+                        evidence = Path("secrets") / f"{fid}.json"
                     findings.append(Finding(
                         id=fid,
                         source="secrets",
@@ -35,7 +40,7 @@ def scan(profile: CloudProfile) -> list[Finding]:
                         title=f"Secret in EC2 user-data ({iid})",
                         description=f"{hit['detector']} matched in user-data of instance {iid} (region {region}, account {profile.account_id}). Preview: {hit['preview']}",
                         asset=None,
-                        evidence_path=Path("secrets") / f"{fid}.json",
+                        evidence_path=evidence,
                         cloud_context=CloudContext(
                             account_id=profile.account_id, region=region, service="ec2",
                             arn=f"arn:aws:ec2:{region}:{profile.account_id}:instance/{iid}",
