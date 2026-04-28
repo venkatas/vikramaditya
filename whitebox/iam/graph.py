@@ -65,11 +65,14 @@ class IAMGraph:
                 if e["destination"] not in reachable and e["destination"] != src:
                     reachable.add(e["destination"])
                     stack.append(e["destination"])
+        roles = sorted(a for a in reachable if ":role/" in a)
+        users = sorted(a for a in reachable if ":user/" in a)
         return BlastRadius(
             principal_arn=src,
             s3_buckets=[],   # populated later by cross-referencing inventory
             kms_keys=[],
             lambdas=[],
-            assumable_roles=sorted(reachable),
+            assumable_roles=roles,
+            assumable_users=users,
             regions=[],
         )

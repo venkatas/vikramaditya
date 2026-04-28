@@ -62,10 +62,12 @@ class BlastRadius:
     kms_keys: list[str]
     lambdas: list[str]
     assumable_roles: list[str]
+    assumable_users: list[str]
     regions: list[str]
 
     def total_resources(self) -> int:
-        return len(self.s3_buckets) + len(self.kms_keys) + len(self.lambdas) + len(self.assumable_roles)
+        return (len(self.s3_buckets) + len(self.kms_keys) + len(self.lambdas)
+                + len(self.assumable_roles) + len(self.assumable_users))
 
 
 @dataclass
