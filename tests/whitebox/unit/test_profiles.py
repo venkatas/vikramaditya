@@ -46,3 +46,19 @@ def test_probe_permissions_records_each():
     assert probe["simulate_principal_policy"] is True
     assert probe["secretsmanager_list"] is True
     assert probe["logs_describe"] is True
+
+
+def test_probe_permissions_lazy_flags_default_false():
+    """secretsmanager_get_value and kms_decrypt are lazy — start False, set later."""
+    fake_session = MagicMock()
+    fake_session.client.return_value.simulate_principal_policy.side_effect = Exception("denied")
+    fake_session.client.return_value.list_secrets.side_effect = Exception("denied")
+    fake_session.client.return_value.describe_log_groups.side_effect = Exception("denied")
+
+    probe = probe_permissions(fake_session, principal_arn="arn:aws:iam::1:user/u")
+    assert probe["secretsmanager_get_value"] is False  # lazy — never probed here
+    assert probe["kms_decrypt"] is False               # lazy — never probed here
+    # And the eager probes correctly recorded denial:
+    assert probe["simulate_principal_policy"] is False
+    assert probe["secretsmanager_list"] is False
+    assert probe["logs_describe"] is False
