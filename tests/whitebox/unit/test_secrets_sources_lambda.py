@@ -30,3 +30,23 @@ def test_scan_lambda_finds_aws_key_in_env(profile):
     assert f.source == "secrets"
     assert f.rule_id.startswith("secrets.lambda_env.")
     assert "leaky" in f.description
+
+
+@mock_aws
+def test_lambda_finding_id_includes_account_and_region(profile):
+    iam = boto3.client("iam")
+    iam.create_role(RoleName="r2", AssumeRolePolicyDocument="{}")
+    role_arn = iam.get_role(RoleName="r2")["Role"]["Arn"]
+    lam = boto3.client("lambda", region_name="us-east-1")
+    lam.create_function(
+        FunctionName="dup", Runtime="python3.11", Role=role_arn,
+        Handler="x.handler",
+        Code={"ZipFile": b"def handler(e,c):pass"},
+        Environment={"Variables": {"K": "AKIAIOSFODNN7EXAMPLE"}},
+    )
+    profile._session = boto3.Session(region_name="us-east-1")
+    findings = scan_lambda(profile)
+    assert findings, "expected at least one finding"
+    # Finding ID must include account + region to avoid cross-region collision
+    assert "111" in findings[0].id
+    assert "us-east-1" in findings[0].id
