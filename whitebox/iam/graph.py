@@ -13,7 +13,17 @@ class IAMGraph:
 
     @classmethod
     def load(cls, path: Path) -> "IAMGraph":
-        data = json.loads(Path(path).read_text())
+        """Load from either a single-file JSON (legacy/test fixture) or a PMapper storage directory."""
+        path = Path(path)
+        if path.is_dir():
+            nodes_data = json.loads((path / "graph" / "nodes.json").read_text())
+            edges_data = json.loads((path / "graph" / "edges.json").read_text())
+            # PMapper node entries: {"arn": ..., "id_value": ..., "is_admin": ...} (compatible)
+            # PMapper edge entries: {"source": ..., "destination": ..., "reason": ...} (compatible)
+            data = {"nodes": nodes_data if isinstance(nodes_data, list) else nodes_data.get("nodes", []),
+                    "edges": edges_data if isinstance(edges_data, list) else edges_data.get("edges", [])}
+        else:
+            data = json.loads(path.read_text())
         nodes = {n["arn"]: n for n in data.get("nodes", [])}
         edges: dict[str, list[dict]] = defaultdict(list)
         for e in data.get("edges", []):
