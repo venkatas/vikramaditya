@@ -36,6 +36,11 @@ SERVICE_PULLS = {
 
 DEFAULT_SERVICES = list(SERVICE_PULLS.keys())
 
+# Per-service kwargs that the boto3 list method requires.
+SERVICE_KWARGS = {
+    "wafv2": {"Scope": "REGIONAL"},
+}
+
 
 def collect_service(profile: CloudProfile, service_key: str, out_dir: Path) -> dict:
     """Pull one service across all regions (or once for global). Writes JSON files."""
@@ -50,23 +55,16 @@ def collect_service(profile: CloudProfile, service_key: str, out_dir: Path) -> d
 
     for region in regions:
         try:
-            kwargs = {} if scope == "global" else {"region_name": region}
-            client = profile._session.client(client_name, **kwargs)
+            client_kwargs = {} if scope == "global" else {"region_name": region}
+            client = profile._session.client(client_name, **client_kwargs)
+            method_kwargs = SERVICE_KWARGS.get(service_key, {})
             if client.can_paginate(method):
                 paginator = client.get_paginator(method)
-                pages = list(paginator.paginate())
-                # Merge pages by concatenating all top-level list values
-                merged: dict = {}
-                for page in pages:
-                    page.pop("ResponseMetadata", None)
-                    for k, v in page.items():
-                        if isinstance(v, list):
-                            merged.setdefault(k, []).extend(v)
-                        else:
-                            merged.setdefault(k, v)
-                data = merged
+                # build_full_result handles nested result keys correctly
+                data = paginator.paginate(**method_kwargs).build_full_result()
+                data.pop("ResponseMetadata", None)
             else:
-                data = getattr(client, method)()
+                data = getattr(client, method)(**method_kwargs)
                 data.pop("ResponseMetadata", None)
             (svc_dir / f"{region}.json").write_text(
                 json.dumps(data, indent=2, default=str)
@@ -81,7 +79,7 @@ def collect_service(profile: CloudProfile, service_key: str, out_dir: Path) -> d
 def collect_all(profile: CloudProfile, out_dir: Path,
                 services: list[str] | None = None) -> dict:
     """Collect all (or selected) services. Returns summary dict."""
-    services = services or DEFAULT_SERVICES
+    services = DEFAULT_SERVICES if services is None else services
     summary = {
         "account_id": profile.account_id,
         "profile": profile.name,
