@@ -11,7 +11,7 @@ Return JSON: {{"buckets": ["..."], "log_groups": ["..."]}}.
 
 FILTER_CHAINS = """Review candidate exploit chains. Drop false positives. Keep all rule-traced chains intact.
 Chains: {chains}
-Return JSON list of chain IDs to keep.
+Return JSON: {{"keep": ["chain_id_1", "chain_id_2", ...]}}.
 """
 
 EXECUTIVE_SUMMARY = """Write a 200-word executive summary of these findings for the client.
