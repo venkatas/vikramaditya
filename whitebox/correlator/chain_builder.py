@@ -28,7 +28,9 @@ def build_chains(blackbox_findings: list[Finding],
             continue
         admin_arn = admins[0]
         path = iam_graph.can_reach(role_arn, admin_arn) or [role_arn, admin_arn]
-        has_imds = "ssrf" in f.rule_id or "imds" in f.rule_id
+        # IMDS evidence requires an explicit IMDS-class rule. Generic ssrf.basic
+        # without confirmed IMDS reachability promotes to HIGH only, not CRITICAL.
+        has_imds = f.rule_id in {"ssrf.imds", "lfi.read_imds"} or "imds" in f.rule_id
         promoted = promote(base=f.severity, has_imds=has_imds, reaches_admin=True)
         out.append(Chain(
             trigger_finding_id=f.id,
