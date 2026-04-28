@@ -47,7 +47,9 @@ def test_collect_all_returns_summary(tmp_path, aws_profile):
     boto3.client("s3").create_bucket(Bucket="bkt1")
     aws_profile._session = boto3.Session(region_name="us-east-1")
 
-    summary = collect_all(aws_profile, tmp_path, services=["s3", "iam"])
+    summary = collect_all(aws_profile, tmp_path, services=["s3", "iam_users"])
     assert "s3" in summary["services"]
-    assert "iam" in summary["services"]
+    assert "iam_users" in summary["services"]
+    # iam_users is global scope — confirm the file was actually written
+    assert (tmp_path / "iam_users" / "global.json").exists()
     assert summary["account_id"] == "123456789012"

@@ -1,3 +1,10 @@
+"""Normalize raw boto3 inventory JSON into typed Asset objects.
+
+Intentional starter set: EC2 instances and S3 buckets only. Extend this
+module before Task 17 (asset_join) — it will need ELBv2 load balancers,
+Lambda functions, EKS clusters, RDS instances, and CloudFront distributions
+to join blackbox-discovered hosts to their cloud asset records.
+"""
 from __future__ import annotations
 import json
 from pathlib import Path
