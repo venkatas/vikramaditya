@@ -21,14 +21,24 @@ def analyze_security_groups(sgs: list[dict]) -> dict[str, dict]:
         cidrs: set[str] = set()
         public = False
         for perm in sg.get("IpPermissions", []):
+            proto = perm.get("IpProtocol")
             fp, tp = perm.get("FromPort"), perm.get("ToPort")
-            if fp is not None and tp is not None:
+            # IpProtocol "-1" means all traffic — represents the full port range
+            if proto == "-1" or proto == -1:
+                ports.update(range(0, 65536))
+            elif fp is not None and tp is not None:
                 ports.update(range(fp, tp + 1))
             for r in perm.get("IpRanges", []):
                 cidr = r.get("CidrIp", "")
                 if cidr:
                     cidrs.add(cidr)
                     if cidr == "0.0.0.0/0":
+                        public = True
+            for r in perm.get("Ipv6Ranges", []):
+                cidr6 = r.get("CidrIpv6", "")
+                if cidr6:
+                    cidrs.add(cidr6)
+                    if cidr6 == "::/0":
                         public = True
         result[sgid] = {
             "public": public,
