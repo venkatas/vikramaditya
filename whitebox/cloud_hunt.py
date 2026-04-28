@@ -15,19 +15,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--refresh", action="store_true",
                         help="Bust phase cache and re-run all phases")
     parser.add_argument("--allowlist", action="append", default=None,
-                        help="Authorized in-scope domain (repeatable). Use '*' to disable scope-lock.")
+                        help="Authorized in-scope domain (repeatable; required unless --no-scope-lock)")
+    parser.add_argument("--no-scope-lock", action="store_true",
+                        help="Disable Route53 scope-lock (audit ALL public zones in the account)")
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     if not args.profile:
         parser.print_help(sys.stderr)
         return 2
 
+    # Scope-lock guard: must be explicit either way
+    if not args.allowlist and not args.no_scope_lock:
+        print(
+            "error: --allowlist (repeatable) or --no-scope-lock is REQUIRED.\n"
+            "  Pass each authorized in-scope domain via --allowlist (e.g. --allowlist adfactorspr.com),\n"
+            "  or explicitly disable scope-locking with --no-scope-lock.",
+            file=sys.stderr,
+        )
+        return 2
+
+    allowlist = ["*"] if args.no_scope_lock else args.allowlist
+
     rc = 0
     for prof in args.profile:
         rc |= run_for_profile(profile_name=prof,
                               session_dir=Path(args.session_dir),
                               refresh=args.refresh,
-                              authorized_allowlist=args.allowlist)
+                              authorized_allowlist=allowlist)
     return rc
 
 
