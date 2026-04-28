@@ -53,3 +53,18 @@ def test_collect_all_returns_summary(tmp_path, aws_profile):
     # iam_users is global scope — confirm the file was actually written
     assert (tmp_path / "iam_users" / "global.json").exists()
     assert summary["account_id"] == "123456789012"
+
+
+@mock_aws
+def test_collect_all_with_empty_services_does_nothing(tmp_path, aws_profile):
+    aws_profile._session = boto3.Session(region_name="us-east-1")
+    summary = collect_all(aws_profile, tmp_path, services=[])
+    assert summary["services"] == {}
+
+
+@mock_aws
+def test_collect_wafv2_passes_scope_arg(tmp_path, aws_profile):
+    aws_profile._session = boto3.Session(region_name="us-east-1")
+    out = collect_service(aws_profile, "wafv2", tmp_path)
+    # No Scope error — moto returns ok even with empty WAFs
+    assert out["regions"]["us-east-1"] == "ok"
