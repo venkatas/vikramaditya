@@ -156,18 +156,46 @@ def run_for_profile(profile_name: str, session_dir: Path,
             cache.mark_failed("exposure", error=str(e))
             failed_phases.append("exposure")
 
-    # Phase E — Secrets (brain selects targets when available)
+    # Phase E — Secrets (brain selects targets when available; heuristic otherwise)
     secrets_dir = account_dir / "secrets"
     if not cache.is_fresh("secrets"):
         try:
+            all_buckets = [a.name for a in assets if a.service == "s3"]
+            # Discover log groups from inventory (logs/ subdir per region)
+            all_log_groups: list[str] = []
+            logs_dir = inv_dir / "logs"
+            if logs_dir.exists():
+                for f in logs_dir.glob("*.json"):
+                    try:
+                        d = _json.loads(f.read_text())
+                        for lg in d.get("logGroups", []):
+                            name = lg.get("logGroupName")
+                            if name:
+                                all_log_groups.append(name)
+                    except Exception:
+                        continue
+
             if brain is not None:
                 bo = BrainOrchestrator(brain=brain, trace_path=account_dir / "brain_trace.jsonl")
                 targets = bo.select_secret_targets({
-                    "buckets": [{"name": a.name} for a in assets if a.service == "s3"],
-                    "log_groups": [],
+                    "buckets": [{"name": n} for n in all_buckets],
+                    "log_groups": [{"name": n} for n in all_log_groups],
                 })
             else:
-                targets = {"buckets": [a.name for a in assets if a.service == "s3"], "log_groups": []}
+                # Default heuristic: name-match buckets/log groups whose names
+                # suggest secret storage. Avoids the 79-minute scan-everything
+                # behaviour observed in live smoke.
+                _SECRET_HINTS = ("config", "secret", "backup", "dump", "infra",
+                                 "dev", "env", "key", "cred", "private",
+                                 "terraform", "tfstate", "passw", "token",
+                                 ".env", "vault")
+                def _looks_secret(name: str) -> bool:
+                    n = (name or "").lower()
+                    return any(h in n for h in _SECRET_HINTS)
+                targets = {
+                    "buckets": [b for b in all_buckets if _looks_secret(b)],
+                    "log_groups": [g for g in all_log_groups if _looks_secret(g)],
+                }
             phase_findings = run_secrets(profile, secrets_dir,
                                          target_buckets=targets["buckets"],
                                          target_log_groups=targets["log_groups"])
