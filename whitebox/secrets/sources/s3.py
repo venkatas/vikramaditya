@@ -38,6 +38,10 @@ def scan(profile: CloudProfile, target_buckets: list[str],
                     except Exception:
                         continue
                     for hit in scan_text(text, source=f"s3:{bucket}/{obj['Key']}"):
+                        # S3 false-positive guard: high_entropy is too noisy on
+                        # binary/base64 payloads; only emit named-detector hits.
+                        if hit["detector"] == "high_entropy":
+                            continue
                         safe_key = obj['Key'].replace('/', '_').replace('..', '_')
                         fid = f"secret-s3-{profile.account_id}-global-{bucket}-{safe_key}-{hit['offset']}-{hit['detector']}"
                         if secrets_dir is not None:

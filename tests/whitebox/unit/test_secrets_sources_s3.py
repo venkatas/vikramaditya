@@ -30,3 +30,32 @@ def test_scan_s3_skips_buckets_not_in_targets(profile):
     profile._session = boto3.Session(region_name="us-east-1")
     findings = scan_s3(profile, target_buckets=["different"])
     assert findings == []
+
+
+@mock_aws
+def test_scan_s3_skips_generic_high_entropy(profile):
+    """High-entropy random data in S3 (e.g. image bytes, request IDs) must
+    NOT be flagged — only named-detector hits should emit findings."""
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="binary-bucket")
+    # 200 chars of base64-shaped high-entropy noise; passes high_entropy regex
+    # but is NOT a real secret. Should NOT produce a finding.
+    s3.put_object(Bucket="binary-bucket", Key="image.bin",
+                  Body=b"qN3p2k1vDjZ8m4tyWGq7hFB6cvL9aXrI5sP0nEoK3uYTMjC1lVxRhB4dgaQHfeUsZ7w8DjPN6m4tyWGq7hFB6cvL9aXrI5sP0nEoK3uYTMjC1lVxRhB4dgaQHfeUsZ7w8DjPNqN3p2k1vDjZ8m4tyWGq7hFB6cvL9aXrI5sP0nEoK3uYTMjC1lVxRhB4dgaQHfeUsZ7w8")
+    profile._session = boto3.Session(region_name="us-east-1")
+    findings = scan_s3(profile, target_buckets=["binary-bucket"])
+    # No high_entropy findings should leak through for S3 source
+    assert not any("high_entropy" in f.rule_id for f in findings), \
+        f"S3 should suppress generic high_entropy: got {[f.rule_id for f in findings]}"
+
+
+@mock_aws
+def test_scan_s3_still_finds_named_detectors(profile):
+    """Named detectors (aws_access_key_id, jwt, etc.) must still fire on S3 contents."""
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="cred-bucket")
+    s3.put_object(Bucket="cred-bucket", Key="creds.txt",
+                  Body=b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")
+    profile._session = boto3.Session(region_name="us-east-1")
+    findings = scan_s3(profile, target_buckets=["cred-bucket"])
+    assert any(f.rule_id == "secrets.s3.aws_access_key_id" for f in findings)
