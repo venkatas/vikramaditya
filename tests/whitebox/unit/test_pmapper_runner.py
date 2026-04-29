@@ -78,7 +78,7 @@ def test_build_graph_sets_pythonnousersite_for_isolated_venv(tmp_path, monkeypat
 
 
 def test_build_graph_passes_PMAPPER_REGIONS(tmp_path, monkeypatch):
-    """PMAPPER_REGIONS env → multiple --region flags before subcommand."""
+    """PMAPPER_REGIONS env → --include-regions r1 r2 ... AFTER graph create subcommand."""
     profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
     monkeypatch.setenv("PMAPPER_REGIONS", "us-east-1, ap-south-1 , eu-west-1")
     fake = "/fake/pmapper"
@@ -97,15 +97,18 @@ def test_build_graph_passes_PMAPPER_REGIONS(tmp_path, monkeypatch):
         except Exception:
             pass  # fails after subprocess looking for graph storage; we only assert cmd
     cmd = captured["cmd"]
-    assert "--region" in cmd
+    assert "--include-regions" in cmd
     assert "us-east-1" in cmd
     assert "ap-south-1" in cmd
     assert "eu-west-1" in cmd
-    # All --region flags must come BEFORE the 'graph' subcommand
-    graph_idx = cmd.index("graph")
-    for i, arg in enumerate(cmd):
-        if arg == "--region":
-            assert i < graph_idx, "--region flags must precede 'graph' subcommand"
+    # --include-regions is a subcommand-level flag, must come AFTER 'graph create'
+    create_idx = cmd.index("create")
+    inc_idx = cmd.index("--include-regions")
+    assert inc_idx > create_idx, "--include-regions must come after 'graph create' subcommand"
+    # And the regions must appear consecutively after --include-regions (nargs='*')
+    assert cmd[inc_idx + 1] == "us-east-1"
+    assert cmd[inc_idx + 2] == "ap-south-1"
+    assert cmd[inc_idx + 3] == "eu-west-1"
 
 
 def test_build_graph_no_region_flags_when_env_unset(tmp_path, monkeypatch):
@@ -127,4 +130,4 @@ def test_build_graph_no_region_flags_when_env_unset(tmp_path, monkeypatch):
             build_graph(profile, tmp_path)
         except Exception:
             pass
-    assert "--region" not in captured["cmd"]
+    assert "--include-regions" not in captured["cmd"]
