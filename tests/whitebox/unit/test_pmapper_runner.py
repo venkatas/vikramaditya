@@ -131,3 +131,69 @@ def test_build_graph_no_region_flags_when_env_unset(tmp_path, monkeypatch):
         except Exception:
             pass
     assert "--include-regions" not in captured["cmd"]
+
+
+def test_build_graph_honours_PMAPPER_TIMEOUT_env_var(tmp_path, monkeypatch):
+    """PMAPPER_TIMEOUT env var (seconds) overrides the 1800s default."""
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    monkeypatch.setenv("PMAPPER_TIMEOUT", "3600")
+    monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    fake = "/fake/pmapper"
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["timeout"] = kw.get("timeout")
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        try:
+            build_graph(profile, tmp_path)
+        except Exception:
+            pass
+    assert captured["timeout"] == 3600
+
+
+def test_build_graph_default_timeout_is_1800_when_env_unset(tmp_path, monkeypatch):
+    """No PMAPPER_TIMEOUT and no explicit kwarg → 1800s default."""
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    monkeypatch.delenv("PMAPPER_TIMEOUT", raising=False)
+    monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    fake = "/fake/pmapper"
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["timeout"] = kw.get("timeout")
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        try:
+            build_graph(profile, tmp_path)
+        except Exception:
+            pass
+    assert captured["timeout"] == 1800
+
+
+def test_build_graph_explicit_timeout_overrides_PMAPPER_TIMEOUT_env(tmp_path, monkeypatch):
+    """An explicit timeout kwarg wins over the env var (consistent with prowler_runner)."""
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    monkeypatch.setenv("PMAPPER_TIMEOUT", "9999")
+    monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    fake = "/fake/pmapper"
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["timeout"] = kw.get("timeout")
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        try:
+            build_graph(profile, tmp_path, timeout=42)
+        except Exception:
+            pass
+    assert captured["timeout"] == 42
