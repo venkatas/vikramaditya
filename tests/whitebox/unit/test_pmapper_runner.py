@@ -75,3 +75,56 @@ def test_build_graph_sets_pythonnousersite_for_isolated_venv(tmp_path, monkeypat
         except Exception:
             pass
     assert captured["env"].get("PYTHONNOUSERSITE") == "1"
+
+
+def test_build_graph_passes_PMAPPER_REGIONS(tmp_path, monkeypatch):
+    """PMAPPER_REGIONS env → multiple --region flags before subcommand."""
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    monkeypatch.setenv("PMAPPER_REGIONS", "us-east-1, ap-south-1 , eu-west-1")
+    fake = "/fake/pmapper"
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["cmd"] = cmd
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        try:
+            from whitebox.iam.pmapper_runner import build_graph
+            build_graph(profile, tmp_path)
+        except Exception:
+            pass  # fails after subprocess looking for graph storage; we only assert cmd
+    cmd = captured["cmd"]
+    assert "--region" in cmd
+    assert "us-east-1" in cmd
+    assert "ap-south-1" in cmd
+    assert "eu-west-1" in cmd
+    # All --region flags must come BEFORE the 'graph' subcommand
+    graph_idx = cmd.index("graph")
+    for i, arg in enumerate(cmd):
+        if arg == "--region":
+            assert i < graph_idx, "--region flags must precede 'graph' subcommand"
+
+
+def test_build_graph_no_region_flags_when_env_unset(tmp_path, monkeypatch):
+    """No PMAPPER_REGIONS → no --region flags (preserves current default behaviour)."""
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    fake = "/fake/pmapper"
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["cmd"] = cmd
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        try:
+            from whitebox.iam.pmapper_runner import build_graph
+            build_graph(profile, tmp_path)
+        except Exception:
+            pass
+    assert "--region" not in captured["cmd"]
