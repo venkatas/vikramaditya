@@ -32,7 +32,8 @@ def test_to_findings_skips_non_fail_status():
 
 def test_run_invokes_subprocess(tmp_path):
     profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
-    with patch("subprocess.run") as mock_run:
+    with patch("whitebox.audit.prowler_runner._has_prowler", return_value=True), \
+         patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stderr="")
         ocsf_path = tmp_path / "out.ocsf.json"
         ocsf_path.write_text("[]")
@@ -58,3 +59,10 @@ def test_to_findings_slugifies_check_id_in_evidence_path():
     assert "/" not in str(findings[0].evidence_path.name)
     # rule_id stays as the original (defensibility)
     assert findings[0].rule_id == "../../etc/passwd"
+
+
+def test_run_raises_friendly_error_when_prowler_missing(tmp_path):
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    with patch("shutil.which", return_value=None):
+        with pytest.raises(FileNotFoundError, match="pip install prowler-cloud"):
+            run(profile, tmp_path)

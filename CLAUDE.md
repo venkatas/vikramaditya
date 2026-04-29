@@ -147,7 +147,7 @@ populated and the final report includes a "Cloud Posture" chapter plus
 inline cloud context on each blackbox finding.
 
 **Required external tools:**
-- `prowler-cloud==4.5.0` (pip): `pip install prowler-cloud==4.5.0`
+- `prowler-cloud==4.5.0` (pip): `pip install prowler-cloud==4.5.0` — if missing, Prowler phase is skipped with a friendly `FileNotFoundError` in the manifest.
 - `principalmapper>=1.1.5` (pip): `pip install principalmapper`
 
 **Permission gaps:** Whitebox falls back to metadata-only when
