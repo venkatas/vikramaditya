@@ -147,8 +147,20 @@ populated and the final report includes a "Cloud Posture" chapter plus
 inline cloud context on each blackbox finding.
 
 **Required external tools:**
-- `prowler-cloud==4.5.0` (pip): `pip install prowler-cloud==4.5.0` — if missing, Prowler phase is skipped with a friendly `FileNotFoundError` in the manifest.
-- `principalmapper>=1.1.5` (pip): `pip install principalmapper`
+- `prowler-cloud==4.5.0` — MUST be installed in an isolated venv because it
+  hard-pins `pydantic==1.10.18`, which conflicts with `ollama` (used by
+  `brain.py`) and most other packages in the main venv.
+
+  ```bash
+  python3 -m venv ~/.venvs/prowler          # use Python 3.11 (Prowler 4.5 incompatible with 3.14)
+  ~/.venvs/prowler/bin/pip install prowler-cloud==4.5.0
+  ```
+
+  The runner discovers the binary via (in order): `PROWLER_BIN` env var →
+  `~/.venvs/prowler/bin/prowler` → `~/.local/share/prowler/bin/prowler` →
+  `/opt/prowler/bin/prowler` → `$PATH`. If missing, the phase is skipped
+  with a friendly `FileNotFoundError` in the manifest.
+- `principalmapper>=1.1.5` (pip, main venv is fine): `pip install principalmapper`
 
 **Permission gaps:** Whitebox falls back to metadata-only when
 `secretsmanager:GetSecretValue` is denied. To enable full secret-value
