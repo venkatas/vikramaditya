@@ -44,15 +44,16 @@ def build_graph(profile: CloudProfile, out_dir: Path, timeout: int = 1800) -> Pa
         )
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [binary, "--profile", profile.name]
+    cmd = [binary, "--profile", profile.name, "graph", "create"]
     # PMAPPER_REGIONS comma-separated env var narrows graph build to specific
     # regions, avoiding ConnectTimeoutError on slow opt-in regions like me-south-1.
-    # Note: pmapper expects --region BEFORE the subcommand.
+    # PMapper's actual flag is `--include-regions r1 r2 ...` (subcommand-level,
+    # NOT top-level `--region` which it doesn't accept).
     pmapper_regions = os.environ.get("PMAPPER_REGIONS", "").strip()
     if pmapper_regions:
-        for region in [r.strip() for r in pmapper_regions.split(",") if r.strip()]:
-            cmd += ["--region", region]
-    cmd += ["graph", "create"]
+        regions_list = [r.strip() for r in pmapper_regions.split(",") if r.strip()]
+        if regions_list:
+            cmd += ["--include-regions", *regions_list]
 
     env = os.environ.copy()
     # Only suppress user-site for known isolated-venv binaries. A pip --user
