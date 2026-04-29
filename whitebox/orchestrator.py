@@ -213,7 +213,17 @@ def run_for_profile(profile_name: str, session_dir: Path,
                                          target_log_groups=targets["log_groups"])
             findings += phase_findings
             _persist_phase_findings(account_dir, "secrets", phase_findings)
-            cache.mark_complete("secrets")
+            # Record coverage so operators see what was scanned vs skipped
+            secrets_artifacts = {
+                "selection_mode": "brain" if brain is not None else "heuristic",
+                "buckets_total": len(all_buckets),
+                "buckets_scanned": len(targets["buckets"]),
+                "buckets_skipped": len(all_buckets) - len(targets["buckets"]),
+                "log_groups_total": len(all_log_groups),
+                "log_groups_scanned": len(targets["log_groups"]),
+                "log_groups_skipped": len(all_log_groups) - len(targets["log_groups"]),
+            }
+            cache.mark_complete("secrets", artifacts=secrets_artifacts)
         except Exception as e:
             cache.mark_failed("secrets", error=str(e))
             failed_phases.append("secrets")

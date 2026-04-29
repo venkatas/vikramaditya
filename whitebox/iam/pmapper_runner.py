@@ -47,7 +47,15 @@ def build_graph(profile: CloudProfile, out_dir: Path, timeout: int = 1800) -> Pa
     cmd = [binary, "--profile", profile.name, "graph", "create"]
 
     env = os.environ.copy()
-    env["PYTHONNOUSERSITE"] = "1"
+    # Only suppress user-site for known isolated-venv binaries. A pip --user
+    # PMapper install lives in user-site itself, so PYTHONNOUSERSITE would
+    # break its imports.
+    is_isolated = (
+        os.environ.get("PMAPPER_BIN") == binary
+        or any(str(c) == binary for c in _PMAPPER_PATH_CANDIDATES)
+    )
+    if is_isolated:
+        env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONWARNINGS"] = "ignore::DeprecationWarning"
 
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)

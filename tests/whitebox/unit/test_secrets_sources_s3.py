@@ -50,6 +50,21 @@ def test_scan_s3_skips_generic_high_entropy(profile):
 
 
 @mock_aws
+def test_scan_s3_keeps_high_entropy_in_text_files(profile):
+    """Text S3 config objects should KEEP high_entropy hits — they may be
+    the only signal for non-AWS random tokens."""
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="config-bucket")
+    s3.put_object(Bucket="config-bucket", Key="app.yaml",
+                  Body=b"db_url: postgres://prod\napi_key: 8s9d7f6g7h8j9k0l1m2n3b4v5c6x7z8q9w0e1r2t\n")
+    profile._session = boto3.Session(region_name="us-east-1")
+    findings = scan_s3(profile, target_buckets=["config-bucket"])
+    # high_entropy hit must survive on text content
+    assert any("high_entropy" in f.rule_id for f in findings), \
+        f"text S3 should keep high_entropy: got {[f.rule_id for f in findings]}"
+
+
+@mock_aws
 def test_scan_s3_still_finds_named_detectors(profile):
     """Named detectors (aws_access_key_id, jwt, etc.) must still fire on S3 contents."""
     s3 = boto3.client("s3", region_name="us-east-1")

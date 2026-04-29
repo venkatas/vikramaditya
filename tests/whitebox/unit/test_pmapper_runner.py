@@ -27,3 +27,51 @@ def test_build_graph_raises_friendly_error_when_pmapper_missing(tmp_path, monkey
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=None):
         with pytest.raises(FileNotFoundError, match="principalmapper"):
             build_graph(profile, tmp_path)
+
+
+def test_build_graph_skips_pythonnousersite_for_path_install(tmp_path, monkeypatch):
+    """A PATH-discovered pip --user PMapper must NOT get PYTHONNOUSERSITE=1
+    (which would break its own user-site import)."""
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    monkeypatch.delenv("PMAPPER_BIN", raising=False)
+    fake = "/usr/local/bin/pmapper"  # not in candidates, not env override
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["env"] = kw.get("env", {})
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        # Will fail when looking for graph storage but we only care that
+        # subprocess was called with the right env
+        try:
+            build_graph(profile, tmp_path)
+        except Exception:
+            pass
+    assert "PYTHONNOUSERSITE" not in captured["env"]
+    assert captured["env"]["PYTHONWARNINGS"] == "ignore::DeprecationWarning"
+
+
+def test_build_graph_sets_pythonnousersite_for_isolated_venv(tmp_path, monkeypatch):
+    """An isolated-venv install MUST get PYTHONNOUSERSITE=1 to suppress
+    distutils-hack startup noise."""
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    monkeypatch.delenv("PMAPPER_BIN", raising=False)
+    from whitebox.iam.pmapper_runner import _PMAPPER_PATH_CANDIDATES
+    isolated = str(_PMAPPER_PATH_CANDIDATES[0])
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["env"] = kw.get("env", {})
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=isolated), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        try:
+            build_graph(profile, tmp_path)
+        except Exception:
+            pass
+    assert captured["env"].get("PYTHONNOUSERSITE") == "1"
