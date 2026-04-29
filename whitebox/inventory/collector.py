@@ -1,0 +1,103 @@
+from __future__ import annotations
+import json
+from pathlib import Path
+from botocore.config import Config as _BotoConfig
+from whitebox.profiles import CloudProfile
+
+# boto3 has no socket timeout by default — a single unhealthy regional endpoint
+# can wedge the entire inventory phase indefinitely. Cap aggressively: any one
+# AWS API call that doesn't complete in 30s is treated as a region failure and
+# captured in region_results, not blocking other regions/services.
+_CLIENT_CONFIG = _BotoConfig(
+    connect_timeout=10,
+    read_timeout=30,
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
+# Service → (boto3 client, list method, region scope)
+# region scope: "regional" iterates profile.regions; "global" calls once.
+SERVICE_PULLS = {
+    "ec2":            ("ec2",            "describe_instances",                "regional"),
+    "ec2_sg":         ("ec2",            "describe_security_groups",          "regional"),
+    "ec2_vpc":        ("ec2",            "describe_vpcs",                     "regional"),
+    "s3":             ("s3",             "list_buckets",                      "global"),
+    "iam_users":      ("iam",            "list_users",                        "global"),
+    "iam_roles":      ("iam",            "list_roles",                        "global"),
+    "iam_policies":   ("iam",            "list_policies",                     "global"),
+    "rds":            ("rds",            "describe_db_instances",             "regional"),
+    "lambda":         ("lambda",         "list_functions",                    "regional"),
+    "ecs":            ("ecs",            "list_clusters",                     "regional"),
+    "eks":            ("eks",            "list_clusters",                     "regional"),
+    "elbv2":          ("elbv2",          "describe_load_balancers",           "regional"),
+    "apigateway":     ("apigateway",     "get_rest_apis",                     "regional"),
+    "apigatewayv2":   ("apigatewayv2",   "get_apis",                          "regional"),
+    "cloudfront":     ("cloudfront",     "list_distributions",                "global"),
+    "route53":        ("route53",        "list_hosted_zones",                 "global"),
+    "ssm":            ("ssm",            "describe_parameters",               "regional"),
+    "secretsmanager": ("secretsmanager", "list_secrets",                      "regional"),
+    "kms":            ("kms",            "list_keys",                         "regional"),
+    "wafv2":          ("wafv2",          "list_web_acls",                     "regional"),
+    "logs":           ("logs",           "describe_log_groups",               "regional"),
+    "codecommit":     ("codecommit",     "list_repositories",                 "regional"),
+    "ecr":            ("ecr",            "describe_repositories",             "regional"),
+    "guardduty":      ("guardduty",      "list_detectors",                    "regional"),
+    "cloudtrail":     ("cloudtrail",     "describe_trails",                   "regional"),
+    "config":         ("config",         "describe_configuration_recorders",  "regional"),
+}
+
+DEFAULT_SERVICES = list(SERVICE_PULLS.keys())
+
+# Per-service kwargs that the boto3 list method requires.
+SERVICE_KWARGS = {
+    "wafv2": {"Scope": "REGIONAL"},
+}
+
+
+def collect_service(profile: CloudProfile, service_key: str, out_dir: Path) -> dict:
+    """Pull one service across all regions (or once for global). Writes JSON files."""
+    if service_key not in SERVICE_PULLS:
+        return {"service": service_key, "status": "unknown_service"}
+    client_name, method, scope = SERVICE_PULLS[service_key]
+    svc_dir = out_dir / service_key
+    svc_dir.mkdir(parents=True, exist_ok=True)
+
+    regions = ["global"] if scope == "global" else profile.regions
+    region_results: dict[str, str] = {}
+
+    for region in regions:
+        try:
+            client_kwargs = {"config": _CLIENT_CONFIG}
+            if scope != "global":
+                client_kwargs["region_name"] = region
+            client = profile._session.client(client_name, **client_kwargs)
+            method_kwargs = SERVICE_KWARGS.get(service_key, {})
+            if client.can_paginate(method):
+                paginator = client.get_paginator(method)
+                # build_full_result handles nested result keys correctly
+                data = paginator.paginate(**method_kwargs).build_full_result()
+                data.pop("ResponseMetadata", None)
+            else:
+                data = getattr(client, method)(**method_kwargs)
+                data.pop("ResponseMetadata", None)
+            (svc_dir / f"{region}.json").write_text(
+                json.dumps(data, indent=2, default=str)
+            )
+            region_results[region] = "ok"
+        except Exception as e:
+            region_results[region] = f"error({type(e).__name__}): {e!s}"
+
+    return {"service": service_key, "regions": region_results}
+
+
+def collect_all(profile: CloudProfile, out_dir: Path,
+                services: list[str] | None = None) -> dict:
+    """Collect all (or selected) services. Returns summary dict."""
+    services = DEFAULT_SERVICES if services is None else services
+    summary = {
+        "account_id": profile.account_id,
+        "profile": profile.name,
+        "services": {},
+    }
+    for svc in services:
+        summary["services"][svc] = collect_service(profile, svc, out_dir)
+    return summary

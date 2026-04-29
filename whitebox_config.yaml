@@ -1,0 +1,27 @@
+# Vikramaditya Whitebox — profile ↔ in-scope domain mapping
+# Auto-populated from Route53 on first run; edit to override.
+profiles:
+  adf-erp:
+    account_id: "443370705278"
+    display: "ADF ERP"
+    domains:
+      - adfactorspr.com
+  adf-pranapr:
+    account_id: "591335425990"
+    display: "ADF Pranapr"
+    domains:
+      - pranapr.com
+
+# Per-engagement runtime defaults
+defaults:
+  cache_ttl_seconds: 86400
+  pmapper_timeout_seconds: 1800
+  prowler_timeout_seconds: 1800
+  max_secrets_per_source: 500
+
+# Whitebox auto-detect behaviour for vikramaditya.py
+whitebox:
+  # When set true, autonomous runs (driven by Ollama brain) will run cloud
+  # whitebox alongside blackbox without prompting. Default false: explicit
+  # opt-in only.
+  autonomous_default: false

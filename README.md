@@ -402,6 +402,8 @@ vikramaditya/
 ├── sneaky_bits.py               # LLM prompt-injection encoder (v6.3)
 ├── cicd_scanner.sh              # sisakulint GitHub Actions auditor (v5.2)
 │
+├── whitebox/cloud_hunt.py       # Whitebox VAPT — AWS audit (Prowler + PMapper + secrets), feeds blackbox
+│
 ├── llm_anon/                    # 🛡️ Engagement privacy (v7.0 / v7.1)
 │   ├── proxy.py                 # FastAPI reverse proxy for Claude Code
 │   ├── regex_detector.py        # IP/hash/credential/FQDN/JWT patterns

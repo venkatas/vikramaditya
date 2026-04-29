@@ -28,6 +28,7 @@ the AI brain if Ollama is installed, and routes to the right scan engine.
 | `reporter.py` | Burp Suite-style HTML + Markdown report generator |
 | `auth_utils.py` | JWT helper, rate limiter, authenticated session management |
 | `prioritize.py` | CVE risk scoring and host prioritization |
+| `whitebox/cloud_hunt.py` | **Whitebox VAPT** — AWS audit (Prowler + PMapper + secrets), feeds blackbox |
 
 ## Advanced Usage (Direct Engine Access)
 
@@ -113,3 +114,74 @@ python3 vapt_suite.py
 - Never test outside defined scope
 - Use `--scope-lock` to restrict to exact target only
 - HAR files may contain sensitive session data — handle securely
+
+## Whitebox VAPT (AWS Cloud Integration)
+
+Run alongside blackbox to add cloud audit, IAM blast-radius, secrets scanning,
+and exploit chaining.
+
+```bash
+# Standalone whitebox audit (single account)
+python3 -m whitebox.cloud_hunt --profile adf-erp \
+  --allowlist adfactorspr.com \
+  --session-dir recon/adfactorspr.com
+
+# Both accounts in one run
+python3 -m whitebox.cloud_hunt --profile adf-erp --profile adf-pranapr \
+  --allowlist adfactorspr.com --allowlist pranapr.com \
+  --session-dir recon/<target>
+
+# Bust the 24h phase cache and re-run everything
+python3 -m whitebox.cloud_hunt --profile adf-erp --refresh \
+  --allowlist adfactorspr.com --session-dir <dir>
+
+# Disable scope-lock (audit ALL public Route53 zones in the account)
+python3 -m whitebox.cloud_hunt --profile adf-erp --no-scope-lock \
+  --session-dir <dir>
+```
+
+When `vikramaditya.py` runs, it auto-detects whether the target domain is
+listed in `whitebox_config.yaml`. If so, it offers to run cloud whitebox
+alongside blackbox; the `cloud/` directory under `recon/<target>/` is
+populated and the final report includes a "Cloud Posture" chapter plus
+inline cloud context on each blackbox finding.
+
+**Required external tools:**
+- `prowler-cloud==4.5.0` — MUST be installed in an isolated venv because it
+  hard-pins `pydantic==1.10.18`, which conflicts with `ollama` (used by
+  `brain.py`) and most other packages in the main venv.
+
+  ```bash
+  python3 -m venv ~/.venvs/prowler          # use Python 3.11 (Prowler 4.5 incompatible with 3.14)
+  ~/.venvs/prowler/bin/pip install prowler-cloud==4.5.0
+  ```
+
+  The runner discovers the binary via (in order): `PROWLER_BIN` env var →
+  `~/.venvs/prowler/bin/prowler` → `~/.local/share/prowler/bin/prowler` →
+  `/opt/prowler/bin/prowler` → `$PATH`. If missing, the phase is skipped
+  with a friendly `FileNotFoundError` in the manifest.
+- `principalmapper>=1.1.5` — install in an isolated venv:
+  ```bash
+  python3.11 -m venv ~/.venvs/pmapper
+  ~/.venvs/pmapper/bin/pip install principalmapper
+  # Patch the Python 3.10+ collections.abc import bug:
+  sed -i 's/from collections import Mapping/from collections.abc import Mapping/' \
+    ~/.venvs/pmapper/lib/python*/site-packages/principalmapper/util/case_insensitive_dict.py
+  ```
+  Discovery order: `PMAPPER_BIN` env → `~/.venvs/pmapper/bin/pmapper` →
+  `~/.local/share/pmapper/bin/pmapper` → `/opt/pmapper/bin/pmapper` → `$PATH`.
+  Region narrowing: set `PMAPPER_REGIONS=us-east-1,ap-south-1,eu-west-1`
+  to skip slow/opt-in regions where the graph build can hang on
+  `ConnectTimeoutError` (e.g. `me-south-1`).
+
+**Permission gaps:** Whitebox falls back to metadata-only when
+`secretsmanager:GetSecretValue` is denied. To enable full secret-value
+scanning, add `secretsmanager:GetSecretValue` to the audit user's policy.
+
+**Scope-lock:** `--allowlist` is REQUIRED unless `--no-scope-lock` is
+passed explicitly. Route53 zones in the AWS account are intersected with
+the allowlist before being treated as in-scope.
+
+**Real-account smoke test:** set `WHITEBOX_SMOKE=1` to run
+`tests/whitebox/smoke/test_real_aws.py` against `adf-erp` and
+`adf-pranapr` profiles.
