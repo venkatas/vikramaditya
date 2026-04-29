@@ -177,6 +177,38 @@ def test_build_graph_default_timeout_is_1800_when_env_unset(tmp_path, monkeypatc
     assert captured["timeout"] == 1800
 
 
+def test_build_graph_finds_graph_at_macos_appdirs_path(tmp_path, monkeypatch):
+    """PMapper 1.1.5 on macOS persists graph state under
+    ~/Library/Application Support/com.nccgroup.principalmapper/<account_id>/, not
+    ~/.principalmapper/. Wrapper must locate the graph there too."""
+    profile = CloudProfile(name="t", account_id="999888777666", arn="a", regions=[])
+    monkeypatch.delenv("PMAPPER_TIMEOUT", raising=False)
+    monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    monkeypatch.delenv("PMAPPER_STORAGE", raising=False)
+    fake = "/fake/pmapper"
+
+    # Lay out a fake macOS appdirs storage tree
+    fake_home = tmp_path / "home"
+    macos_storage = fake_home / "Library" / "Application Support" / "com.nccgroup.principalmapper" / "999888777666"
+    (macos_storage / "graph").mkdir(parents=True)
+    (macos_storage / "metadata.json").write_text('{"account_id":"999888777666","pmapper_version":"1.1.5"}')
+    (macos_storage / "graph" / "nodes.json").write_text("[]")
+    (macos_storage / "graph" / "edges.json").write_text("[]")
+
+    out_dir = tmp_path / "out"
+
+    def fake_subprocess_run(cmd, **kw):
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        result = build_graph(profile, out_dir)
+    assert (result / "metadata.json").exists()
+    assert (result / "graph" / "nodes.json").exists()
+
+
 def test_build_graph_explicit_timeout_overrides_PMAPPER_TIMEOUT_env(tmp_path, monkeypatch):
     """An explicit timeout kwarg wins over the env var (consistent with prowler_runner)."""
     profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
