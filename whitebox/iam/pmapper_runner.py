@@ -93,8 +93,15 @@ def build_graph(profile: CloudProfile, out_dir: Path, timeout: int | None = None
     storage_root = Path(env.get("PMAPPER_STORAGE") or (Path.home() / ".principalmapper"))
     src_dir = storage_root / profile.account_id
     if not (src_dir / "metadata.json").exists():
+        # PMapper 1.1.5 uses platform-specific app-data directories via the appdirs
+        # library. macOS resolves to ~/Library/Application Support/com.nccgroup.principalmapper/;
+        # Linux is XDG_DATA_HOME (typically ~/.local/share/principalmapper). Linux
+        # legacy is ~/.principalmapper. Cover all of them.
+        home = Path.home()
         candidates = [
-            Path.home() / ".principalmapper" / profile.account_id,
+            home / ".principalmapper" / profile.account_id,
+            home / "Library" / "Application Support" / "com.nccgroup.principalmapper" / profile.account_id,
+            home / ".local" / "share" / "principalmapper" / profile.account_id,
             Path("/var/lib/principalmapper") / profile.account_id,
         ]
         for c in candidates:
