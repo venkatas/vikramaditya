@@ -158,6 +158,61 @@ This bridges the cloud-audit pipeline back into the existing blackbox scanner
 
 ---
 
+## P6 — Configurable phase timeouts (PMAPPER_TIMEOUT, dynamic Prowler timeout)
+
+**Problem.** The 29-Apr live run against adf-pranapr (account 591335425990)
+showed both upstream tools hit timeouts on a real account at scale:
+
+- **Prowler:** 5400s (90 min) was insufficient for `--no-scope-lock` runs on
+  this account. Status: failed, no OCSF output.
+- **PMapper:** 1800s (30 min) was insufficient for the IAM graph build even
+  with `PMAPPER_REGIONS=us-east-1,ap-south-1,eu-west-1`. Status: failed.
+
+Today only `PROWLER_TIMEOUT` is configurable; PMapper's 1800s is hard-coded
+in `whitebox/iam/pmapper_runner.py::build_graph(timeout=1800)`.
+
+**What to add.**
+1. New env var `PMAPPER_TIMEOUT` (parallel to `PROWLER_TIMEOUT`); plumb
+   through orchestrator → `pmapper_runner.build_graph(timeout=...)`.
+2. Document both in `CLAUDE.md` Whitebox section.
+3. Optional: dynamic default — scale timeout by `(IAM users + roles + groups +
+   policies)` count read from inventory before Prowler / PMapper start. Cap
+   at 4 hours.
+4. Reach-goal: split Prowler into per-service runs (`prowler aws --services
+   iam,s3,ec2,...`) so partial timeouts only kill one service category, not
+   the whole audit.
+
+---
+
+## P7 — Manifest coverage for secrets + correlation phases
+
+**Problem.** On the 29-Apr live run, the orchestrator wrote 145 secret
+evidence files to `secrets/` and the run exited cleanly (exit 0), yet the
+session manifest only shows 4 phase entries (`inventory`, `prowler`, `iam`,
+`exposure`) — no `secrets` or `correlation` entry. The phase clearly ran;
+something between `_persist_phase_findings` (line 215) and
+`cache.mark_complete("secrets", artifacts=...)` (line 226) silently swallowed
+the manifest update.
+
+**Reproduction.** Run `cloud_hunt --no-scope-lock --refresh` against
+adf-pranapr; secrets dir fills with 145 files but manifest.json never gains a
+`secrets` key.
+
+**Investigation entry points:**
+- `whitebox/orchestrator.py:172-231` (secrets phase block).
+- `whitebox/cache/manifest.py:43-54` (atomic save — known good).
+- Suspicion: an unhandled `BaseException` (not `Exception`) inside one of the
+  later `run_secrets` sub-sources (ssm/secretsmanager/ec2_userdata) escapes the
+  try block. Or `_persist_phase_findings` ran out of disk / hit a permission
+  issue silently.
+
+**Acceptance.** Manifest must record one of `complete` / `failed` for every
+phase that was reached. Add an integration test that simulates a sub-source
+raising an exception and asserts the manifest has `secrets: failed` not
+absent.
+
+---
+
 ## Tracking
 
 When this lands in a real tracker (Linear, GitHub Issues), each section above
