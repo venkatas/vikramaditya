@@ -38,9 +38,14 @@ def _has_prowler() -> bool:
 
 def run(profile: CloudProfile, out_dir: Path,
         check_groups: list[str] | None = None,
-        timeout: int = 1800) -> Path:
+        timeout: int | None = None) -> Path:
     """Invoke prowler, return path to OCSF JSON output (must be newer than this run's start).
-    Raises FileNotFoundError if prowler binary cannot be located (caller should fall back gracefully)."""
+    Raises FileNotFoundError if prowler binary cannot be located.
+
+    timeout defaults to the PROWLER_TIMEOUT env var (seconds) if set, otherwise 5400 (90 min).
+    Real-world full Prowler scans on enterprise AWS accounts typically run 60-90 min.
+    Pass check_groups (a list of check folders) to narrow the scan when timeout is tight.
+    """
     binary = _resolve_prowler_binary()
     if binary is None:
         raise FileNotFoundError(
@@ -50,6 +55,8 @@ def run(profile: CloudProfile, out_dir: Path,
             "Or set PROWLER_BIN to an existing prowler executable. The phase will be marked "
             "failed in the manifest and the rest of the audit will continue."
         )
+    if timeout is None:
+        timeout = int(os.environ.get("PROWLER_TIMEOUT", "5400"))
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     start_ts = time.time()
