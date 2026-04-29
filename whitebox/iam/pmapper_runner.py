@@ -27,10 +27,16 @@ def _resolve_pmapper_binary() -> str | None:
     return shutil.which("pmapper")
 
 
-def build_graph(profile: CloudProfile, out_dir: Path, timeout: int = 1800) -> Path:
+def build_graph(profile: CloudProfile, out_dir: Path, timeout: int | None = None) -> Path:
     """Invoke pmapper to create the graph; return path to the storage directory.
     Sets PYTHONNOUSERSITE=1 to avoid distutils-hack noise polluting subprocess output.
-    Raises FileNotFoundError if pmapper binary cannot be located."""
+    Raises FileNotFoundError if pmapper binary cannot be located.
+
+    timeout defaults to the PMAPPER_TIMEOUT env var (seconds) if set, otherwise 1800 (30 min).
+    On large IAM estates (many users/roles/policies) 1800s is often too tight; raise via
+    the env var or by passing an explicit timeout kwarg."""
+    if timeout is None:
+        timeout = int(os.environ.get("PMAPPER_TIMEOUT", "1800"))
     binary = _resolve_pmapper_binary()
     if binary is None:
         raise FileNotFoundError(
