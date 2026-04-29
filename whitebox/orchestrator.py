@@ -90,6 +90,18 @@ def run_for_profile(profile_name: str, session_dir: Path,
     cache = PhaseCache(account_dir)
     if refresh:
         cache.refresh()
+        # Clean phase artifact dirs so new evidence isn't polluted by stale runs
+        import shutil as _shutil
+        for sub in ("inventory", "prowler", "pmapper", "secrets", "exposure"):
+            stale = account_dir / sub
+            if stale.exists():
+                _shutil.rmtree(stale, ignore_errors=True)
+        # Also remove cached phase-finding artifacts
+        for f in account_dir.glob("phase_*_findings.json"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
     findings: list[Finding] = []
     failed_phases: list[str] = []
