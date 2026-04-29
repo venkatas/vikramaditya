@@ -88,3 +88,41 @@ def test_resolve_prowler_binary_returns_none_when_nothing_found(monkeypatch):
          patch("shutil.which", return_value=None):
         from whitebox.audit.prowler_runner import _resolve_prowler_binary
         assert _resolve_prowler_binary() is None
+
+
+def test_run_honours_PROWLER_TIMEOUT_env_var(tmp_path, monkeypatch):
+    profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
+    monkeypatch.setenv("PROWLER_TIMEOUT", "120")
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["timeout"] = kw.get("timeout")
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    fake_binary = "/fake/prowler"
+    with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
+         patch("subprocess.run", side_effect=fake_subprocess_run), \
+         patch("whitebox.audit.prowler_runner._find_output_file", return_value=tmp_path / "x.json"):
+        (tmp_path / "x.json").write_text("[]")
+        run(profile, tmp_path)
+    assert captured["timeout"] == 120
+
+
+def test_run_default_timeout_is_5400_seconds(tmp_path, monkeypatch):
+    profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
+    monkeypatch.delenv("PROWLER_TIMEOUT", raising=False)
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["timeout"] = kw.get("timeout")
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    fake_binary = "/fake/prowler"
+    with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
+         patch("subprocess.run", side_effect=fake_subprocess_run), \
+         patch("whitebox.audit.prowler_runner._find_output_file", return_value=tmp_path / "x.json"):
+        (tmp_path / "x.json").write_text("[]")
+        run(profile, tmp_path)
+    assert captured["timeout"] == 5400
