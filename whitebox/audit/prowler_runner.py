@@ -69,7 +69,9 @@ def run(profile: CloudProfile, out_dir: Path,
     if check_groups:
         cmd += ["--checks-folder"] + check_groups
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
+    # Prowler exit codes: 0 = no findings, 3 = completed with findings
+    # (normal case for real accounts). Anything else is a true failure.
+    if proc.returncode not in (0, 3):
         (out_dir / "error.log").write_text(
             f"prowler exited {proc.returncode}\nbinary: {binary}\n\n"
             f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}\n"

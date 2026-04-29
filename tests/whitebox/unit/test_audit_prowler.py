@@ -35,7 +35,7 @@ def test_run_invokes_subprocess(tmp_path):
     fake_binary = "/fake/venvs/prowler/bin/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
          patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        mock_run.return_value = MagicMock(returncode=3, stderr="", stdout="")
         ocsf_path = tmp_path / "out.ocsf.json"
         ocsf_path.write_text("[]")
         with patch("whitebox.audit.prowler_runner._find_output_file", return_value=ocsf_path):
@@ -46,6 +46,31 @@ def test_run_invokes_subprocess(tmp_path):
         assert args[0] == fake_binary
         assert "--profile" in args
         assert "test" in args
+
+
+def test_run_treats_exit_code_3_as_success(tmp_path):
+    """Prowler exit 3 = completed with findings (normal); must NOT raise."""
+    profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
+    fake_binary = "/fake/prowler"
+    with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
+         patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=3, stdout="", stderr="")
+        ocsf_path = tmp_path / "out.ocsf.json"
+        ocsf_path.write_text("[]")
+        with patch("whitebox.audit.prowler_runner._find_output_file", return_value=ocsf_path):
+            result = run(profile, tmp_path)
+    assert result == ocsf_path  # success — output returned, no exception
+
+
+def test_run_treats_exit_code_2_as_failure(tmp_path):
+    """Non-(0,3) exit codes are still real failures."""
+    profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
+    fake_binary = "/fake/prowler"
+    with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
+         patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=2, stdout="", stderr="boom")
+        with pytest.raises(RuntimeError, match="prowler exited 2"):
+            run(profile, tmp_path)
 
 
 def test_to_findings_slugifies_check_id_in_evidence_path():
