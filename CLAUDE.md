@@ -170,6 +170,9 @@ inline cloud context on each blackbox finding.
   ```
   Discovery order: `PMAPPER_BIN` env → `~/.venvs/pmapper/bin/pmapper` →
   `~/.local/share/pmapper/bin/pmapper` → `/opt/pmapper/bin/pmapper` → `$PATH`.
+  Region narrowing: set `PMAPPER_REGIONS=us-east-1,ap-south-1,eu-west-1`
+  to skip slow/opt-in regions where the graph build can hang on
+  `ConnectTimeoutError` (e.g. `me-south-1`).
 
 **Permission gaps:** Whitebox falls back to metadata-only when
 `secretsmanager:GetSecretValue` is denied. To enable full secret-value
