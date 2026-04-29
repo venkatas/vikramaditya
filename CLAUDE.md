@@ -160,7 +160,16 @@ inline cloud context on each blackbox finding.
   `~/.venvs/prowler/bin/prowler` → `~/.local/share/prowler/bin/prowler` →
   `/opt/prowler/bin/prowler` → `$PATH`. If missing, the phase is skipped
   with a friendly `FileNotFoundError` in the manifest.
-- `principalmapper>=1.1.5` (pip, main venv is fine): `pip install principalmapper`
+- `principalmapper>=1.1.5` — install in an isolated venv:
+  ```bash
+  python3.11 -m venv ~/.venvs/pmapper
+  ~/.venvs/pmapper/bin/pip install principalmapper
+  # Patch the Python 3.10+ collections.abc import bug:
+  sed -i 's/from collections import Mapping/from collections.abc import Mapping/' \
+    ~/.venvs/pmapper/lib/python*/site-packages/principalmapper/util/case_insensitive_dict.py
+  ```
+  Discovery order: `PMAPPER_BIN` env → `~/.venvs/pmapper/bin/pmapper` →
+  `~/.local/share/pmapper/bin/pmapper` → `/opt/pmapper/bin/pmapper` → `$PATH`.
 
 **Permission gaps:** Whitebox falls back to metadata-only when
 `secretsmanager:GetSecretValue` is denied. To enable full secret-value
