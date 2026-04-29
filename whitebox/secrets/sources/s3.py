@@ -7,6 +7,32 @@ from whitebox.secrets.detectors import scan_text
 MAX_OBJECT_SIZE = 1_000_000   # 1 MB
 MAX_OBJECTS_PER_BUCKET = 200
 
+_BINARY_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".svg",
+    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".mp4", ".mp3", ".wav", ".mov", ".avi", ".mkv", ".webm",
+    ".bin", ".dat", ".db", ".sqlite", ".so", ".dylib", ".dll",
+    ".pyc", ".pyo", ".class", ".jar", ".war", ".ear",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".tar.gz", ".tar.bz2",
+}
+
+
+def _is_binaryish(key: str, body_sample: bytes) -> bool:
+    """Detect binary-ish S3 objects to suppress noisy high_entropy hits.
+    Returns True for known binary extensions, or if a sample of the object
+    body has high non-printable byte density."""
+    key_lower = key.lower()
+    for ext in _BINARY_EXTENSIONS:
+        if key_lower.endswith(ext):
+            return True
+    # Content sniff: sample first 4KB; if > 30% non-printable bytes it's binary
+    sample = body_sample[:4096]
+    if not sample:
+        return False
+    non_printable = sum(1 for b in sample if b < 0x09 or (0x0E <= b <= 0x1F) or b == 0x7F)
+    return (non_printable / len(sample)) > 0.30
+
 
 def scan(profile: CloudProfile, target_buckets: list[str],
          secrets_dir: Path | None = None) -> list[Finding]:
@@ -37,10 +63,13 @@ def scan(profile: CloudProfile, target_buckets: list[str],
                         text = body.decode("utf-8", errors="ignore")
                     except Exception:
                         continue
+                    body_is_binary = _is_binaryish(obj["Key"], body)
                     for hit in scan_text(text, source=f"s3:{bucket}/{obj['Key']}"):
-                        # S3 false-positive guard: high_entropy is too noisy on
-                        # binary/base64 payloads; only emit named-detector hits.
-                        if hit["detector"] == "high_entropy":
+                        # S3 entropy gating: drop high_entropy hits only on
+                        # binary objects (image/zip/etc.) where entropy adds no
+                        # signal. Text config files keep entropy hits for tokens
+                        # not matched by named regexes.
+                        if hit["detector"] == "high_entropy" and body_is_binary:
                             continue
                         safe_key = obj['Key'].replace('/', '_').replace('..', '_')
                         fid = f"secret-s3-{profile.account_id}-global-{bucket}-{safe_key}-{hit['offset']}-{hit['detector']}"
