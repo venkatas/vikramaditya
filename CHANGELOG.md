@@ -1,5 +1,66 @@
 # Changelog
 
+## v8.0.0 — Whitebox AWS audit + dual-track operation (2026-04-30)
+
+**Major release.** Adds an authenticated whitebox engine alongside the existing blackbox stack. Both feed the same correlator and the same final report. Previous v7.x capabilities (engagement-privacy proxy, HAR auth replay, meme-coin module, anonymization vault, HackerOne MCP, brain.py) are preserved unchanged.
+
+### New: `whitebox/` subpackage
+
+Dual-track AWS audit driven by `whitebox/cloud_hunt.py`. Seven phases, each independently cacheable and resumable:
+
+- **inventory** — Account-wide boto3 enumeration across 26 services (EC2, EC2 SGs, EC2 VPCs, S3, IAM users / roles / policies, RDS, Lambda, ECS, EKS, ELBv2, API Gateway v1+v2, CloudFront, Route53, SSM, Secrets Manager, KMS, WAFv2, CloudWatch Logs, CodeCommit, ECR, GuardDuty, CloudTrail, Config). Iterates only enabled regions (`ec2 describe-regions` filter) so unenabled opt-in regions don't hang boto3.
+- **prowler** — Runs Prowler 4.5 full-checks suite via isolated venv (handles its `pydantic 1.10.18` pin without breaking the main venv). Emits OCSF JSON + 17 compliance CSVs (CIS 1.4 / 1.5 / 2.0 / 3.0, AWS-FSBP, AWS-Well-Architected Reliability + Security, SOC2, HIPAA, FedRAMP Low + Moderate, FFIEC, CISA, GxP-EU-Annex-11, ENS-RD-2022, AWS Audit Manager Control Tower Guardrails, AWS Account Security Onboarding, AWS Foundational Technical Review). Exit codes 0 + 3 are both treated as success-with-findings (per Prowler convention). `PROWLER_TIMEOUT` env override (default 5400s).
+- **iam** — Runs PMapper 1.1.5 in its own isolated venv (with the documented Python 3.10+ collections.abc patch) to build the IAM blast-radius graph. Discovers privesc paths, admin-reachability, role-assumption chains. Storage location resolution covers macOS appdirs (`~/Library/Application Support/com.nccgroup.principalmapper/`), Linux XDG (`~/.local/share/principalmapper/`), legacy `~/.principalmapper`, and `/var/lib/principalmapper`. Region narrowing via `PMAPPER_REGIONS`. Timeout via `PMAPPER_TIMEOUT` env (default 1800s).
+- **exposure** — Joins Security Group analysis with EC2 instance attachment data to tag assets. The current implementation flags any SG with 0.0.0.0/0 ingress; a follow-up (backlog P0) adds reachability verification (TCP probe of attached running instances) so orphan-SG findings are auto-downgraded.
+- **secrets** — Scans Lambda environment variables, SSM parameters, Secrets Manager metadata, EC2 user-data, CloudWatch Logs (heuristic / brain-selected log groups), and S3 buckets (heuristic / brain-selected by name hint). Detectors cover AWS access / secret keys, OpenAI / Gemini / Google / Azure API keys, generic password assignments, high-entropy tokens. Each finding writes a 0600-permission JSON evidence file in a 0700 directory; redacted previews are what flow into the report.
+- **correlation** — Per-profile asset feed (`asset_feed_<account_id>.json`) plus a session-wide merged `asset_feed.json`, ready for blackbox cross-reference. PMapper-discovered IAM privesc paths join blackbox SSRF / IDOR / RCE findings to surface chained risks.
+- **report** — `findings.json` consolidated dump. The HTML reporter (`whitebox/reporting/posture_chapter.py` + `correlation_inline.py`) renders a "Cloud Posture" chapter and inlines cloud context on each blackbox finding.
+
+### New env vars
+
+- `PROWLER_TIMEOUT` (seconds, default 5400) — Prowler subprocess wall-clock cap.
+- `PMAPPER_TIMEOUT` (seconds, default 1800) — PMapper graph-build cap.
+- `PMAPPER_REGIONS` (CSV, default unset) — Pin PMapper to specific regions to avoid opt-in-region hangs.
+- `WHITEBOX_REGIONS` (CSV, default unset) — Pipeline-wide region override; bypasses the `describe-regions` enabled-regions filter.
+- `PROWLER_BIN` / `PMAPPER_BIN` — explicit binary path overrides.
+- `PMAPPER_STORAGE` — explicit graph storage root override.
+- `WHITEBOX_SMOKE=1` — opt-in flag to run the real-AWS smoke tests in `tests/whitebox/smoke/`.
+
+### New CLI flags (`python3 -m whitebox.cloud_hunt`)
+
+- `--profile <name>` — AWS profile to audit (repeatable for multi-account).
+- `--session-dir <path>` — Output root.
+- `--allowlist <domain>` — Required unless `--no-scope-lock`. Repeatable. Route53 zones in the account are intersected with this list before being treated as in-scope.
+- `--no-scope-lock` — Audit every public Route53 zone in the account.
+- `--refresh` — Bust the per-phase 24h cache and re-run all phases.
+
+### Test suite
+
+`tests/whitebox/` — 142 unit + integration tests (4 smoke skipped without `WHITEBOX_SMOKE=1`). Covers profile validation, region resolution, every secrets source, exposure analyzer, PMapper privesc detection, correlator chain builder, cache atomicity, scope-lock enforcement, scope-lock allowlist intersection. Full project sweep on the v8.0 tip: 670+ tests passing, 4 skipped, 0 failures.
+
+### Engagement-validated
+
+Both major architectural goals validated end-to-end against authorized live AWS accounts during the engagement that drove this release:
+
+- Prowler full-checks completes cleanly in ~14 min on a small account (~500 findings) and times out gracefully on larger ones (manifest records the timeout, orchestrator continues to the next phase).
+- PMapper graph build completes in ~12 min on a 49-node IAM estate; storage path detection works on macOS without any operator intervention.
+- Secrets phase finds real Lambda environment-variable leaks (AWS access keys, OpenAI / Azure / Google API keys, Postgres passwords) without hanging on opt-in regions.
+- All seven phases reach `complete` status on the validation account.
+
+### Breaking changes
+
+None. v8.0 is purely additive over v7.4.10. Existing blackbox workflows are unchanged. Whitebox is opt-in via `whitebox_config.yaml` (default empty) — `vikramaditya.py` only invokes it when the target domain matches a configured cloud profile.
+
+### Migration
+
+Install the two isolated venvs as documented in [`README.md`](README.md#whitebox-aws-audit-v80). Without them, the whitebox phases skip with a friendly install hint in the manifest; the rest of the audit continues.
+
+### Known gaps (tracked)
+
+See `docs/superpowers/backlog/2026-04-29-whitebox-post-merge-backlog.md` for the post-release backlog (P0 reachability gate, P1 route-table analyzer, P2 EventBridge GuardDuty fan-out + SNS subscriber checks, P3 SSM coverage, P4 CloudTrail recency + Backup Vault Lock, P5 IIS / HTTPAPI fingerprint, P7 manifest coverage for failed phases).
+
+---
+
 ## v7.4.10 — Check 0 expansion + remediation-pack templates (2026-04-28)
 
 Two threads of work, both driven by a real-world engagement.
