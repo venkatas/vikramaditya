@@ -173,6 +173,8 @@ inline cloud context on each blackbox finding.
   Region narrowing: set `PMAPPER_REGIONS=us-east-1,ap-south-1,eu-west-1`
   to skip slow/opt-in regions where the graph build can hang on
   `ConnectTimeoutError` (e.g. `me-south-1`).
+  Timeout override: set `PMAPPER_TIMEOUT=3600` (seconds) when the default
+  1800s is too tight for a large IAM estate. Mirrors `PROWLER_TIMEOUT`.
 
 **Permission gaps:** Whitebox falls back to metadata-only when
 `secretsmanager:GetSecretValue` is denied. To enable full secret-value

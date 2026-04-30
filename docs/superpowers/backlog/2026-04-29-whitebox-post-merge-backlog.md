@@ -213,6 +213,60 @@ absent.
 
 ---
 
+## P8 — Region narrowing for secrets phase (opt-in-region SYN_SENT hang)
+
+**Problem.** The secrets phase iterates `profile.regions`, which is populated
+from `session.get_available_regions("ec2")` — that returns ALL AWS regions
+including opt-in ones (`me-south-1`, `af-south-1`, `eu-south-1`, `ap-east-1`).
+For accounts that have not enabled an opt-in region, boto3 hangs in SYN_SENT
+on TCP handshake to that region's API endpoints, and the secrets phase never
+makes forward progress.
+
+**Evidence (29-Apr live run on adf-erp, account 443370705278).** Run hung at
+T+1h21m, secrets dir empty, active TCP socket in SYN_SENT to
+`ec2-15-185-84-192.me-south-1.compute.amazonaws.com:443`. Killed manually.
+Same hang class that motivated `PMAPPER_REGIONS`, now manifesting in
+`whitebox/secrets/sources/{lambda_env,ssm,secretsmanager}.py` (all do
+`for region in profile.regions`).
+
+**What to add.**
+1. Filter `profile.regions` to **enabled** regions only at profile-validation
+   time. Use `ec2 describe-regions --filters
+   Name=opt-in-status,Values=opt-in-not-required,opted-in` to get the list
+   the account actually has access to.
+2. Honor a `WHITEBOX_REGIONS` env var as an explicit override (parallels
+   `PMAPPER_REGIONS`). Document in CLAUDE.md.
+3. Add per-region timeout budget (e.g. 60s) on each boto3 client init in the
+   secrets sources, with a friendly skip-with-warning rather than a hang.
+4. Test: simulate a region that hangs by patching `client(region_name=...)`
+   to raise `EndpointConnectionError`; assert the source skips the region
+   and continues, and the wall-clock impact is bounded.
+
+**Acceptance.** Live run against adf-erp completes the secrets phase in
+under 5 minutes regardless of opt-in region status.
+
+---
+
+## P9 — adf-erp live validation results (29-Apr)
+
+Recording the partial-run validation results so the next session has a
+baseline to compare against once P8 lands.
+
+| Phase | Status | Notes |
+|---|---|---|
+| inventory | complete | 26/26 services, 17 regions, ~12 min |
+| **prowler** | **complete** | **3,750 OCSF findings**: severity 5 (HIGH) 1,317; sev 4 (MEDIUM-HIGH) 681; sev 3 (MEDIUM) 1,517; sev 2 (LOW) 234; sev 1 (INFO) 1. Plus CIS 1.5 / SOC2 / HIPAA / GxP compliance CSVs. **First successful Prowler completion** of the engagement (pranapr timed out). |
+| iam (PMapper) | failed | Not a timeout — graph **was** generated successfully (49 nodes, 7 admins, 19 edges, 74 policies) but the wrapper looked at `~/.principalmapper` instead of macOS appdirs path. **Fixed on `feat/pmapper-timeout-env` at commit `7d3a958`** but not yet validated end-to-end. |
+| exposure | complete | Asset tagging based on inventory + Prowler. |
+| secrets | hung | See P8. Manually killed at T+1h21m. |
+| correlation | not reached | — |
+
+**Permission probe** (also recorded by `whitebox/profiles.py::probe_permissions`)
+came back clean — `ReadOnlyAccess + SecurityAudit` on `venkata.satish-audit`
+worked for every API call attempted.
+
+---
+
 ## Tracking
 
 When this lands in a real tracker (Linear, GitHub Issues), each section above

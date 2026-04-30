@@ -27,10 +27,16 @@ def _resolve_pmapper_binary() -> str | None:
     return shutil.which("pmapper")
 
 
-def build_graph(profile: CloudProfile, out_dir: Path, timeout: int = 1800) -> Path:
+def build_graph(profile: CloudProfile, out_dir: Path, timeout: int | None = None) -> Path:
     """Invoke pmapper to create the graph; return path to the storage directory.
     Sets PYTHONNOUSERSITE=1 to avoid distutils-hack noise polluting subprocess output.
-    Raises FileNotFoundError if pmapper binary cannot be located."""
+    Raises FileNotFoundError if pmapper binary cannot be located.
+
+    timeout defaults to the PMAPPER_TIMEOUT env var (seconds) if set, otherwise 1800 (30 min).
+    On large IAM estates (many users/roles/policies) 1800s is often too tight; raise via
+    the env var or by passing an explicit timeout kwarg."""
+    if timeout is None:
+        timeout = int(os.environ.get("PMAPPER_TIMEOUT", "1800"))
     binary = _resolve_pmapper_binary()
     if binary is None:
         raise FileNotFoundError(
@@ -87,8 +93,15 @@ def build_graph(profile: CloudProfile, out_dir: Path, timeout: int = 1800) -> Pa
     storage_root = Path(env.get("PMAPPER_STORAGE") or (Path.home() / ".principalmapper"))
     src_dir = storage_root / profile.account_id
     if not (src_dir / "metadata.json").exists():
+        # PMapper 1.1.5 uses platform-specific app-data directories via the appdirs
+        # library. macOS resolves to ~/Library/Application Support/com.nccgroup.principalmapper/;
+        # Linux is XDG_DATA_HOME (typically ~/.local/share/principalmapper). Linux
+        # legacy is ~/.principalmapper. Cover all of them.
+        home = Path.home()
         candidates = [
-            Path.home() / ".principalmapper" / profile.account_id,
+            home / ".principalmapper" / profile.account_id,
+            home / "Library" / "Application Support" / "com.nccgroup.principalmapper" / profile.account_id,
+            home / ".local" / "share" / "principalmapper" / profile.account_id,
             Path("/var/lib/principalmapper") / profile.account_id,
         ]
         for c in candidates:
