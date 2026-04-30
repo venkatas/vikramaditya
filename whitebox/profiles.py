@@ -1,10 +1,39 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
+import os
 import boto3
 import logging
 
 _log = logging.getLogger(__name__)
+
+
+def _resolve_enabled_regions(session) -> list[str]:
+    """Return the regions the audit should iterate.
+
+    Resolution order:
+      1. WHITEBOX_REGIONS env var (comma-separated explicit override).
+      2. ec2 describe-regions filtered to opt-in-status in
+         (opt-in-not-required, opted-in) — only regions the account has
+         enabled. This is the safe default; opt-in regions the account
+         has NOT enabled hang boto3 in SYN_SENT during sign-on.
+      3. Fallback to session.get_available_regions("ec2") if describe-regions
+         is denied (preserves liveness for restricted audit profiles).
+    """
+    override = os.environ.get("WHITEBOX_REGIONS", "").strip()
+    if override:
+        return [r.strip() for r in override.split(",") if r.strip()]
+    try:
+        resp = session.client("ec2").describe_regions(
+            Filters=[{"Name": "opt-in-status",
+                      "Values": ["opt-in-not-required", "opted-in"]}],
+        )
+        regions = [r["RegionName"] for r in resp.get("Regions", []) if r.get("RegionName")]
+        if regions:
+            return regions
+    except Exception as e:
+        _log.debug("ec2 describe-regions denied or failed; falling back: %s", e)
+    return list(session.get_available_regions("ec2"))
 
 
 def _normalize_to_iam_arn(arn: str) -> str:
@@ -47,7 +76,7 @@ def validate(profile: CloudProfile) -> CloudProfile:
 
     profile.account_id = ident["Account"]
     profile.arn = ident["Arn"]
-    profile.regions = list(session.get_available_regions("ec2"))
+    profile.regions = _resolve_enabled_regions(session)
     profile._session = session
     profile.permission_probe = probe_permissions(session, principal_arn=_normalize_to_iam_arn(profile.arn))
     return profile
