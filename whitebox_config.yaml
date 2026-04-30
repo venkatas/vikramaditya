@@ -1,16 +1,16 @@
 # Vikramaditya Whitebox — profile ↔ in-scope domain mapping
 # Auto-populated from Route53 on first run; edit to override.
 profiles:
-  client-a:
-    account_id: "000000000001"
+  client-erp:
+    account_id: "111122223333"
     display: "Client-A"
     domains:
-      - clienta.com
-  client-b:
-    account_id: "000000000002"
+      - example-prod.invalid
+  example-example-data:
+    account_id: "444455556666"
     display: "Client-B"
     domains:
-      - clientb.com
+      - example-data.invalid
 
 # Per-engagement runtime defaults
 defaults:
