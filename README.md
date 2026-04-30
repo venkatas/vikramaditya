@@ -9,7 +9,9 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v7.4.10 — Check 0 expanded to ~100 upload paths (generic + WP + file-managers + framework-specific + API + GraphQL) with recon-driven extractor and POST-probe pass for 405/401/403/415 endpoints + multi-shape catchall detection (probes 4 URL shapes per host: /, /api, /admin, /static — catches SPA-200, API-401, admin-403 catchalls so they don't pollute findings) + bash-3.2-safe baseline persistence + templates/remediation_pack/ generic drop-in fix templates (XSS, CORS, FastAPI auth/docs, WP user-enum, AWS DevOps remediation) — client-specific instances gitignored at client_remediation_pack/ + Check 0 false-positive elimination: SPA soft-404 fingerprinting (catchall-detection result was being thrown away because `head | while` ran the loop in a subshell + status-only catchall check missed SPA soft-404s where every URL returns the same 200/HTML shell — now MD5-fingerprints the random-URL baseline per host and rejects matches + bash-3.2-safe via tmp-file mapping instead of `declare -A`) + scanner.sh hardening: macOS-safe dalfox dedup mktemp (X's-suffix template was unreliable on BSD; cascaded to empty $DAL_DEDUP_FILE → `head: : No such file` and dedup count 0) + correct `Target` name in consolidated summary when invoked with parent recon path (was printing repo dir basename) + single-line SQLi count (grep -c double-fired `|| echo 0` on no-match) + HAR engine: line-buffered stdout for visible progress under nohup, brain-script auto-pivot on accepted-but-unverified upload, dropped broken reporter.py invocation that expected a recon tree + v7.4.7 autonomous pipeline robustness + scope-lock hint always fires + empty-findings diagnostic section + reporter subdir coverage + NAT64 FP fix + severity-spelling fix + email_audit per-check package + brain.py LLM bridge + hunt_journal auto-append + 553-test suite + email-auditor agent + sqlmap JSON API detection + anonymization proxy + sneaky_bits + /autopilot + /remember + /surface + recon-ranker + meme-coin + /intel + bb-methodology + credential store + /pickup + CI/CD + HackerOne MCP + CVSS 4.0 + HAR auth testing**
+**v8.0.0 — Dual-track VAPT: Blackbox engine + Whitebox AWS audit, unified correlator, single report**
+
+Give it a target. It picks the right engine — recon/fuzz/scan from the outside, or `cloud_hunt` from the inside (Prowler + PMapper + secrets correlator) — and feeds findings through the same correlator into the same Burp-style HTML report. The whitebox layer adds CIS / SOC2 / HIPAA / FedRAMP / FFIEC compliance evidence, IAM blast-radius graphs, and Lambda-environment / S3 / CloudWatch-Logs / SSM / SecretsManager / EC2-userdata secret scanning. v8 stays compatible with everything v7 added — engagement-privacy proxy, HAR auth replay, meme-coin module, HackerOne MCP, anonymization vault.
 
 > *"He who seeks the truth must be ready to face the fire."*
 > — inspired by the legend of Vikramaditya
@@ -19,19 +21,101 @@
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
 
-[Quick Start](#quick-start) · [What's New in v7.x](#whats-new-in-v7x) · [Engagement Privacy](#engagement-privacy-v70v71) · [HAR-based Testing](#har-based-authenticated-testing) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
+[Quick Start](#quick-start) · [What's New in v8.0](#whats-new-in-v80) · [Whitebox AWS Audit](#whitebox-aws-audit-v80) · [Engagement Privacy](#engagement-privacy-v70v71) · [HAR-based Testing](#har-based-authenticated-testing) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
 
 ---
 
 **One target → Auto-fingerprint → Smart engine selection → AI writes exploit code → Professional report**
 
-**🔥 NEW: HAR-based authenticated testing — Use real browser sessions for deep security testing**
+**🔥 NEW in v8.0: Whitebox AWS audit (Prowler + PMapper + secrets correlator) feeds the same report.**
 
 </div>
 
 ---
 
-## What's New in v7.x
+## What's New in v8.0
+
+| Pillar | What it does |
+|:-------|:-------------|
+| **`whitebox/cloud_hunt.py`** | Authenticated AWS audit. Iterates account-wide inventory (26 services × enabled regions), runs Prowler full-checks suite (~380 controls, OCSF JSON + CIS 1.4 / 1.5 / 2.0 / 3.0 / SOC2 / HIPAA / FedRAMP / FFIEC / GxP / AWS-FSBP / AWS-Well-Architected compliance CSVs), builds the PMapper IAM blast-radius graph (privesc paths, admin-reachability), scans secrets across Lambda env vars / SSM / SecretsManager / EC2 user-data / CloudWatch-Logs / S3 (with brain-driven or heuristic bucket selection so the scan finishes in minutes not hours), and emits a normalized correlator-ready findings dump. |
+| **Region-aware by default** | `ec2 describe-regions` filtered to opt-in-status in (`opt-in-not-required`, `opted-in`) — unenabled opt-in regions never enter the iteration set, so boto3 doesn't hang in SYN_SENT against `me-south-1` / `af-south-1`. Override via `WHITEBOX_REGIONS=us-east-1,ap-south-1,eu-west-1`. |
+| **Isolated-venv tool discovery** | Prowler 4.5 hard-pins `pydantic 1.10.18` (incompatible with `ollama` and most other deps in the main venv); PMapper 1.1.5 has its own dependency cluster. Whitebox discovers both binaries via env override → standard venv paths → `$PATH`. Lifts the typical pain of running CIS-grade audit tools alongside an LLM agent in one repo. |
+| **macOS / Linux storage path support** | PMapper's graph storage on macOS lives under `~/Library/Application Support/com.nccgroup.principalmapper/`, not `~/.principalmapper/`. Wrapper handles both, plus Linux XDG paths and `/var/lib/principalmapper`. |
+| **Configurable phase timeouts** | `PROWLER_TIMEOUT` (default 5400s) and `PMAPPER_TIMEOUT` (default 1800s) — large IAM estates and full-scope Prowler scans now extend cleanly without source edits. |
+| **Per-phase atomic manifest** | Every phase reports `complete` or `failed` with `completed_at` and `artifacts`. Re-runs without `--refresh` skip cached fresh phases (24h TTL); `--refresh` busts everything. Failed phases auto-retry on the next invocation. |
+| **Correlator hand-off** | Cloud assets (EC2, S3, Route53) are written as a per-account `asset_feed_<account>.json` and merged across accounts into `asset_feed.json` so blackbox findings on `203.0.113.42` get cloud context (instance ID, IAM role, SG posture, bucket public-access state) inline in the final report. |
+| **Scope-lock by allowlist** | Route53 zones in the audited account are intersected with `--allowlist <domain>` before being treated as in-scope; `--no-scope-lock` is required to audit every zone. Prevents the engagement-creep pattern of "I audited this account, look what I found in their other domain." |
+| **142-test whitebox suite** | Unit + integration coverage of every phase, plus optional smoke (`WHITEBOX_SMOKE=1`) against real AWS profiles for end-to-end validation. |
+
+### Why dual-track matters
+
+Blackbox tests like a real attacker (no credentials, perimeter-only). Whitebox tests like an authorized cloud auditor (read-only IAM credentials, account-wide visibility). They surface different bug classes:
+
+- Blackbox finds: open ports, default IIS pages, SSRF, IDOR, public S3 with the right key guess.
+- Whitebox finds: orphan SG rules, IAM privesc graphs, leaked secrets in Lambda env vars, missing CIS controls, GuardDuty findings going to a void, root MFA misconfig, CloudTrail / KMS gaps.
+
+Run them together, and the correlator surfaces the chains: "the public-Internet host you found is in a VPC peered to PROD, runs as an IAM role with `iam:AttachRolePolicy`, and the Lambda next door has an AWS access key in its env vars." That chain is invisible to either tool alone.
+
+### Whitebox AWS Audit (v8.0)
+
+```bash
+# Run alongside a blackbox engagement (vikramaditya.py auto-detects from whitebox_config.yaml)
+python3 vikramaditya.py example.com
+
+# Standalone whitebox-only run, single AWS profile
+python3 -m whitebox.cloud_hunt --profile client-erp \
+    --allowlist example.com \
+    --session-dir recon/example.com
+
+# Multi-account run with all timeouts widened for a large IAM estate
+PROWLER_TIMEOUT=7200 PMAPPER_TIMEOUT=3600 \
+WHITEBOX_REGIONS=us-east-1,ap-south-1,eu-west-1 \
+python3 -m whitebox.cloud_hunt \
+    --profile client-erp --profile client-data \
+    --allowlist example.com --allowlist example-data.invalid \
+    --session-dir recon/example.com --refresh
+
+# Audit every public Route53 zone in the account (skip allowlist intersection)
+python3 -m whitebox.cloud_hunt --profile client-erp --no-scope-lock \
+    --session-dir recon/example.com
+```
+
+**Required external tools (one-time install):**
+
+```bash
+# Prowler — pydantic-pinned, install in an isolated venv
+python3 -m venv ~/.venvs/prowler            # use Python 3.11
+~/.venvs/prowler/bin/pip install prowler-cloud==4.5.0
+
+# PMapper — patch a Python 3.10+ collections.abc bug
+python3.11 -m venv ~/.venvs/pmapper
+~/.venvs/pmapper/bin/pip install principalmapper
+sed -i '' 's/from collections import Mapping/from collections.abc import Mapping/' \
+    ~/.venvs/pmapper/lib/python*/site-packages/principalmapper/util/case_insensitive_dict.py
+```
+
+The discovery order for both binaries: `<TOOL>_BIN` env var → `~/.venvs/<tool>/bin/<tool>` → `~/.local/share/<tool>/bin/<tool>` → `/opt/<tool>/bin/<tool>` → `$PATH`.
+
+**Required IAM permissions** (audit user / role): `ReadOnlyAccess` + `SecurityAudit`. To enable full secret-value scanning add `secretsmanager:GetSecretValue`; without it the scanner falls back to metadata-only.
+
+**Session output structure:**
+
+```
+recon/<target>/cloud/<account_id>/
+├── inventory/                 # 26 services × N regions, raw boto3 JSON
+├── prowler/                   # OCSF JSON + 17 compliance CSVs
+├── pmapper/                   # Graph storage copy + stdout/stderr logs
+├── secrets/                   # Per-finding redacted JSON (mode 0600 in 0700 dir)
+├── findings.json              # Consolidated normalized findings
+├── manifest.json              # Per-phase status + TTL cache key
+└── ../correlation/
+    ├── asset_feed_<account>.json
+    └── asset_feed.json        # Merged across accounts in this session
+```
+
+---
+
+## What's New in v7.x (still active)
 
 v5 → v7 added **10 releases, 270 passing tests, 1 new security domain (client-data anonymization), 1 new web3 sub-domain (meme-coin / Solana / DEX LP), and a HackerOne MCP server.** Full changelog in [`CHANGELOG.md`](CHANGELOG.md).
 

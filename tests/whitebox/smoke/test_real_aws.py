@@ -9,8 +9,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("profile_name,expected_account", [
-    ("adf-erp",     "443370705278"),
-    ("adf-pranapr", "591335425990"),
+    ("client-erp",     "111122223333"),
+    ("example-example-data", "444455556666"),
 ])
 def test_validate_real_profile(profile_name, expected_account):
     prof = validate(CloudProfile(name=profile_name))
@@ -18,7 +18,7 @@ def test_validate_real_profile(profile_name, expected_account):
     assert prof.permission_probe["simulate_principal_policy"] is True
 
 
-@pytest.mark.parametrize("profile_name", ["adf-erp", "adf-pranapr"])
+@pytest.mark.parametrize("profile_name", ["client-erp", "example-example-data"])
 def test_route53_zones_returned(profile_name):
     from whitebox.inventory.route53 import candidate_domains
     prof = validate(CloudProfile(name=profile_name))

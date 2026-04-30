@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a self-contained `whitebox/` package that audits AWS accounts (`adf-erp` → 443370705278, `adf-pranapr` → 591335425990), pulls IAM/secrets/exposure data, correlates with blackbox findings, and produces an integrated Burp-style HTML report.
+**Goal:** Add a self-contained `whitebox/` package that audits AWS accounts (`client-erp` → 111122223333, `example-example-data` → 444455556666), pulls IAM/secrets/exposure data, correlates with blackbox findings, and produces an integrated Burp-style HTML report.
 
 **Architecture:** Sequential, brain-orchestrated, per-account pipeline. Wraps Prowler v4 (cloud audit), PMapper (IAM graph), and a custom secrets/exposure/correlation layer. Every finding traces to a deterministic rule. Brain (Ollama) plans phases, selects targets, filters chains, and writes narratives — never invents findings or alters severity without citing a rule.
 
@@ -516,17 +516,17 @@ def test_validate_calls_sts(tmp_path):
     fake_session = MagicMock()
     fake_sts = MagicMock()
     fake_sts.get_caller_identity.return_value = {
-        "UserId": "AID", "Account": "443370705278",
-        "Arn": "arn:aws:iam::443370705278:user/venkata.satish-audit",
+        "UserId": "AID", "Account": "111122223333",
+        "Arn": "arn:aws:iam::111122223333:user/audit-user",
     }
     fake_session.client.return_value = fake_sts
     fake_session.get_available_regions.return_value = ["us-east-1", "ap-south-1"]
 
     with patch("boto3.Session", return_value=fake_session):
-        prof = validate(CloudProfile(name="adf-erp"))
+        prof = validate(CloudProfile(name="client-erp"))
 
-    assert prof.account_id == "443370705278"
-    assert prof.arn.endswith("venkata.satish-audit")
+    assert prof.account_id == "111122223333"
+    assert prof.arn.endswith("audit-user")
     assert "us-east-1" in prof.regions
 
 
@@ -879,13 +879,13 @@ def profile(monkeypatch):
 @mock_aws
 def test_enumerate_returns_zone_names(profile):
     r = boto3.client("route53")
-    r.create_hosted_zone(Name="adfactorspr.com.", CallerReference="x")
-    r.create_hosted_zone(Name="pranapr.com.", CallerReference="y")
+    r.create_hosted_zone(Name="example-prod.invalid.", CallerReference="x")
+    r.create_hosted_zone(Name="example-data.invalid.", CallerReference="y")
     profile._session = boto3.Session(region_name="us-east-1")
 
     zones = enumerate_zones(profile)
     names = sorted(z["name"] for z in zones)
-    assert names == ["adfactorspr.com", "pranapr.com"]
+    assert names == ["example-prod.invalid", "example-data.invalid"]
 
 
 @mock_aws
@@ -3071,7 +3071,7 @@ def test_cli_requires_profile_arg(capsys, monkeypatch):
 
 def test_cli_calls_orchestrator_with_profile(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", [
-        "cloud_hunt", "--profile", "adf-erp",
+        "cloud_hunt", "--profile", "client-erp",
         "--session-dir", str(tmp_path),
     ])
     fake_run = MagicMock(return_value=0)
@@ -3080,7 +3080,7 @@ def test_cli_calls_orchestrator_with_profile(monkeypatch, tmp_path):
     assert rc == 0
     fake_run.assert_called_once()
     args, kwargs = fake_run.call_args
-    assert kwargs.get("profile_name") == "adf-erp" or "adf-erp" in args
+    assert kwargs.get("profile_name") == "client-erp" or "client-erp" in args
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -3476,8 +3476,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("profile_name,expected_account", [
-    ("adf-erp",     "443370705278"),
-    ("adf-pranapr", "591335425990"),
+    ("client-erp",     "111122223333"),
+    ("example-example-data", "444455556666"),
 ])
 def test_validate_real_profile(profile_name, expected_account):
     prof = validate(CloudProfile(name=profile_name))
@@ -3485,7 +3485,7 @@ def test_validate_real_profile(profile_name, expected_account):
     assert prof.permission_probe["simulate_principal_policy"] is True
 
 
-@pytest.mark.parametrize("profile_name", ["adf-erp", "adf-pranapr"])
+@pytest.mark.parametrize("profile_name", ["client-erp", "example-example-data"])
 def test_route53_zones_returned(profile_name):
     from whitebox.inventory.route53 import in_scope_domains
     prof = validate(CloudProfile(name=profile_name))
@@ -3508,7 +3508,7 @@ Expected: 4 PASSED. If permissions or profile names differ, fix profile setup be
 
 ```bash
 git add tests/whitebox/smoke/test_real_aws.py
-git commit -m "test(whitebox): opt-in smoke test for adf-erp + adf-pranapr profiles"
+git commit -m "test(whitebox): opt-in smoke test for client-erp + example-example-data profiles"
 ```
 
 ---
@@ -3526,16 +3526,16 @@ git commit -m "test(whitebox): opt-in smoke test for adf-erp + adf-pranapr profi
 # Vikramaditya Whitebox — profile ↔ in-scope domain mapping
 # Auto-populated from Route53 on first run; edit to override.
 profiles:
-  adf-erp:
-    account_id: "443370705278"
+  client-erp:
+    account_id: "111122223333"
     display: "ADF ERP"
     domains:
-      - adfactorspr.com
-  adf-pranapr:
-    account_id: "591335425990"
+      - example-prod.invalid
+  example-example-data:
+    account_id: "444455556666"
     display: "ADF Pranapr"
     domains:
-      - pranapr.com
+      - example-data.invalid
 
 # Per-engagement runtime defaults
 defaults:
@@ -3557,14 +3557,14 @@ and exploit chaining.
 
 ```bash
 # Standalone whitebox audit (single account)
-python3 -m whitebox.cloud_hunt --profile adf-erp --session-dir recon/adfactorspr.com/sessions/<id>
+python3 -m whitebox.cloud_hunt --profile client-erp --session-dir recon/example-prod.invalid/sessions/<id>
 
 # Both accounts
-python3 -m whitebox.cloud_hunt --profile adf-erp --profile adf-pranapr \
+python3 -m whitebox.cloud_hunt --profile client-erp --profile example-example-data \
   --session-dir recon/<target>/sessions/<id>
 
 # Bust the 24h phase cache and re-run everything
-python3 -m whitebox.cloud_hunt --profile adf-erp --refresh --session-dir <dir>
+python3 -m whitebox.cloud_hunt --profile client-erp --refresh --session-dir <dir>
 ```
 
 When `vikramaditya.py` runs, it auto-detects whether the target domain is
@@ -3620,27 +3620,27 @@ Expected: 4 passed (validates STS + Route53 against real AWS).
 
 Run:
 ```
-python3 -m whitebox.cloud_hunt --profile adf-erp \
-  --session-dir recon/adfactorspr.com/sessions/whitebox-smoke
+python3 -m whitebox.cloud_hunt --profile client-erp \
+  --session-dir recon/example-prod.invalid/sessions/whitebox-smoke
 ```
-Expected: completes (may take 30–60 min). Inspect `recon/adfactorspr.com/sessions/whitebox-smoke/cloud/443370705278/findings.json`.
+Expected: completes (may take 30–60 min). Inspect `recon/example-prod.invalid/sessions/whitebox-smoke/cloud/111122223333/findings.json`.
 
 - [ ] **Step 5: Generate full report**
 
 Run:
 ```
-python3 reporter.py recon/adfactorspr.com/sessions/whitebox-smoke/findings/ \
-  --client "ADF" --target adfactorspr.com
+python3 reporter.py recon/example-prod.invalid/sessions/whitebox-smoke/findings/ \
+  --client "ADF" --target example-prod.invalid
 ```
-Inspect the HTML output for the "Cloud Posture — Account 443370705278" chapter and any inline cloud context.
+Inspect the HTML output for the "Cloud Posture — Account 111122223333" chapter and any inline cloud context.
 
 - [ ] **Step 6: Commit smoke artifacts (only the report files, not raw secrets)**
 
 ```bash
 git status
 # Verify cloud/secrets/ is gitignored (per Task 0)
-git add recon/adfactorspr.com/sessions/whitebox-smoke/reports/
-git commit -m "test(whitebox): smoke run report artifacts for adf-erp"
+git add recon/example-prod.invalid/sessions/whitebox-smoke/reports/
+git commit -m "test(whitebox): smoke run report artifacts for client-erp"
 ```
 
 ---

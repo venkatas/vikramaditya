@@ -22,9 +22,9 @@ def test_cli_requires_scope_lock_decision(capsys, monkeypatch):
 
 def test_cli_calls_orchestrator_with_profile_and_allowlist(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", [
-        "cloud_hunt", "--profile", "adf-erp",
+        "cloud_hunt", "--profile", "client-erp",
         "--session-dir", str(tmp_path),
-        "--allowlist", "adfactorspr.com",
+        "--allowlist", "example-prod.invalid",
     ])
     fake_run = MagicMock(return_value=0)
     with patch("whitebox.cloud_hunt.run_for_profile", fake_run):
@@ -32,8 +32,8 @@ def test_cli_calls_orchestrator_with_profile_and_allowlist(monkeypatch, tmp_path
     assert rc == 0
     fake_run.assert_called_once()
     _, kwargs = fake_run.call_args
-    assert kwargs.get("profile_name") == "adf-erp"
-    assert kwargs.get("authorized_allowlist") == ["adfactorspr.com"]
+    assert kwargs.get("profile_name") == "client-erp"
+    assert kwargs.get("authorized_allowlist") == ["example-prod.invalid"]
 
 
 def test_cli_no_scope_lock_passes_wildcard(monkeypatch, tmp_path):

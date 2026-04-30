@@ -1,7 +1,7 @@
 # Whitebox VAPT — Post-Merge Backlog
 
-Filed 2026-04-29 after live validation against `adf-pranapr` (account 591335425990)
-and cross-check with the AdfactorPR AWS Posture report dated 29-Apr-2026.
+Filed 2026-04-29 after live validation against `example-example-data` (account 444455556666)
+and cross-check with the ExampleClient AWS Posture report dated 29-Apr-2026.
 
 The branch `feat/whitebox-vapt` is being merged with these gaps known and tracked.
 None are bugs in shipped behavior; all are net-new detection surface.
@@ -19,14 +19,14 @@ Priority is severity-of-blind-spot, highest first.
 2. Does that host have a public IP?
 3. Does a TCP packet from outside complete a three-way handshake to that port?
 
-**Evidence from 29-Apr live run (adf-pranapr).** Five SGs flagged for "MSSQL 1433
+**Evidence from 29-Apr live run (example-example-data).** Five SGs flagged for "MSSQL 1433
 from 0/0":
 
-- `AD-FACTOR-PROD-RDS-SG`, `ad-factor-rds-3-ondemand`, `ad-factor-rds-3-uat`,
+- `AD-FACTOR-PROD-RDS-SG`, `example-co-rds-3-ondemand`, `example-co-rds-3-uat`,
   `radar-boundary-box-lambda-SG` — **0 instances attached** (orphan rules).
-- `ADF-OpenVPN` (`13.232.207.52`) — 1 instance with public IP, but `:1433` and
+- `EXAMPLE-OpenVPN` (`203.0.113.12`) — 1 instance with public IP, but `:1433` and
   `:5432` time out on direct TCP probe (filtered upstream).
-- `AD-FACTOR-PROD-ES-ASG` "9200 + 5601 from 0/0" — host `ADF-ElasticSearch`
+- `AD-FACTOR-PROD-ES-ASG` "9200 + 5601 from 0/0" — host `EXAMPLE-ElasticSearch`
   has **no public IP**, lives in a private subnet.
 - Account contains **0 RDS instances**, period.
 
@@ -95,7 +95,7 @@ configured, etc.).
 For every SNS topic referenced by an EventBridge rule or a CloudWatch alarm,
 flag if `sns list-subscriptions-by-topic` returns zero confirmed subscribers.
 
-**Evidence.** Manual report: "pranapr `security-alerts` SNS topic — zero
+**Evidence.** Manual report: "example-data `security-alerts` SNS topic — zero
 subscribers; CloudTrail-tampering and S3-LogBucket-tampering rules fire into
 this topic. Tampering events go nowhere."
 
@@ -110,7 +110,7 @@ this topic. Tampering events go nowhere."
 ## P3 — SSM coverage check
 
 **Problem.** Manual report Headline 3 ("Forensic agility on the anchor host
-absent — EC2AMZ-D8IH8H1 not SSM-managed; ~37% of pranapr running fleet
+absent — EC2AMZ-D8IH8H1 not SSM-managed; ~37% of example-data running fleet
 similarly unmanaged"). We don't query `ssm describe-instance-information`.
 
 **What to add.**
@@ -149,8 +149,8 @@ focused fingerprint pass:
 - `Server: Microsoft-HTTPAPI/2.0` raw `http.sys` listeners (often forgotten
   WCF / self-hosted WebAPI; commonly missing auth).
 
-Live run evidence: `13.232.36.49` and `13.202.204.62` both serve default IIS
-10.0 pages from 2024; `13.202.204.62:443` returns `Microsoft-HTTPAPI/2.0` HTTP/2
+Live run evidence: `203.0.113.10` and `203.0.113.11` both serve default IIS
+10.0 pages from 2024; `203.0.113.11:443` returns `Microsoft-HTTPAPI/2.0` HTTP/2
 404 — raw http.sys listener, not IIS-fronted.
 
 This bridges the cloud-audit pipeline back into the existing blackbox scanner
@@ -160,7 +160,7 @@ This bridges the cloud-audit pipeline back into the existing blackbox scanner
 
 ## P6 — Configurable phase timeouts (PMAPPER_TIMEOUT, dynamic Prowler timeout)
 
-**Problem.** The 29-Apr live run against adf-pranapr (account 591335425990)
+**Problem.** The 29-Apr live run against example-example-data (account 444455556666)
 showed both upstream tools hit timeouts on a real account at scale:
 
 - **Prowler:** 5400s (90 min) was insufficient for `--no-scope-lock` runs on
@@ -195,7 +195,7 @@ something between `_persist_phase_findings` (line 215) and
 the manifest update.
 
 **Reproduction.** Run `cloud_hunt --no-scope-lock --refresh` against
-adf-pranapr; secrets dir fills with 145 files but manifest.json never gains a
+example-example-data; secrets dir fills with 145 files but manifest.json never gains a
 `secrets` key.
 
 **Investigation entry points:**
@@ -222,7 +222,7 @@ For accounts that have not enabled an opt-in region, boto3 hangs in SYN_SENT
 on TCP handshake to that region's API endpoints, and the secrets phase never
 makes forward progress.
 
-**Evidence (29-Apr live run on adf-erp, account 443370705278).** Run hung at
+**Evidence (29-Apr live run on client-erp, account 111122223333).** Run hung at
 T+1h21m, secrets dir empty, active TCP socket in SYN_SENT to
 `ec2-15-185-84-192.me-south-1.compute.amazonaws.com:443`. Killed manually.
 Same hang class that motivated `PMAPPER_REGIONS`, now manifesting in
@@ -242,12 +242,12 @@ Same hang class that motivated `PMAPPER_REGIONS`, now manifesting in
    to raise `EndpointConnectionError`; assert the source skips the region
    and continues, and the wall-clock impact is bounded.
 
-**Acceptance.** Live run against adf-erp completes the secrets phase in
+**Acceptance.** Live run against client-erp completes the secrets phase in
 under 5 minutes regardless of opt-in region status.
 
 ---
 
-## P9 — adf-erp live validation results (29-Apr)
+## P9 — client-erp live validation results (29-Apr)
 
 Recording the partial-run validation results so the next session has a
 baseline to compare against once P8 lands.
@@ -255,14 +255,14 @@ baseline to compare against once P8 lands.
 | Phase | Status | Notes |
 |---|---|---|
 | inventory | complete | 26/26 services, 17 regions, ~12 min |
-| **prowler** | **complete** | **3,750 OCSF findings**: severity 5 (HIGH) 1,317; sev 4 (MEDIUM-HIGH) 681; sev 3 (MEDIUM) 1,517; sev 2 (LOW) 234; sev 1 (INFO) 1. Plus CIS 1.5 / SOC2 / HIPAA / GxP compliance CSVs. **First successful Prowler completion** of the engagement (pranapr timed out). |
+| **prowler** | **complete** | **3,750 OCSF findings**: severity 5 (HIGH) 1,317; sev 4 (MEDIUM-HIGH) 681; sev 3 (MEDIUM) 1,517; sev 2 (LOW) 234; sev 1 (INFO) 1. Plus CIS 1.5 / SOC2 / HIPAA / GxP compliance CSVs. **First successful Prowler completion** of the engagement (example-data timed out). |
 | iam (PMapper) | failed | Not a timeout — graph **was** generated successfully (49 nodes, 7 admins, 19 edges, 74 policies) but the wrapper looked at `~/.principalmapper` instead of macOS appdirs path. **Fixed on `feat/pmapper-timeout-env` at commit `7d3a958`** but not yet validated end-to-end. |
 | exposure | complete | Asset tagging based on inventory + Prowler. |
 | secrets | hung | See P8. Manually killed at T+1h21m. |
 | correlation | not reached | — |
 
 **Permission probe** (also recorded by `whitebox/profiles.py::probe_permissions`)
-came back clean — `ReadOnlyAccess + SecurityAudit` on `venkata.satish-audit`
+came back clean — `ReadOnlyAccess + SecurityAudit` on `audit-user`
 worked for every API call attempted.
 
 ---

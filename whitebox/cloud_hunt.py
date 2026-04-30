@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.allowlist and not args.no_scope_lock:
         print(
             "error: --allowlist (repeatable) or --no-scope-lock is REQUIRED.\n"
-            "  Pass each authorized in-scope domain via --allowlist (e.g. --allowlist adfactorspr.com),\n"
+            "  Pass each authorized in-scope domain via --allowlist (e.g. --allowlist example-prod.invalid),\n"
             "  or explicitly disable scope-locking with --no-scope-lock.",
             file=sys.stderr,
         )

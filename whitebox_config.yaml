@@ -1,16 +1,16 @@
 # Vikramaditya Whitebox — profile ↔ in-scope domain mapping
 # Auto-populated from Route53 on first run; edit to override.
 profiles:
-  adf-erp:
-    account_id: "443370705278"
+  client-erp:
+    account_id: "111122223333"
     display: "ADF ERP"
     domains:
-      - adfactorspr.com
-  adf-pranapr:
-    account_id: "591335425990"
+      - example-prod.invalid
+  example-example-data:
+    account_id: "444455556666"
     display: "ADF Pranapr"
     domains:
-      - pranapr.com
+      - example-data.invalid
 
 # Per-engagement runtime defaults
 defaults:

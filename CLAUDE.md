@@ -122,21 +122,21 @@ and exploit chaining.
 
 ```bash
 # Standalone whitebox audit (single account)
-python3 -m whitebox.cloud_hunt --profile adf-erp \
-  --allowlist adfactorspr.com \
-  --session-dir recon/adfactorspr.com
+python3 -m whitebox.cloud_hunt --profile client-erp \
+  --allowlist example-prod.invalid \
+  --session-dir recon/example-prod.invalid
 
 # Both accounts in one run
-python3 -m whitebox.cloud_hunt --profile adf-erp --profile adf-pranapr \
-  --allowlist adfactorspr.com --allowlist pranapr.com \
+python3 -m whitebox.cloud_hunt --profile client-erp --profile example-example-data \
+  --allowlist example-prod.invalid --allowlist example-data.invalid \
   --session-dir recon/<target>
 
 # Bust the 24h phase cache and re-run everything
-python3 -m whitebox.cloud_hunt --profile adf-erp --refresh \
-  --allowlist adfactorspr.com --session-dir <dir>
+python3 -m whitebox.cloud_hunt --profile client-erp --refresh \
+  --allowlist example-prod.invalid --session-dir <dir>
 
 # Disable scope-lock (audit ALL public Route53 zones in the account)
-python3 -m whitebox.cloud_hunt --profile adf-erp --no-scope-lock \
+python3 -m whitebox.cloud_hunt --profile client-erp --no-scope-lock \
   --session-dir <dir>
 ```
 
@@ -194,5 +194,5 @@ passed explicitly. Route53 zones in the AWS account are intersected with
 the allowlist before being treated as in-scope.
 
 **Real-account smoke test:** set `WHITEBOX_SMOKE=1` to run
-`tests/whitebox/smoke/test_real_aws.py` against `adf-erp` and
-`adf-pranapr` profiles.
+`tests/whitebox/smoke/test_real_aws.py` against `client-erp` and
+`example-example-data` profiles.

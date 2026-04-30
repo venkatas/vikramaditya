@@ -12,8 +12,8 @@ The whitebox layer ships as a self-contained `whitebox/` Python package, integra
 
 ## Engagement Context
 
-- **Targets:** `adfactorspr.com` (AWS profile `adf-erp`, account `443370705278`), `pranapr.com` (AWS profile `adf-pranapr`, account `591335425990`).
-- **AWS access:** Both profiles authenticated as `venkata.satish-audit` with `ReadOnlyAccess` + `SecurityAudit` managed policies.
+- **Targets:** `example-prod.invalid` (AWS profile `client-erp`, account `111122223333`), `example-data.invalid` (AWS profile `example-example-data`, account `444455556666`).
+- **AWS access:** Both profiles authenticated as `audit-user` with `ReadOnlyAccess` + `SecurityAudit` managed policies.
 - **Authorization:** VAPT engagement conducted on behalf of a CERT-In empanelled company with written client authorization.
 - **Account-to-domain model:** **Multi-domain per account** — Route53 zones are enumerated per account, every zone in an account is treated as in-scope automatically. Both accounts may host multiple domains; tool tags every finding with source account ID.
 
@@ -146,7 +146,7 @@ recon/<target>/sessions/<id>/cloud/
 ```
 User runs: python3 vikramaditya.py
   └─> orchestrator detects whitebox-eligible target
-      └─> python3 -m whitebox.cloud_hunt --profile adf-erp [--profile adf-pranapr]
+      └─> python3 -m whitebox.cloud_hunt --profile client-erp [--profile example-example-data]
 
 For each AWS profile:
   1. profiles.validate()              → sts:GetCallerIdentity, list policies, probe critical perms
@@ -198,8 +198,8 @@ Each brain call: prompt + structured context → JSON decision → logged to `br
 ```python
 @dataclass
 class CloudProfile:
-    name: str                    # "adf-erp"
-    account_id: str              # "443370705278"
+    name: str                    # "client-erp"
+    account_id: str              # "111122223333"
     arn: str
     regions: list[str]           # all enabled regions
     in_scope_domains: list[str]  # from Route53 zones
@@ -327,7 +327,7 @@ class Finding:
 - **Prowler runner:** test fixtures of canned OCSF JSON (no live Prowler call in unit tests).
 - **PMapper:** test against a fixture graph JSON; do not invoke `pmapper` subprocess in unit tests.
 - **Brain:** mock Ollama responses; assert prompts include required context, decisions logged to trace.
-- **Real-account smoke test:** `tests/smoke/test_real_aws.py` (gated by env var, runs only with explicit opt-in) hits both `adf-erp` and `adf-pranapr` for sanity check during development.
+- **Real-account smoke test:** `tests/smoke/test_real_aws.py` (gated by env var, runs only with explicit opt-in) hits both `client-erp` and `example-example-data` for sanity check during development.
 - **Defensibility test:** scan every emitted Finding, assert `rule_id` is non-null and resolves to a known rule registry.
 
 ## Rollout
@@ -347,7 +347,7 @@ class Finding:
 11. `vikramaditya.py` integration
 12. `hunt.py` consume asset feed
 13. `reporter.py` integration
-14. End-to-end test on `adf-erp` + `adf-pranapr`
+14. End-to-end test on `client-erp` + `example-example-data`
 
 ### Risks & mitigations
 

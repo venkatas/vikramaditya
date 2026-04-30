@@ -15,13 +15,13 @@ def profile(monkeypatch):
 @mock_aws
 def test_enumerate_returns_zone_names(profile):
     r = boto3.client("route53")
-    r.create_hosted_zone(Name="adfactorspr.com.", CallerReference="x")
-    r.create_hosted_zone(Name="pranapr.com.", CallerReference="y")
+    r.create_hosted_zone(Name="example-prod.invalid.", CallerReference="x")
+    r.create_hosted_zone(Name="example-data.invalid.", CallerReference="y")
     profile._session = boto3.Session(region_name="us-east-1")
 
     zones = enumerate_zones(profile)
     names = sorted(z["name"] for z in zones)
-    assert names == ["adfactorspr.com", "pranapr.com"]
+    assert names == ["example-data.invalid", "example-prod.invalid"]
 
 
 @mock_aws

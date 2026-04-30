@@ -43,7 +43,7 @@ def _build_fake_session(account="123456789012", enabled_regions=None):
 def test_validate_calls_sts(tmp_path):
     fake_session = _build_fake_session()
     with patch("boto3.Session", return_value=fake_session):
-        prof = validate(CloudProfile(name="adf-erp"))
+        prof = validate(CloudProfile(name="client-erp"))
 
     assert prof.account_id == "123456789012"
     assert prof.arn.endswith("audit")

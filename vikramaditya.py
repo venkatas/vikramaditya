@@ -2,8 +2,13 @@
 """
 Vikramaditya — One command to rule them all.
 
-Interactive VAPT orchestrator. Give it a target, it figures out the rest.
+v8.0.0 — Dual-track VAPT orchestrator. Blackbox engine (recon, fuzz, scan,
+HAR auth replay) and whitebox engine (AWS audit via Prowler + PMapper +
+secrets scanner) feed the same correlator and report. Give it a target,
+it figures out the rest.
+
 Accepts URLs, domains, IPs, CIDRs, and HAR files (browser session exports).
+For whitebox cloud audit see `python3 -m whitebox.cloud_hunt --help`.
 
 Usage:
     python3 vikramaditya.py
