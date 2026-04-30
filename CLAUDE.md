@@ -176,6 +176,15 @@ inline cloud context on each blackbox finding.
   Timeout override: set `PMAPPER_TIMEOUT=3600` (seconds) when the default
   1800s is too tight for a large IAM estate. Mirrors `PROWLER_TIMEOUT`.
 
+**Region narrowing (whole pipeline):** by default, `cloud_hunt` calls
+`ec2 describe-regions` filtered to `opt-in-status` in (`opt-in-not-required`,
+`opted-in`) to skip opt-in regions the account has not enabled. Without
+this, boto3 hangs in SYN_SENT against unenabled opt-in regions
+(`me-south-1`, `af-south-1`, etc.). To override explicitly, set
+`WHITEBOX_REGIONS=us-east-1,ap-south-1,eu-west-1`. The fallback when
+`describe-regions` is denied is `session.get_available_regions("ec2")`
+(legacy behaviour).
+
 **Permission gaps:** Whitebox falls back to metadata-only when
 `secretsmanager:GetSecretValue` is denied. To enable full secret-value
 scanning, add `secretsmanager:GetSecretValue` to the audit user's policy.
