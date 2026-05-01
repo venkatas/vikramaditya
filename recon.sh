@@ -677,6 +677,42 @@ fi
 fi  # end Phase 3 resume skip
 
 # ============================================================
+# Phase 3.5: TLS Cert SAN Harvest (v9.0 — P11)
+# Pulls Subject-Alternative-Names from each live host's TLS cert.
+# Often surfaces adjacent client domains that subdomain-enum sources miss
+# (during the live engagement this surfaced merryspiders.com from the IIS
+# host's cert in 60 seconds; subfinder + amass + assetfinder produced 0 hits).
+# ============================================================
+echo ""
+log_info "Phase 3.5: TLS Cert SAN Harvest"
+mkdir -p "$RECON_DIR/certs"
+if phase_done "$RECON_DIR/certs/sans.txt"; then true; else
+if tool_ok tlsx && [ -s "$RECON_DIR/live/ips.txt" ]; then
+    log_step "tlsx (Subject-Alternative-Name extraction)..."
+    cat "$RECON_DIR/live/ips.txt" \
+        | tlsx -san -cn -resp-only -silent -c 30 2>/dev/null \
+        | sort -u > "$RECON_DIR/certs/sans.txt" || true
+    SAN_COUNT=$(file_lines "$RECON_DIR/certs/sans.txt")
+    log_done "tlsx: $SAN_COUNT cert SAN/CN values"
+
+    # Cross-check against subdomains/all.txt: anything new is a "scope candidate"
+    if [ "$SAN_COUNT" -gt 0 ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
+        comm -23 \
+            <(grep -E '\.[a-z]+$' "$RECON_DIR/certs/sans.txt" | sort -u) \
+            <(sort -u "$RECON_DIR/subdomains/all.txt") \
+            > "$RECON_DIR/certs/scope_candidates.txt" 2>/dev/null || true
+        NEW=$(file_lines "$RECON_DIR/certs/scope_candidates.txt")
+        if [ "$NEW" -gt 0 ]; then
+            log_warn "tlsx surfaced $NEW domain(s) not in subdomain enum — see certs/scope_candidates.txt"
+        fi
+    fi
+else
+    [ -s "$RECON_DIR/live/ips.txt" ] || log_warn "Phase 3.5 skipped — no live hosts"
+    tool_ok tlsx || log_warn "Phase 3.5 skipped — tlsx not installed (go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest)"
+fi
+fi  # end Phase 3.5
+
+# ============================================================
 # Phase 4: Tech CVE Prioritization
 # ============================================================
 echo ""
@@ -740,6 +776,34 @@ fi
 ASYNC_LOG_DIR="$RECON_DIR/.async"
 start_async_phase "Phase 5: Port Scanning" "$ASYNC_LOG_DIR/phase5_port_scanning.log" run_phase5_port_scanning
 start_async_phase "Phase 11: Subdomain Takeover Pre-Check" "$ASYNC_LOG_DIR/phase11_takeover_check.log" run_phase11_takeover_check
+
+# ============================================================
+# Phase 4.5: Visual Recon (v9.0 — P15)
+# Renders each live URL with a headless browser and saves a screenshot +
+# the rendered DOM title. During the engagement this caught the UNI5
+# HRMS production host that initially looked like an Apache default
+# install page on HTTP — the JS-driven /signin page was only visible
+# after a real browser followed the 307 redirect.
+# ============================================================
+echo ""
+log_info "Phase 4.5: Visual Recon"
+mkdir -p "$RECON_DIR/screenshots"
+if phase_done "$RECON_DIR/screenshots/.gowitness.done"; then true; else
+if tool_ok gowitness && [ -s "$RECON_DIR/live/urls.txt" ]; then
+    URL_COUNT=$(file_lines "$RECON_DIR/live/urls.txt")
+    log_step "gowitness ($URL_COUNT URLs, 6 threads, 12s/URL timeout)..."
+    gowitness scan file -f "$RECON_DIR/live/urls.txt" -t 6 -T 12 \
+        -s "$RECON_DIR/screenshots" \
+        --write-jsonl --write-jsonl-file "$RECON_DIR/screenshots/gowitness.jsonl" \
+        -q 2>/dev/null || true
+    SCREENS=$(find "$RECON_DIR/screenshots" -maxdepth 1 -type f \( -name '*.jpeg' -o -name '*.png' \) 2>/dev/null | wc -l | tr -d ' ')
+    touch "$RECON_DIR/screenshots/.gowitness.done"
+    log_done "gowitness: $SCREENS screenshots → screenshots/"
+else
+    [ -s "$RECON_DIR/live/urls.txt" ] || log_warn "Phase 4.5 skipped — no live URLs"
+    tool_ok gowitness || log_warn "Phase 4.5 skipped — gowitness not installed (go install github.com/sensepost/gowitness@latest)"
+fi
+fi  # end Phase 4.5
 
 # ============================================================
 # Phase 6: URL Collection
