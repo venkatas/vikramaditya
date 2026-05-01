@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.0.0 — Greybox enrichment: TLS SAN harvest + visual recon + scope auto-suggest + SG description round-trip**
+
+First batch of the v9.0 backlog landed (4 of 15 items: P11, P15, P22, P23).
+- **Phase 3.5 TLS SAN harvest** in `recon.sh` — `tlsx -san -cn` finds adjacent client domains via cert SANs (engagement-validated: surfaced `merryspiders.com` in 60 sec where subfinder + amass + assetfinder produced 0).
+- **Phase 4.5 Visual recon** in `recon.sh` — `gowitness scan file` captures rendered-DOM titles + screenshots (engagement-validated: corrected the misclassification of UNI5 HRMS as "Apache default install page").
+- **SG `Description` round-trip** in `whitebox/exposure/analyzer.py` — operator intent strings ("Mongo DB" tag on the SG ingress) now flow into findings.
+- **Route 53 → blackbox scope auto-suggest** in `whitebox/correlator/scope_suggest.py` — `cloud_hunt` now emits `scope-suggestion.json` listing every client-owned domain reachable from the audited account (Route53 zones + CloudFront aliases + internet-facing ELB DNS + LB product names). The same engagement found 5 client-owned domains via this pattern manually.
+
+Whitebox test suite: **153 passing** (+11), 4 smoke skipped, 0 failures.
+
 **v8.1.0 — Engagement-driven backlog (P10–P24) + tool-list expansion**
 
 The whitebox AWS audit + dual-track operation introduced in v8.0.0 stays unchanged.
