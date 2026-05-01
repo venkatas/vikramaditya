@@ -1,5 +1,33 @@
 # Changelog
 
+## v9.0.0 — Greybox enrichment: TLS SAN harvest + visual recon + scope auto-suggest + SG description round-trip (2026-05-01)
+
+Minor release shipping the first batch of v9.0 backlog items (P11, P15, P22, P23 of `docs/superpowers/backlog/2026-05-01-engagement-driven-tool-gaps.md`). Each is anchored to a specific gap surfaced during the four-day live engagement.
+
+### Added — recon.sh
+
+- **Phase 3.5: TLS Cert SAN Harvest** (P11) — runs `tlsx -san -cn` against the live IP list, dedupes, and emits `certs/sans.txt`. Diffed against the existing subdomain enum into `certs/scope_candidates.txt` so any cert-leaked domain that subdomain enum missed gets surfaced. Skips with friendly hint if `tlsx` isn't installed. (Engagement value: surfaced `merryspiders.com` in 60 sec; subfinder + amass + assetfinder produced 0 hits for it.)
+- **Phase 4.5: Visual Recon** (P15) — runs `gowitness scan file -f live/urls.txt` to capture per-URL JPEG screenshots + the rendered DOM title into `screenshots/`. JSONL output (`screenshots/gowitness.jsonl`) is reporter-consumable. Skips with friendly hint if `gowitness` isn't installed. (Engagement value: caught the v1.3 misclassification of `15.207.251.19/signin` as "Apache default install page" — it's actually the production UNI5 HRMS payroll Sign-In page.)
+
+### Added — whitebox
+
+- **Security-Group `Description` round-trip** (P22) — `whitebox/exposure/analyzer.py::analyze_security_groups` now captures the operator-supplied free-text `Description` field on every public 0.0.0.0/0 / ::/0 ingress rule and returns it under a new `descriptions` key per SG. Knowing whether a rule was deliberately tagged ("Mongo DB") vs. left blank materially changes report tone. 3 new unit tests cover the IPv4 + IPv6 + blank cases.
+- **Route 53 → blackbox scope auto-suggest** (P23) — new module `whitebox/correlator/scope_suggest.py`. The orchestrator's correlation phase now writes `<session>/cloud/<account_id>/scope-suggestion.json` listing every client-owned domain reachable from the audited account: Route 53 hosted zones (public only — internal zones excluded), CloudFront aliases (CNAMEs), Internet-facing ELB DNS names, and ELB-name product fragments that often map to product domains. 8 new unit tests including an engagement-reproduction case (the `Adf-Prod-UI-merryspiders` LB-name → product domain pattern that surfaced merryspiders.com in this engagement).
+
+### Stats
+
+- Whitebox suite: **153 passing** (+11 new tests for v9.0 features), 4 smoke skipped, 0 failures
+- Lines added: ~290 (110 code + 180 tests)
+- Closes 4 of 15 v9.0 backlog items: P11, P15, P22, P23
+- Carry-forward to v9.1: P10 (JS endpoint mining), P12 (greybox correlator), P13 (email security audit), P14/P0 (reachability verification), P16 (DB protocol probe), P17 (bbot wrapper), P18 (S3 bucket-policy capture in findings), P20 (wpscan Docker fallback), P21 (cloud_enum integration), P24 (false-positive memory DB)
+
+### Notes
+
+- v9.0 still requires the operator to install `tlsx` and `gowitness` (`go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest`, `go install github.com/sensepost/gowitness@latest`). Auto-install / dependency manifest is on the v9.1 roadmap.
+- The recon.sh phase numbering now goes 1, 2, 3, 3.5, 4, 4.5, 5, 6 — the half-step naming is intentional so resume-mode (`phase_done` markers) keeps working without renumbering existing artifact paths.
+
+---
+
 ## v8.1.2 — fix(recon): SPA-catchall + empty-body false-positive suppression in Phase 9 (2026-05-01)
 
 Patch release. Closes P19 of the v9.0 backlog.
