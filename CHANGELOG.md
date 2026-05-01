@@ -1,5 +1,38 @@
 # Changelog
 
+## v8.1.2 — fix(recon): SPA-catchall + empty-body false-positive suppression in Phase 9 (2026-05-01)
+
+Patch release. Closes P19 of the v9.0 backlog.
+
+### Fixed
+
+- `recon.sh` Phase 9 (Exposed Config Files & Sensitive Paths) was emitting
+  `[EXPOSED]` lines for any path returning HTTP 200 with a textual content
+  type, regardless of whether the response body was actually configured
+  content or just the host's catch-all shell. Live engagement found two
+  false-positive patterns:
+  1. **SPA catchall** (e.g. `kalki.pranapr.com`) — every path returns the
+     same `<title>Kalki.ai</title>` HTML shell because the host runs a
+     React/Vue SPA and the server hands the bundle for unmatched paths.
+  2. **Empty-body 200** (e.g. `mtrack.merryspiders.com`) — IIS / ASP.NET
+     routing returns `200 OK` with `Content-Length: 0` for paths the
+     application doesn't recognize.
+  Total false positives across the 4-day engagement: **87** (kalki 36 +
+  mtrack/v2 51).
+- New logic: pre-fingerprint each host with one curl to a randomly-named
+  path, save body md5 + size; for each candidate config-path probe, skip
+  if (a) body is empty, (b) body md5 matches the fingerprint, or (c)
+  body size is within 2 bytes of the fingerprint. Single combined GET
+  per probe (was 2: one for status, one for content-type → now one).
+
+### Verified
+
+- `kalki.pranapr.com`: 36 → **0** false positives
+- `mtrack.merryspiders.com`: 51 → **0** false positives
+- `www.pranapr.com`: 0 → 0 (no regression)
+
+---
+
 ## v8.1.1 — fix(hunt): `_probe_url_headers` missing return on success path (2026-05-01)
 
 Patch release. Fixes a `TypeError: cannot unpack non-iterable NoneType object`

@@ -1246,19 +1246,48 @@ log_step "Config-path coverage: $CONFIG_MAX_HOSTS hosts, ${#CONFIG_PATHS[@]} pat
 
 JOB_COUNT=0
 CONFIG_PIDS=()
+# v8.1.2 — closes P19 of v9.0 backlog: kalki + merryspiders both produced
+# 87 false positives because SPA catchall responses (and empty-body 200s)
+# matched the old "status==200 + content-type=text" heuristic. We now
+# pre-fingerprint each host with a random non-existent path; any candidate
+# path whose body md5 matches the fingerprint OR whose body is empty is
+# treated as a non-finding.
+RAND_PROBE_PATH=$(printf "/zzz-no-such-%08x-%08x/" "$RANDOM" "$RANDOM")
 while IFS= read -r base_url; do
     [ -z "$base_url" ] && continue
     (
+        # Per-host SPA-catchall fingerprint pre-flight (one curl).
+        # Any path that returns the same body as this random missing path is
+        # considered a catchall artifact, not a real exposure.
+        FP_BODY=$(curl -s --max-time "$CURL_TIMEOUT" "${base_url}${RAND_PROBE_PATH}" 2>/dev/null || true)
+        FP_MD5=$(printf '%s' "$FP_BODY" | md5 -q 2>/dev/null || printf '%s' "$FP_BODY" | md5sum 2>/dev/null | awk '{print $1}')
+        FP_SIZE=${#FP_BODY}
+
         while IFS= read -r path; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-                --max-time "$CURL_TIMEOUT" "${base_url}${path}" 2>/dev/null || echo "000")
-            if [ "$STATUS" = "200" ]; then
-                CT=$(curl -sI --max-time "$CURL_TIMEOUT" "${base_url}${path}" 2>/dev/null \
-                    | grep -i content-type | head -1)
-                if echo "$CT" | grep -qiE '(javascript|json|text/plain|text/html|text/xml)'; then
-                    echo "[EXPOSED] ${base_url}${path}"
-                fi
+            # Single combined GET — capture status + content-type + body together.
+            HEADER_FILE=$(mktemp -t recon_h.XXXXXXXX 2>/dev/null) || HEADER_FILE="/tmp/recon_h.$$.$RANDOM"
+            BODY=$(curl -s --max-time "$CURL_TIMEOUT" -D "$HEADER_FILE" "${base_url}${path}" 2>/dev/null || true)
+            STATUS=$(awk 'toupper($1) ~ /^HTTP/ {print $2; exit}' "$HEADER_FILE" 2>/dev/null)
+            CT=$(grep -i '^content-type:' "$HEADER_FILE" 2>/dev/null | head -1)
+            rm -f "$HEADER_FILE"
+            [ "$STATUS" = "200" ] || continue
+            echo "$CT" | grep -qiE '(javascript|json|text/plain|text/html|text/xml)' || continue
+
+            # Body checks — suppress the two known false-positive classes
+            BODY_SIZE=${#BODY}
+            [ "$BODY_SIZE" -eq 0 ] && continue   # empty 200 (mtrack pattern)
+            BODY_MD5=$(printf '%s' "$BODY" | md5 -q 2>/dev/null || printf '%s' "$BODY" | md5sum 2>/dev/null | awk '{print $1}')
+            if [ -n "$FP_MD5" ] && [ "$BODY_MD5" = "$FP_MD5" ]; then
+                continue   # SPA catchall (kalki pattern)
             fi
+            # Heuristic: same length within 2 bytes is also catchall (some SPAs
+            # vary by 1 byte from CSP nonce / routing string).
+            if [ -n "$FP_SIZE" ] && [ "$FP_SIZE" -gt 0 ]; then
+                DIFF=$((BODY_SIZE - FP_SIZE)); [ "$DIFF" -lt 0 ] && DIFF=$((-DIFF))
+                if [ "$DIFF" -le 2 ]; then continue; fi
+            fi
+
+            echo "[EXPOSED] ${base_url}${path}"
         done < "$CONFIG_PATHS_FILE"
     ) >> "$RECON_DIR/exposure/config_files.txt" &
     CONFIG_PIDS+=("$!")
