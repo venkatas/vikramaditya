@@ -248,6 +248,19 @@ def run_for_profile(profile_name: str, session_dir: Path,
                 except Exception:
                     continue
             (asset_feed_path / "asset_feed.json").write_text(_json.dumps(all_feeds, indent=2))
+
+            # v9.0 P23 — Route53 → blackbox scope auto-suggest. Emit a per-account
+            # scope-suggestion.json listing every client-owned domain reachable
+            # from this account's inventory (Route53 zones + CloudFront aliases +
+            # internet-facing ELB DNS + LB-name product fragments). Operators
+            # consult this BEFORE blackbox kickoff to avoid missing third-party
+            # client products living in the same AWS account.
+            from whitebox.correlator.scope_suggest import write_scope_suggestion
+            write_scope_suggestion(
+                inv_dir,
+                account_dir / "scope-suggestion.json",
+            )
+
             cache.mark_complete("correlation")
         except Exception as e:
             cache.mark_failed("correlation", error=str(e))
