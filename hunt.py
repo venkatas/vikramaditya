@@ -1859,6 +1859,7 @@ def _probe_url_headers(url: str, timeout: int = 6) -> tuple[int, str]:
                 status = int(parts[1])
         elif line.lower().startswith("content-type:"):
             content_type = line.split(":", 1)[1].strip()
+    return status, content_type
 
 
 def _classify_exposed_file(url: str, domain: str, session_id: str | None = None,

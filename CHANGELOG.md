@@ -1,5 +1,35 @@
 # Changelog
 
+## v8.1.1 — fix(hunt): `_probe_url_headers` missing return on success path (2026-05-01)
+
+Patch release. Fixes a `TypeError: cannot unpack non-iterable NoneType object`
+crash in the autonomous hunt pipeline.
+
+### Fixed
+
+- `hunt.py::_probe_url_headers()` was missing its trailing
+  `return status, content_type` statement. The early-exception path returned
+  `0, ""` correctly, but the success path fell off the end of the function
+  and implicitly returned `None`. Callers in `_propagate_exposed_paths()`
+  did `status, content_type = _probe_url_headers(url)`, which crashed the
+  whole `concurrent.futures.ThreadPoolExecutor` worker pool with the
+  TypeError above. The crash aborted the autonomous hunt after recon
+  finished but before the scanner phase.
+- Discovered during a live full run on `adfactorspr.com` (38 min recon,
+  35 live hosts, 14,605 URLs, 18 exposed configs all produced cleanly —
+  then the post-recon `_propagate_exposed_paths` path-cross-correlation
+  step crashed). Recon output was intact; only the propagation step and
+  downstream phases were affected.
+
+Regression test:
+```python
+>>> import hunt
+>>> hunt._probe_url_headers('https://example.com/', timeout=5)
+(200, 'text/html')   # was None before the fix
+```
+
+---
+
 ## v8.1.0 — Engagement-driven backlog + tool-list expansion (2026-05-01)
 
 Docs-only release. No code paths or behaviours change vs. v8.0.0. Adds an engagement-validated backlog and updates the README + in-code banner.
