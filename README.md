@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v8.1.0 — Engagement-driven backlog (P10–P24) + tool-list expansion**
+
+The whitebox AWS audit + dual-track operation introduced in v8.0.0 stays unchanged.
+This release adds an engagement-validated backlog of 15 tool-improvement items
+([`docs/superpowers/backlog/2026-05-01-engagement-driven-tool-gaps.md`](docs/superpowers/backlog/2026-05-01-engagement-driven-tool-gaps.md))
+covering JS endpoint mining, TLS SAN harvesting, greybox correlation, email security
+audit, visual recon, DB protocol probes, SPA-catchall false-positive suppression,
+and Route53 → blackbox scope auto-suggest. Each item is anchored to a real finding
+the v8.0 pipeline missed, false-positived, or required manual extraction on.
+
 **v8.0.0 — Dual-track VAPT: Blackbox engine + Whitebox AWS audit, unified correlator, single report**
 
 Give it a target. It picks the right engine — recon/fuzz/scan from the outside, or `cloud_hunt` from the inside (Prowler + PMapper + secrets correlator) — and feeds findings through the same correlator into the same Burp-style HTML report. The whitebox layer adds CIS / SOC2 / HIPAA / FedRAMP / FFIEC compliance evidence, IAM blast-radius graphs, and Lambda-environment / S3 / CloudWatch-Logs / SSM / SecretsManager / EC2-userdata secret scanning. v8 stays compatible with everything v7 added — engagement-privacy proxy, HAR auth replay, meme-coin module, HackerOne MCP, anonymization vault.
@@ -21,7 +31,7 @@ Give it a target. It picks the right engine — recon/fuzz/scan from the outside
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#multi-provider-ai)
 
-[Quick Start](#quick-start) · [What's New in v8.0](#whats-new-in-v80) · [Whitebox AWS Audit](#whitebox-aws-audit-v80) · [Engagement Privacy](#engagement-privacy-v70v71) · [HAR-based Testing](#har-based-authenticated-testing) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
+[Quick Start](#quick-start) · [What's New in v8.1](#whats-new-in-v81) · [What's New in v8.0](#whats-new-in-v80) · [Whitebox AWS Audit](#whitebox-aws-audit-v80) · [Engagement Privacy](#engagement-privacy-v70v71) · [HAR-based Testing](#har-based-authenticated-testing) · [Architecture](#architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Reports](#reports) · [Installation](#installation) · [Contributing](#contributing)
 
 ---
 
@@ -30,6 +40,38 @@ Give it a target. It picks the right engine — recon/fuzz/scan from the outside
 **🔥 NEW in v8.0: Whitebox AWS audit (Prowler + PMapper + secrets correlator) feeds the same report.**
 
 </div>
+
+---
+
+## What's New in v8.1
+
+A docs-only release filed after a four-day live VAPT engagement (29 Apr – 1 May 2026) against two AWS accounts and seven client domains. Every item below is anchored to a real finding the v8.0 pipeline either missed, false-positived, or required manual extraction on.
+
+### Backlog highlights (P10 – P24)
+
+| # | Gap | Why it matters | Effort |
+|:--|:----|:---------------|:-------|
+| **P10** | JS endpoint mining for Next.js / Vite / Angular bundles | Hidden subdomains in modern SPAs (engagement found two `*-gateway.example.com` hosts only by `grep` on Next.js chunks) | M |
+| **P11** | TLS SAN harvesting (`tlsx` integration) | Surfaced an additional client domain in 60 sec | S |
+| **P12** | Greybox correlator (whitebox cloud assets → blackbox seed) | 70 of 81 cloud-known IPs were invisible to pure DNS recon | M |
+| **P13** | Email security audit module (DMARC / MTA-STS / TLS-RPT / DNSSEC) | Currently raw `dig` — DMARC misconfiguration was a top-3 finding | M |
+| **P14** | Reachability verification on every exposure finding | 60% Critical-rate overstatement without it | M |
+| **P15** | Visual recon (`gowitness`) | Caught a misclassification of an HRMS app as "Apache default page" | S |
+| **P16** | DB-protocol probe library (MongoDB OP_MSG, Redis INFO, …) | Three-tier severity on DB ports (filtered / open-with-auth / open-without-auth) | M |
+| **P17** | `bbot` wrapper as alternative recon engine | Modular multi-source enum supersets `recon.sh` | M |
+| **P18** | S3 bucket-policy capture in findings | Verbatim policy quote needed for AWS-team remediation | XS |
+| **P19** | SPA-catchall false-positive suppression in exposure module | 87 false positives across two engagements (kalki + mtrack patterns) | XS |
+| **P20** | wpscan via Docker fallback | Homebrew wpscan has Bundler/Ruby gem-path issue on macOS | XS |
+| **P21** | External `cloud_enum` integration | Shadow-IT bucket detection from outside | S |
+| **P22** | SG rule `Description` round-trip | Operator-intent string leaks into findings (better report tone) | XS |
+| **P23** | Route 53 → blackbox scope auto-suggest | Engagement scope was 2 domains; Route 53 held 5 more in the same account | S |
+| **P24** | False-positive memory DB | Same false positive rediscovered three days running | S |
+
+Detail: [`docs/superpowers/backlog/2026-05-01-engagement-driven-tool-gaps.md`](docs/superpowers/backlog/2026-05-01-engagement-driven-tool-gaps.md).
+
+### Tooling that should ship pre-installed in v9.0
+
+`bbot`, `tlsx`, `alterx`, `shuffledns`, `massdns`, `dnsgen`, `fingerprintx`, `xnLinkFinder`, `noseyparker`, `cloud_enum`, `gowitness`, `subzy`, `subjack`, `wpscan-via-docker`, plus the existing ProjectDiscovery base (`subfinder`, `dnsx`, `httpx`, `katana`, `naabu`, `nuclei`, `ffuf`).
 
 ---
 

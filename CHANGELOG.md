@@ -1,5 +1,40 @@
 # Changelog
 
+## v8.1.0 — Engagement-driven backlog + tool-list expansion (2026-05-01)
+
+Docs-only release. No code paths or behaviours change vs. v8.0.0. Adds an engagement-validated backlog and updates the README + in-code banner.
+
+### Added
+
+- `docs/superpowers/backlog/2026-05-01-engagement-driven-tool-gaps.md` — 15 backlog items (P10–P24) anchored to specific findings the v8.0 pipeline missed, false-positived, or required manual extraction on during a four-day live VAPT engagement (29 Apr – 1 May 2026):
+  - **P10** JS endpoint mining for Next.js / Vite / Angular bundles
+  - **P11** TLS Subject-Alternative-Name harvesting (`tlsx` integration)
+  - **P12** Greybox correlator (whitebox cloud asset feed → blackbox seed)
+  - **P13** Email security audit module (DMARC / MTA-STS / TLS-RPT / DNSSEC)
+  - **P14** Reachability verification on every exposure finding (already P0)
+  - **P15** Visual recon module (`gowitness` integration)
+  - **P16** DB-protocol probe library (MongoDB / Redis / Postgres / etc.)
+  - **P17** `bbot` wrapper as alternative recon engine
+  - **P18** S3 bucket-policy capture in findings
+  - **P19** SPA-catchall false-positive suppression in `recon.sh` Phase 9
+  - **P20** wpscan via Docker fallback (Homebrew wpscan has Ruby gem-path issue on macOS)
+  - **P21** External `cloud_enum` integration for shadow-IT bucket detection
+  - **P22** SG rule `Description` field round-trip in findings
+  - **P23** Route 53 → blackbox scope auto-suggest
+  - **P24** False-positive memory DB
+
+### Changed
+
+- `README.md` — new "What's New in v8.1" section (engagement-driven backlog + v9.0 tooling list).
+- `vikramaditya.py` banner — `v8.0.0` → `v8.1.0`.
+
+### Notes
+
+- The v8.0.0 backlog (P0–P9 in `docs/superpowers/backlog/2026-04-29-whitebox-post-merge-backlog.md`) remains open in parallel.
+- v9.0 will ship the implementation of these items plus `bbot`, `tlsx`, `alterx`, `shuffledns`, `massdns`, `dnsgen`, `fingerprintx`, `xnLinkFinder`, `noseyparker`, `cloud_enum`, `gowitness` pre-installed.
+
+---
+
 ## v8.0.0 — Whitebox AWS audit + dual-track operation (2026-04-30)
 
 **Major release.** Adds an authenticated whitebox engine alongside the existing blackbox stack. Both feed the same correlator and the same final report. Previous v7.x capabilities (engagement-privacy proxy, HAR auth replay, meme-coin module, anonymization vault, HackerOne MCP, brain.py) are preserved unchanged.
