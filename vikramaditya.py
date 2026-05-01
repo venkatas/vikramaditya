@@ -2,7 +2,7 @@
 """
 Vikramaditya — One command to rule them all.
 
-v8.0.0 — Dual-track VAPT orchestrator. Blackbox engine (recon, fuzz, scan,
+v8.1.0 — Dual-track VAPT orchestrator. Blackbox engine (recon, fuzz, scan,
 HAR auth replay) and whitebox engine (AWS audit via Prowler + PMapper +
 secrets scanner) feed the same correlator and report. Give it a target,
 it figures out the rest.
