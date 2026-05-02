@@ -34,6 +34,11 @@ from urllib.parse import urlparse
 
 from auth_utils import RateLimiter, JWTHelper, AuthSession, FindingSaver
 
+# v9.x — Semgrep ERROR finding (requests verify=False, ~20 sites in this
+# module). Default to strict TLS; opt out for self-signed staging via
+# VAPT_INSECURE_SSL=1.
+VERIFY_TLS = os.environ.get("VAPT_INSECURE_SSL", "0") != "1"
+
 # ── Severity constants ────────────────────────────────────────────────────────
 CRITICAL, HIGH, MEDIUM, LOW, INFO = "critical", "high", "medium", "low", "info"
 
@@ -60,6 +65,11 @@ DEFAULT_PHASE_ORDER = [
     {"phase": "biz_logic", "priority": 7},
     {"phase": "file_upload", "priority": 6},
     {"phase": "injection", "priority": 5},
+    # Phase 8a — differential NoSQL operator-injection probe (added v9.x
+    # after Codex review caught the api-maya false-positive: a single
+    # ``{"$gt":""}`` 500 was being reported as NoSQLi when it was generic
+    # type confusion. See whitebox/nosql_probe.py for the six-probe diff.
+    {"phase": "nosql_probe", "priority": 5},
     {"phase": "info_disclosure", "priority": 4},
     {"phase": "rate_limit", "priority": 3},
     {"phase": "token_security", "priority": 2},
@@ -156,6 +166,10 @@ def _brain_create_initial_plan(endpoints: list[dict], with_brain: bool) -> list[
         plan.append({"phase": "file_upload", "priority": 6, "reason": f"{len(upload_eps)} upload endpoints"})
     plan.append({"phase": "biz_logic", "priority": 5})
     plan.append({"phase": "injection", "priority": 4})
+    # Phase 8a — differential NoSQL probe (post-injection so SQLi already
+    # eliminated relational DBs as the backend).
+    plan.append({"phase": "nosql_probe", "priority": 4,
+                 "reason": "differential check vs api-maya FP pattern"})
     plan.append({"phase": "token_security", "priority": 3})
     plan.append({"phase": "timing_oracle", "priority": 2})
     plan.append({"phase": "priv_esc", "priority": 1})
@@ -262,6 +276,8 @@ def _run_phase(phase_spec: dict, session: AuthSession, token: str,
             return results
         elif name == "injection":
             return InjectionTester().run(session, eps, saver)
+        elif name == "nosql_probe":
+            return NoSQLProbeRunner().run(session, eps, saver)
         elif name == "info_disclosure":
             return InfoDisclosureScanner().run(session, eps, saver)
         elif name == "rate_limit":
@@ -385,7 +401,7 @@ class EndpointDiscovery:
         try:
             import requests
             # Fetch the HTML page
-            html = requests.get(url, verify=False, timeout=15).text
+            html = requests.get(url, verify=VERIFY_TLS, timeout=15).text
 
             # Collect JS file URLs from ALL bundler patterns
             js_files = set()
@@ -406,7 +422,7 @@ class EndpointDiscovery:
                 else:
                     js_url = base + js_path
                 try:
-                    content = requests.get(js_url, verify=False, timeout=30).text
+                    content = requests.get(js_url, verify=VERIFY_TLS, timeout=30).text
                     fetched_js[js_path] = content
                 except Exception:
                     continue
@@ -444,7 +460,7 @@ class EndpointDiscovery:
                 else:
                     continue
                 try:
-                    content = requests.get(chunk_url, verify=False, timeout=30).text
+                    content = requests.get(chunk_url, verify=VERIFY_TLS, timeout=30).text
                     fetched_js[chunk_ref] = content
                 except Exception:
                     continue
@@ -492,7 +508,7 @@ class EndpointDiscovery:
 
         for doc_path in self.OPENAPI_PATHS:
             try:
-                resp = requests.get(f"{base}/{doc_path}", verify=False, timeout=10)
+                resp = requests.get(f"{base}/{doc_path}", verify=VERIFY_TLS, timeout=10)
                 if resp.status_code != 200:
                     continue
 
@@ -506,7 +522,7 @@ class EndpointDiscovery:
                         try:
                             if not spec_url.startswith("http"):
                                 spec_url = base + "/" + spec_url.lstrip("/")
-                            spec_resp = requests.get(spec_url, verify=False, timeout=10)
+                            spec_resp = requests.get(spec_url, verify=VERIFY_TLS, timeout=10)
                             spec = spec_resp.json()
                             break
                         except Exception:
@@ -541,7 +557,7 @@ class EndpointDiscovery:
             import requests
             resp = requests.post(
                 f"{self.session.base_url}/nonexistent_vapt_probe/",
-                data={}, verify=False, timeout=15
+                data={}, verify=VERIFY_TLS, timeout=15
             )
             if "DEBUG = True" in resp.text or "URLconf" in resp.text:
                 log("vuln", "  Django DEBUG=True — full URL patterns exposed!")
@@ -856,7 +872,7 @@ class FileUploadTester:
                           "email": f"vapt_{test_name}_{int(time.time())}@test.com",
                           "contact_no": f"98765{int(time.time())%100000:05d}",
                           "country_code": "IN"},
-                    cookies=cookies, verify=False, timeout=15
+                    cookies=cookies, verify=VERIFY_TLS, timeout=15
                 )
                 if resp_raw.status_code == 200:
                     body = resp_raw.json()
@@ -954,7 +970,7 @@ class FileTypeEvasionTester:
                               "email": f"vapt_evasion_{int(time.time())}@test.com",
                               "contact_no": f"98765{int(time.time()) % 100000:05d}",
                               "country_code": "IN"},
-                        cookies=cookies, verify=False, timeout=15,
+                        cookies=cookies, verify=VERIFY_TLS, timeout=15,
                     )
                     os.unlink(tmp.name)
 
@@ -981,7 +997,7 @@ class FileTypeEvasionTester:
                         try:
                             dl_resp = _req.get(
                                 f"{session.base_url}/{storage_path}",
-                                cookies=cookies, verify=False, timeout=10,
+                                cookies=cookies, verify=VERIFY_TLS, timeout=10,
                             )
                             if dl_resp.status_code == 200 and len(dl_resp.content) > 10:
                                 row["accessible"] = True
@@ -1110,7 +1126,7 @@ class InjectionTester:
             import requests as _req
             resp = _req.post(f"{session.base_url}/login-view/",
                              data={"email": email, "password": pwd},
-                             verify=False, timeout=10)
+                             verify=VERIFY_TLS, timeout=10)
             if resp.status_code == 200:
                 try:
                     body = resp.json()
@@ -1217,8 +1233,12 @@ class InjectionTester:
                 nuclei_out = os.path.join(
                     os.path.dirname(saver.dir) if saver else "/tmp",
                     "nuclei_results.txt")
+                # v9.x P0-6: prefer ~/go/bin/nuclei to avoid PATH shadowing
+                # (Python httpx pip pkg shadows PD httpx; same risk for nuclei).
+                _gobin_nuclei = os.path.expanduser("~/go/bin/nuclei")
+                _nuclei_bin = _gobin_nuclei if os.path.isfile(_gobin_nuclei) and os.access(_gobin_nuclei, os.X_OK) else "nuclei"
                 result = _sp.run(
-                    ["nuclei", "-l", urls_file.name,
+                    [_nuclei_bin, "-l", urls_file.name,
                      "-severity", "critical,high,medium", "-silent",
                      "-o", nuclei_out],
                     capture_output=True, text=True, timeout=120)
@@ -1251,6 +1271,93 @@ class InjectionTester:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 8a: NoSQL DIFFERENTIAL PROBE
+# ═══════════════════════════════════════════════════════════════════════════════
+# Added v9.x after the api-maya / hrms-user-gateway engagement, where the
+# old single-payload check (``{"$gt": ""}`` → 500) generated dozens of
+# false-positive "NoSQL injection" findings that Codex review showed were
+# actually generic type-confusion crashes. The fix is a six-probe diff
+# implemented in ``whitebox/nosql_probe.py``.
+class NoSQLProbeRunner:
+    """Phase 8a wrapper around ``whitebox.nosql_probe.NoSQLProbe``.
+
+    Picks endpoints that look like login / search / lookup handlers, runs
+    the six differential probes against the most likely user-controlled
+    parameter, and persists VULNERABLE / TYPE_CONFUSION verdicts via the
+    standard ``FindingSaver``.
+    """
+
+    # Parameters most often reflected straight into a Mongo / Mongoose
+    # query without coercion.
+    LIKELY_PARAMS = ("email", "username", "user", "id", "search", "q",
+                     "query", "filter", "name")
+
+    # Path keywords that hint at a query or lookup handler.
+    PATH_KEYWORDS = ("login", "auth", "search", "lookup", "find", "list",
+                     "view", "filter", "query")
+
+    MAX_ENDPOINTS = 12  # safety cap — each endpoint is 6 requests
+
+    def run(self, session: AuthSession, endpoints: list[dict],
+            saver: FindingSaver = None) -> list[dict]:
+        log("phase", "Phase 8a: NoSQL Differential Probe")
+        try:
+            from whitebox.nosql_probe import NoSQLProbe, to_finding
+        except Exception as e:
+            log("err", f"  whitebox.nosql_probe import failed: {e}")
+            return []
+
+        candidates = [
+            ep for ep in endpoints
+            if any(kw in ep.get("path", "").lower() for kw in self.PATH_KEYWORDS)
+        ][: self.MAX_ENDPOINTS]
+
+        if not candidates:
+            log("info", "  No login/search/lookup endpoints — skipping")
+            return []
+
+        findings: list[dict] = []
+        # Reuse the AuthSession's existing session cookies + bearer token by
+        # extracting them once into a plain headers dict for the probe.
+        base_headers = dict(session._session.headers) if hasattr(session, "_session") else {}
+        base_url = session.base_url.rstrip("/")
+
+        for ep in candidates:
+            path = ep.get("path", "").lstrip("/")
+            full_url = f"{base_url}/{path}"
+            for param in self.LIKELY_PARAMS[:3]:  # 3 params max per endpoint
+                template = {param: "<INJECT>"}
+                # Login-style endpoints expect a password too.
+                if "login" in path or "auth" in path:
+                    template.setdefault("password", "vapt-probe")
+
+                try:
+                    result = NoSQLProbe(
+                        url=full_url,
+                        headers=base_headers,
+                        template=template,
+                        method=ep.get("method", "POST"),
+                        param=param,
+                    ).run()
+                except Exception as e:
+                    log("warn", f"  probe error on {path}/{param}: {e}")
+                    continue
+
+                finding = to_finding(result, full_url, param)
+                if finding is None:
+                    continue
+                findings.append(finding)
+                if saver:
+                    saver.save(finding)
+                    saver.save_txt(finding)
+                # First hit per endpoint is enough — move on.
+                break
+
+        log("ok", f"  {len(findings)} NoSQL probe findings")
+        return findings
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PHASE 8: INFO DISCLOSURE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1266,7 +1373,7 @@ class InfoDisclosureScanner:
         import requests as _req
         try:
             resp = _req.post(f"{session.base_url}/nonexistent_probe/",
-                             data={}, verify=False, timeout=10)
+                             data={}, verify=VERIFY_TLS, timeout=10)
             if "DEBUG = True" in resp.text:
                 f = {"type": "django_debug", "severity": CRITICAL,
                      "detail": "Django DEBUG=True — tracebacks, settings, URL patterns exposed",
@@ -1281,7 +1388,7 @@ class InfoDisclosureScanner:
 
         # 8b. Server header disclosure
         try:
-            resp = _req.head(session.base_url, verify=False, timeout=10)
+            resp = _req.head(session.base_url, verify=VERIFY_TLS, timeout=10)
             server = resp.headers.get("Server", "")
             if server and any(v in server.lower() for v in ("nginx/", "apache/", "gunicorn", "iis/")):
                 f = {"type": "server_version", "severity": LOW,
@@ -1351,12 +1458,12 @@ class RateLimitTester:
                     if path == "login-view/":
                         resp = _req.post(f"{session.base_url}/{path}",
                                          data={"email": "test@test.com", "password": "wrong"},
-                                         verify=False, timeout=5)
+                                         verify=VERIFY_TLS, timeout=5)
                     else:
                         cookies = dict(session._session.cookies) if hasattr(session, '_session') else {}
                         resp = _req.post(f"{session.base_url}/{path}",
                                          data={"email": "test@test.com", "id": "1"},
-                                         cookies=cookies, verify=False, timeout=5)
+                                         cookies=cookies, verify=VERIFY_TLS, timeout=5)
                     statuses.append(resp.status_code)
                     if resp.status_code == 429:
                         break
@@ -1415,7 +1522,7 @@ class TokenSecurityTester:
             import requests as _req
             resp = _req.post(f"{session.base_url}/learner-list/",
                              json={}, cookies={"cf_at": tampered, "cf_rt": cf_rt},
-                             verify=False, timeout=10)
+                             verify=VERIFY_TLS, timeout=10)
             if resp.status_code == 200:
                 f = {"type": "refresh_token_bypass", "severity": HIGH,
                      "detail": "Invalid access token + valid refresh token = authenticated (silent re-auth)",
@@ -1451,7 +1558,7 @@ class TimingOracle:
             start = time.monotonic()
             try:
                 _req.post(f"{base}/reset-password-request/",
-                          data={"email": email}, verify=False, timeout=15)
+                          data={"email": email}, verify=VERIFY_TLS, timeout=15)
             except Exception:
                 pass
             valid_times.append(time.monotonic() - start)
@@ -1460,7 +1567,7 @@ class TimingOracle:
             start = time.monotonic()
             try:
                 _req.post(f"{base}/reset-password-request/",
-                          data={"email": email}, verify=False, timeout=15)
+                          data={"email": email}, verify=VERIFY_TLS, timeout=15)
             except Exception:
                 pass
             invalid_times.append(time.monotonic() - start)
@@ -1573,7 +1680,7 @@ def _auto_detect_login_url(session: AuthSession, username: str, password: str) -
             {"email": username, "password": password},
         ]:
             try:
-                resp = _req.post(url, json=payload, verify=False, timeout=10)
+                resp = _req.post(url, json=payload, verify=VERIFY_TLS, timeout=10)
                 if resp.status_code == 200:
                     body = resp.json()
                     token = body.get("token") or body.get("access_token") or ""
@@ -1611,7 +1718,7 @@ def _auto_detect_login_url(session: AuthSession, username: str, password: str) -
         try:
             # Fetch the login page to discover form fields
             login_page_url = f"{base}/{page_path.lstrip('/')}"
-            page_resp = _req.get(login_page_url, verify=False, timeout=10,
+            page_resp = _req.get(login_page_url, verify=VERIFY_TLS, timeout=10,
                                   allow_redirects=True)
             if page_resp.status_code not in (200, 301, 302):
                 continue
@@ -1650,7 +1757,7 @@ def _auto_detect_login_url(session: AuthSession, username: str, password: str) -
                 continue
 
             log("info", f"  Trying CGI login: {path} ({len(form_data)} fields)")
-            resp = _req.post(action_url, data=form_data, verify=False,
+            resp = _req.post(action_url, data=form_data, verify=VERIFY_TLS,
                               timeout=15, allow_redirects=False,
                               cookies=dict(page_resp.cookies))
 
@@ -1732,7 +1839,7 @@ def _auto_detect_api_base(domain_url: str, rate_limit: float = 5.0) -> str:
 
     for candidate in candidates:
         try:
-            resp = _req.get(candidate, verify=False, timeout=8, allow_redirects=False)
+            resp = _req.get(candidate, verify=VERIFY_TLS, timeout=8, allow_redirects=False)
             # A valid API base returns JSON or a non-HTML response
             # Skip if it returns the SPA HTML (false positive)
             content_type = resp.headers.get("Content-Type", "")
@@ -1747,7 +1854,7 @@ def _auto_detect_api_base(domain_url: str, rate_limit: float = 5.0) -> str:
                     log("ok", f"  API base auto-detected: {candidate}")
                     return candidate
             # Also try POST — some API bases only accept POST
-            resp_post = _req.post(candidate + "/", json={}, verify=False, timeout=8)
+            resp_post = _req.post(candidate + "/", json={}, verify=VERIFY_TLS, timeout=8)
             ct_post = resp_post.headers.get("Content-Type", "")
             if resp_post.status_code not in (404, 405, 502, 503, 0) and "application/json" in ct_post:
                 log("ok", f"  API base auto-detected: {candidate}")
@@ -1763,7 +1870,7 @@ def _auto_detect_api_base(domain_url: str, rate_limit: float = 5.0) -> str:
 def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/",
                   auth_creds_b: str = None, frontend_url: str = None,
                   output_dir: str = None, rate_limit: float = 5.0,
-                  with_brain: bool = False) -> dict:
+                  with_brain: bool = False, har_file: str = None) -> dict:
     """Run all 12 phases of the autonomous API VAPT."""
 
     O = "\033[38;5;208m"  # Orange/amber
@@ -1943,6 +2050,49 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
         log("info", f"  Supervisor log: {log_path}")
 
     all_findings = ctx.all_findings
+
+    # Phase 11.5: HAR-replay differential probe (P1-FIX-2).
+    # When the operator captured a browser session HAR, replay every in-scope
+    # JSON POST/PUT through the same 6-probe TYPE_CONFUSION / OPERATOR_INJECTION
+    # / AUTH_BYPASS matrix used by the live NoSQL probe. Picks up endpoints the
+    # crawler missed (multi-step wizards, role-gated admin pages).
+    if har_file:
+        try:
+            from whitebox.har_replay import HARReplayProbe
+            scope_host = urlparse(base_url).hostname or ""
+            har_out = (os.path.join(output_dir, "findings", "har_replay")
+                       if output_dir else None)
+            cookies = {}
+            try:
+                cookies = {c.name: c.value for c in session._session.cookies}
+            except Exception:
+                pass
+            log("phase", f"Phase 11.5: HAR-replay differential ({har_file})")
+            replay_results = HARReplayProbe(
+                har_path=har_file,
+                scope_hosts=[scope_host] if scope_host else [],
+                output_dir=har_out,
+                auth_cookies=cookies,
+            ).run()
+            for entry in replay_results:
+                for param, verdict in (entry.get("results") or {}).items():
+                    v = verdict.get("verdict")
+                    if v == "NOT_VULNERABLE":
+                        continue
+                    sev_map = {"TYPE_CONFUSION": MEDIUM,
+                               "OPERATOR_INJECTION": HIGH,
+                               "AUTH_BYPASS": CRITICAL}
+                    all_findings.append({
+                        "type": f"har_replay_{v.lower()}",
+                        "severity": sev_map.get(v, MEDIUM),
+                        "detail": f"HAR replay {v} on `{param}` ({entry.get('endpoint')})",
+                        "url": entry.get("url"),
+                        "evidence": verdict.get("reason", ""),
+                        "probes": verdict.get("probes", []),
+                    })
+            log("ok", f"  HAR replay: {len(replay_results)} requests inspected")
+        except Exception as e:
+            log("warn", f"  HAR replay phase failed: {e}")
 
     # Phase 12: Chain Building
     chains = ChainBuilder().run(all_findings, saver)
@@ -2185,6 +2335,9 @@ Examples:
     parser.add_argument("--output", help="Output directory for findings")
     parser.add_argument("--rate-limit", type=float, default=5.0, help="Max requests/sec")
     parser.add_argument("--with-brain", action="store_true", help="Use local Ollama for analysis")
+    parser.add_argument("--har-file", default=None,
+                        help="HAR file: replay every in-scope JSON POST/PUT through "
+                             "the 6-probe NoSQL/operator-injection differential")
     args = parser.parse_args()
 
     run_autopilot(
@@ -2196,6 +2349,7 @@ Examples:
         output_dir=args.output,
         rate_limit=args.rate_limit,
         with_brain=args.with_brain,
+        har_file=args.har_file,
     )
 
 

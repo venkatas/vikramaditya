@@ -512,24 +512,18 @@ fi  # end SCOPE_LOCK else block
 fi  # end Phase 1 resume skip
 
 # ============================================================
-# Phase 2: DNS Resolution — filter to only resolvable hosts
+# Phase 2: DNS Resolution — httpx-only (v9.x: dropped dnsx, hangs on macOS)
 # ============================================================
+# v9.x change: dnsx historically hangs on macOS for large lists (no progress
+# after ~hundreds of hosts) and httpx already does its own DNS resolution
+# inline.  We now skip dnsx entirely and pass all.txt straight to httpx in
+# Phase 3.  IPs are extracted from httpx output via awk after the probe.
 echo ""
-log_info "Phase 2: DNS Resolution"
+log_info "Phase 2: DNS Resolution (httpx-only — dnsx removed in v9.x)"
 if phase_done "$RECON_DIR/subdomains/resolved.txt"; then true; else
-
-if tool_ok dnsx; then
-    log_step "Resolving subdomains with dnsx..."
-    dnsx -l "$RECON_DIR/subdomains/all.txt" \
-        -silent \
-        -threads "$THREADS" \
-        -o "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
-    log_done "Resolved: $(file_lines "$RECON_DIR/subdomains/resolved.txt") hosts"
-else
-    log_warn "dnsx not installed — using all subdomains as-is"
+    log_step "Skipping dnsx; httpx will resolve + probe in Phase 3"
     cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
-fi
-
+    log_done "Resolved candidates: $(file_lines "$RECON_DIR/subdomains/resolved.txt") hosts (httpx will filter live)"
 fi  # end Phase 2 resume skip
 
 RESOLVED_FILE="$RECON_DIR/subdomains/resolved.txt"
@@ -603,6 +597,8 @@ else
         # httpx: tech-detect skipped on first fast pass; added via separate run below
         # -no-fallback prevents HTTPS→HTTP retry loops that cause hangs
         # timeout(1) is a hard OS-level watchdog — kills httpx if it exceeds BATCH_WATCHDOG
+        # v9.x: httpx-only resolution (dnsx removed). Explicit -timeout/-retries/-threads
+        # so each batch fails fast on dead hosts instead of stalling.
         timeout "$BATCH_WATCHDOG" \
         httpx -l "$BATCH_FILE" \
             -silent \
@@ -613,9 +609,10 @@ else
             -ip \
             -no-fallback \
             -no-color \
-            -threads "$THREADS" \
+            -threads 50 \
             -rate-limit "$RATE_LIMIT" \
-            -timeout "$HTTP_PROBE_TIMEOUT" \
+            -timeout 6 \
+            -retries 1 \
             2>/dev/null >> "$RECON_DIR/live/httpx_full.txt" || true
 
         BATCH_END=$(date +%s)
@@ -668,10 +665,12 @@ else
     grep '\[401\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_401.txt"  2>/dev/null || true
     grep '\[429\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_429.txt"  2>/dev/null || true
 
-    # Extract unique IPs from httpx output (needed for vhost discovery Phase 7.5)
-    # httpx -ip outputs IP as last bracketed field: https://host [200] [...] [1.2.3.4]
-    grep -oE '\[([0-9]{1,3}\.){3}[0-9]{1,3}\]' "$RECON_DIR/live/httpx_full.txt" \
-        | tr -d '[]' | sort -u > "$RECON_DIR/live/ips.txt" 2>/dev/null || true
+    # Extract unique IPs from httpx output (needed for vhost discovery Phase 7.5).
+    # v9.x change: dnsx is gone, so this awk pass is the ONLY source of IPs.
+    # httpx -ip outputs IP as a bracketed field: https://host [200] [...] [1.2.3.4]
+    awk -F'[][]' '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\./) print $i}' \
+        "$RECON_DIR/live/httpx_full.txt" \
+        | sort -u > "$RECON_DIR/live/ips.txt" 2>/dev/null || true
 
     log_done "200 OK:         $(file_lines "$RECON_DIR/live/status_200.txt")"
     log_done "3xx Redirect:   $(file_lines "$RECON_DIR/live/status_3xx.txt")"
