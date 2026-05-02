@@ -9,6 +9,18 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.1.0 — Engagement-driven hardening: Prowler FP filter + WAF-COUNT detector + HAR-replay differential + NoSQL/Next.js probes + SSL strict-by-default**
+
+Eight surgical fixes shipped after a 4-day live VAPT engagement, triple-verified (two independent agents + Codex GPT-5.5 review).
+
+**P0 (5 fixes):** SSL `verify=False` purge — 25 sites strict-by-default with `VAPT_INSECURE_SSL=1` env opt-out (Semgrep ERRORs 25 → 0); Prowler false-positive filter (`whitebox/audit/fp_filter.py`) re-verifies RDS-snapshot-public, S3-write-public, Lambda-public-policy via boto3 before emitting findings; `recon.sh` dnsx step removed (was hanging 30+ min); ProjectDiscovery binaries pinned via `~/go/bin/` to dodge Python httpx PATH conflict.
+
+**P1 (3 fixes):** WAF-COUNT-mode check (`whitebox/audit/waf_count_check.py`) — Prowler 4.5 doesn't flag rules in `Action.Count`; HAR-replay differential phase (`whitebox/har_replay.py`) — operator-injection probes per JSON parameter via `--har-file`; session config-lock (`whitebox/config_lock.py`) — tool versions + wordlist sha256 + env vars per session for reproducibility.
+
+**New modules:** `whitebox/nosql_probe.py` (7-probe differential NoSQLi detector — distinguishes type-confusion from real operator-injection), `whitebox/nextjs_bypass.py` (CVE-2025-29927 X-Middleware-Subrequest probe with buildId discovery + protected-route enum), `burp_cli/burp_rescan.sh` (Burp Pro REST API wrapper for headless scan workflows).
+
+---
+
 **v9.0.0 — Greybox enrichment: TLS SAN harvest + visual recon + scope auto-suggest + SG description round-trip**
 
 First batch of the v9.0 backlog landed (4 of 15 items: P11, P15, P22, P23).

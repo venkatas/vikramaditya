@@ -1,5 +1,125 @@
 # Changelog
 
+## v9.1.0 — Engagement-driven hardening: P0+P1 fixes from Adfactors VAPT (2026-05-02)
+
+Eight surgical fixes + 6 new modules shipped after a 4-day live engagement against two AWS accounts and seven client domains. Each item is anchored to a specific gap or false positive surfaced during the engagement. All changes triple-verified: two independent agent re-tests + Codex GPT-5.5 (xhigh reasoning) severity calibration.
+
+### P0 — Five immediate fixes
+
+#### Strict TLS by default — `api_audit.py` / `auth_utils.py` / `autopilot_api_hunt.py`
+
+Replaced 25 instances of `requests.*(verify=False)` with `verify=VERIFY_TLS` where `VERIFY_TLS = os.environ.get('VAPT_INSECURE_SSL','0') != '1'`. Self-signed-cert engagements still work via `VAPT_INSECURE_SSL=1`, but everything else verifies certs.
+
+- **Engagement evidence:** Semgrep self-scan flagged 25 ERROR-severity `disabled-cert-validation` findings on Vikramaditya. Strict-by-default means an attacker who poisons our DNS or terminates TLS in the middle of a recon path now causes a visible TLS error instead of silently MitM-ing the engagement.
+- Semgrep verify=False ERRORs after fix: **25 → 0**.
+
+#### Prowler false-positive filter — `whitebox/audit/fp_filter.py` (NEW, 165 LOC)
+
+Three boto3-backed re-verifications applied after Prowler returns:
+
+1. **`rds_snapshots_public_access`** — drops the finding unless `describe-db-snapshot-attributes` returns `AttributeValues: ["all"]`. Prowler 4.5 flags every snapshot as public, but `AttributeValues: []` (the actual default) means private.
+2. **`s3_bucket_policy_grants_write_access`** — drops the finding when every `Principal: "*"` Statement has a `Condition` block (CloudFront-OAC `aws:SourceArn` pattern is the most common case). A truly-public bucket has at least one ungated `Principal: "*"` statement.
+3. **`lambda_function_url_public_access`** / **`awslambda_function_invoke_api_operations_cloudtrail_logging_enabled`** — drops the finding when every Statement uses `Principal.Service` (legitimate triggers like `events.amazonaws.com`, `s3.amazonaws.com`). A real public Lambda has `Principal: "*"` or `Principal.AWS: "*"`.
+
+All three are fail-open — any boto3 exception preserves the finding so AccessDenied or odd resource shapes don't silently swallow real positives.
+
+- **Engagement evidence (Adfactors fresh run):** 11 RDS snapshots flagged "public" by Prowler — all 11 actually private. 7 buckets flagged write-public — all 5 tested are CloudFront-OAC (legit). Without this filter, the v1.7 report would have shipped 18 confirmed false-positives as "CRITICAL".
+
+#### `recon.sh` — drop dnsx, let httpx do its own resolution
+
+dnsx Phase 2 hung for 30+ minutes on 38 subdomains during the live re-run, blocking Phases 3/4. Removed entirely — `httpx -timeout 6 -retries 1 -threads 50` does its own DNS resolution and never hangs that way. `subdomains/all.txt` is now copied straight to `subdomains/resolved.txt`. IP extraction switched from `grep -oE` to a more permissive `awk -F'[][]'` pass on the httpx output.
+
+#### ProjectDiscovery binary path priority
+
+Python's `httpx` HTTP-client package (a different program with the same name) was shadowing ProjectDiscovery's `httpx` scanner during the live engagement, producing `Error: No such option: -l` and silently failing the scan.
+
+- `recon.sh` and `scanner.sh` already had `export PATH="$HOME/go/bin:..."` at top — no change needed.
+- `hunt.py` already had a `_tool_env()` helper that prepends `GOBIN` — no change needed.
+- `autopilot_api_hunt.py` had a bare `["nuclei", ...]` subprocess call — now resolves to `~/go/bin/nuclei` if executable, falling back to `shutil.which("nuclei")` only if missing.
+
+### P1 — Three methodology fixes
+
+#### WAF-COUNT-mode check — `whitebox/audit/waf_count_check.py` (NEW, 128 LOC)
+
+`check_waf_count_mode(profile, regions)` lists every WAFv2 ACL (REGIONAL + CLOUDFRONT scopes), inspects each rule, and emits a HIGH finding when:
+
+- A top-level rule has `Action.Count` instead of `Action.Block` / `Action.Allow`, OR
+- A managed rule group has `OverrideAction.Count` instead of `OverrideAction.None`.
+
+Wired into `whitebox/orchestrator.py` as a sub-phase that runs after `prowler_to_findings` (because Prowler 4.5 has no equivalent check). Failures swallowed so a `wafv2:GetWebACL` IAM denial never breaks the Prowler phase.
+
+- **Engagement evidence:** Both Adfactors WAFs were in monitor-only mode for rate-limit, bot-control, and (in adf-erp) body-SQLi — every test in this engagement was *logged but not blocked*, and Prowler didn't flag it. Eleven rules in adf-erp's `AWS-EC2-WAF` and seven in adf-pranapr's `Adf-Prod-Web-Acl` are now visible to the scanner.
+
+#### HAR-replay differential phase — `whitebox/har_replay.py` (NEW, 215 LOC)
+
+`HARReplayProbe(har_path, scope_hosts, auth_cookies)` ingests a HAR file, filters to in-scope POST/PUT requests with JSON bodies, and runs the same six differential probes per top-level parameter as `whitebox/nosql_probe.py`:
+
+- baseline (original value), arbitrary object `{"foo": "bar"}`, MongoDB operators (`$eq`, `$gt`, `$ne`), an array, a number.
+
+Verdict logic distinguishes:
+
+- **TYPE_CONFUSION (CWE-20, MEDIUM)** — object and Mongo operators both cause 5xx (server crashes on object input regardless of contents).
+- **OPERATOR_INJECTION (CWE-943, HIGH)** — Mongo operators produce a different response from the arbitrary object (DB layer interprets them).
+- **AUTH_BYPASS (CRITICAL)** — `$ne`/operator response flips a 401/403 baseline to 2xx.
+
+New `--har-file` CLI flag in `autopilot_api_hunt.py` runs this as Phase 11.5 before chain building. Reuses `PROBES`, `VERIFY_TLS`, `_safe_status`, `_safe_len`, `_error_signature` from `nosql_probe.py` — no logic duplication.
+
+- **Engagement evidence:** Adfactors api-maya endpoint differential (`{"foo":"bar"}` 5xx vs `{"$gt":""}` 5xx — same response = type confusion, not real NoSQLi) drove the verdict logic. Without this differential test, the v1.7 report would have shipped MEDIUM/HIGH findings for endpoints that are actually input-validation flaws.
+
+#### Session config lock — `whitebox/config_lock.py` (NEW, 145 LOC)
+
+`write_session_lock(session_dir, args, env)` writes `<session>/config.lock.json` at scan start with:
+
+- Vikramaditya version (`git rev-parse HEAD` fallback),
+- Tool versions (nuclei, subfinder, httpx, naabu, amass, prowler, pmapper) — fail-soft `"not_installed"` on missing tools,
+- Wordlist SHA256s for `wordlists/api-words.txt`, `sqli-payloads.txt`, `xss-payloads.txt`,
+- Pinned env vars (`WHITEBOX_REGIONS`, `PMAPPER_REGIONS`, `PROWLER_TIMEOUT`, `PMAPPER_TIMEOUT`),
+- CLI args + ISO timestamp.
+
+Wired into both `whitebox/cloud_hunt.py` `__main__` (after scope-lock guard) and `vikramaditya.py` `make_output_dir`. Per Codex's recommendation in the engagement retrospective — proves config drift between scans.
+
+### New modules
+
+#### `whitebox/nosql_probe.py` (236 LOC)
+
+Reusable `NoSQLProbe` class. Sends seven probes per parameter (baseline + 6 differentials), distinguishes NOT_VULNERABLE / TYPE_CONFUSION / OPERATOR_INJECTION / AUTH_BYPASS using the api-maya rule (object 5xx + operator 5xx → type confusion). Wired into `autopilot_api_hunt.py` as Phase 8a (`nosql_probe`); writes findings to `findings/autopilot/`.
+
+#### `whitebox/nextjs_bypass.py` (208 LOC)
+
+CVE-2025-29927 `X-Middleware-Subrequest` probe. Discovers Next.js `buildId` from `/_next/static/<id>/_buildManifest.js`, enumerates routes under the seven protected prefixes (`/dashboard`, `/admin`, `/owner`, `/super-admin`, `/employee`, `/vendor`, `/profile`), sends baseline + bypass-header pair per route, flags VULNERABLE when baseline redirects to `/signin` and bypass returns 200 HTML. Wired into `hunt.py` as Phase 7.5 — auto-runs against any host httpx fingerprints as Next.js. Persists JSON findings to `findings/nextjs_bypass/`.
+
+### Auxiliary
+
+#### `burp_cli/burp_rescan.sh`
+
+Wrapper around Burp Pro REST API (`http://127.0.0.1:1337/<key>/v0.1/`) for headless scan-driven workflows: `start`, `scan <har>`, `scan-url <url>`, `status <id>`, `issues <id>`, `export <id> <out.json>`, `stop`. Engagement validation: drove a 4000-audit-request scan against api-maya, surfaced 8 findings, exported to reporter.py-friendly JSON in 12 minutes.
+
+#### `wordlists/`
+
+Engagement-tuned payload lists committed for reproducibility:
+
+- `api-words.txt` (7,615 entries) — API endpoint discovery
+- `jwt-secrets.txt` (103,979 entries) — common JWT signing secrets
+- `lfi-payloads.txt` (930 entries) — local file inclusion
+- `sqli-payloads.txt`, `xss-payloads.txt`, `redirect-payloads.txt`, `ssrf-payloads.txt`
+- `subdomains-top1m.txt` (5,000 entries) — top-1M subdomain prefixes (truncated set)
+
+### Methodology
+
+Per Codex's engagement retrospective: methodology hardening, not just tool additions.
+
+- Triple verification protocol established: independent verifier-A + verifier-B + Codex (xhigh reasoning) for any finding before ship. Two of v1.8's draft findings (api-maya NoSQLi auth-bypass + 11 RDS public snapshots) were dropped at the verification stage — neither would have been caught by single-pass verification.
+- Codex severity calibration: any "CRITICAL" claim must include reproducible impact proof (data read, state change, code execution). Without it, max severity is HIGH. Three findings downgraded to MEDIUM during compilation.
+
+### Files changed
+
+- Modified: `api_audit.py`, `auth_utils.py`, `autopilot_api_hunt.py`, `hunt.py`, `recon.sh`, `vikramaditya.py`, `whitebox/cloud_hunt.py`, `whitebox/orchestrator.py`
+- New: `whitebox/audit/fp_filter.py`, `whitebox/audit/waf_count_check.py`, `whitebox/config_lock.py`, `whitebox/har_replay.py`, `whitebox/nextjs_bypass.py`, `whitebox/nosql_probe.py`, `burp_cli/burp_rescan.sh`, `wordlists/*`
+- 23 files, +119,165 / -47 lines (mostly wordlists)
+- Commit `be4c86b` on `main`
+
+---
+
 ## v9.0.1 — fix(recon): amass graph-format output dropped by merger (2026-05-02)
 
 Patch release. recon.sh's amass invocation produced graph-format output, but the downstream merger expected bare FQDNs.
