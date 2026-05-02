@@ -711,6 +711,15 @@ def make_output_dir(target: str) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(SCRIPT_DIR, "recon", safe_target, "sessions", f"{ts}_autopilot")
     os.makedirs(out_dir, exist_ok=True)
+    # P1-FIX-3 — drop a per-session config.lock.json. Captures vikramaditya
+    # version, external tool versions, wordlist hashes, scope-control env
+    # vars and CLI args so two runs are diffable for config drift.
+    try:
+        sys.path.insert(0, SCRIPT_DIR)
+        from whitebox.config_lock import write_session_lock
+        write_session_lock(out_dir, args={"target": target, "argv": sys.argv})
+    except Exception:
+        pass
     return out_dir
 
 

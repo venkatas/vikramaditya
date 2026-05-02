@@ -14,6 +14,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# v9.x — Semgrep ERROR finding (requests verify=False). Default to strict TLS
+# verification; allow opt-out via VAPT_INSECURE_SSL=1 for engagements that
+# legitimately target self-signed staging hosts.
+VERIFY_TLS = os.environ.get("VAPT_INSECURE_SSL", "0") != "1"
+
 
 class RateLimiter:
     """Enforces max requests per second."""
@@ -214,7 +219,7 @@ class AuthSession:
                 resp = _bare_req.request(
                     method, url, json=json_body, data=data,
                     headers=hdrs, timeout=timeout, allow_redirects=False,
-                    verify=False,
+                    verify=VERIFY_TLS,
                 )
             elif token is not None and token != "cookie-auth":
                 # Explicit token: bare request with ONLY this token (no session cookies)
@@ -223,7 +228,7 @@ class AuthSession:
                     method, url, json=json_body, data=data,
                     headers=hdrs, cookies={"cf_at": token},
                     timeout=timeout, allow_redirects=False,
-                    verify=False,
+                    verify=VERIFY_TLS,
                 )
             else:
                 # Default: use session as-is (carries login cookies)
