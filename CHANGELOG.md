@@ -1,5 +1,27 @@
 # Changelog
 
+## v9.0.1 — fix(recon): amass graph-format output dropped by merger (2026-05-02)
+
+Patch release. recon.sh's amass invocation produced graph-format output, but the downstream merger expected bare FQDNs.
+
+### Fixed
+
+- `recon.sh` Phase 1 — `amass enum -passive -d <target>` writes its output as `foo.example.com (FQDN) --> a_record --> 1.2.3.4 (IPAddress)` instead of bare names. The merger at line 463-468 used the regex `^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$` which **rejected every amass line because of the parenthetical annotations and arrow tokens**. Result: zero of amass's discoveries reached `all.txt` → `resolved.txt` → `live/`.
+- Live engagement evidence: `maya.adfactorspr.com` was discovered by amass on 1 May (1 hit in `subdomains/amass.txt`) but never appeared in `subdomains/all.txt` (0 hits). When the user asked whether `maya.adfactorspr.com` was in our live list today, it was missing — even though amass had found it the previous day.
+- Fix: post-process amass.txt right after the tool exits — extract every FQDN-shaped token ending in the target domain (escaping the target's dots), dedupe, and overwrite amass.txt with the flat list before the merger runs.
+
+### Net engagement impact
+
+Re-running the post-processor against the existing `recon/adfactorspr.com/sessions/20260501_120323_e6f0/subdomains/amass.txt` recovered **50 subdomains** that had been silently dropped. Of those, **3 are confirmed live HTTPS** with real applications behind them:
+
+- `maya.adfactorspr.com` → Apache 2.4.58 Ubuntu, 307 → Sign In page
+- `dboxconfig.adfactorspr.com` → Microsoft IIS 10.0, 301 "Document Moved"
+- `kalki-fm.adfactorspr.com` → Microsoft IIS 10.0, 302 "Object moved"
+
+Plus 15+ other DNS-only or filtered hosts that should be re-validated in the next engagement.
+
+---
+
 ## v9.0.0 — Greybox enrichment: TLS SAN harvest + visual recon + scope auto-suggest + SG description round-trip (2026-05-01)
 
 Minor release shipping the first batch of v9.0 backlog items (P11, P15, P22, P23 of `docs/superpowers/backlog/2026-05-01-engagement-driven-tool-gaps.md`). Each is anchored to a specific gap surfaced during the four-day live engagement.

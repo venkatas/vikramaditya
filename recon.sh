@@ -380,6 +380,25 @@ if tool_ok amass && [ "$QUICK_MODE" != "--quick" ]; then
     timeout "$AMASS_TIMEOUT" amass enum -passive -d "$TARGET" \
         -o "$RECON_DIR/subdomains/amass.txt" 2>/dev/null || true
     [ ! -f "$RECON_DIR/subdomains/amass.txt" ] && touch "$RECON_DIR/subdomains/amass.txt"
+    # v9.0.1 fix — amass writes graph format
+    # ("foo.example.com (FQDN) --> a_record --> 1.2.3.4 (IPAddress)") which the
+    # downstream merger drops because its regex expects bare FQDNs only. Live
+    # engagement evidence: maya.adfactorspr.com appeared in amass.txt but never
+    # made it through to all.txt → resolved.txt → live/. Fix: extract every
+    # FQDN-shaped token ending in the target domain and overwrite amass.txt
+    # with the flat list before the merger runs.
+    if [ -s "$RECON_DIR/subdomains/amass.txt" ]; then
+        TARGET_ESC=$(printf '%s' "$TARGET" | sed 's/\./\\./g')
+        grep -oiE "[a-z0-9_-]+(\\.[a-z0-9_-]+)*\\.${TARGET_ESC}" "$RECON_DIR/subdomains/amass.txt" 2>/dev/null \
+            | sort -u > "$RECON_DIR/subdomains/amass.flat" || true
+        # Also keep the apex if amass mentioned it
+        grep -oiE "(^|[[:space:]])${TARGET_ESC}([[:space:]]|$)" "$RECON_DIR/subdomains/amass.txt" 2>/dev/null \
+            | tr -d ' ' >> "$RECON_DIR/subdomains/amass.flat" || true
+        if [ -s "$RECON_DIR/subdomains/amass.flat" ]; then
+            sort -u "$RECON_DIR/subdomains/amass.flat" -o "$RECON_DIR/subdomains/amass.txt"
+        fi
+        rm -f "$RECON_DIR/subdomains/amass.flat"
+    fi
     log_done "amass: $(file_lines "$RECON_DIR/subdomains/amass.txt") subdomains"
 else
     [ "$QUICK_MODE" = "--quick" ] && log_warn "amass skipped (quick mode)"
