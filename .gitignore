@@ -96,3 +96,17 @@ nuclei_output*
 recon/*/sessions/*/cloud/*/secrets/
 whitebox_config.local.yaml
 *.pmapper-graph.json
+
+# ── Engagement scratch (P2-FIX-C) ─────────────────────────────────────────────
+dirs.txt
+parse_docs.py
+parse_docs_zip.py
+partner_index.js
+run_scan.sh
+test_file_upload_only.py
+with_params.txt
+schemathesis-report/
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/scheduled_tasks.lock
+.claude/projects/
