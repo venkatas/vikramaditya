@@ -3,6 +3,7 @@ import argparse
 import sys
 from pathlib import Path
 from whitebox.orchestrator import run_for_profile
+from whitebox.config_lock import write_session_lock
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,6 +36,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     allowlist = ["*"] if args.no_scope_lock else args.allowlist
+
+    # P1-FIX-3 — write a deterministic config.lock.json so two runs are
+    # diffable for tool/wordlist/env drift.
+    try:
+        write_session_lock(args.session_dir, args=args)
+    except Exception:
+        pass
 
     rc = 0
     for prof in args.profile:

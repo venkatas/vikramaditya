@@ -5,6 +5,8 @@ from whitebox.profiles import CloudProfile, validate
 from whitebox.inventory import collector, route53, normalizer
 from whitebox.audit import prowler_runner
 from whitebox.audit.normalizer import to_findings as prowler_to_findings
+from whitebox.audit.fp_filter import filter_prowler_fps
+from whitebox.audit.waf_count_check import check_waf_count_mode
 from whitebox.iam.pmapper_runner import build_graph
 from whitebox.iam.graph import IAMGraph
 from whitebox.iam.privesc import detect_paths
@@ -123,6 +125,39 @@ def run_for_profile(profile_name: str, session_dir: Path,
         try:
             ocsf = prowler_runner.run(profile, prowler_dir)
             phase_findings = prowler_to_findings(prowler_runner.parse(ocsf), profile.account_id)
+            # v9.x P0-1/P0-2/P0-3 — drop Prowler FPs (RDS-snapshot-public,
+            # S3-write-public-with-Condition, Lambda-public-with-Service-principal)
+            # by re-querying boto3 with the same profile session.
+            phase_findings = filter_prowler_fps(phase_findings, profile._session)
+            # P1-FIX-1 — Prowler 4.5 has no wafv2-COUNT-mode check; bolt on a
+            # native sub-phase that runs immediately after the Prowler pass and
+            # appends to the same findings batch.
+            try:
+                waf_dicts = check_waf_count_mode(profile, profile.regions)
+                for d in waf_dicts:
+                    sev_name = (d.get("severity") or "MEDIUM").upper()
+                    sev = Severity[sev_name] if sev_name in Severity.__members__ else Severity.MEDIUM
+                    arn = d.get("resource_id", "") or ""
+                    ctx = CloudContext(
+                        account_id=profile.account_id,
+                        region=d.get("region", "us-east-1"),
+                        service="wafv2",
+                        arn=arn,
+                    )
+                    fid = f"wafv2-count-{abs(hash(arn + d.get('details', '')))}"
+                    phase_findings.append(Finding(
+                        id=fid,
+                        source="prowler",
+                        rule_id=d.get("check_id", "wafv2_rule_action_count"),
+                        severity=sev,
+                        title=d.get("title", "AWS WAF rule in COUNT mode"),
+                        description=d.get("details", ""),
+                        asset=None,
+                        evidence_path=Path("prowler") / f"{d.get('check_id', 'wafv2_rule_action_count')}.json",
+                        cloud_context=ctx,
+                    ))
+            except Exception as _waf_e:  # never fail the Prowler phase on this
+                pass
             findings += phase_findings
             _persist_phase_findings(account_dir, "prowler", phase_findings)
             cache.mark_complete("prowler")

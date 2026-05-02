@@ -3287,6 +3287,89 @@ def run_vuln_scan(domain: str, quick: bool = False, skip_items: set[str] | None 
     return ok
 
 
+# ── Next.js CVE-2025-29927 middleware bypass (v9.x) ────────────────────────────
+# Added after the published advisory and the 2026-04 engagements where
+# several Next.js admin panels were silently bypassable via the
+# X-Middleware-Subrequest header. Implementation lives in
+# whitebox/nextjs_bypass.py; this wrapper just identifies Next.js hosts
+# from httpx output and dispatches the probe.
+def run_nextjs_bypass(domain: str) -> bool:
+    """Phase: Next.js middleware bypass (CVE-2025-29927).
+
+    Reads ``live/httpx_full.txt`` for hosts fingerprinted as Next.js
+    (``X-Powered-By: Next.js`` header or ``/_next/`` path artefacts) and
+    runs the differential probe in ``whitebox.nextjs_bypass``.
+    """
+    log("phase", f"NEXTJS BYPASS: {domain}")
+    recon_dir = _resolve_recon_dir(domain)
+    httpx_file = os.path.join(recon_dir, "live", "httpx_full.txt")
+    if not _file_nonempty(httpx_file):
+        log("warn", "No httpx_full.txt — run recon first")
+        _brain_phase_complete("NEXTJS BYPASS", False,
+                              detail=f"target={domain} missing httpx_full.txt")
+        return False
+
+    if _brain and _brain.enabled:
+        _brain.phase_start("NEXTJS BYPASS", f"target={domain}")
+
+    # Build the candidate host list from httpx output. httpx writes one
+    # line per live host with tech/header annotations — we look for
+    # "Next.js" or any "/_next/" reference in the line.
+    candidates: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(httpx_file, "r", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                low = line.lower()
+                if "next.js" not in low and "/_next/" not in low:
+                    continue
+                # The first whitespace-separated token is the URL.
+                url = line.split()[0]
+                if url in seen:
+                    continue
+                seen.add(url)
+                candidates.append(url)
+    except OSError as e:
+        log("err", f"Could not read httpx_full.txt: {e}")
+        _brain_phase_complete("NEXTJS BYPASS", False,
+                              detail=f"target={domain} httpx read error")
+        return False
+
+    if not candidates:
+        log("info", "No Next.js hosts detected — skipping CVE-2025-29927 probe")
+        _brain_phase_complete("NEXTJS BYPASS", True,
+                              detail=f"target={domain} no_nextjs_hosts")
+        return True
+
+    log("info", f"  {len(candidates)} Next.js host(s) — probing CVE-2025-29927")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+
+    try:
+        from whitebox.nextjs_bypass import run as _run_nextjs_bypass
+    except Exception as e:
+        log("err", f"  whitebox.nextjs_bypass import failed: {e}")
+        _brain_phase_complete("NEXTJS BYPASS", False,
+                              detail=f"target={domain} import_error")
+        return False
+
+    findings = _run_nextjs_bypass(candidates, findings_dir)
+    if findings:
+        log("crit", f"  {len(findings)} CVE-2025-29927 bypass(es) confirmed")
+    else:
+        log("ok", "  No middleware bypass detected")
+
+    _brain_phase_complete(
+        "NEXTJS BYPASS",
+        True,
+        detail=f"target={domain} hosts={len(candidates)} findings={len(findings)}",
+        artifacts={"nextjs_bypass": os.path.join(findings_dir, "nextjs_bypass")},
+    )
+    return True
+
+
 # ── NEW: JS Analysis ───────────────────────────────────────────────────────────
 def run_js_analysis(domain: str) -> bool:
     """
@@ -6090,6 +6173,16 @@ def hunt_target(
         log("info", f"Skipping vuln scan for {domain} (already covered by autonomous session)")
     else:
         result["scan"] = run_vuln_scan(domain, quick=quick, skip_items=skip_items, full=full)
+
+    # ── Phase 7.5: Next.js CVE-2025-29927 middleware bypass (v9.x) ─────────
+    # Cheap (~one HTTP round-trip per protected route per Next.js host).
+    # Skips automatically when httpx didn't fingerprint any Next.js hosts.
+    if not skip_has(skip_items, "nextjs_bypass"):
+        try:
+            result["nextjs_bypass"] = run_nextjs_bypass(domain)
+        except Exception as _nx_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"Next.js bypass phase errored: {_nx_err}")
+            result["nextjs_bypass"] = False
 
     # ── Phase 8: CMS Exploit (Drupal / WordPress) ──────────────────────────
     if cms_exploit and not skip_has(skip_items, "cms_exploit"):
