@@ -85,7 +85,11 @@ export PRIORITY_DIR="$RECON_DIR/priority"
 export FINDINGS_DIR
 
 CURL_TIMEOUT=60
-mkdir -p "$FINDINGS_DIR"/{upload,xss,sqli,takeover,misconfig,exposure,ssrf,cves,redirects,idor,auth_bypass,lfi,ssti,graphql,cors,jwt,smuggling,cloud,manual_review,metasploit,.tmp}
+# Custom nuclei templates directory (repo-local). Operators can override via env.
+# These are scanned alongside official ProjectDiscovery templates so engagement-
+# specific overrides (e.g. CVE-2025-68645 Zimbra with custom tags) get hit.
+CUSTOM_NUCLEI_TEMPLATES="${CUSTOM_NUCLEI_TEMPLATES:-$SCRIPT_DIR/nuclei-templates}"
+mkdir -p "$FINDINGS_DIR"/{upload,xss,sqli,takeover,misconfig,exposure,ssrf,cves,redirects,idor,auth_bypass,lfi,ssti,graphql,cors,jwt,smuggling,cloud,manual_review,metasploit,cves_custom,.tmp}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 file_lines()  { [ -f "${1:-}" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
@@ -376,6 +380,20 @@ if ! skip_has upload; then
         done
     done < <(head -30 "$ORDERED_SCAN")
     rm -f "$SOFT404_FILE"
+fi
+
+# ── Check 1.5: Custom nuclei templates (vikramaditya-tagged) ────────────
+# Runs the repo-local nuclei-templates/ directory so engagement-specific custom
+# templates (e.g. CVE-2025-68645 Zimbra) execute alongside the official set.
+# Must run BEFORE the per-tag SQLi pass so operator sees custom-template
+# coverage even when --skip sqli is set.
+if tool_ok nuclei && [ -d "$CUSTOM_NUCLEI_TEMPLATES" ] && [ -n "$(ls -A "$CUSTOM_NUCLEI_TEMPLATES" 2>/dev/null)" ]; then
+    log_info "Check 1.5: Custom nuclei templates (${CUSTOM_NUCLEI_TEMPLATES})"
+    nuclei -l "$ORDERED_SCAN" -t "$CUSTOM_NUCLEI_TEMPLATES" \
+        -severity low,medium,high,critical -silent \
+        -o "$FINDINGS_DIR/cves_custom/nuclei_custom.txt" 2>/dev/null || true
+    CUSTOM_HITS=$(count_vuln "$FINDINGS_DIR/cves_custom/nuclei_custom.txt")
+    [ "$CUSTOM_HITS" -gt 0 ] && log_ok "[CUSTOM-NUCLEI] $CUSTOM_HITS finding(s) — review $FINDINGS_DIR/cves_custom/"
 fi
 
 # ── Check 2: SQL Injection ──────────────────────────────────────────────

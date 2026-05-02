@@ -7,6 +7,7 @@ from whitebox.audit import prowler_runner
 from whitebox.audit.normalizer import to_findings as prowler_to_findings
 from whitebox.audit.fp_filter import filter_prowler_fps
 from whitebox.audit.waf_count_check import check_waf_count_mode
+from whitebox.audit.mfa_hardware_check import check_mfa_hardware
 from whitebox.iam.pmapper_runner import build_graph
 from whitebox.iam.graph import IAMGraph
 from whitebox.iam.privesc import detect_paths
@@ -174,6 +175,34 @@ def run_for_profile(profile_name: str, session_dir: Path,
             graph_path = build_graph(profile, pmap_dir)
             graph = IAMGraph.load(graph_path)
             phase_findings = detect_paths(graph, profile.account_id)
+            # P2-FIX-B — CIS 1.5 / 1.6 hardware-vs-virtual MFA check (Prowler
+            # treats any MFA as compliant; this distinguishes virtual from U2F).
+            try:
+                mfa_dicts = check_mfa_hardware(profile)
+                for d in mfa_dicts:
+                    sev_name = (d.get("severity") or "MEDIUM").upper()
+                    sev = Severity[sev_name] if sev_name in Severity.__members__ else Severity.MEDIUM
+                    arn = d.get("resource_id", "") or ""
+                    ctx = CloudContext(
+                        account_id=profile.account_id,
+                        region=d.get("region", "us-east-1"),
+                        service="iam",
+                        arn=arn,
+                    )
+                    fid = f"mfa-hw-{abs(hash(arn + d.get('check_id', '')))}"
+                    phase_findings.append(Finding(
+                        id=fid,
+                        source="pmapper",
+                        rule_id=d.get("check_id", "iam_user_mfa_hardware"),
+                        severity=sev,
+                        title=d.get("title", "MFA hardware check"),
+                        description=d.get("details", ""),
+                        asset=None,
+                        evidence_path=Path("pmapper") / f"{d.get('check_id', 'iam_user_mfa_hardware')}.json",
+                        cloud_context=ctx,
+                    ))
+            except Exception:
+                pass
             findings += phase_findings
             _persist_phase_findings(account_dir, "iam", phase_findings)
             cache.mark_complete("iam", artifacts={"graph": str(graph_path)})

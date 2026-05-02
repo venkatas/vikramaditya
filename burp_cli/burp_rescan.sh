@@ -17,14 +17,23 @@ BURP_BIN="/Applications/Burp Suite Professional.app/Contents/MacOS/JavaApplicati
 PROJECT_DIR="$HOME/burp-projects"
 CONFIG="$HOME/burp-configs/api-enabled.json"
 PROJECT="$PROJECT_DIR/$(date +%Y%m%d).burp"
-BURP_API_KEY="${BURP_API_KEY:-wLLCQeKxWV139OTau9uq6jf3bq41T5zc}"
-API="http://127.0.0.1:1337/${BURP_API_KEY}/v0.1"
+BURP_API_KEY="${BURP_API_KEY:-}"
 REPORT_DIR="${REPORT_DIR:-/tmp/burp-reports}"
 mkdir -p "$PROJECT_DIR" "$REPORT_DIR"
 
 require() { command -v "$1" >/dev/null || { echo "missing: $1"; exit 1; }; }
+require_burp_key() {
+  if [ -z "$BURP_API_KEY" ]; then
+    echo "ERROR: BURP_API_KEY env var not set." >&2
+    echo "Generate a key in Burp: User options -> Misc -> REST API -> New" >&2
+    echo "Then: export BURP_API_KEY=<key>" >&2
+    exit 1
+  fi
+}
 require jq
 require curl
+require_burp_key
+API="http://127.0.0.1:1337/${BURP_API_KEY}/v0.1"
 
 cmd_start() {
   if curl -fsS "$API/" >/dev/null 2>&1; then
