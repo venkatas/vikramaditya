@@ -303,31 +303,31 @@ class LLMClient:
         return []
 
 # Model preference order — first available wins
-# Benchmark-tested model priority (M4 Max 36GB, April 2026):
-#   #0 bugtraceai-apex     35s  57.0 tok/s  4/4 quality  ★ Security-tuned, <thinking> blocks, 0% refusal
-#   #1 gemma4:26b         23s  66.4 tok/s  4/4 quality  Fast all-rounder, supervisor decisions
-#   #2 qwen3-coder-64k    26s  10.2 tok/s  4/4 quality  Best for code/JS analysis
-#   #3 vapt-qwen25         88s   4.1 tok/s  4/4 quality  Deepest VAPT knowledge
-#   #4 deepseek-r1:32b   153s   3.9 tok/s  4/4 quality  Chain-of-thought reasoning
-#   #5 baron-llm           17s  14.2 tok/s  2/4 quality  Fast triage only
+# v9.1.3 benchmark (M-series, 03 May 2026, num_predict=1024):
+#   ★ phi4:14b           T1=4.3s  T2=7.4s  8.66 tok/s  100% valid JSON, no hidden thinking
+#     deepseek-r1:14b    T1=17.0s T2=31.5s  3.18 tok/s  Strong reasoning, slow, <think> blocks
+#     gemma4:26b         T1=16.1s T2=22.0s  0 tok/s     SILENT FAIL: eats num_predict on internal reasoning
+#                                                       (use only with num_predict>=2048)
+#   bugtraceai-apex / qwen3-coder-64k retained as deep-analysis tier when needed.
 MODEL_PRIORITY = [
-    "bugtraceai-apex",           # ★ #0 — Gemma4 26B security-tuned, DPO on bug bounty reports, 0% refusal
-    "gemma4:26b",                # #1 — 25.8B MoE, 66.4 tok/s, 262K context, fast all-rounder
-    "qwen3-coder-64k:latest",   # #2 — 30.5B, 10.2 tok/s, 64K context, best for code
-    "vapt-qwen25:latest",       # #3 — custom 32B VAPT-tuned, deepest security knowledge
-    "vikramaditya-custom:latest", # custom 32B vikramaditya
-    "vapt-model:latest",         # custom 30B VAPT
-    "qwen3-coder:30b",           # coder 30B
-    "deepseek-r1:32b",           # strong reasoning (slow: 3.9 tok/s)
-    "qwen3:30b-a3b",             # MoE 30B, 25.1 tok/s but 3/4 quality
-    "qwen2.5-coder:32b",         # coder 32B (slow: 2.7 tok/s)
-    "qwen2.5:32b",               # general 32B
-    "gemma4:e4b",                # Gemma 4 4B — fast, fits anywhere
-    "deepseek-r1:14b",           # reasoning 14B
-    "qwen3:14b",                 # 14B fallback
-    "baron-llm:latest",          # BaronLLM 8B — fast triage (14.2 tok/s, 2/4 quality)
-    "qwen3:8b",                  # 8B fallback
-    "mistral:7b-instruct-v0.3-q8_0",  # 7B last resort
+    "phi4:14b",                  # ★ #0 v9.1.3 — fastest + most consistent JSON, no hidden thinking
+    "bugtraceai-apex",           # #1 — security-tuned, DPO on bug bounty reports, 0% refusal
+    "qwen3-coder-64k:latest",    # #2 — 64K context, best for code/JS analysis
+    "deepseek-r1:14b",           # #3 — strong chain-of-thought, use for deep reasoning
+    "vapt-qwen25:latest",        # #4 — custom 32B VAPT-tuned
+    "gemma4:26b",                # #5 — kept as fallback; needs num_predict>=2048 to avoid silent truncation
+    "vikramaditya-custom:latest",
+    "vapt-model:latest",
+    "qwen3-coder:30b",
+    "deepseek-r1:32b",
+    "qwen3:30b-a3b",
+    "qwen2.5-coder:32b",
+    "qwen2.5:32b",
+    "gemma4:e4b",
+    "qwen3:14b",
+    "baron-llm:latest",
+    "qwen3:8b",
+    "mistral:7b-instruct-v0.3-q8_0",
 ]
 
 # MLX model preference order (Apple Silicon — mac-code technique, ~40 tok/s on M4)
@@ -340,9 +340,11 @@ MLX_MODEL_PRIORITY = [
     "mlx-community/Mistral-7B-Instruct-v0.3-4bit",    # 7B fallback
 ]
 
-# Fast triage model priority — BaronLLM first (8B, security-focused, low latency)
+# Fast triage model priority — phi4:14b first (v9.1.3 benchmark winner)
 # Used by triage_finding() and next_action() where speed > depth
+# 03 May 2026 bench: phi4:14b T1=4.3s vs baron-llm 17s — 4× faster, 100% valid JSON
 TRIAGE_MODEL_PRIORITY = [
+    "phi4:14b",                  # ★ v9.1.3 — fastest triage, consistent JSON, no hidden thinking
     "baron-llm:latest",          # BaronLLM — RLHF on offensive security data
     "gemma4:e4b",                # Gemma 4 4B — fast triage with tool calling
     "vapt-qwen25:latest",        # custom VAPT-tuned fallback
