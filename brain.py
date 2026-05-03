@@ -431,10 +431,19 @@ def _get_available_models() -> list[str]:
 
 
 def _pick_model(preferred: str = None) -> str | None:
-    """Return the best available model from priority list."""
+    """Return the best available model from priority list.
+
+    v9.1.4 — env override: BRAIN_MODEL=<name> forces a specific model
+    (used by A/B benchmarks, per-engagement model swap without code edits).
+    """
     available = _get_available_models()
     if not available:
         return None
+
+    # v9.1.4 env override takes precedence over caller's preferred arg
+    env_override = os.environ.get("BRAIN_MODEL", "").strip()
+    if env_override and env_override in available:
+        return env_override
 
     if preferred:
         # exact match first
@@ -454,10 +463,16 @@ def _pick_model(preferred: str = None) -> str | None:
 
 
 def _pick_triage_model(preferred: str = None) -> str | None:
-    """Return the best fast triage model — prefers BaronLLM when installed."""
+    """Return the best fast triage model — prefers BaronLLM when installed.
+
+    v9.1.4 — TRIAGE_MODEL=<name> env var overrides for A/B testing.
+    """
     available = _get_available_models()
     if not available:
         return None
+    env_override = os.environ.get("TRIAGE_MODEL", "").strip()
+    if env_override and env_override in available:
+        return env_override
     if preferred and preferred in available:
         return preferred
     for candidate in TRIAGE_MODEL_PRIORITY:
