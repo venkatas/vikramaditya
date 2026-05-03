@@ -1,5 +1,99 @@
 # Changelog
 
+## v9.1.4 — brain.py BRAIN_MODEL / TRIAGE_MODEL env overrides (2026-05-03)
+
+`_pick_model()` and `_pick_triage_model()` now read `BRAIN_MODEL` and `TRIAGE_MODEL` env vars before falling back to `MODEL_PRIORITY[0]`. Used for per-engagement model swap and A/B testing without source edits.
+
+```bash
+BRAIN_MODEL=phi4:14b TRIAGE_MODEL=phi4:14b python3 hunt.py --target X
+BRAIN_MODEL=gemma4:26b python3 hunt.py --target X     # one-off comparison
+BRAIN_MODEL=deepseek-r1:14b python3 hunt.py --target X  # for deeper reasoning
+```
+
+### A/B comparison that motivated this
+
+Same target (`kalki.pranapr.com`), same args, parallel runs:
+
+| Metric | phi4:14b | gemma4:26b |
+|---|---|---|
+| Brain 01 (recon analysis) | 3,668 B | 5,179 B |
+| Brain 02 (scan interpretation) | **2,452 B (full structured)** | 95 B (one-line punt) |
+| Brain 03 (exploit chains) | 1,871 B | NOT GENERATED |
+| Brain 04 (H1 reports) | 140 B (stub) | NOT GENERATED |
+| Total brain output | 8,131 B | 5,274 B |
+
+`gemma4:26b` skipped exploit-chain + H1 report phases entirely on this target. `phi4:14b` produced all 4 brain files including manual-testing queue, chain candidates, and missing-coverage list.
+
+Commit `791ed53`.
+
+---
+
+## v9.1.3 — brain.py model swap to phi4:14b primary + triage (2026-05-03)
+
+Benchmark on M-series (3 models × 5 triage + 3 reasoning + speed, num_predict=1024) ran against fresh adf-erp findings.json from 03 May whitebox run:
+
+| Model | T1 Triage avg | T2 Reason avg | Speed | JSON parseable |
+|---|---|---|---|---|
+| **phi4:14b** | **4.3s** | **7.4s** | **8.66 tok/s** | ✅ 100% |
+| deepseek-r1:14b | 17.0s | 31.5s | 3.18 tok/s | ✅ valid (with `<think>` blocks stripped) |
+| gemma4:26b | 16.1s | 22.0s | 0 tok/s | inconsistent — silent fail at default `num_predict` |
+
+Key insight: `gemma4:26b` consumes all available `num_predict` tokens on internal reasoning before producing any response — needs `num_predict>=2048` to be useful. At default settings it returns empty responses with `done_reason=length`, which likely caused silent truncation in production scans (a bug masked as "no findings").
+
+`phi4:14b` strengths: 4× faster triage, 3× faster reasoning, no hidden thinking phase, 100% valid JSON output across the test set, fits in 9.1 GB (vs gemma4:26b at 17 GB — frees 8 GB during scans).
+
+### Changes
+
+- `MODEL_PRIORITY`: `phi4:14b` → #0 primary (was `bugtraceai-apex` / `gemma4:26b`).
+- `TRIAGE_MODEL_PRIORITY`: `phi4:14b` → #0 (was `baron-llm:latest`).
+- `gemma4:26b` retained at #5 with caveat about `num_predict` requirement.
+- `deepseek-r1:14b` promoted to #3 for deep chain-of-thought when needed.
+
+Commit `be2f3cb`.
+
+---
+
+## v9.1.2 — reporter.py 8-bug fix (2026-05-03)
+
+Discovered while monitoring v9.1.1 e2e validation run on `adfactorspr.com`.
+
+### Bugs fixed
+
+1. **97-FP storm** — reporter.py treated `upload/auth_required.txt` and similar scanner.sh state files as confirmed findings. A site that returned 403 on `/upload`, `/upload.php` etc. produced 97 fake "Unrestricted File Upload" HIGHs in the report. `NON_FINDING_FILES` + `NON_FINDING_PREFIXES` exclude lists added at line 757.
+2. **CVE-loader schema mismatch** — `cve_database_matches.json` is a dict-with-`cves_found`-array, not a bare list. Reporter's `isinstance(cve_data, list)` check skipped every CVE row. Now normalises both schemas.
+3. **`cves_custom/` subdir not registered** — scanner.sh Check 1.5 (added in v9.1.1) writes to `cves_custom/nuclei_custom.txt` but reporter ignored the dir. Added Method 1c loader that parses nuclei output format.
+4. **`KeyError 'raw'` on synthetic findings** — CVE-loader-built dicts don't have a `raw` key; renderer crashed. `f.get("poc", f.get("raw", f.get("detail", "—")))` fallback chain.
+5. **`KeyError 'unknown'` on severity** — CVE rows can carry severities not in `SEVERITY_COLOR`. Default to `info` colour instead of crashing.
+6. **Host points at NVD instead of target** — host extracted from URL pointed at `nvd.nist.gov` for CVE rows. Now substitutes back to target.
+7. **Template title overwrites real title** — `VULN_TEMPLATES["cves"].title` is "Known CVE Vulnerability on {host}" — overwrote per-CVE titles like "CVE-2017-7235 — cloudflare". Finding-level title now takes precedence.
+8. **CVSS hardcoded to severity bucket** — every CVE finding rendered with `CVSS_DEFAULT[severity]` (9.0 for high/critical). Now extracts actual score from poc string ("CVSS: 9.8" → 9.8).
+
+### Net impact
+
+Pre-fix: report showed 0 findings + 97-FP storm. Post-fix: 45 findings with real CVE IDs, correct hosts, per-CVE CVSS scores.
+
+Commit `a664b68`.
+
+---
+
+## v9.1.1 — P2 hardening: Zimbra CVE template + MFA hardware check + .gitignore + Burp key fix (2026-05-02)
+
+Four P2 fixes from the Adfactors engagement.
+
+### Added
+
+- Custom nuclei template for **CVE-2025-68645 Zimbra LFI** (`nuclei-templates/cve-2025-68645-zimbra.yaml`, 39 LOC), wired into `scanner.sh` as **Check 1.5** with `CUSTOM_NUCLEI_TEMPLATES` env override (defaults to repo-local `nuclei-templates/`).
+- IAM MFA hardware-vs-virtual distinction (`whitebox/audit/mfa_hardware_check.py`, 122 LOC). Function `check_mfa_hardware(profile)` paginates `iam.list_users` → `list_mfa_devices`, flags virtual-MFA serials (`:mfa/`) as MEDIUM (CIS 1.6); cross-checks `list_virtual_mfa_devices(AssignmentStatus='Assigned')` for root virtual MFA → CRITICAL (CIS 1.5). Wired into `whitebox/orchestrator.py` after IAM phase, before report. Wrapped in try/except so a permission gap never breaks the IAM phase.
+
+### Fixed
+
+- `.gitignore` — added engagement-scratch ignores: `dirs.txt`, `parse_docs.py`, `parse_docs_zip.py`, `partner_index.js`, `run_scan.sh`, `test_file_upload_only.py`, `with_params.txt`, `schemathesis-report/`, `.claude/scheduled_tasks.lock`, `.claude/projects/`.
+- `burp_cli/burp_rescan.sh` — removed hardcoded API key (which had been committed in v9.1.0); added `require_burp_key()` guard that prints generation instructions and exits 1 if `BURP_API_KEY` env is unset. **SECURITY NOTE:** the previously committed key in `be4c86b` should be rotated in Burp Pro (User options → Misc → REST API → revoke + new); removing it from source does not invalidate it on the server side.
+
+Commit `6fdbf68`.
+
+---
+
 ## v9.1.0 — Engagement-driven hardening: P0+P1 fixes from Adfactors VAPT (2026-05-02)
 
 Eight surgical fixes + 6 new modules shipped after a 4-day live engagement against two AWS accounts and seven client domains. Each item is anchored to a specific gap or false positive surfaced during the engagement. All changes triple-verified: two independent agent re-tests + Codex GPT-5.5 (xhigh reasoning) severity calibration.

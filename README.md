@@ -9,6 +9,48 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.1.4 — phi4:14b promoted to primary brain + env-overridable model selection**
+
+A/B comparison run on 03 May 2026 (kalki.pranapr.com, same args, parallel) confirmed `phi4:14b` strictly dominates `gemma4:26b` on output utility:
+- phi4:14b produced all 4 brain analysis files (8,131 B total) including chain-candidates, manual-testing queue, H1 report stub
+- gemma4:26b produced only 2 brain files (5,274 B total); brain phase 02 punted with "No findings — nothing to interpret." and skipped exploit-chain + report phases entirely
+- phi4:14b was 4× faster on triage (4.3s vs 16.1s) and 3× faster on reasoning (7.4s vs 22.0s)
+- gemma4:26b silently consumes all `num_predict` tokens on internal reasoning at default settings — produces empty responses with `done_reason=length` (likely caused silent truncation in production scans before this fix)
+
+**New env overrides:** `BRAIN_MODEL=<name>` and `TRIAGE_MODEL=<name>` — used for per-engagement model swap and A/B testing without code edits.
+
+```bash
+BRAIN_MODEL=phi4:14b TRIAGE_MODEL=phi4:14b python3 hunt.py --target X
+BRAIN_MODEL=deepseek-r1:14b python3 hunt.py --target X   # for deeper reasoning
+```
+
+Memory savings: gemma4:26b 17 GB → phi4:14b 9.1 GB = 8 GB freed during scans.
+
+---
+
+**v9.1.2/v9.1.3 — reporter.py 8-bug fix + brain.py model promotion**
+
+Discovered while monitoring v9.1.1 e2e validation run on adfactorspr.com:
+- Bug 1 (97-FP storm): reporter.py treated `upload/auth_required.txt` and similar scanner.sh state files as confirmed findings. A site that returned 403 on `/upload`, `/upload.php` etc. produced 97 fake "Unrestricted File Upload" HIGHs in the report. `NON_FINDING_FILES` + `NON_FINDING_PREFIXES` exclude lists added.
+- Bug 2: `cve_database_matches.json` schema is dict-with-`cves_found`-array; reporter expected bare list. Now normalises both.
+- Bug 3: `cves_custom/` subdir (P2 added) wasn't registered. Added Method 1c loader.
+- Bugs 4–8: `KeyError 'raw'` on synthetic findings, `KeyError 'unknown'` on non-standard severities, host points at NVD instead of target, template title overwrites real title, CVSS hardcoded to severity bucket.
+
+Net: pre-fix → 0 findings + 97-FP storm. Post-fix → 45 real findings with proper CVE IDs, correct hosts, per-CVE CVSS scores.
+
+`brain.py` v9.1.3: MODEL_PRIORITY[0] swap to `phi4:14b` based on benchmark (see v9.1.4 above).
+
+---
+
+**v9.1.1 — P2 hardening: Zimbra CVE template + MFA hardware check**
+
+- Custom nuclei template for **CVE-2025-68645 Zimbra LFI** (`nuclei-templates/cve-2025-68645-zimbra.yaml`), wired into `scanner.sh` as Check 1.5 with `CUSTOM_NUCLEI_TEMPLATES` env override.
+- IAM MFA hardware-vs-virtual distinction (`whitebox/audit/mfa_hardware_check.py`) — flags virtual MFA as MEDIUM (CIS 1.6), root virtual MFA as CRITICAL (CIS 1.5); fail-soft.
+- `.gitignore` additions for engagement scratch (parse_docs.py, schemathesis-report/, .claude/scheduled_tasks.lock, etc.).
+- `burp_cli/burp_rescan.sh` — removed hardcoded API key; added `require_burp_key()` guard.
+
+---
+
 **v9.1.0 — Engagement-driven hardening: Prowler FP filter + WAF-COUNT detector + HAR-replay differential + NoSQL/Next.js probes + SSL strict-by-default**
 
 Eight surgical fixes shipped after a 4-day live VAPT engagement, triple-verified (two independent agents + Codex GPT-5.5 review).
