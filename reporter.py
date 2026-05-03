@@ -763,13 +763,33 @@ def load_findings(findings_dir: str) -> list:
         for fn in sorted(os.listdir(path)):
             if fn.endswith(".poc"):
                 all_pocs.update(_load_poc_blocks(os.path.join(path, fn)))
+        # v9.1.2 — non-finding files written by scanner.sh into finding dirs
+        # to record probe state (auth-required, candidates, timeouts). These are
+        # NOT findings; treating them as such inflates the report (97 fake "Unrestricted
+        # File Upload" HIGHs from auth_required.txt during the 03-May Adfactors run).
+        NON_FINDING_FILES = {
+            "auth_required.txt",          # upload/ — paths protected by auth, not vulnerable
+            "timebased_candidates.txt",   # sqli/ — unverified timing candidates
+            "auth-required.txt",
+        }
+        # Line-prefix markers used by scanner.sh to record state, not findings.
+        NON_FINDING_PREFIXES = (
+            "[UPLOAD-CANDIDATE-AUTH]",   # path returned 403 to GET+POST = auth-protected
+            "[SQLI-CANDIDATE]",          # unverified time-based candidate, needs follow-up
+            "[SQLI-TIMEOUT-CANDIDATE]",  # timeout was server-side slow, not necessarily SQLi
+            "[GIT-FLAG-INJECTION-CANDIDATE]",  # candidate, not confirmed
+        )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
+                continue
+            if fn in NON_FINDING_FILES:
                 continue
             with open(os.path.join(path, fn), errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith("#"):
+                        continue
+                    if any(line.startswith(p) for p in NON_FINDING_PREFIXES):
                         continue
                     finding = parse_custom_line(line, vtype)
                     for poc_key, poc_text in all_pocs.items():
@@ -779,6 +799,8 @@ def load_findings(findings_dir: str) -> list:
                     results.append(finding)
 
     # Method 1b: CVE database matches (cves/ subdirectory)
+    # v9.1.2 — handles both schemas: bare list AND
+    # {target, scan_date, technologies_detected, cves_found:[...]} (current cve.py format).
     cve_path = os.path.join(findings_dir, "cves")
     if os.path.isdir(cve_path):
         for fn in sorted(os.listdir(cve_path)):
@@ -787,21 +809,57 @@ def load_findings(findings_dir: str) -> list:
             try:
                 with open(os.path.join(cve_path, fn), errors="replace") as f:
                     cve_data = _json.load(f)
-                if isinstance(cve_data, list):
-                    for item in cve_data:
-                        cve_id = item.get("cve_id", item.get("id", ""))
-                        desc = item.get("description", item.get("summary", ""))
-                        sev = item.get("severity", "medium").lower()
-                        score = item.get("cvss_score", item.get("score", ""))
-                        product = item.get("product", item.get("software", ""))
-                        if cve_id:
+                # Normalize to a list of CVE dicts
+                if isinstance(cve_data, dict) and "cves_found" in cve_data:
+                    cve_list = cve_data["cves_found"]
+                elif isinstance(cve_data, list):
+                    cve_list = cve_data
+                else:
+                    cve_list = []
+                for item in cve_list:
+                    cve_id = item.get("cve_id", item.get("id", ""))
+                    desc = item.get("description", item.get("summary", ""))
+                    sev = item.get("severity", "medium").lower()
+                    score = item.get("cvss_score", item.get("score", ""))
+                    product = item.get("product", item.get("software", item.get("technology", "")))
+                    if cve_id:
+                        results.append({
+                            "severity": sev,
+                            "vtype": "cves",
+                            "title": f"{cve_id} — {product}" if product else cve_id,
+                            "detail": desc[:300] if desc else f"Known CVE: {cve_id}",
+                            "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                            "poc": f"CVE: {cve_id}\nCVSS: {score}\nProduct: {product}\n{desc[:500]}",
+                        })
+            except Exception:
+                pass
+
+    # Method 1c: cves_custom/ — output of scanner.sh Check 1.5 (nuclei custom templates)
+    # v9.1.2 — added to surface findings from /Users/venkatasatish/Documents/GitHub/obsidian/nuclei-templates/
+    cves_custom_path = os.path.join(findings_dir, "cves_custom")
+    if os.path.isdir(cves_custom_path):
+        for fn in sorted(os.listdir(cves_custom_path)):
+            if not fn.endswith(".txt"):
+                continue
+            try:
+                with open(os.path.join(cves_custom_path, fn), errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        # nuclei output format: [template-id] [proto] [severity] url
+                        # e.g. "[CVE-2025-68645-zimbra-webxml-lfi] [http] [high] https://mapi..../h/changepass?..."
+                        import re as _re
+                        m = _re.search(r"\[([^\]]+)\]\s+\[\w+\]\s+\[(\w+)\]\s+(\S+)", line)
+                        if m:
+                            template_id, sev, url = m.group(1), m.group(2), m.group(3)
                             results.append({
-                                "severity": sev,
+                                "severity": sev.lower(),
                                 "vtype": "cves",
-                                "title": f"{cve_id} — {product}" if product else cve_id,
-                                "detail": desc[:300] if desc else f"Known CVE: {cve_id}",
-                                "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
-                                "poc": f"CVE: {cve_id}\nCVSS: {score}\nProduct: {product}\n{desc[:500]}",
+                                "title": f"{template_id} (custom template)",
+                                "detail": f"Custom nuclei template fired: {template_id}",
+                                "url": url,
+                                "poc": line,
                             })
             except Exception:
                 pass
@@ -1442,7 +1500,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
                          for n, u in tmpl.get("references", []))
         details += f"""
 <div id="VN-{i:03d}" style="margin-bottom:36px;border:1px solid #dee2e6;border-radius:6px;overflow:hidden">
-  <div style="background:{SEVERITY_COLOR[sev]};padding:12px 18px;color:#fff">
+  <div style="background:{SEVERITY_COLOR.get(sev, SEVERITY_COLOR['info'])};padding:12px 18px;color:#fff">
     <b>VN-{i:03d} — {vtitle}</b>
     <span style="float:right;font-size:0.9em">CVSS: {cvss} | {tmpl.get("cwe","N/A")} | ATT&amp;CK: {ATTACK_IDS.get(vtype,"—")}</span>
   </div>
@@ -1458,7 +1516,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
     <h4 style="color:#343a40;margin:10px 0 6px">Description / Impact</h4>
     <p style="margin:0 0 10px">{tmpl["impact"]}</p>
     <h4 style="color:#343a40;margin:10px 0 6px">Evidence / Proof of Concept</h4>
-    <pre style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:12px;overflow-x:auto;font-size:0.85em;white-space:pre-wrap">{f.get("poc", f["raw"])}</pre>
+    <pre style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:12px;overflow-x:auto;font-size:0.85em;white-space:pre-wrap">{f.get("poc", f.get("raw", f.get("detail", "—")))}</pre>
     <h4 style="color:#343a40;margin:10px 0 6px">Remediation</h4>
     <p style="margin:0 0 10px">{tmpl["remediation"]}</p>
     <h4 style="color:#343a40;margin:4px 0 6px">References</h4>
@@ -1662,22 +1720,37 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         tmpl  = VULN_TEMPLATES.get(f["vtype"], VULN_TEMPLATES["misconfig"])
         host  = re.search(r'https?://([^/]+)', f["url"])
         host  = host.group(1) if host else target
-        cvss  = tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A")
-        lines.append(f"| VN-{i:03d} | {tmpl['title'].format(host=host)} | {f['severity'].upper()} | {cvss} | {host} |")
+        # v9.1.2 — for CVE-DB findings the host extracted from URL points at
+        # nvd.nist.gov; the real "affected host" is the engagement target.
+        if "nvd.nist.gov" in host or "cve.mitre.org" in host:
+            host = target
+        # v9.1.2 — finding's own title takes precedence over the template title.
+        # CVE-DB rows already supply a useful "CVE-2017-7235 — cloudflare" title;
+        # the generic template "Known CVE Vulnerability on {host}" is a fallback.
+        title = f.get("title") or tmpl["title"].format(host=host)
+        # v9.1.2 — actual CVSS from finding (CVE rows carry per-CVE score) takes
+        # precedence over template default.
+        m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
+        cvss = m.group(1) if m else (tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
+        lines.append(f"| VN-{i:03d} | {title} | {f['severity'].upper()} | {cvss} | {host} |")
     lines += ["", "---", "", "## Detailed Findings", ""]
     for i, f in enumerate(findings, 1):
         tmpl  = VULN_TEMPLATES.get(f["vtype"], VULN_TEMPLATES["misconfig"])
         host  = re.search(r'https?://([^/]+)', f["url"])
         host  = host.group(1) if host else target
-        cvss  = tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A")
+        if "nvd.nist.gov" in host or "cve.mitre.org" in host:
+            host = target
+        title = f.get("title") or tmpl["title"].format(host=host)
+        m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
+        cvss = m.group(1) if m else (tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
         refs  = "\n".join(f"- [{n}]({u})" for n, u in tmpl.get("references", []))
         lines += [
-            f"### VN-{i:03d} — {tmpl['title'].format(host=host)}",
+            f"### VN-{i:03d} — {title}",
             f"**Severity:** {f['severity'].upper()} | **CVSS:** {cvss} | **CWE:** {tmpl.get('cwe','N/A')} | **ATT&CK:** {ATTACK_IDS.get(f['vtype'],'—')}  ",
             f"**Affected URL:** `{f['url']}`", "",
             f"**Impact:** {tmpl['impact']}", "",
             "**Evidence / Proof of Concept:**", "```",
-            f.get("poc", f["raw"]),
+            f.get("poc", f.get("raw", f.get("detail", "—"))),
             "```", "",
             f"**Remediation:** {tmpl['remediation']}", "",
             "**References:**", refs, "", "---", "",
