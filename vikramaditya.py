@@ -41,10 +41,10 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.8.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.7.0 for k8s_audit.py (Kubescape + Trivy + Falco).
-# See CHANGELOG.md v9.8.0.
-__version__ = "9.8.0"
+# v9.9.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.8.0 for iac_audit.py (Checkov + KICS dedicated IaC scanner).
+# See CHANGELOG.md v9.9.0.
+__version__ = "9.9.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -889,6 +889,9 @@ Options:
   --k8s-trivy-images      Enumerate cluster images via kubectl + scan each
   --k8s-falco-seconds N   Run Falco runtime tap for N seconds
   --iac PATH              Trivy IaC scan on a local path (Helm/K8s/TF)
+  --iac-deep PATH         v9.9.0 — Checkov + KICS dedicated IaC scan
+                          (deeper than Trivy config for Terraform/CFN)
+  --iac-frameworks CSV    Checkov frameworks (terraform,kubernetes,helm,...)
 """
 
 
@@ -935,6 +938,9 @@ def parse_cli_args() -> dict:
         "k8s_trivy_images": False,
         "k8s_falco_seconds": 0,
         "iac": "",
+        # v9.9.0 — IaC dedicated
+        "iac_deep": "",
+        "iac_frameworks": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -1005,6 +1011,10 @@ def parse_cli_args() -> dict:
             i += 2
         elif argv[i] == "--iac" and i + 1 < len(argv):
             args["iac"] = argv[i + 1]; i += 2
+        elif argv[i] == "--iac-deep" and i + 1 < len(argv):
+            args["iac_deep"] = argv[i + 1]; i += 2
+        elif argv[i] == "--iac-frameworks" and i + 1 < len(argv):
+            args["iac_frameworks"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1333,6 +1343,17 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["iac_deep"]:
+        log("info", f"--iac-deep: {cli['iac_deep']}")
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "iac_audit.py"),
+                   "--path", cli["iac_deep"]]
+            if cli["iac_frameworks"]:
+                cmd += ["--frameworks", cli["iac_frameworks"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=2400)
+        except Exception as e:
+            log("warn", f"iac_audit failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["k8s_audit"] or cli["iac"]:
         log("info", f"--k8s-audit: ctx={cli['k8s_audit']} fw={cli['k8s_framework']}")
