@@ -41,10 +41,10 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.7.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.6.0 for ad_hunt.py (NetExec + BloodHound CE + Impacket + Certipy).
-# See CHANGELOG.md v9.7.0.
-__version__ = "9.7.0"
+# v9.8.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.7.0 for k8s_audit.py (Kubescape + Trivy + Falco).
+# See CHANGELOG.md v9.8.0.
+__version__ = "9.8.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -882,6 +882,13 @@ Options:
   --ad-user USER          AD audit user
   --ad-pass PASS          AD audit password
   --ad-mode MODE          discover|bloodhound|certipy|kerberoast|all
+  --k8s-audit CONTEXT     v9.8.0 — Kubescape + Trivy + Falco audit on
+                          a kubectl context. Optional: --k8s-framework,
+                          --k8s-trivy-images, --k8s-falco-seconds, --iac.
+  --k8s-framework FW      nsa|mitre|cis|soc2|allcontrols|armobest
+  --k8s-trivy-images      Enumerate cluster images via kubectl + scan each
+  --k8s-falco-seconds N   Run Falco runtime tap for N seconds
+  --iac PATH              Trivy IaC scan on a local path (Helm/K8s/TF)
 """
 
 
@@ -922,6 +929,12 @@ def parse_cli_args() -> dict:
         "ad_user": "",
         "ad_pass": "",
         "ad_mode": "discover",
+        # v9.8.0 — K8s
+        "k8s_audit": "",
+        "k8s_framework": "nsa",
+        "k8s_trivy_images": False,
+        "k8s_falco_seconds": 0,
+        "iac": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -978,6 +991,20 @@ def parse_cli_args() -> dict:
             args["ad_pass"] = argv[i + 1]; i += 2
         elif argv[i] == "--ad-mode" and i + 1 < len(argv):
             args["ad_mode"] = argv[i + 1]; i += 2
+        elif argv[i] == "--k8s-audit" and i + 1 < len(argv):
+            args["k8s_audit"] = argv[i + 1]; i += 2
+        elif argv[i] == "--k8s-framework" and i + 1 < len(argv):
+            args["k8s_framework"] = argv[i + 1]; i += 2
+        elif argv[i] == "--k8s-trivy-images":
+            args["k8s_trivy_images"] = True; i += 1
+        elif argv[i] == "--k8s-falco-seconds" and i + 1 < len(argv):
+            try:
+                args["k8s_falco_seconds"] = int(argv[i + 1])
+            except ValueError:
+                pass
+            i += 2
+        elif argv[i] == "--iac" and i + 1 < len(argv):
+            args["iac"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1306,6 +1333,22 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["k8s_audit"] or cli["iac"]:
+        log("info", f"--k8s-audit: ctx={cli['k8s_audit']} fw={cli['k8s_framework']}")
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "k8s_audit.py")]
+            if cli["k8s_audit"]:
+                cmd += ["--context", cli["k8s_audit"], "--framework", cli["k8s_framework"]]
+                if cli["k8s_trivy_images"]:
+                    cmd += ["--trivy-images"]
+                if cli["k8s_falco_seconds"]:
+                    cmd += ["--falco-seconds", str(cli["k8s_falco_seconds"])]
+            if cli["iac"]:
+                cmd += ["--iac", cli["iac"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=2400)
+        except Exception as e:
+            log("warn", f"k8s_audit failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
 
     has_ollama = ollama_available()
