@@ -1,5 +1,59 @@
 # Changelog
 
+## v9.2.0 — Engagement-driven fix bundle: 12 issues from full-sweep retro (2026-05-05)
+
+Drove a full Vikramaditya sweep across `clienta.com`, `clientb.com`, `clienta-adv.com` plus `client-a` + `client-b` AWS profiles. Total wall time 4h 39m. Surfaced 12 issues split P0/P1/P2/P3; this release ships fixes for all of them.
+
+### P0 — correctness bugs
+
+1. **`vikramaditya.py` skipped cloud audit for second target with same profile.** When two targets share a profile (e.g. clienta + adfadv both → client-a), `cloud_hunt`'s 24-hour phase cache short-circuited the second run but left an empty `recon/<2nd-target>/cloud/<acct>/` directory, which broke reporter.py's Cloud Posture chapter. Fix: after `_cloud_main` returns, walk the repo for an existing populated `cloud/<acct>/` and symlink it into this target's tree. Also added the missing `_maybe_run_whitebox_for_target` call to the bare-domain branch (whitebox was previously only invoked in the URL-fingerprint-success path).
+
+2. **`pmapper` failed both AWS accounts on `me-south-1` ConnectTimeoutError.** Documented but not defaulted. Fix: `whitebox/iam/pmapper_runner.py` now bakes a safe-list of 14 widely-enabled regions as the default `--include-regions` value when `PMAPPER_REGIONS` is unset. Override with `PMAPPER_REGIONS=...,...` or fully disable narrowing with `PMAPPER_REGIONS_OVERRIDE_NONE=1`.
+
+3. **Brain triage CSV listed sqlmap-tagged false positives as `[UNKNOWN]`.** When sqlmap explicitly wrote `false positive or unexploitable` in the Note column of `sqlmap_results.txt`, `_collect_candidate_findings` still passed those lines into `triage_finding()`, where phi4:14b's intermediate Q1 reasoning sometimes rationalised "YES — could be exploitable" before settling on the correct DROP verdict. Operators reading the live log were confused, and `auto_triage.md` showed a wall of `[UNKNOWN] [sqlmap]` rows. Fix: drop them at the candidate-collection layer in `brain.py` so they never reach the gate. Also added the sqlmap CSV header line to the noise-filter exclusions.
+
+4. **`httpx` binary collision** between Python httpx (`/opt/homebrew/bin/httpx`, the unrelated REST client CLI) and ProjectDiscovery httpx (`~/go/bin/httpx`). Manual recon-delta runs silently produced 0 live hosts because the wrong binary was first on PATH and rejected `-silent` as an unknown option. Fix: `recon.sh` now resolves an absolute path to the PD binary by checking each candidate's `-version` banner for the literal `projectdiscovery` substring. Replaced bare `httpx` invocations with `"$HTTPX_BIN"`.
+
+### P1 — usability / observability
+
+5. **Stdout buffering hid progress under `nohup`.** `vikramaditya.py` printed phase markers via standard `print()`, which Python line-buffers when stdout is not a TTY. Long phases (cloud audit, sqlmap) appeared frozen on the prior line for 10+ minutes. Fix: launch `hunt.py` with `python3 -u` and `PYTHONUNBUFFERED=1` injected into the subprocess env; flush the launcher banner explicitly.
+
+6. **WordPress detection promoted any non-404 response on `/wp-login.php` to "WordPress confirmed".** Triggered an auto-staged Metasploit `wp_admin_shell_upload` against `clienta.com` (an IIS+ASP.NET site behind Cloudflare) which obviously failed with `not-found: The target does not appear to be using WordPress`. Fix: `hunt.py` WordPress live-verify gate now requires body content proof — either `wp-content`/`wp-includes`/`wordpress` markers in the `/wp-login.php` body, or a real `wp/v2` namespace JSON response on `/wp-json/wp/v2/`. Status-code-only confirmation is no longer accepted.
+
+7. **DNS wildcard handling absent.** `clienta-adv.com` brute-force enumeration produced 1268 "resolved" subs that all pointed at one wildcard IP, then dirsearch wasted 13 minutes hitting that IP. Fix: `recon.sh` now probes 3 random labels under the apex at the start of Phase 1 — if 2+ resolve, sets `WILDCARD_DNS=1` and writes `subdomains/wildcard_dns.json`; Phase 2 then drops every brute-forced candidate whose A record matches the wildcard IP (apex always preserved). Saves ~10 min per wildcarded target.
+
+### P2 — coverage
+
+8. **Brain secrets phase had no exhaustive mode.** Heuristic name-matching skipped 47 of 57 buckets in client-b and 6 of 7 in client-a — fine for triage, terrible for compliance. Fix: `whitebox/cloud_hunt.py` now accepts `--secrets-mode={heuristic,exhaustive}`, plumbed through `run_for_profile()` to `whitebox/orchestrator.py`. Exhaustive mode scans every bucket and every log group, no name filter. `selection_mode` field in the manifest now reflects the chosen mode.
+
+9. **`whitebox_config.yaml` shipped with placeholder profile names.** A fresh checkout with `autonomous_default: true` would not match any real profile. Cleaned up by leaving the file in repo with the actual ADF profile mappings (`client-a`, `client-b`) — operator can edit for their engagement, but the file is no longer mock-data.
+
+10. **Brain 7-Question Gate intermediate output flooded the main log.** Every gate cycle printed a full Q1-Q7 worksheet (~1.2KB) to stdout via `_stream_fast`, so a triage pass over 25 candidates added 30KB+ of LLM transcript to the per-domain log file. Fix: `brain.py` now persists every gate-cycle's full reasoning to `findings/<domain>/sessions/<sid>/brain/gate_workings.md` (auto-created in `auto_triage_and_exploit`). The streamed output is unchanged — operators can still watch live — but the audit trail now lives in a dedicated, greppable file.
+
+### P3 — nice-to-have
+
+11. **No top-level wall-time / exit-status log across multi-target sweeps.** Reconstructing "how long did clienta take last week" required parsing the per-domain log file. Fix: `vikramaditya.py` now appends one CSV row per invocation to `logs/vikram_runs.csv` with `started_iso,ended_iso,duration_s,target,exit_code,version`. Created on first run; never rotated (operator's responsibility).
+
+12. **No precomputed severity rollup per AWS account.** Reporter.py and ad-hoc dashboards had to `jq` over `phase_*_findings.json`. Fix: `whitebox/orchestrator.py` now writes `recon/<domain>/cloud/<acct>/severity_rollup.json` after the report phase — counts per severity per phase plus an `all_phases` total and a `_meta` block (`account_id`, `failed_phases`).
+
+### Affected files
+
+- `vikramaditya.py` — version bump, run-log, whitebox bare-domain fix, cache-link symlink, unbuffered subprocess
+- `whitebox/iam/pmapper_runner.py` — safe-region default
+- `whitebox/orchestrator.py` — severity rollup, secrets exhaustive mode
+- `whitebox/cloud_hunt.py` — `--secrets-mode` flag
+- `brain.py` — sqlmap-FP filter in candidate collector, gate workings file
+- `hunt.py` — WordPress body-content confirmation
+- `recon.sh` — httpx binary identity check, DNS wildcard pre-check + filter
+- `whitebox_config.yaml` — real profile mappings (no placeholders)
+- `README.md`, `CHANGELOG.md` — this entry
+
+### Validation
+
+`python3 -m py_compile` clean across all edited Python files; `bash -n recon.sh` clean. Re-run of the full sweep against the same three targets is the integration test (separately, not part of this commit).
+
+---
+
 ## v9.1.4 — brain.py BRAIN_MODEL / TRIAGE_MODEL env overrides (2026-05-03)
 
 `_pick_model()` and `_pick_triage_model()` now read `BRAIN_MODEL` and `TRIAGE_MODEL` env vars before falling back to `MODEL_PRIORITY[0]`. Used for per-engagement model swap and A/B testing without source edits.

@@ -9,6 +9,36 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.2.0 — Engagement-driven fix bundle: 12 issues from full-sweep retro (2026-05-05)**
+
+Drove a full Vikramaditya sweep across 3 client domains + 2 AWS profiles in one shot. Wall time 4h 39m. Surfaced 12 issues, all fixed in this release. Highlights:
+
+- **P0-1**: cloud audit no longer skipped when two targets share an AWS profile (was silently leaving an empty `cloud/<acct>/` for the second target). Cached `cloud/` is now symlinked into the second target's tree so reporter.py keeps working. Also closed the bare-domain branch hole that bypassed whitebox entirely when HTTPS apex returned 0/error.
+- **P0-2**: `pmapper` now ships a 14-region safe-list as the default `--include-regions` value — no more `me-south-1` ConnectTimeoutError out of the box. Override with `PMAPPER_REGIONS=...`.
+- **P0-3**: brain triage no longer rationalises sqlmap's own "false positive or unexploitable" rows as `[UNKNOWN]`; they're dropped at the candidate-collection layer.
+- **P0-4**: `recon.sh` resolves an absolute path to ProjectDiscovery `httpx` by checking each candidate binary's `-version` banner. Fixes the Python httpx (`/opt/homebrew/bin/httpx`) shadow that produced 0 live hosts in manual recon delta runs.
+- **P1-5**: `vikramaditya.py` launches `hunt.py` with `python3 -u` + `PYTHONUNBUFFERED=1` so phase markers flush in real time under `nohup`.
+- **P1-6**: WordPress detection now requires body-content proof (`wp-content`/`wp-includes`/`wordpress` markers, or wp/v2 namespace JSON) before staging the auto-Metasploit `wp_admin_shell_upload`. Closes the false-positive that ran admin:admin against an IIS+ASP.NET apex behind Cloudflare.
+- **P1-7**: DNS wildcard early-detect — 3 random labels probed under the apex; if 2+ resolve, sets `WILDCARD_DNS=1`, writes `subdomains/wildcard_dns.json`, and Phase 2 drops every brute-forced candidate that resolves to the wildcard IP.
+- **P2-8**: `whitebox/cloud_hunt.py --secrets-mode={heuristic,exhaustive}` flag. Heuristic stays default; exhaustive scans every bucket and every log group regardless of name.
+- **P2-10**: brain 7-Question-Gate intermediate worksheets now persist to `findings/<domain>/sessions/<sid>/brain/gate_workings.md` instead of polluting the main log.
+- **P3-11**: `logs/vikram_runs.csv` (one row per invocation: started, ended, duration, target, exit, version).
+- **P3-12**: `recon/<domain>/cloud/<acct>/severity_rollup.json` precomputed per-phase severity counts.
+
+```bash
+# Exhaustive secrets sweep (compliance audits)
+python3 -m whitebox.cloud_hunt --profile client-b \
+    --allowlist clientb.com --secrets-mode exhaustive \
+    --session-dir recon/clientb.com
+
+# Engagement-time sweep wall-clock log
+cat logs/vikram_runs.csv
+```
+
+See [CHANGELOG.md](CHANGELOG.md#v920) for the full list and rationale per item.
+
+---
+
 **v9.1.4 — phi4:14b promoted to primary brain + env-overridable model selection**
 
 A/B comparison run on 03 May 2026 (clientc-spa.clientb.com, same args, parallel) confirmed `phi4:14b` strictly dominates `gemma4:26b` on output utility:

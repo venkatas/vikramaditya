@@ -55,7 +55,17 @@ def build_graph(profile: CloudProfile, out_dir: Path, timeout: int | None = None
     # regions, avoiding ConnectTimeoutError on slow opt-in regions like me-south-1.
     # PMapper's actual flag is `--include-regions r1 r2 ...` (subcommand-level,
     # NOT top-level `--region` which it doesn't accept).
+    #
+    # v9.2.0 (P0-2) — bake a safe-list default so pmapper doesn't fail on
+    # opt-in regions out of the box. Two engagement runs in a row blew up on
+    # `me-south-1` ConnectTimeoutError because the region is enabled per
+    # AWS-account but boto3 still attempts to reach STS there with no route.
+    # Operators can override either with PMAPPER_REGIONS=...,... or
+    # PMAPPER_REGIONS_OVERRIDE_NONE=1 to disable narrowing entirely.
+    DEFAULT_PMAPPER_REGIONS = "us-east-1,us-east-2,us-west-1,us-west-2,ap-south-1,ap-southeast-1,ap-southeast-2,ap-northeast-1,eu-west-1,eu-west-2,eu-central-1,eu-north-1,ca-central-1,sa-east-1"
     pmapper_regions = os.environ.get("PMAPPER_REGIONS", "").strip()
+    if not pmapper_regions and not os.environ.get("PMAPPER_REGIONS_OVERRIDE_NONE"):
+        pmapper_regions = DEFAULT_PMAPPER_REGIONS
     if pmapper_regions:
         regions_list = [r.strip() for r in pmapper_regions.split(",") if r.strip()]
         if regions_list:

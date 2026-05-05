@@ -65,8 +65,65 @@ RECON_DIR="${RECON_OUT_DIR:-$BASE_DIR/recon/$TARGET}"
 SESSION_ID="${RECON_SESSION_ID:-}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-# Prefer ProjectDiscovery httpx (~/go/bin) over Python httpx (/opt/homebrew/bin)
+# Prefer ProjectDiscovery httpx (~/go/bin) over Python httpx (/opt/homebrew/bin).
+# v9.2.0 (P0-4) — explicit absolute-path resolution so we never accidentally
+# invoke `python -m httpx` (the unrelated HTTP client CLI which silently
+# returns 0 live hosts because its arg surface is different from
+# projectdiscovery/httpx). Brew's /opt/homebrew/bin/httpx is the Python one
+# on most macs, while ~/go/bin/httpx is the ProjectDiscovery one.
 export PATH="$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# Resolve an absolute path to the *ProjectDiscovery* httpx (its banner
+# contains "projectdiscovery" — Python httpx --help does not). Falls back
+# to the bare `httpx` token if no PD binary is found anywhere, so existing
+# CI without PD installed still produces a clear error from PATH.
+_resolve_pd_httpx() {
+    local cand
+    for cand in \
+        "$HOME/go/bin/httpx" \
+        "/opt/homebrew/bin/httpx" \
+        "/usr/local/bin/httpx" \
+        "$(command -v httpx 2>/dev/null)"; do
+        [ -z "$cand" ] && continue
+        [ -x "$cand" ] || continue
+        if "$cand" -version 2>&1 | grep -qi "projectdiscovery"; then
+            echo "$cand"; return 0
+        fi
+    done
+    # Worst case: emit the raw token; the actual httpx invocation will fail
+    # loudly enough that the operator can install PD httpx from the message.
+    echo "httpx"
+    return 1
+}
+HTTPX_BIN="$(_resolve_pd_httpx || true)"
+if ! "$HTTPX_BIN" -version 2>&1 | grep -qi "projectdiscovery"; then
+    echo -e "[!] WARNING: ProjectDiscovery httpx not found on PATH. Live-host probing will fail." >&2
+    echo -e "    Install with:  GOBIN=\"\$HOME/go/bin\" go install github.com/projectdiscovery/httpx/cmd/httpx@latest" >&2
+fi
+export HTTPX_BIN
+
+# v9.2.0 (P1-7) — DNS wildcard early-detect. Probe 3 random labels under
+# the apex; if all 3 resolve, the zone has a wildcard A record and any
+# brute-force list will produce 1000s of "resolved" subdomains that are
+# all the same dead host. Sets WILDCARD_DNS=1 so downstream phases can
+# short-circuit live-probe + dirsearch when no real subs exist beyond the
+# apex. Cheap (3 dig calls) and saves ~10 min on wildcarded targets.
+_detect_dns_wildcard() {
+    local apex="$1" hits=0 r1 r2 r3
+    [ -z "$apex" ] && return
+    [[ "$apex" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]] && return  # skip for IP/CIDR
+    r1=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
+    r2=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
+    r3=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
+    [ -n "$r1" ] && hits=$((hits+1))
+    [ -n "$r2" ] && hits=$((hits+1))
+    [ -n "$r3" ] && hits=$((hits+1))
+    if [ "$hits" -ge 2 ]; then
+        export WILDCARD_DNS=1
+        export WILDCARD_DNS_IP="$r1"
+        echo -e "[!] DNS wildcard detected on $apex (random labels resolved to $r1) — brute-forced subs will be filtered post-resolution"
+    fi
+}
 
 # macOS compatibility: 'timeout' is a Linux coreutils command.
 # On macOS use gtimeout (brew install coreutils) or fall back to a no-op wrapper.
@@ -313,6 +370,21 @@ run_phase11_takeover_check() {
 # Phase 1: Subdomain Enumeration
 # ============================================================
 log_info "Phase 1: Subdomain Enumeration"
+
+# v9.2.0 (P1-7) — DNS wildcard pre-check. Three random labels are tried
+# under the apex; if 2+ resolve we set WILDCARD_DNS=1 and persist a
+# wildcard_dns.json artifact so post-resolution dedup / dirsearch can
+# short-circuit when the entire brute-force list collapses to a single
+# wildcard IP.
+if [ "$TARGET_TYPE" = "domain" ] && [ "$SCOPE_LOCK" != "1" ]; then
+    _detect_dns_wildcard "$TARGET" || true
+    if [ "${WILDCARD_DNS:-0}" = "1" ]; then
+        cat > "$RECON_DIR/subdomains/wildcard_dns.json" <<EOF
+{"target":"$TARGET","wildcard":true,"wildcard_ip":"${WILDCARD_DNS_IP:-}","detected_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","note":"random labels resolved — brute-forced subs that resolve to wildcard_ip should be filtered before httpx live-probe to avoid wasted dirsearch on dead hosts."}
+EOF
+    fi
+fi
+
 if phase_done "$RECON_DIR/subdomains/all.txt"; then true; else
 
 # ── Scope-lock: skip all enum tools, test only the exact given target ─────────
@@ -523,6 +595,31 @@ log_info "Phase 2: DNS Resolution (httpx-only — dnsx removed in v9.x)"
 if phase_done "$RECON_DIR/subdomains/resolved.txt"; then true; else
     log_step "Skipping dnsx; httpx will resolve + probe in Phase 3"
     cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
+    # v9.2.0 (P1-7) — when DNS wildcard was detected, every brute-forced
+    # candidate "resolves" to the same dead IP. Filter the resolved list
+    # using the wildcard IP we captured during _detect_dns_wildcard so
+    # downstream Phase 3 (httpx) and Phase 4 (dirsearch) don't waste hours
+    # probing a single virtual host 1000+ times. Apex is always preserved.
+    if [ "${WILDCARD_DNS:-0}" = "1" ] && [ -n "${WILDCARD_DNS_IP:-}" ] && command -v dig &>/dev/null; then
+        TOTAL_BEFORE=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
+        FILTERED="$RECON_DIR/subdomains/.resolved.filtered.txt"
+        : > "$FILTERED"
+        # Always keep the apex
+        echo "$TARGET" >> "$FILTERED"
+        # Parallel dig with xargs; drop any host whose A record == wildcard_ip
+        xargs -P 16 -I{} sh -c '
+            host="$1"; wc_ip="$2"
+            [ "$host" = "$3" ] && exit 0   # apex already added
+            real=$(dig +short +time=2 +tries=1 "$host" A 2>/dev/null | head -1)
+            if [ -n "$real" ] && [ "$real" != "$wc_ip" ]; then
+                echo "$host"
+            fi
+        ' _ {} "$WILDCARD_DNS_IP" "$TARGET" < "$RECON_DIR/subdomains/resolved.txt" >> "$FILTERED" 2>/dev/null || true
+        sort -u "$FILTERED" > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null
+        rm -f "$FILTERED"
+        TOTAL_AFTER=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
+        log_step "Wildcard DNS filter: $TOTAL_BEFORE → $TOTAL_AFTER hosts (dropped $(( TOTAL_BEFORE - TOTAL_AFTER )) wildcard-only candidates)"
+    fi
     log_done "Resolved candidates: $(file_lines "$RECON_DIR/subdomains/resolved.txt") hosts (httpx will filter live)"
 fi  # end Phase 2 resume skip
 
@@ -600,7 +697,7 @@ else
         # v9.x: httpx-only resolution (dnsx removed). Explicit -timeout/-retries/-threads
         # so each batch fails fast on dead hosts instead of stalling.
         timeout "$BATCH_WATCHDOG" \
-        httpx -l "$BATCH_FILE" \
+        "$HTTPX_BIN" -l "$BATCH_FILE" \
             -silent \
             -status-code \
             -title \
@@ -634,7 +731,7 @@ else
             RETRY_COUNT=$(file_lines "$SCHEME_RETRY_FILE")
             log_step "No live hosts on bare-host probe — retrying explicit http:// and https:// URLs ($RETRY_COUNT targets)..."
             timeout "$BATCH_WATCHDOG" \
-            httpx -l "$SCHEME_RETRY_FILE" \
+            "$HTTPX_BIN" -l "$SCHEME_RETRY_FILE" \
                 -silent \
                 -status-code \
                 -title \
