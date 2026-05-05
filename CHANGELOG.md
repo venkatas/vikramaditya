@@ -1,5 +1,28 @@
 # Changelog
 
+## v9.9.0 — IaC dedicated scanner (Checkov + KICS) (2026-05-05)
+
+New `iac_audit.py` — deeper, policy-driven IaC analysis than Trivy config (which v9.8.0's `--iac` invokes). Use Checkov as primary (graph + cross-resource) and KICS as second-pass (different rule philosophy).
+
+### Tools wired
+- **Checkov** (Bridgecrew/Prisma Cloud) — 1,000+ policies, graph-based cross-resource analysis (validates relationships, not just isolated resources). Frameworks: terraform, kubernetes, helm, cloudformation, ARM, Pulumi, CDK, Dockerfile, secrets
+- **KICS** (Checkmarx) — 2,400+ Rego queries, broadest format coverage. Native binary or Docker fallback
+
+### Vikramaditya integration
+- `--iac-deep PATH` (Checkov + KICS combined)
+- `--iac-frameworks CSV` (filter Checkov to specific frameworks)
+
+### Output
+`findings/<label>/iac/{checkov.json, kics/, summary.json}`
+
+### Sample
+```bash
+pip install checkov && brew install kics
+python3 vikramaditya.py --iac-deep path/to/terraform --iac-frameworks terraform,kubernetes
+```
+
+---
+
 ## v9.8.0 — Kubernetes audit engine (Kubescape + Trivy + Falco) (2026-05-05)
 
 New `k8s_audit.py`. Our `whitebox/` covers AWS only; clients increasingly run K8s.
