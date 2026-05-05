@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.13.0 — GraphQL DAST bundle (graphw00f + Clairvoyance + InQL) (2026-05-05)**
+
+`graphql_audit.py` — engine fingerprinting + introspection-disabled schema reconstruction + auto-query generation.
+```bash
+python3 vikramaditya.py --graphql https://api.client.com/graphql --header "Authorization: Bearer $TOK" --graphql-clairvoyance
+```
+See [CHANGELOG.md](CHANGELOG.md#v9130).
+
+---
+
 **v9.12.0 — Microsoft RESTler stateful REST API fuzzer (2026-05-05)**
 
 `restler_audit.py` — infers producer-consumer dependencies from OpenAPI; reaches deep states stateless tools can't.

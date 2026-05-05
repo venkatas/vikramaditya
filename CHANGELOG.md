@@ -1,5 +1,30 @@
 # Changelog
 
+## v9.13.0 — GraphQL DAST bundle (graphw00f + Clairvoyance + InQL) (2026-05-05)
+
+New `graphql_audit.py`. GraphQL is increasingly client-facing; current Vikramaditya only had ad-hoc nuclei templates.
+
+### Tools wired
+- **graphw00f** — fingerprints the GraphQL engine (Apollo, Hasura, Yoga, GraphQL-Ruby, Strawberry, etc.). Different engines have different default-on misconfigs.
+- **Clairvoyance** — reconstructs the schema when introspection is disabled, by brute-forcing field names against the engine's error messages
+- **InQL CLI** — auto-generates one .gql file per detected query/mutation so the operator can manually probe each for auth/IDOR (the Burp BApp does the interactive fuzzing; outside scope of this wrapper)
+
+### Vikramaditya integration
+- `--graphql URL --graphql-clairvoyance --graphql-wordlist PATH`
+- Re-uses `--header "K: V"` from v9.4.0 race-test for auth headers
+
+### Output
+`findings/<host>/graphql/{graphw00f.txt, clairvoyance_schema.json, inql_queries/, summary.json}`
+
+### Sample
+```bash
+pip install graphw00f clairvoyance inql
+python3 vikramaditya.py --graphql https://api.client.com/graphql \
+    --header "Authorization: Bearer $TOK" --graphql-clairvoyance
+```
+
+---
+
 ## v9.12.0 — Microsoft RESTler stateful REST API fuzzer (2026-05-05)
 
 New `restler_audit.py`. RESTler is the only OSS stateful REST fuzzer that infers producer-consumer dependencies from an OpenAPI spec ("create user → login → access admin endpoint as that user"). Complements (does not duplicate) schemathesis which is property-based but stateless.
