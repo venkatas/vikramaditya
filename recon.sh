@@ -293,6 +293,16 @@ run_phase5_port_scanning() {
             awk -F: 'NF>1 {print $2"/open"}' "$RECON_DIR/ports/naabu_results.txt" \
                 | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
 
+            # v9.5.0 — fingerprintx adds structured per-port service banners
+            # (auth-protocol detection: RDP/SSH/SMB/Postgres/MySQL/Mongo/etc).
+            # Complements nmap -sV with a JSON output that downstream tools
+            # (priority ranker, brain) can consume without re-parsing.
+            if tool_ok fingerprintx && [ -s "$RECON_DIR/ports/naabu_results.txt" ]; then
+                log_step "fingerprintx service banners..."
+                fingerprintx -l "$RECON_DIR/ports/naabu_results.txt" \
+                    -json -o "$RECON_DIR/ports/fingerprintx.json" 2>/dev/null || true
+            fi
+
             if [ -s "$RECON_DIR/ports/open_ports.txt" ]; then
                 PORT_CSV="$(cut -d/ -f1 "$RECON_DIR/ports/open_ports.txt" | paste -sd, -)"
                 log_step "nmap service fingerprinting on naabu-discovered ports: ${PORT_CSV:-none}"
@@ -580,6 +590,36 @@ if tool_ok alterx && [ "$QUICK_MODE" != "--quick" ] && [ "$TOTAL_SUBS" -gt 0 ]; 
     fi
 fi
 
+# v9.5.0 — shuffledns (massdns wrapper with wildcard handling).
+# Resolves the alterx-permuted list against fast public resolvers BEFORE
+# Phase 3 httpx so dead candidates don't pollute the live-host probe.
+# This complements the wildcard-IP filter we added in v9.2.0 (which only
+# filters AFTER httpx returns 0 lives) — shuffledns drops dead names
+# pre-flight, much faster. Optional: skipped if SHUFFLEDNS_SKIP=1 or the
+# resolver list isn't found.
+SHUFFLEDNS_RESOLVERS="${SHUFFLEDNS_RESOLVERS:-}"
+if [ -z "$SHUFFLEDNS_RESOLVERS" ]; then
+    for cand in "$HOME/.config/shuffledns/resolvers.txt" \
+                "$HOME/wordlists/resolvers.txt" \
+                "/opt/wordlists/resolvers.txt"; do
+        [ -f "$cand" ] && { SHUFFLEDNS_RESOLVERS="$cand"; break; }
+    done
+fi
+if tool_ok shuffledns && [ "${SHUFFLEDNS_SKIP:-0}" != "1" ] \
+   && [ -n "$SHUFFLEDNS_RESOLVERS" ] && [ -s "$RECON_DIR/subdomains/all.txt" ] \
+   && [ "$TOTAL_SUBS" -gt 100 ]; then
+    log_step "shuffledns (wildcard-aware resolve, $TOTAL_SUBS candidates)..."
+    shuffledns -d "$TARGET" -list "$RECON_DIR/subdomains/all.txt" \
+        -r "$SHUFFLEDNS_RESOLVERS" -mode resolve -silent \
+        -o "$RECON_DIR/subdomains/shuffledns_resolved.txt" 2>/dev/null || true
+    if [ -s "$RECON_DIR/subdomains/shuffledns_resolved.txt" ]; then
+        RESOLVED_COUNT=$(file_lines "$RECON_DIR/subdomains/shuffledns_resolved.txt")
+        log_done "shuffledns: $RESOLVED_COUNT real-resolving subs (filtered $((TOTAL_SUBS - RESOLVED_COUNT)) dead/wildcard)"
+        cp "$RECON_DIR/subdomains/shuffledns_resolved.txt" "$RECON_DIR/subdomains/all.txt"
+        TOTAL_SUBS="$RESOLVED_COUNT"
+    fi
+fi
+
 fi  # end SCOPE_LOCK else block
 fi  # end Phase 1 resume skip
 
@@ -768,6 +808,21 @@ else
     awk -F'[][]' '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\./) print $i}' \
         "$RECON_DIR/live/httpx_full.txt" \
         | sort -u > "$RECON_DIR/live/ips.txt" 2>/dev/null || true
+
+    # v9.5.0 — cdncheck tags each live IP with the CDN/WAF/cloud-provider
+    # fronting it (Cloudflare/Akamai/CloudFront/Fastly/Azure FD/GCP LB/etc.).
+    # Downstream phases (port scan, vuln scan) can skip CDN-fronted hosts to
+    # avoid wasting requests against the edge instead of the origin. Output
+    # is `live/cdn_map.json`: {ip: {cdn: name, type: cdn|waf|cloud, source: ...}}.
+    if tool_ok cdncheck && [ -s "$RECON_DIR/live/ips.txt" ]; then
+        log_step "cdncheck (CDN/WAF/cloud-provider tagging)..."
+        cdncheck -i "$RECON_DIR/live/ips.txt" -resp -json -silent \
+            > "$RECON_DIR/live/cdn_map.json" 2>/dev/null || true
+        if [ -s "$RECON_DIR/live/cdn_map.json" ]; then
+            CDN_HITS=$(grep -c '"cdn"\|"waf"' "$RECON_DIR/live/cdn_map.json" 2>/dev/null || echo 0)
+            log_done "cdncheck: $CDN_HITS CDN/WAF-fronted hosts identified"
+        fi
+    fi
 
     log_done "200 OK:         $(file_lines "$RECON_DIR/live/status_200.txt")"
     log_done "3xx Redirect:   $(file_lines "$RECON_DIR/live/status_3xx.txt")"

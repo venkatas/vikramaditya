@@ -1,5 +1,59 @@
 # Changelog
 
+## v9.5.0 — ProjectDiscovery tool integration bundle (8 tools wired) (2026-05-05)
+
+Audit of the PD toolkit revealed 8 binaries already installed in `~/go/bin` (or trivially installable) but never invoked by Vikramaditya. v9.5.0 wires all 8 into the appropriate phase of the pipeline.
+
+### Tools wired
+
+| Tool | Phase | What it does |
+|---|---|---|
+| **cvemap** | `intel.py` — preferred CVE source | Queries PD's CVE database (KEV / public-PoC / EPSS metadata) before falling back to GHSA + NVD. Requires PDCP API key (`cvemap -auth`); silently returns [] without one so fallback paths still produce intel. |
+| **cdncheck** | `recon.sh` Phase 3, after live-host probe | Tags each live IP with the CDN/WAF/cloud provider fronting it (Cloudflare/Akamai/CloudFront/Fastly/Azure FD/etc.). Output `live/cdn_map.json` lets downstream phases warn or skip CDN-fronted hosts where port-scan / vuln-scan would hit the edge instead of origin. |
+| **fingerprintx** | `recon.sh` after naabu | Structured per-port service banners (RDP/SSH/SMB/Postgres/MySQL/Mongo auth-protocol detection). JSON output `ports/fingerprintx.json` consumed by priority ranker + brain without re-parsing nmap output. |
+| **asnmap** | `vikramaditya.py classify_target()` | New `AS<num>` and `asn:<num>` target type. asnmap expands to CIDR blocks; orchestrator iterates `hunt.py --target <cidr>` over each. Full CIDR list saved to `recon/AS<num>/cidrs.txt` for the report. |
+| **mapcidr** | `vikramaditya.py expand_cidrs()` | CIDR-to-IP expansion with `max_hosts` cap (default 65536) so an accidental `/8` doesn't expand to 16M IPs. Falls back to `ipaddress` stdlib if mapcidr isn't on PATH. |
+| **shuffledns** | `recon.sh` Phase 1, after alterx permutations | Wildcard-aware mass DNS resolution against PD-recommended fast resolvers. Drops dead/wildcard candidates BEFORE Phase 3 httpx (saves the wildcard-IP filter from doing post-mortem cleanup on 1000+ dead names). Skipped if `SHUFFLEDNS_SKIP=1` or no resolver list found at any of the standard paths. |
+| **notify** | `brain.py auto_triage_and_exploit()` | When a `SUBMIT` verdict lands during a long autonomous run, fires a one-line ping via PD `notify` to the engagement Slack/Discord/Teams/Telegram channel (per `~/.config/notify/provider-config.yaml`). Best-effort; silent if notify isn't installed or no provider configured. |
+| **cloudlist** | `vikramaditya.py --cloudlist` | Standalone multi-provider asset listing (AWS/Azure/GCP/DO/Hetzner/Linode/etc.) via `~/.config/cloudlist/config.yaml`. Emits JSON to `recon/cloudlist/assets.json`. Useful for non-AWS engagements not covered by our `whitebox/` audit. |
+
+### New CLI flags / behaviours
+
+- `--cloudlist` — standalone PD cloudlist enumeration; short-circuits main() before active pipeline
+- `AS<num>` / `asn:<num>` target types — classify_target() now expands these via asnmap and iterates hunt.py over each CIDR
+- Auto-detection of `cvemap` / `cdncheck` / `fingerprintx` / `shuffledns` / `notify` — present and wired = used; absent = silent fallback
+
+### Helpers added (importable from `vikramaditya.py`)
+
+- `_expand_asn_to_cidrs(asn) -> list[str]`
+- `expand_cidrs(cidrs, max_hosts=65536) -> list[str]`
+- `notify_finding(message, severity)` — direct PD notify pipe-stdin wrapper
+- `run_cloudlist(out_dir=None)` — wraps `cloudlist -json -silent`
+
+### Why this was overdue
+
+5 of the 8 tools (`cvemap`, `cdncheck`, `fingerprintx`, `asnmap`, `shuffledns`) were already in `~/go/bin` from initial setup but nothing in the codebase invoked them. The other 3 (`mapcidr`, `notify`, `cloudlist`) install in seconds via `go install github.com/projectdiscovery/<tool>/cmd/<tool>@latest`. The pipeline was leaving documented capability on the table. v9.5.0 closes the gap.
+
+### Affected files
+
+- `vikramaditya.py` — version bump 9.4.0→9.5.0; ASN target type; 4 PD wrappers (`_expand_asn_to_cidrs`, `expand_cidrs`, `notify_finding`, `run_cloudlist`); new `--cloudlist` flag; ASN routing branch
+- `recon.sh` — cdncheck after live-host IPs; fingerprintx after naabu; shuffledns wildcard-aware resolve before Phase 3
+- `intel.py` — `fetch_cvemap()` integrated into `fetch_intel()` ahead of GHSA + NVD
+- `brain.py` — `notify` ping inside `auto_triage_and_exploit()` on `SUBMIT` verdicts
+- `README.md`, `CHANGELOG.md` — this entry
+
+### Validation
+
+`python3 -m py_compile` clean across all four edited Python files. `bash -n recon.sh` clean. `vikramaditya.__version__` returns `9.5.0`. `--help` shows `--cloudlist` and `AS<num>` target type. `cdncheck` smoke against `1.1.1.1` correctly identifies `[waf][cloudflare]`. `cvemap` correctly degrades to empty list when PDCP key absent; downstream GHSA + NVD paths still populate `recon/<target>/intel.md`.
+
+### Out of scope (skipped)
+
+- `chaos-client` standalone — already covered by `subfinder -all`
+- `uncover` (Shodan/Censys/Fofa search) — needs per-engagement API keys; manual via Burp suffices
+- `proxify` — Burp covers MITM use case
+
+---
+
 ## v9.4.0 — Tier-1 power-up bundle: mindmap + intel + oauth + race + cicd wired (2026-05-05)
 
 Five upstream tools (`mindmap.py`, `intel.py`, `oauth_tester.py`, `race_audit.py`, `cicd_scanner.sh`) shipped in the initial repo release as orphan scripts but were never wired into the orchestrator. v9.4.0 adapts them for VAPT framing, replaces HackerOne-specific paths with generic ones, and integrates each into the appropriate phase of `vikramaditya.py`.

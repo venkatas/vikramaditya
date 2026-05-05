@@ -2043,6 +2043,22 @@ Based on this:
                     evidence=line,
                     findings_dir=findings_dir,
                 )
+                # v9.5.0 — fire a PD `notify` ping to the engagement channel
+                # when a SUBMIT verdict lands during a long autonomous run.
+                # Best-effort; silent if notify isn't installed or no
+                # provider is configured in ~/.config/notify/provider-config.yaml.
+                try:
+                    import shutil as _sh
+                    import subprocess as _sub
+                    if verdict == "SUBMIT" and _sh.which("notify"):
+                        msg = f"[Vikramaditya/{target}] {cat.upper()} SUBMIT-verdict finding: {line[:200]}"
+                        proc = _sub.Popen(
+                            ["notify", "-bulk", "-silent", "-id", "vikramaditya-submit"],
+                            stdin=_sub.PIPE, stdout=_sub.DEVNULL, stderr=_sub.DEVNULL,
+                        )
+                        proc.communicate(input=msg.encode(), timeout=10)
+                except Exception:
+                    pass
 
         # Save triage summary
         summary_md = (
