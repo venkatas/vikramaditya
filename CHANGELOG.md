@@ -1,5 +1,31 @@
 # Changelog
 
+## v9.7.0 — Active Directory / hybrid identity engine (NetExec + BloodHound CE + Impacket + Certipy) (2026-05-05)
+
+New `ad_hunt.py`. Hybrid (Entra ID + on-prem AD) clients increasingly need this; our `whitebox/` covers cloud only.
+
+### Tools wired
+- **NetExec / nxc** — replaces dead CrackMapExec; SMB/LDAP/MSSQL/WinRM/RDP/SSH discovery; --shares, --users, --groups, --pass-pol, --asreproast, --kerberoasting
+- **bloodhound-python** — BloodHound CE collector for Linux/macOS; produces zip importable into BloodHound CE UI for graph-based attack-path analysis
+- **Impacket** — GetUserSPNs (Kerberoast), GetNPUsers (ASREPRoast), secretsdump (only when `--domain-admin` flag set, gates the destructive DCSync)
+- **Certipy v5** — ADCS enumeration (ESC1-ESC15 attacks via `certipy find -vulnerable`)
+
+### Vikramaditya integration
+- `--ad-hunt DOMAIN` + `--ad-dc IP --ad-user USER --ad-pass PASS --ad-mode {discover,bloodhound,certipy,kerberoast,all}` flags
+- Run-and-exit standalone
+
+### Output
+`findings/<domain>/ad/{nxc/, bloodhound/, impacket/, certipy/, summary.json}`
+
+### Sample
+```bash
+pip install netexec bloodhound impacket certipy-ad
+python3 vikramaditya.py --ad-hunt corp.client.local --ad-dc 10.1.1.10 \
+    --ad-user audit_user --ad-pass 'P@ss' --ad-mode all
+```
+
+---
+
 ## v9.6.0 — Mobile VAPT engine (MobSF + Frida + Objection + Drozer) (2026-05-05)
 
 Closes the longest-standing scope gap: every Indian enterprise engagement asks "do you do mobile?" and we previously said no. New `mobile_hunt.py` wraps four tools into a single Vikramaditya-shaped session.

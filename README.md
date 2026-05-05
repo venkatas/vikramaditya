@@ -9,6 +9,17 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.7.0 — Active Directory / hybrid identity (NetExec + BloodHound CE + Impacket + Certipy) (2026-05-05)**
+
+New `ad_hunt.py`. NetExec replaces dead CME; BloodHound CE for graph attack-paths; Certipy for ADCS ESC1-ESC15.
+```bash
+python3 vikramaditya.py --ad-hunt corp.client.local --ad-dc 10.1.1.10 \
+    --ad-user audit_user --ad-pass 'P@ss' --ad-mode all
+```
+See [CHANGELOG.md](CHANGELOG.md#v970).
+
+---
+
 **v9.6.0 — Mobile VAPT (MobSF + Frida + Objection + Drozer) (2026-05-05)**
 
 New `mobile_hunt.py`. Closes the biggest scope gap — clients asking "do you do mobile?" no longer gets a no.

@@ -41,10 +41,10 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.6.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.5.0 for mobile_hunt.py (MobSF + Frida + Objection + Drozer wiring).
-# See CHANGELOG.md v9.6.0.
-__version__ = "9.6.0"
+# v9.7.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.6.0 for ad_hunt.py (NetExec + BloodHound CE + Impacket + Certipy).
+# See CHANGELOG.md v9.7.0.
+__version__ = "9.7.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -875,6 +875,13 @@ Options:
                           the full CIDR list to recon/AS<num>/cidrs.txt.
   --mobile APK_OR_IPA     v9.6.0 — mobile VAPT (MobSF static + Frida +
                           Objection + Drozer). Produces findings/<app>/mobile/.
+  --ad-hunt DOMAIN        v9.7.0 — AD/hybrid identity audit (NetExec +
+                          BloodHound CE + Impacket + Certipy). Pass via
+                          --ad-dc, --ad-user, --ad-pass, --ad-mode.
+  --ad-dc IP              Domain Controller IP for --ad-hunt
+  --ad-user USER          AD audit user
+  --ad-pass PASS          AD audit password
+  --ad-mode MODE          discover|bloodhound|certipy|kerberoast|all
 """
 
 
@@ -909,6 +916,12 @@ def parse_cli_args() -> dict:
         "cloudlist": False,
         # v9.6.0 — mobile
         "mobile": "",
+        # v9.7.0 — AD
+        "ad_hunt": "",
+        "ad_dc": "",
+        "ad_user": "",
+        "ad_pass": "",
+        "ad_mode": "discover",
     }
     argv = sys.argv[1:]
     i = 0
@@ -955,6 +968,16 @@ def parse_cli_args() -> dict:
             args["cloudlist"] = True; i += 1
         elif argv[i] == "--mobile" and i + 1 < len(argv):
             args["mobile"] = argv[i + 1]; i += 2
+        elif argv[i] == "--ad-hunt" and i + 1 < len(argv):
+            args["ad_hunt"] = argv[i + 1]; i += 2
+        elif argv[i] == "--ad-dc" and i + 1 < len(argv):
+            args["ad_dc"] = argv[i + 1]; i += 2
+        elif argv[i] == "--ad-user" and i + 1 < len(argv):
+            args["ad_user"] = argv[i + 1]; i += 2
+        elif argv[i] == "--ad-pass" and i + 1 < len(argv):
+            args["ad_pass"] = argv[i + 1]; i += 2
+        elif argv[i] == "--ad-mode" and i + 1 < len(argv):
+            args["ad_mode"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1269,6 +1292,20 @@ def main():
                             flag, cli["mobile"]], cwd=SCRIPT_DIR, check=False, timeout=900)
         except Exception as e:
             log("warn", f"mobile_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["ad_hunt"]:
+        log("info", f"--ad-hunt: {cli['ad_hunt']} via DC={cli['ad_dc']}")
+        if not (cli["ad_dc"] and cli["ad_user"] and cli["ad_pass"]):
+            log("err", "missing --ad-dc / --ad-user / --ad-pass")
+            return
+        try:
+            subprocess.run([sys.executable, "-u", os.path.join(SCRIPT_DIR, "ad_hunt.py"),
+                            "--dc", cli["ad_dc"], "--domain", cli["ad_hunt"],
+                            "--user", cli["ad_user"], "--pass", cli["ad_pass"],
+                            "--mode", cli["ad_mode"]],
+                           cwd=SCRIPT_DIR, check=False, timeout=1800)
+        except Exception as e:
+            log("warn", f"ad_hunt failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
 
     has_ollama = ollama_available()
