@@ -41,10 +41,10 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.9.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.8.0 for iac_audit.py (Checkov + KICS dedicated IaC scanner).
-# See CHANGELOG.md v9.9.0.
-__version__ = "9.9.0"
+# v9.10.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.9.0 for llm_hunt.py (Garak + PyRIT + Promptfoo LLM red-teaming).
+# See CHANGELOG.md v9.10.0.
+__version__ = "9.10.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -892,6 +892,14 @@ Options:
   --iac-deep PATH         v9.9.0 — Checkov + KICS dedicated IaC scan
                           (deeper than Trivy config for Terraform/CFN)
   --iac-frameworks CSV    Checkov frameworks (terraform,kubernetes,helm,...)
+  --llm-hunt URL          v9.10.0 — LLM red-team (Garak + PyRIT +
+                          Promptfoo) against an LLM endpoint URL.
+                          Optional: --llm-auth, --llm-probes, --llm-tools,
+                          --llm-promptfoo-config.
+  --llm-auth HEADER       e.g. 'Authorization: Bearer ...'
+  --llm-probes CSV        Garak probes (all|encoding|promptinject|...)
+  --llm-tools CSV         all | garak | pyrit | promptfoo
+  --llm-promptfoo-config PATH   YAML config for promptfoo redteam
 """
 
 
@@ -941,6 +949,12 @@ def parse_cli_args() -> dict:
         # v9.9.0 — IaC dedicated
         "iac_deep": "",
         "iac_frameworks": "",
+        # v9.10.0 — LLM red-team
+        "llm_hunt": "",
+        "llm_auth": "",
+        "llm_probes": "all",
+        "llm_tools": "all",
+        "llm_promptfoo_config": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -1015,6 +1029,16 @@ def parse_cli_args() -> dict:
             args["iac_deep"] = argv[i + 1]; i += 2
         elif argv[i] == "--iac-frameworks" and i + 1 < len(argv):
             args["iac_frameworks"] = argv[i + 1]; i += 2
+        elif argv[i] == "--llm-hunt" and i + 1 < len(argv):
+            args["llm_hunt"] = argv[i + 1]; i += 2
+        elif argv[i] == "--llm-auth" and i + 1 < len(argv):
+            args["llm_auth"] = argv[i + 1]; i += 2
+        elif argv[i] == "--llm-probes" and i + 1 < len(argv):
+            args["llm_probes"] = argv[i + 1]; i += 2
+        elif argv[i] == "--llm-tools" and i + 1 < len(argv):
+            args["llm_tools"] = argv[i + 1]; i += 2
+        elif argv[i] == "--llm-promptfoo-config" and i + 1 < len(argv):
+            args["llm_promptfoo_config"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1343,6 +1367,21 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["llm_hunt"] or cli["llm_promptfoo_config"]:
+        log("info", f"--llm-hunt: {cli['llm_hunt'] or cli['llm_promptfoo_config']}")
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "llm_hunt.py"),
+                   "--probes", cli["llm_probes"], "--tools", cli["llm_tools"]]
+            if cli["llm_hunt"]:
+                cmd += ["--target-url", cli["llm_hunt"]]
+            if cli["llm_auth"]:
+                cmd += ["--auth-header", cli["llm_auth"]]
+            if cli["llm_promptfoo_config"]:
+                cmd += ["--promptfoo-config", cli["llm_promptfoo_config"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=4800)
+        except Exception as e:
+            log("warn", f"llm_hunt failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["iac_deep"]:
         log("info", f"--iac-deep: {cli['iac_deep']}")
