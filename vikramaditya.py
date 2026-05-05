@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # v9.10.0 — single-source-of-truth for the orchestrator version. Bumped from
 # v9.9.0 for llm_hunt.py (Garak + PyRIT + Promptfoo LLM red-teaming).
 # See CHANGELOG.md v9.10.0.
-__version__ = "9.10.0"
+__version__ = "9.11.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -900,6 +900,12 @@ Options:
   --llm-probes CSV        Garak probes (all|encoding|promptinject|...)
   --llm-tools CSV         all | garak | pyrit | promptfoo
   --llm-promptfoo-config PATH   YAML config for promptfoo redteam
+  --waf-bypass URL        v9.11.0 — WAF bypass primitives: padding,
+                          URL mangling, FireProx. --waf-mangle,
+                          --waf-pad-bytes N, --waf-fireprox-create.
+  --waf-mangle            URL mangling (200+ permutations)
+  --waf-pad-bytes N       nowafpls-style body padding (default 20000)
+  --waf-fireprox-create   Create FireProx API GW proxy (--aws-profile)
 """
 
 
@@ -955,6 +961,12 @@ def parse_cli_args() -> dict:
         "llm_probes": "all",
         "llm_tools": "all",
         "llm_promptfoo_config": "",
+        # v9.11.0 — WAF bypass
+        "waf_bypass": "",
+        "waf_mangle": False,
+        "waf_pad_bytes": 0,
+        "waf_fireprox_create": False,
+        "aws_profile": "default",
     }
     argv = sys.argv[1:]
     i = 0
@@ -1039,6 +1051,20 @@ def parse_cli_args() -> dict:
             args["llm_tools"] = argv[i + 1]; i += 2
         elif argv[i] == "--llm-promptfoo-config" and i + 1 < len(argv):
             args["llm_promptfoo_config"] = argv[i + 1]; i += 2
+        elif argv[i] == "--waf-bypass" and i + 1 < len(argv):
+            args["waf_bypass"] = argv[i + 1]; i += 2
+        elif argv[i] == "--waf-mangle":
+            args["waf_mangle"] = True; i += 1
+        elif argv[i] == "--waf-pad-bytes" and i + 1 < len(argv):
+            try:
+                args["waf_pad_bytes"] = int(argv[i + 1])
+            except ValueError:
+                pass
+            i += 2
+        elif argv[i] == "--waf-fireprox-create":
+            args["waf_fireprox_create"] = True; i += 1
+        elif argv[i] == "--aws-profile" and i + 1 < len(argv):
+            args["aws_profile"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1367,6 +1393,24 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["waf_bypass"] or cli["waf_fireprox_create"]:
+        log("info", f"--waf-bypass: {cli['waf_bypass'] or '(fireprox)'}")
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "waf_bypass.py")]
+            if cli["waf_bypass"]:
+                cmd += ["--url", cli["waf_bypass"]]
+            if cli["waf_mangle"]:
+                cmd += ["--mangle"]
+            if cli["waf_pad_bytes"]:
+                cmd += ["--pad-bytes", str(cli["waf_pad_bytes"])]
+            if cli["waf_fireprox_create"]:
+                cmd += ["--fireprox-create",
+                        "--target-url", cli["waf_bypass"],
+                        "--aws-profile", cli["aws_profile"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=900)
+        except Exception as e:
+            log("warn", f"waf_bypass failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["llm_hunt"] or cli["llm_promptfoo_config"]:
         log("info", f"--llm-hunt: {cli['llm_hunt'] or cli['llm_promptfoo_config']}")
