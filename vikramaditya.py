@@ -41,9 +41,9 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.2.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.1.4 for the engagement-driven fix bundle (see CHANGELOG.md v9.2.0).
-__version__ = "9.2.0"
+# v9.3.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.2.0 for the passive dork catalogue (see CHANGELOG.md v9.3.0).
+__version__ = "9.3.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -825,6 +825,12 @@ Options:
   --verify-fix PATH       Verify a deployed fix or source path
   --code-url URL          Source repository or code URL for audit context
   --legacy                Route through the legacy hunt.py flow
+  --passive-only          v9.3.0 — generate Google dork catalogue and exit
+                          (no active scanning; emits HTML+JSON to
+                          recon/<target>/sessions/<id>/passive/).
+  --skip-passive          v9.3.0 — skip the Phase-0 dork catalogue when
+                          running a full scan (default: passive runs once
+                          per session before active phases).
 """
 
 
@@ -842,6 +848,9 @@ def parse_cli_args() -> dict:
         "code_url": "",
         "legacy": False,
         "help": False,
+        # v9.3.0 — passive recon controls
+        "passive_only": False,
+        "skip_passive": False,
     }
     argv = sys.argv[1:]
     i = 0
@@ -858,11 +867,43 @@ def parse_cli_args() -> dict:
             args["code_url"] = argv[i + 1]; i += 2
         elif argv[i] == "--legacy":
             args["legacy"] = True; i += 1
+        elif argv[i] == "--passive-only":
+            args["passive_only"] = True; i += 1
+        elif argv[i] == "--skip-passive":
+            args["skip_passive"] = True; i += 1
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
             i += 1
     return args
+
+
+# ── Passive recon (v9.3.0 — Google dork catalogue) ────────────────────────────
+
+def run_passive_dorks(target: str, out_dir: str | None = None) -> str | None:
+    """Generate the passive dork catalogue for `target` before active scanning.
+
+    No requests are issued — outputs HTML/JSON/TXT under the session's
+    `passive/` subdir. Imports `dorks` lazily so a malformed dorks.py does
+    not break the active flow. Returns the HTML report path (for the report
+    chapter) or None on failure.
+    """
+    try:
+        sys.path.insert(0, SCRIPT_DIR)
+        import dorks as _dorks
+    except Exception as e:
+        print(f"  {Y}[!]{N} dorks module unavailable: {e} — skipping passive phase", flush=True)
+        return None
+    try:
+        results = _dorks.generate(target, "all")
+        if out_dir is None:
+            out_dir = os.path.join(SCRIPT_DIR, "recon", target, "passive")
+        paths = _dorks.write_outputs(target, "all", results, out_dir)
+        log("ok", f"Passive dork catalogue: {len(results)} queries → {paths['html']}")
+        return paths.get("html")
+    except Exception as e:
+        log("warn", f"passive recon skipped: {e}")
+        return None
 
 
 # ── Main Flow ─────────────────────────────────────────────────────────────────
@@ -900,6 +941,28 @@ def main():
 
     if target_info["type"] == "unknown":
         print(f"  {R}Could not parse target: {target_raw}{N}")
+        return
+
+    # ── v9.3.0 — Phase 0: passive dork catalogue ─────────────────────────
+    # Runs before any active scanning so the operator has a clickable HTML
+    # of search-engine queries to skim while recon spins up. No requests
+    # are issued from this host. Skipped for IP / CIDR / HAR targets (no
+    # apex domain to dork) and when --skip-passive is set.
+    if not cli["skip_passive"] and target_info["type"] in ("domain", "url"):
+        passive_target = (
+            target_info["value"]
+            if target_info["type"] == "domain"
+            else urlparse(
+                target_info["value"]
+                if "://" in target_info["value"]
+                else f"http://{target_info['value']}"
+            ).netloc or target_info["value"]
+        )
+        run_passive_dorks(passive_target)
+
+    if cli["passive_only"]:
+        log("ok", "--passive-only set; exiting before active phases")
+        print(f"\n  {D}Done.{N}\n")
         return
 
     # ── Step 2: Route based on target type ────────────────────────────────
