@@ -1,5 +1,36 @@
 # Changelog
 
+## v9.6.0 — Mobile VAPT engine (MobSF + Frida + Objection + Drozer) (2026-05-05)
+
+Closes the longest-standing scope gap: every Indian enterprise engagement asks "do you do mobile?" and we previously said no. New `mobile_hunt.py` wraps four tools into a single Vikramaditya-shaped session.
+
+### Tools wired
+- **MobSF** — static + dynamic + malware analysis via REST API (Docker server). Scans APK/IPA/AAB, OWASP MASVS mapping. Set `MOBSF_URL` + `MOBSF_API_KEY` env vars.
+- **Frida** — runtime instrumentation; ships with universal Android SSL pinning bypass script
+- **Objection** — iOS keychain dumps, jailbreak detection bypass
+- **Drozer** — Android IPC attack surface (content providers, exported activities, broadcast receivers, services)
+
+### Output
+`findings/<app>/mobile/{mobsf_static.json, frida_pinning.log, objection_keychain.txt, drozer_ipc.txt, summary.json}`
+
+### Vikramaditya integration
+- `--mobile APK_OR_IPA` flag in `vikramaditya.py` → run-and-exit
+- All sub-tools degrade silently with helpful install-hint when missing (Docker for MobSF, `pip install` for Frida/Objection/Drozer)
+
+### Sample
+```bash
+# Setup
+docker run -d -p 8000:8000 opensecurity/mobile-security-framework-mobsf
+export MOBSF_API_KEY=<key from http://localhost:8000>
+pip install frida-tools objection drozer-python3
+
+# Run
+python3 vikramaditya.py --mobile path/to/client_app.apk
+python3 mobile_hunt.py --apk app.apk --app-id com.client.app --frida-pinning-bypass --drozer
+```
+
+---
+
 ## v9.5.0 — ProjectDiscovery tool integration bundle (8 tools wired) (2026-05-05)
 
 Audit of the PD toolkit revealed 8 binaries already installed in `~/go/bin` (or trivially installable) but never invoked by Vikramaditya. v9.5.0 wires all 8 into the appropriate phase of the pipeline.

@@ -9,6 +9,18 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.6.0 — Mobile VAPT (MobSF + Frida + Objection + Drozer) (2026-05-05)**
+
+New `mobile_hunt.py`. Closes the biggest scope gap — clients asking "do you do mobile?" no longer gets a no.
+```bash
+docker run -d -p 8000:8000 opensecurity/mobile-security-framework-mobsf
+export MOBSF_API_KEY=<key>
+python3 vikramaditya.py --mobile app.apk
+```
+See [CHANGELOG.md](CHANGELOG.md#v960).
+
+---
+
 **v9.5.0 — ProjectDiscovery tool integration bundle: 8 tools wired (2026-05-05)**
 
 5 PD binaries were already in `~/go/bin` but never invoked; 3 more installed in seconds. v9.5.0 wires all 8 into the appropriate phase.
