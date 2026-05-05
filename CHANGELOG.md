@@ -1,5 +1,30 @@
 # Changelog
 
+## v9.10.0 — LLM red-teaming engine (Garak + PyRIT + Promptfoo) (2026-05-05)
+
+New `llm_hunt.py`. Every B2B SaaS now ships AI features; bug-bounty programs accept LLM findings; emerging client requirement.
+
+### Tools wired
+- **Garak** (NVIDIA) — "nmap for LLMs", 37+ probes for jailbreak/leakage/encoding bypass/toxicity. **Breadth.**
+- **PyRIT** (Microsoft AI Red Team) — multi-turn adaptive attacks (Crescendo, TAP). **Depth.** (Wrapper provides scaffold; operator writes per-target orchestrator using PyRIT's Python API.)
+- **Promptfoo** — 50+ vuln types, YAML config, CI/CD-native. Used by OpenAI + Anthropic internally.
+
+### Vikramaditya integration
+- `--llm-hunt URL --llm-auth HEADER --llm-probes CSV --llm-tools CSV --llm-promptfoo-config PATH`
+- All three tools degrade silently with install hints when missing
+
+### Output
+`findings/<label>/llm/{garak/, pyrit/, promptfoo/, summary.json}`
+
+### Sample
+```bash
+pip install garak && npm install -g promptfoo
+python3 vikramaditya.py --llm-hunt https://api.client.com/chat \
+    --llm-auth 'Authorization: Bearer $TOK' --llm-probes encoding,promptinject
+```
+
+---
+
 ## v9.9.0 — IaC dedicated scanner (Checkov + KICS) (2026-05-05)
 
 New `iac_audit.py` — deeper, policy-driven IaC analysis than Trivy config (which v9.8.0's `--iac` invokes). Use Checkov as primary (graph + cross-resource) and KICS as second-pass (different rule philosophy).
