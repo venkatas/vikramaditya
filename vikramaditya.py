@@ -41,11 +41,10 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.5.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.4.0 for the ProjectDiscovery tool integration bundle (cvemap, cdncheck,
-# fingerprintx, asnmap, mapcidr, shuffledns, notify, cloudlist all wired).
-# See CHANGELOG.md v9.5.0.
-__version__ = "9.5.0"
+# v9.6.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.5.0 for mobile_hunt.py (MobSF + Frida + Objection + Drozer wiring).
+# See CHANGELOG.md v9.6.0.
+__version__ = "9.6.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -874,6 +873,8 @@ Options:
   AS<num> | asn:<num>     v9.5.0 — ASN target. asnmap expands to CIDR list,
                           each CIDR is then scanned with hunt.py. Saves
                           the full CIDR list to recon/AS<num>/cidrs.txt.
+  --mobile APK_OR_IPA     v9.6.0 — mobile VAPT (MobSF static + Frida +
+                          Objection + Drozer). Produces findings/<app>/mobile/.
 """
 
 
@@ -906,6 +907,8 @@ def parse_cli_args() -> dict:
         "cicd_audit": "",
         # v9.5.0 — PD tool flags
         "cloudlist": False,
+        # v9.6.0 — mobile
+        "mobile": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -950,6 +953,8 @@ def parse_cli_args() -> dict:
             args["cicd_audit"] = argv[i + 1]; i += 2
         elif argv[i] == "--cloudlist":
             args["cloudlist"] = True; i += 1
+        elif argv[i] == "--mobile" and i + 1 < len(argv):
+            args["mobile"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1254,6 +1259,16 @@ def main():
     if cli["cloudlist"]:
         log("info", "--cloudlist: enumerating multi-cloud assets")
         run_cloudlist()
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["mobile"]:
+        log("info", f"--mobile: {cli['mobile']}")
+        try:
+            ext = os.path.splitext(cli["mobile"])[1].lower()
+            flag = "--apk" if ext == ".apk" else "--ipa" if ext == ".ipa" else "--aab"
+            subprocess.run([sys.executable, "-u", os.path.join(SCRIPT_DIR, "mobile_hunt.py"),
+                            flag, cli["mobile"]], cwd=SCRIPT_DIR, check=False, timeout=900)
+        except Exception as e:
+            log("warn", f"mobile_hunt failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
 
     has_ollama = ollama_available()
