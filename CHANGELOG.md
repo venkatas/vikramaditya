@@ -1,5 +1,31 @@
 # Changelog
 
+## v9.12.0 — Microsoft RESTler stateful REST API fuzzer (2026-05-05)
+
+New `restler_audit.py`. RESTler is the only OSS stateful REST fuzzer that infers producer-consumer dependencies from an OpenAPI spec ("create user → login → access admin endpoint as that user"). Complements (does not duplicate) schemathesis which is property-based but stateless.
+
+### Three stages
+- **compile** — turn OpenAPI/Swagger spec into a fuzzing grammar (~30s)
+- **test** — smoke each request once with valid sequences (~5-15min)
+- **fuzz** — smart payload mutation against the grammar (configurable time budget, default 2h)
+
+### Vikramaditya integration
+- `--restler SPEC` + `--restler-base-url URL` + `--restler-token "Bearer ..."` + `--restler-mode {compile,test,fuzz,all}` + `--restler-time-h N`
+- Detects local binary via `RESTLER_BIN` env var, falls back to Docker (`mcr.microsoft.com/restlerfuzzer/restler:latest`), errors with install hint if neither
+
+### Output
+`findings/<host>/restler/{Compile/, Test/, Fuzz/, summary.json}`
+
+### Sample
+```bash
+docker pull mcr.microsoft.com/restlerfuzzer/restler:latest
+python3 vikramaditya.py --restler openapi.json \
+    --restler-base-url https://api.client.com \
+    --restler-token "Bearer $TOK" --restler-time-h 4
+```
+
+---
+
 ## v9.11.0 — WAF / anti-bot bypass toolkit (2026-05-05)
 
 We tagged CDN/WAF in v9.5.0 (cdncheck) but didn't bypass it. New `waf_bypass.py` adds three operator-driven primitives.

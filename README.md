@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.12.0 — Microsoft RESTler stateful REST API fuzzer (2026-05-05)**
+
+`restler_audit.py` — infers producer-consumer dependencies from OpenAPI; reaches deep states stateless tools can't.
+```bash
+python3 vikramaditya.py --restler openapi.json --restler-base-url https://api.client.com --restler-time-h 4
+```
+See [CHANGELOG.md](CHANGELOG.md#v9120).
+
+---
+
 **v9.11.0 — WAF / anti-bot bypass toolkit (2026-05-05)**
 
 `waf_bypass.py` — padding (nowafpls-style), URL mangling (bypass-url-parser), FireProx IP rotation.
