@@ -1,5 +1,27 @@
 # Changelog
 
+## v9.14.0 — Deep SAST (CodeQL + Bearer) (2026-05-05)
+
+New `sast_audit.py`. We have Semgrep (pattern-based); v9.14.0 adds semantic taint-tracking (CodeQL, 88% accuracy / 5% FP) + privacy/PII data-flow (Bearer).
+
+### Tools wired
+- **CodeQL** — GitHub semantic SAST; supports python, javascript, typescript, java, kotlin, go, ruby, csharp, cpp, swift. Builds a database then runs the standard query suite; SARIF output.
+- **Bearer** — privacy/data-flow analysis; finds PII flowing to logs/external services. Required for DPDP/GDPR engagements.
+
+### Vikramaditya integration
+- `--sast PATH --sast-language python,javascript,go,... --sast-tools {all,codeql,bearer}`
+
+### Output
+`findings/<repo>/sast/{codeql/results_<lang>.sarif, bearer/bearer.json, summary.json}`
+
+### Sample
+```bash
+brew install codeql bearer/tap/bearer
+python3 vikramaditya.py --sast path/to/repo --sast-language python,javascript
+```
+
+---
+
 ## v9.13.0 — GraphQL DAST bundle (graphw00f + Clairvoyance + InQL) (2026-05-05)
 
 New `graphql_audit.py`. GraphQL is increasingly client-facing; current Vikramaditya only had ad-hoc nuclei templates.
