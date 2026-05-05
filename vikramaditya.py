@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # v9.10.0 — single-source-of-truth for the orchestrator version. Bumped from
 # v9.9.0 for llm_hunt.py (Garak + PyRIT + Promptfoo LLM red-teaming).
 # See CHANGELOG.md v9.10.0.
-__version__ = "9.12.0"
+__version__ = "9.13.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -909,6 +909,11 @@ Options:
   --restler SPEC          v9.12.0 — Microsoft RESTler stateful REST API
                           fuzzer. --restler-base-url, --restler-token,
                           --restler-mode, --restler-time-h.
+  --graphql URL           v9.13.0 — graphw00f + Clairvoyance + InQL
+                          GraphQL DAST bundle. --graphql-clairvoyance,
+                          --graphql-wordlist, --header.
+  --graphql-clairvoyance  Reconstruct schema when introspection is OFF
+  --graphql-wordlist PATH Wordlist for Clairvoyance brute-force
 """
 
 
@@ -976,6 +981,10 @@ def parse_cli_args() -> dict:
         "restler_token": "",
         "restler_mode": "all",
         "restler_time_h": 2.0,
+        # v9.13.0 — GraphQL
+        "graphql": "",
+        "graphql_clairvoyance": False,
+        "graphql_wordlist": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -1088,6 +1097,12 @@ def parse_cli_args() -> dict:
             except ValueError:
                 pass
             i += 2
+        elif argv[i] == "--graphql" and i + 1 < len(argv):
+            args["graphql"] = argv[i + 1]; i += 2
+        elif argv[i] == "--graphql-clairvoyance":
+            args["graphql_clairvoyance"] = True; i += 1
+        elif argv[i] == "--graphql-wordlist" and i + 1 < len(argv):
+            args["graphql_wordlist"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1416,6 +1431,21 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["graphql"]:
+        log("info", f"--graphql: {cli['graphql']}")
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "graphql_audit.py"),
+                   "--url", cli["graphql"]]
+            for h in cli["extra_headers"]:
+                cmd += ["--header", h]
+            if cli["graphql_clairvoyance"]:
+                cmd += ["--clairvoyance"]
+            if cli["graphql_wordlist"]:
+                cmd += ["--wordlist", cli["graphql_wordlist"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=2400)
+        except Exception as e:
+            log("warn", f"graphql_audit failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["restler"]:
         log("info", f"--restler: spec={cli['restler']}")
