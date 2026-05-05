@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # v9.10.0 — single-source-of-truth for the orchestrator version. Bumped from
 # v9.9.0 for llm_hunt.py (Garak + PyRIT + Promptfoo LLM red-teaming).
 # See CHANGELOG.md v9.10.0.
-__version__ = "9.11.0"
+__version__ = "9.12.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -906,6 +906,9 @@ Options:
   --waf-mangle            URL mangling (200+ permutations)
   --waf-pad-bytes N       nowafpls-style body padding (default 20000)
   --waf-fireprox-create   Create FireProx API GW proxy (--aws-profile)
+  --restler SPEC          v9.12.0 — Microsoft RESTler stateful REST API
+                          fuzzer. --restler-base-url, --restler-token,
+                          --restler-mode, --restler-time-h.
 """
 
 
@@ -967,6 +970,12 @@ def parse_cli_args() -> dict:
         "waf_pad_bytes": 0,
         "waf_fireprox_create": False,
         "aws_profile": "default",
+        # v9.12.0 — RESTler
+        "restler": "",
+        "restler_base_url": "",
+        "restler_token": "",
+        "restler_mode": "all",
+        "restler_time_h": 2.0,
     }
     argv = sys.argv[1:]
     i = 0
@@ -1065,6 +1074,20 @@ def parse_cli_args() -> dict:
             args["waf_fireprox_create"] = True; i += 1
         elif argv[i] == "--aws-profile" and i + 1 < len(argv):
             args["aws_profile"] = argv[i + 1]; i += 2
+        elif argv[i] == "--restler" and i + 1 < len(argv):
+            args["restler"] = argv[i + 1]; i += 2
+        elif argv[i] == "--restler-base-url" and i + 1 < len(argv):
+            args["restler_base_url"] = argv[i + 1]; i += 2
+        elif argv[i] == "--restler-token" and i + 1 < len(argv):
+            args["restler_token"] = argv[i + 1]; i += 2
+        elif argv[i] == "--restler-mode" and i + 1 < len(argv):
+            args["restler_mode"] = argv[i + 1]; i += 2
+        elif argv[i] == "--restler-time-h" and i + 1 < len(argv):
+            try:
+                args["restler_time_h"] = float(argv[i + 1])
+            except ValueError:
+                pass
+            i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1393,6 +1416,21 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["restler"]:
+        log("info", f"--restler: spec={cli['restler']}")
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "restler_audit.py"),
+                   "--spec", cli["restler"], "--mode", cli["restler_mode"],
+                   "--time-budget", str(cli["restler_time_h"])]
+            if cli["restler_base_url"]:
+                cmd += ["--base-url", cli["restler_base_url"]]
+            if cli["restler_token"]:
+                cmd += ["--token", cli["restler_token"]]
+            timeout_s = int(cli["restler_time_h"] * 3600 + 1200)
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=timeout_s)
+        except Exception as e:
+            log("warn", f"restler failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["waf_bypass"] or cli["waf_fireprox_create"]:
         log("info", f"--waf-bypass: {cli['waf_bypass'] or '(fireprox)'}")
