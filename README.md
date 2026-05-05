@@ -9,6 +9,31 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.5.0 — ProjectDiscovery tool integration bundle: 8 tools wired (2026-05-05)**
+
+5 PD binaries were already in `~/go/bin` but never invoked; 3 more installed in seconds. v9.5.0 wires all 8 into the appropriate phase.
+
+| Tool | Phase | Effect |
+|---|---|---|
+| **cvemap** | `intel.py` (preferred CVE source) | KEV / public-PoC / EPSS metadata; falls back to GHSA + NVD without PDCP key |
+| **cdncheck** | `recon.sh` Phase 3 | `live/cdn_map.json` tags Cloudflare/Akamai/CloudFront/Fastly/Azure FD edges |
+| **fingerprintx** | `recon.sh` after naabu | `ports/fingerprintx.json` — RDP/SSH/SMB/Postgres/Mongo auth-protocol detection |
+| **asnmap** | `classify_target()` | NEW `AS<num>` target type → expand to CIDRs, iterate hunt.py |
+| **mapcidr** | `expand_cidrs()` helper | CIDR-to-IP expansion with `max_hosts=65536` safety cap |
+| **shuffledns** | `recon.sh` Phase 1 | Wildcard-aware mass DNS resolve before Phase 3 httpx |
+| **notify** | `brain.py auto_triage_and_exploit` | Slack/Discord/Teams/Telegram ping on SUBMIT verdicts |
+| **cloudlist** | `--cloudlist` flag | Multi-cloud asset listing (AWS/Azure/GCP/DO/Hetzner/Linode) |
+
+```bash
+python3 vikramaditya.py AS13335                # ASN target — asnmap expands, hunt iterates
+python3 vikramaditya.py --cloudlist            # multi-cloud asset enum
+PDCP_API_KEY=... python3 intel.py --tech jquery,iis,aspnet --target X
+```
+
+See [CHANGELOG.md](CHANGELOG.md#v950) for full per-tool wiring details.
+
+---
+
 **v9.4.0 — Tier-1 power-up bundle: mindmap + intel + oauth + race + cicd wired (2026-05-05)**
 
 Five upstream tools (`mindmap.py`, `intel.py`, `oauth_tester.py`, `race_audit.py`, `cicd_scanner.sh`) shipped in the initial release as orphan scripts but were never wired into the orchestrator. v9.4.0 adapts them for VAPT framing and integrates each into `vikramaditya.py`.

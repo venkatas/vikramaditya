@@ -41,10 +41,11 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.4.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.3.0 for the tier-1 power-up bundle (mindmap + intel + oauth + race +
-# cicd wired into the orchestrator). See CHANGELOG.md v9.4.0.
-__version__ = "9.4.0"
+# v9.5.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.4.0 for the ProjectDiscovery tool integration bundle (cvemap, cdncheck,
+# fingerprintx, asnmap, mapcidr, shuffledns, notify, cloudlist all wired).
+# See CHANGELOG.md v9.5.0.
+__version__ = "9.5.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -250,6 +251,16 @@ def classify_target(target: str) -> dict:
     # HAR file (browser session export)
     if target.lower().endswith(".har") and os.path.isfile(target):
         return {"type": "har", "value": target, "original": target}
+
+    # v9.5.0 — ASN target. Operator passes "AS123456" or "asn:123456";
+    # asnmap expands to a CIDR list which we then expand to individual
+    # IPs (or pass through as a CIDR-list batch to hunt.py).
+    asn_match = re.match(r"^(?:asn:|AS)(\d+)$", target.strip(), re.IGNORECASE)
+    if asn_match:
+        asn = "AS" + asn_match.group(1)
+        cidrs = _expand_asn_to_cidrs(asn)
+        if cidrs:
+            return {"type": "asn", "value": asn, "cidrs": cidrs, "original": target}
 
     # CIDR
     if "/" in target:
@@ -856,6 +867,13 @@ Options:
   --cicd-audit OWNER/REPO v9.4.0 — wrap cicd_scanner.sh (sisakulint) for
                           GitHub Actions audit on the given owner/repo or
                           'org:name', then exit.
+  --cloudlist             v9.5.0 — list multi-cloud assets via PD cloudlist
+                          (reads ~/.config/cloudlist/config.yaml). Useful
+                          for non-AWS engagements not covered by our
+                          whitebox audit.
+  AS<num> | asn:<num>     v9.5.0 — ASN target. asnmap expands to CIDR list,
+                          each CIDR is then scanned with hunt.py. Saves
+                          the full CIDR list to recon/AS<num>/cidrs.txt.
 """
 
 
@@ -886,6 +904,8 @@ def parse_cli_args() -> dict:
         "race_body": "",
         "extra_headers": [],
         "cicd_audit": "",
+        # v9.5.0 — PD tool flags
+        "cloudlist": False,
     }
     argv = sys.argv[1:]
     i = 0
@@ -928,11 +948,112 @@ def parse_cli_args() -> dict:
             args["extra_headers"].append(argv[i + 1]); i += 2
         elif argv[i] == "--cicd-audit" and i + 1 < len(argv):
             args["cicd_audit"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cloudlist":
+            args["cloudlist"] = True; i += 1
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
             i += 1
     return args
+
+
+# ── v9.5.0 — ProjectDiscovery tool wrappers ───────────────────────────────────
+
+def _expand_asn_to_cidrs(asn: str) -> list[str]:
+    """asnmap CLI: AS123456 → list of CIDR blocks. Empty list if asnmap
+    is unavailable or returns nothing."""
+    import shutil as _sh
+    if not _sh.which("asnmap"):
+        return []
+    try:
+        proc = subprocess.run(
+            ["asnmap", "-a", asn, "-silent"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return []
+    return [
+        line.strip() for line in proc.stdout.splitlines()
+        if line.strip() and "/" in line.strip()
+    ]
+
+
+def expand_cidrs(cidrs: list[str], max_hosts: int = 65536) -> list[str]:
+    """mapcidr CLI: expand a list of CIDR blocks into individual IPs.
+
+    Falls back to ipaddress stdlib when mapcidr isn't on PATH.
+    Caps total at `max_hosts` to prevent expanding /8 by accident.
+    """
+    import shutil as _sh
+    if not cidrs:
+        return []
+    if _sh.which("mapcidr"):
+        try:
+            proc = subprocess.run(
+                ["mapcidr", "-cl", ",".join(cidrs), "-silent"],
+                capture_output=True, text=True, timeout=60,
+            )
+            ips = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+            return ips[:max_hosts]
+        except Exception:
+            pass
+    # Fallback
+    out: list[str] = []
+    for c in cidrs:
+        try:
+            net = ipaddress.ip_network(c, strict=False)
+            for ip in net.hosts():
+                out.append(str(ip))
+                if len(out) >= max_hosts:
+                    return out
+        except ValueError:
+            continue
+    return out
+
+
+def notify_finding(message: str, severity: str = "info") -> None:
+    """Send a single-line notification via PD `notify` if configured.
+
+    Reads $HOME/.config/notify/provider-config.yaml; silently no-ops if
+    `notify` isn't installed or no provider is configured. Used to ping
+    the engagement Slack/Discord/Telegram channel when a Critical finding
+    lands during a long autonomous run.
+    """
+    import shutil as _sh
+    if not _sh.which("notify"):
+        return
+    try:
+        proc = subprocess.Popen(
+            ["notify", "-bulk", "-silent", "-id", f"vikramaditya-{severity}"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.communicate(input=message.encode(), timeout=15)
+    except Exception:
+        pass
+
+
+def run_cloudlist(out_dir: str | None = None) -> str | None:
+    """PD cloudlist — multi-provider asset listing (AWS/Azure/GCP/DO/etc.)
+    using ~/.config/cloudlist/config.yaml. Useful for non-AWS engagements
+    where our `whitebox/` audit doesn't apply.
+    """
+    import shutil as _sh
+    if not _sh.which("cloudlist"):
+        log("warn", "cloudlist not installed (go install github.com/projectdiscovery/cloudlist/cmd/cloudlist@latest)")
+        return None
+    out = out_dir or os.path.join(SCRIPT_DIR, "recon", "cloudlist", "assets.json")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    try:
+        subprocess.run(
+            ["cloudlist", "-json", "-silent", "-o", out],
+            cwd=SCRIPT_DIR, check=False, timeout=600,
+        )
+        log("ok", f"cloudlist → {out}")
+        return out
+    except Exception as e:
+        log("warn", f"cloudlist skipped: {e}")
+        return None
 
 
 # ── v9.4.0 — Tier-1 power-up wrappers ─────────────────────────────────────────
@@ -1130,6 +1251,10 @@ def main():
             headers=cli["extra_headers"],
         )
         print(f"\n  {D}Done.{N}\n"); return
+    if cli["cloudlist"]:
+        log("info", "--cloudlist: enumerating multi-cloud assets")
+        run_cloudlist()
+        print(f"\n  {D}Done.{N}\n"); return
 
     has_ollama = ollama_available()
 
@@ -1227,6 +1352,24 @@ def main():
                 except Exception as e:
                     log("warn", f"Report generation failed: {e}")
         print(f"\n  {D}Done.{N}\n")
+        return
+
+    # --- ASN → expand to CIDRs, then iterate ---
+    if target_info["type"] == "asn":
+        cidrs = target_info.get("cidrs", [])
+        log("info", f"ASN {target_info['value']} → {len(cidrs)} CIDR blocks")
+        for c in cidrs[:25]:  # safety cap; full list saved to recon/<asn>/cidrs.txt
+            log("info", f"  {c}")
+        # Persist the CIDR list for the report
+        asn_dir = os.path.join(SCRIPT_DIR, "recon", target_info["value"])
+        os.makedirs(asn_dir, exist_ok=True)
+        with open(os.path.join(asn_dir, "cidrs.txt"), "w") as fh:
+            fh.write("\n".join(cidrs) + "\n")
+        if not autonomous and not confirm(f"Proceed with hunt against {len(cidrs)} CIDR(s)?"):
+            print(f"  {D}Aborted.{N}")
+            return
+        for c in cidrs:
+            run_hunt(c, full=True)
         return
 
     # --- CIDR / IP → hunt.py directly ---
