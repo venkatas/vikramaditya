@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.8.0 — Kubernetes audit (Kubescape + Trivy + Falco) (2026-05-05)**
+
+`k8s_audit.py` — Kubescape posture (NSA/CISA/MITRE), Trivy cluster + image + IaC, Falco eBPF runtime.
+```bash
+python3 vikramaditya.py --k8s-audit client-prod --k8s-framework nsa --k8s-trivy-images
+```
+See [CHANGELOG.md](CHANGELOG.md#v980).
+
+---
+
 **v9.7.0 — Active Directory / hybrid identity (NetExec + BloodHound CE + Impacket + Certipy) (2026-05-05)**
 
 New `ad_hunt.py`. NetExec replaces dead CME; BloodHound CE for graph attack-paths; Certipy for ADCS ESC1-ESC15.

@@ -1,5 +1,32 @@
 # Changelog
 
+## v9.8.0 — Kubernetes audit engine (Kubescape + Trivy + Falco) (2026-05-05)
+
+New `k8s_audit.py`. Our `whitebox/` covers AWS only; clients increasingly run K8s.
+
+### Tools wired
+- **Kubescape** (CNCF-graduated) — NSA/CISA + MITRE ATT&CK for Kubernetes mapping, RBAC analysis, posture scoring
+- **Trivy** — cluster scan (misconfigs/secrets/RBAC) + image SBOMs + IaC config scan (Helm/K8s manifests/Terraform)
+- **Falco** — runtime threat detection via eBPF (operator-driven N-second tap)
+
+### Vikramaditya integration
+- `--k8s-audit CONTEXT` flag (Kubescape posture against `--k8s-framework {nsa,mitre,cis,soc2,allcontrols,armobest}`)
+- `--k8s-trivy-images` — enumerate cluster images via kubectl, Trivy-scan each
+- `--k8s-falco-seconds N` — runtime tap for N seconds
+- `--iac PATH` — Trivy IaC config scan on local Helm/K8s/Terraform path
+
+### Output
+`findings/<context>/k8s/{kubescape_<framework>.json, trivy_cluster.json, trivy_images/*.json, trivy_iac.json, falco_runtime.log, summary.json}`
+
+### Sample
+```bash
+brew install kubescape trivy falcosecurity/falco/falco
+python3 vikramaditya.py --k8s-audit client-prod --k8s-framework nsa --k8s-trivy-images
+python3 vikramaditya.py --iac path/to/charts/  # IaC-only mode
+```
+
+---
+
 ## v9.7.0 — Active Directory / hybrid identity engine (NetExec + BloodHound CE + Impacket + Certipy) (2026-05-05)
 
 New `ad_hunt.py`. Hybrid (Entra ID + on-prem AD) clients increasingly need this; our `whitebox/` covers cloud only.
