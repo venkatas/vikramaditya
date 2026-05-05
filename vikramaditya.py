@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # v9.10.0 — single-source-of-truth for the orchestrator version. Bumped from
 # v9.9.0 for llm_hunt.py (Garak + PyRIT + Promptfoo LLM red-teaming).
 # See CHANGELOG.md v9.10.0.
-__version__ = "9.13.0"
+__version__ = "9.14.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -914,6 +914,10 @@ Options:
                           --graphql-wordlist, --header.
   --graphql-clairvoyance  Reconstruct schema when introspection is OFF
   --graphql-wordlist PATH Wordlist for Clairvoyance brute-force
+  --sast PATH             v9.14.0 — CodeQL + Bearer deep SAST.
+                          --sast-language py,js,go,..., --sast-tools.
+  --sast-language CSV     CodeQL languages (python,javascript,go,java,...)
+  --sast-tools CSV        all | codeql | bearer
 """
 
 
@@ -985,6 +989,10 @@ def parse_cli_args() -> dict:
         "graphql": "",
         "graphql_clairvoyance": False,
         "graphql_wordlist": "",
+        # v9.14.0 — SAST
+        "sast": "",
+        "sast_language": "",
+        "sast_tools": "all",
     }
     argv = sys.argv[1:]
     i = 0
@@ -1103,6 +1111,12 @@ def parse_cli_args() -> dict:
             args["graphql_clairvoyance"] = True; i += 1
         elif argv[i] == "--graphql-wordlist" and i + 1 < len(argv):
             args["graphql_wordlist"] = argv[i + 1]; i += 2
+        elif argv[i] == "--sast" and i + 1 < len(argv):
+            args["sast"] = argv[i + 1]; i += 2
+        elif argv[i] == "--sast-language" and i + 1 < len(argv):
+            args["sast_language"] = argv[i + 1]; i += 2
+        elif argv[i] == "--sast-tools" and i + 1 < len(argv):
+            args["sast_tools"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1431,6 +1445,17 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["sast"]:
+        log("info", f"--sast: {cli['sast']}")
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "sast_audit.py"),
+                   "--path", cli["sast"], "--tools", cli["sast_tools"]]
+            if cli["sast_language"]:
+                cmd += ["--language", cli["sast_language"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=7200)
+        except Exception as e:
+            log("warn", f"sast_audit failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["graphql"]:
         log("info", f"--graphql: {cli['graphql']}")

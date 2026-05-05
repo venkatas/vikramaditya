@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.14.0 — Deep SAST (CodeQL + Bearer) (2026-05-05)**
+
+`sast_audit.py` — semantic taint-tracking (CodeQL, 10 languages) + PII flow (Bearer for DPDP/GDPR).
+```bash
+python3 vikramaditya.py --sast path/to/repo --sast-language python,javascript
+```
+See [CHANGELOG.md](CHANGELOG.md#v9140).
+
+---
+
 **v9.13.0 — GraphQL DAST bundle (graphw00f + Clairvoyance + InQL) (2026-05-05)**
 
 `graphql_audit.py` — engine fingerprinting + introspection-disabled schema reconstruction + auto-query generation.
