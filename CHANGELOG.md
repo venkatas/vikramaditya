@@ -1,5 +1,29 @@
 # Changelog
 
+## v9.11.0 — WAF / anti-bot bypass toolkit (2026-05-05)
+
+We tagged CDN/WAF in v9.5.0 (cdncheck) but didn't bypass it. New `waf_bypass.py` adds three operator-driven primitives.
+
+### Tools wired
+- **nowafpls-style padding** — junk-data padding to push payloads past WAF inspection size limits (Cloudflare ~16KB body, AWS WAF ~8KB, Azure FD ~32KB). Implemented inline since the upstream is a Burp BApp.
+- **bypass-url-parser-style mangling** — 200+ URL/header/method permutations against 401/403 endpoints. Wraps the upstream `bypass-url-parser` CLI when installed; ships a 13-permutation × 7-header-set built-in fallback when not.
+- **FireProx** — AWS API Gateway IP rotation; defeats rate-limit / IP-rep WAFs during ffuf enumeration. Wraps upstream `fire.py`.
+
+### Vikramaditya integration
+- `--waf-bypass URL` + `--waf-mangle` + `--waf-pad-bytes N` + `--waf-fireprox-create` + `--aws-profile NAME`
+
+### Output
+`findings/<host>/waf_bypass/{padding/, mangle/, fireprox/, summary.json}`
+
+### Sample
+```bash
+python3 vikramaditya.py --waf-bypass https://target.com/admin --waf-mangle
+python3 vikramaditya.py --waf-bypass https://target.com/api/x --waf-pad-bytes 20000
+python3 vikramaditya.py --waf-bypass https://target.com --waf-fireprox-create --aws-profile bb-rotator
+```
+
+---
+
 ## v9.10.0 — LLM red-teaming engine (Garak + PyRIT + Promptfoo) (2026-05-05)
 
 New `llm_hunt.py`. Every B2B SaaS now ships AI features; bug-bounty programs accept LLM findings; emerging client requirement.

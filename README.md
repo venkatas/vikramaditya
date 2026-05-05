@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.11.0 — WAF / anti-bot bypass toolkit (2026-05-05)**
+
+`waf_bypass.py` — padding (nowafpls-style), URL mangling (bypass-url-parser), FireProx IP rotation.
+```bash
+python3 vikramaditya.py --waf-bypass https://target.com/admin --waf-mangle
+```
+See [CHANGELOG.md](CHANGELOG.md#v9110).
+
+---
+
 **v9.10.0 — LLM red-teaming (Garak + PyRIT + Promptfoo) (2026-05-05)**
 
 `llm_hunt.py` — every B2B SaaS now ships AI features. Garak for breadth, PyRIT for depth, Promptfoo for CI regression.
