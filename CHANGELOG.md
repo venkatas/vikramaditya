@@ -1,5 +1,32 @@
 # Changelog
 
+## v9.15.0 — Brain benchmark vs Buttercup (DARPA AIxCC) (2026-05-05)
+
+New `brain_benchmark.py` — benchmarks our `brain.py` (Ollama / phi4:14b) against the open-source autonomous Cyber Reasoning Systems that emerged from DARPA AIxCC 2024-2025. Closes the v9.5.0 research gap on emerging tools (Neo / XBOW / Buttercup).
+
+### What it does
+1. **Comparison harness** — feeds the same target+recon to brain.py auto_triage AND Trail of Bits' Buttercup (the only one that open-sourced; AIxCC 2nd place / $3M). Records per-engagement: SUBMIT/DROP/UNKNOWN counts (ours), PoV count (Buttercup), elapsed time, exit codes.
+2. **`logs/brain_benchmark.csv`** — one row per benchmark run. Tracks capability drift as Ollama models update.
+3. **Integration design** (`--brain-bench-integrate`) — prints the architectural plan for using Buttercup as fallback when our brain returns NO_REPORTS. Code wiring deferred to v9.16+; needs the operator's call on memory budget (Buttercup needs ~16GB RAM + Docker).
+
+### Vikramaditya integration
+- `--brain-bench TARGET --brain-bench-recon DIR --brain-bench-findings DIR`
+- `--brain-bench-integrate` prints the proposed brain.py edit for v9.16+
+
+### Output
+`logs/brain_benchmark/<run-id>/<target>/{vikram_brain.json, buttercup.json, comparison.md}`
+
+### Sample
+```bash
+git clone https://github.com/trailofbits/buttercup && cd buttercup && make install
+python3 vikramaditya.py --brain-bench https://example.com \
+    --brain-bench-recon recon/example.com/sessions/<id> \
+    --brain-bench-findings findings/example.com/sessions/<id>
+python3 vikramaditya.py --brain-bench-integrate    # design notes
+```
+
+---
+
 ## v9.14.0 — Deep SAST (CodeQL + Bearer) (2026-05-05)
 
 New `sast_audit.py`. We have Semgrep (pattern-based); v9.14.0 adds semantic taint-tracking (CodeQL, 88% accuracy / 5% FP) + privacy/PII data-flow (Bearer).
