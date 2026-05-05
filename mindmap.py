@@ -27,49 +27,49 @@ RESET  = "\033[0m"
 # impact: "HIGH" = red, "MED" = yellow, "LOW" = green
 
 WEBSITE_CHECKS = [
-    ("HIGH", "IDOR/ATO — enumerate user IDs in API endpoints", "bug-bounty-hunt → IDOR section"),
-    ("HIGH", "Authentication bypass — test all auth flows (login, reset, OAuth)", "bug-bounty-hunt → Auth Bypass section"),
-    ("HIGH", "SSRF — find server-side URL fetch params (`url=`, `webhook=`, `redirect=`)", "bug-bounty-hunt → SSRF section"),
-    ("HIGH", "Race condition — parallel requests on transactions, coupons, credits", "bug-bounty-hunt → Race Conditions section"),
-    ("MED",  "Stored XSS — user input reflected in other users' views", "bug-bounty-hunt → XSS section"),
-    ("MED",  "CSRF — state-changing requests without CSRF tokens", "bug-bounty-hunt → CSRF section"),
-    ("MED",  "Open redirect — `returnTo`, `next`, `url` params with unvalidated URLs", "bug-bounty-hunt → Open Redirect"),
-    ("MED",  "Subdomain takeover — dangling CNAMEs to unclaimed services", "bug-bounty-recon → Phase 8"),
+    ("HIGH", "IDOR/ATO — enumerate user IDs in API endpoints", "scanner.sh idor + brain auto_triage"),
+    ("HIGH", "Authentication bypass — test all auth flows (login, reset, OAuth)", "oauth_tester.py + scanner.sh auth_bypass"),
+    ("HIGH", "SSRF — find server-side URL fetch params (`url=`, `webhook=`, `redirect=`)", "scanner.sh ssrf + oast"),
+    ("HIGH", "Race condition — parallel requests on transactions, coupons, credits", "race_audit.py"),
+    ("MED",  "Stored XSS — user input reflected in other users' views", "scanner.sh xss + dalfox"),
+    ("MED",  "CSRF — state-changing requests without CSRF tokens", "scanner.sh csrf"),
+    ("MED",  "Open redirect — `returnTo`, `next`, `url` params with unvalidated URLs", "manual + brain triage"),
+    ("MED",  "Subdomain takeover — dangling CNAMEs to unclaimed services", "recon.sh Phase 11 takeover"),
     ("LOW",  "Information disclosure — error messages, stack traces, debug endpoints", "manual"),
     ("LOW",  "Missing security headers — CSP, HSTS, X-Frame-Options", "manual"),
 ]
 
 OPENSRC_CHECKS = [
-    ("HIGH", "Timing side-channel — `===` on HMAC/token/secret comparisons", "bug-bounty-hunt → Timing Side-Channel section"),
-    ("HIGH", "JWT/token forgery — `alg:none`, weak secret, claim injection", "bug-bounty-hunt → OIDC/OAuth section"),
-    ("HIGH", "Smart contract reentrancy / access control", "bug-bounty-hunt → Smart Contract section"),
-    ("HIGH", "SSRF in server-side fetch — user-controlled URL passed to fetch/axios", "bug-bounty-hunt → SSRF section"),
-    ("MED",  "Event spoofing — SDK public `trigger()` / `postMessage` without origin check", "bug-bounty-hunt → SDK/Client-Library section"),
-    ("MED",  "Open redirect — `new URL(userInput, base)` does NOT prevent open redirect", "bug-bounty-hunt → Open Redirect"),
-    ("MED",  "SIWE double-hash / nonce reuse", "bug-bounty-hunt → SIWE section"),
+    ("HIGH", "Timing side-channel — `===` on HMAC/token/secret comparisons", "semgrep + manual code review"),
+    ("HIGH", "JWT/token forgery — `alg:none`, weak secret, claim injection", "oauth_tester.py + hunt.py --jwt-audit"),
+    ("HIGH", "Smart contract reentrancy / access control", "smart-contract audit (out of scope for web2 VAPT)"),
+    ("HIGH", "SSRF in server-side fetch — user-controlled URL passed to fetch/axios", "scanner.sh ssrf + oast"),
+    ("MED",  "Event spoofing — SDK public `trigger()` / `postMessage` without origin check", "manual SDK review"),
+    ("MED",  "Open redirect — `new URL(userInput, base)` does NOT prevent open redirect", "manual + brain triage"),
+    ("MED",  "SIWE double-hash / nonce reuse", "manual SIWE review"),
     ("MED",  "Hardcoded secrets in `.env.test` / config files", "manual grep"),
-    ("MED",  "Prototype pollution — unsafe `Object.assign` / deep merge on user input", "bug-bounty-hunt → Prototype Pollution"),
+    ("MED",  "Prototype pollution — unsafe `Object.assign` / deep merge on user input", "semgrep + manual"),
     ("LOW",  "Dev breadcrumbs — TODO/FIXME/HACK near security-sensitive code", "grep -rn 'TODO|FIXME|HACK'"),
 ]
 
 API_CHECKS = [
-    ("HIGH", "Auth bypass — test endpoints without Authorization header", "bug-bounty-hunt → Auth Bypass section"),
-    ("HIGH", "IDOR — change numeric/UUID IDs in all requests", "bug-bounty-hunt → IDOR section"),
-    ("HIGH", "Webhook SSRF — webhook URL field = SSRF vector", "bug-bounty-hunt → SSRF section"),
-    ("HIGH", "JWT claim forgery — `x-hasura-role`, `sub`, `iss` manipulation", "bug-bounty-hunt → OIDC/OAuth section"),
+    ("HIGH", "Auth bypass — test endpoints without Authorization header", "oauth_tester.py + scanner.sh auth_bypass"),
+    ("HIGH", "IDOR — change numeric/UUID IDs in all requests", "scanner.sh idor + brain auto_triage"),
+    ("HIGH", "Webhook SSRF — webhook URL field = SSRF vector", "scanner.sh ssrf + oast"),
+    ("HIGH", "JWT claim forgery — `x-hasura-role`, `sub`, `iss` manipulation", "oauth_tester.py + hunt.py --jwt-audit"),
     ("MED",  "Endpoint enumeration — undocumented v1/v2 endpoints, hidden routes", "kiterunner scan"),
-    ("MED",  "Rate limit bypass — no rate limit on auth, OTP, or sensitive endpoints", "bug-bounty-hunt → rate limiting"),
-    ("MED",  "Race condition on batch/parallel operations", "bug-bounty-hunt → Race Conditions section"),
-    ("LOW",  "CORS misconfiguration — wildcard on credentialed endpoints", "bug-bounty-hunt → CORS"),
+    ("MED",  "Rate limit bypass — no rate limit on auth, OTP, or sensitive endpoints", "race_audit.py + manual"),
+    ("MED",  "Race condition on batch/parallel operations", "race_audit.py"),
+    ("LOW",  "CORS misconfiguration — wildcard on credentialed endpoints", "scanner.sh cors"),
     ("LOW",  "API key in URL — logs exposure of credentials", "manual review"),
 ]
 
 MOBILE_CHECKS = [
-    ("HIGH", "WebView JS injection — `addJavascriptInterface` without origin check", "bug-bounty-hunt → SDK/Client-Library section"),
+    ("HIGH", "WebView JS injection — `addJavascriptInterface` without origin check", "manual SDK review"),
     ("HIGH", "Deep link hijack — register same URI scheme, steal OAuth codes", "manual + AndroidManifest review"),
     ("HIGH", "Certificate pinning bypass — Frida/Objection to intercept traffic", "Frida setup guide"),
     ("MED",  "Plaintext secrets — AsyncStorage, SQLite, SharedPreferences", "manual + strings/decompile"),
-    ("MED",  "SDK event spoofing — MiniKit/WalletConnect postMessage without origin check", "bug-bounty-hunt → SDK section"),
+    ("MED",  "SDK event spoofing — MiniKit/WalletConnect postMessage without origin check", "manual SDK review"),
     ("MED",  "Backend API same as web — test mobile JWT on web endpoints", "all web checks apply"),
     ("LOW",  "Insecure data backup — Android allowBackup=true", "AndroidManifest check"),
     ("LOW",  "Hardcoded API keys in decompiled code", "grep after apktool decompile"),
@@ -78,44 +78,44 @@ MOBILE_CHECKS = [
 # Tech-specific additions
 TECH_CHECKS = {
     "graphql": [
-        ("HIGH", "GraphQL IDOR — swap internalId in queries/mutations", "bug-bounty-hunt → GraphQL section"),
-        ("MED",  "Introspection enabled — schema leakage, hidden fields/types", "bug-bounty-hunt → GraphQL section"),
-        ("MED",  "Batch/alias abuse — 10k mutations to bypass rate limit", "bug-bounty-hunt → GraphQL section"),
+        ("HIGH", "GraphQL IDOR — swap internalId in queries/mutations", "scanner.sh + manual GraphQL probes"),
+        ("MED",  "Introspection enabled — schema leakage, hidden fields/types", "scanner.sh + manual GraphQL probes"),
+        ("MED",  "Batch/alias abuse — 10k mutations to bypass rate limit", "scanner.sh + manual GraphQL probes"),
     ],
     "nextjs": [
         ("HIGH", "Next.js middleware bypass — check _next/static path for auth bypass", "CVE-2025-29927"),
-        ("MED",  "SSRF in getServerSideProps — user-controlled fetch URL", "bug-bounty-hunt → SSRF section"),
-        ("MED",  "Server Actions CSRF — test server actions without CSRF token", "bug-bounty-hunt → CSRF section"),
+        ("MED",  "SSRF in getServerSideProps — user-controlled fetch URL", "scanner.sh ssrf + oast"),
+        ("MED",  "Server Actions CSRF — test server actions without CSRF token", "scanner.sh csrf"),
     ],
     "solidity": [
-        ("HIGH", "Reentrancy — check all ETH transfer calls", "bug-bounty-hunt → Smart Contract section"),
-        ("HIGH", "Signature replay — EIP-712 domain separator, nullifier check", "bug-bounty-hunt → Smart Contract section"),
-        ("HIGH", "Access control — `onlyOwner` missing on privileged functions", "bug-bounty-hunt → Smart Contract section"),
-        ("MED",  "Front-running — any state-dependent transaction ordering", "bug-bounty-hunt → Smart Contract section"),
+        ("HIGH", "Reentrancy — check all ETH transfer calls", "smart-contract audit (out of scope for web2 VAPT)"),
+        ("HIGH", "Signature replay — EIP-712 domain separator, nullifier check", "smart-contract audit (out of scope for web2 VAPT)"),
+        ("HIGH", "Access control — `onlyOwner` missing on privileged functions", "smart-contract audit (out of scope for web2 VAPT)"),
+        ("MED",  "Front-running — any state-dependent transaction ordering", "smart-contract audit (out of scope for web2 VAPT)"),
     ],
     "jwt": [
-        ("HIGH", "alg:none attack — remove signature entirely", "bug-bounty-payloads → JWT section"),
-        ("HIGH", "Weak secret — brute force with hashcat/jwt-cracker", "bug-bounty-payloads → JWT section"),
-        ("MED",  "Claim injection — add `role: admin` or `x-hasura-role: admin`", "bug-bounty-hunt → OIDC section"),
+        ("HIGH", "alg:none attack — remove signature entirely", "hunt.py --jwt-audit"),
+        ("HIGH", "Weak secret — brute force with hashcat/jwt-cracker", "hunt.py --jwt-audit"),
+        ("MED",  "Claim injection — add `role: admin` or `x-hasura-role: admin`", "hunt.py --jwt-audit"),
     ],
     "oauth": [
-        ("HIGH", "Open redirect in redirect_uri — steal auth code", "bug-bounty-hunt → OIDC/OAuth section"),
-        ("HIGH", "CSRF on OAuth flow — missing state parameter check", "bug-bounty-hunt → OIDC/OAuth section"),
-        ("MED",  "Token leakage via referrer — access token in URL fragment", "bug-bounty-hunt → OIDC/OAuth section"),
+        ("HIGH", "Open redirect in redirect_uri — steal auth code", "oauth_tester.py + hunt.py --jwt-audit"),
+        ("HIGH", "CSRF on OAuth flow — missing state parameter check", "oauth_tester.py + hunt.py --jwt-audit"),
+        ("MED",  "Token leakage via referrer — access token in URL fragment", "oauth_tester.py + hunt.py --jwt-audit"),
     ],
     "hasura": [
-        ("HIGH", "JWT claim forgery — `x-hasura-role: admin` in JWT payload", "bug-bounty-payloads → Hasura section"),
+        ("HIGH", "JWT claim forgery — `x-hasura-role: admin` in JWT payload", "hasura admin-secret check"),
         ("HIGH", "Admin secret in .env.test — check if reused in staging/prod", "manual check"),
-        ("MED",  "Action handler SSRF — Hasura action webhook URL configurable", "bug-bounty-hunt → SSRF section"),
+        ("MED",  "Action handler SSRF — Hasura action webhook URL configurable", "scanner.sh ssrf + oast"),
     ],
     "aws": [
-        ("HIGH", "SSRF to IMDSv1 — 169.254.169.254/latest/meta-data/iam/security-credentials", "bug-bounty-hunt → SSRF section"),
+        ("HIGH", "SSRF to IMDSv1 — 169.254.169.254/latest/meta-data/iam/security-credentials", "scanner.sh ssrf + oast"),
         ("MED",  "S3 bucket misconfiguration — public read/write", "awscli: aws s3 ls s3://BUCKET --no-sign-request"),
         ("MED",  "Exposed credentials in environment or error responses", "manual review"),
     ],
     "react": [
-        ("MED",  "dangerouslySetInnerHTML with user input — DOM XSS", "bug-bounty-hunt → XSS section"),
-        ("LOW",  "Prototype pollution via props", "bug-bounty-hunt → Prototype Pollution"),
+        ("MED",  "dangerouslySetInnerHTML with user input — DOM XSS", "scanner.sh xss + dalfox"),
+        ("LOW",  "Prototype pollution via props", "semgrep + manual"),
     ],
 }
 
@@ -244,7 +244,7 @@ def build_checklist(target_type: str, techs: list[str]) -> str:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate bug bounty mind map and checklist")
+    parser = argparse.ArgumentParser(description="Vikramaditya tech-stack mind map + prioritized hunting checklist")
     parser.add_argument("--target", required=True, help="Target domain or name (e.g., worldcoin.org)")
     parser.add_argument("--type",   required=True, choices=["website", "opensrc", "api", "mobile"],
                         help="Target type")
@@ -268,7 +268,7 @@ def main():
     mermaid = build_mermaid(target, target_type, techs)
     checklist = build_checklist(target_type, techs)
 
-    content = f"""# Bug Bounty Mind Map — {target}
+    content = f"""# Attack-Surface Mind Map — {target}
 
 **Target:** {target}
 **Type:** {target_type}
@@ -290,20 +290,20 @@ def main():
 ## Quick-Start Commands
 
 ```bash
-# Start recon
-/bug-bounty-recon
+# Full Vikramaditya pipeline (passive + cloud + blackbox)
+python3 vikramaditya.py {target}
 
-# Learn about this tech stack
-/bug-bounty-learn
+# CVE intel feed for this tech stack
+python3 intel.py --tech "graphql,nextjs" --target {target}
 
-# Hunt specific vuln type from checklist
-/bug-bounty-hunt
+# OAuth/OIDC implementation audit
+python3 oauth_tester.py https://{target}
 
-# Generate payloads
-/bug-bounty-payloads
+# Race-condition tester (parallel requests against authenticated forms)
+python3 race_audit.py --url https://{target}/path --threads 30
 
-# Validate a finding and write report
-/bug-bounty-report
+# CI/CD workflow audit (if client has public GitHub org)
+bash cicd_scanner.sh owner/repo
 ```
 
 ## Notes

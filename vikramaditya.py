@@ -41,9 +41,10 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.3.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.2.0 for the passive dork catalogue (see CHANGELOG.md v9.3.0).
-__version__ = "9.3.0"
+# v9.4.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.3.0 for the tier-1 power-up bundle (mindmap + intel + oauth + race +
+# cicd wired into the orchestrator). See CHANGELOG.md v9.4.0.
+__version__ = "9.4.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -831,6 +832,30 @@ Options:
   --skip-passive          v9.3.0 — skip the Phase-0 dork catalogue when
                           running a full scan (default: passive runs once
                           per session before active phases).
+  --skip-mindmap          v9.4.0 — skip the tech-stack mind map artifact
+                          (default: emitted to recon/<target>/mindmap.md
+                          before active scanning).
+  --intel                 v9.4.0 — fetch GHSA + NVD CVE feed for the
+                          detected tech stack into recon/<target>/intel.md.
+                          Auto-runs when --autonomous; explicit flag in
+                          interactive mode.
+  --oauth-audit URL       v9.4.0 — run oauth_tester.py (state CSRF,
+                          redirect_uri bypass, password-reset host header
+                          injection, etc.) against the given OAuth login
+                          URL, then exit.
+  --race-test URL         v9.4.0 — fire N parallel requests at URL via
+                          race_audit.py to surface coupon/wallet/OTP race
+                          conditions. Use --race-threads, --race-method,
+                          --race-body, --header.
+  --race-threads N        v9.4.0 — parallel-request count for --race-test
+                          (default 30).
+  --race-method M         v9.4.0 — HTTP method for --race-test (GET/POST/...)
+  --race-body JSON        v9.4.0 — JSON body for --race-test.
+  --header "K: V"         v9.4.0 — extra HTTP header for --race-test
+                          (repeatable; e.g. Authorization).
+  --cicd-audit OWNER/REPO v9.4.0 — wrap cicd_scanner.sh (sisakulint) for
+                          GitHub Actions audit on the given owner/repo or
+                          'org:name', then exit.
 """
 
 
@@ -851,6 +876,16 @@ def parse_cli_args() -> dict:
         # v9.3.0 — passive recon controls
         "passive_only": False,
         "skip_passive": False,
+        # v9.4.0 — power-up flags
+        "skip_mindmap": False,
+        "intel": False,
+        "oauth_audit": "",
+        "race_test": "",
+        "race_threads": 30,
+        "race_method": "GET",
+        "race_body": "",
+        "extra_headers": [],
+        "cicd_audit": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -871,11 +906,166 @@ def parse_cli_args() -> dict:
             args["passive_only"] = True; i += 1
         elif argv[i] == "--skip-passive":
             args["skip_passive"] = True; i += 1
+        elif argv[i] == "--skip-mindmap":
+            args["skip_mindmap"] = True; i += 1
+        elif argv[i] == "--intel":
+            args["intel"] = True; i += 1
+        elif argv[i] == "--oauth-audit" and i + 1 < len(argv):
+            args["oauth_audit"] = argv[i + 1]; i += 2
+        elif argv[i] == "--race-test" and i + 1 < len(argv):
+            args["race_test"] = argv[i + 1]; i += 2
+        elif argv[i] == "--race-threads" and i + 1 < len(argv):
+            try:
+                args["race_threads"] = int(argv[i + 1])
+            except ValueError:
+                pass
+            i += 2
+        elif argv[i] == "--race-method" and i + 1 < len(argv):
+            args["race_method"] = argv[i + 1]; i += 2
+        elif argv[i] == "--race-body" and i + 1 < len(argv):
+            args["race_body"] = argv[i + 1]; i += 2
+        elif argv[i] == "--header" and i + 1 < len(argv):
+            args["extra_headers"].append(argv[i + 1]); i += 2
+        elif argv[i] == "--cicd-audit" and i + 1 < len(argv):
+            args["cicd_audit"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
             i += 1
     return args
+
+
+# ── v9.4.0 — Tier-1 power-up wrappers ─────────────────────────────────────────
+# Each helper lazy-imports its module so a malformed sub-tool never breaks
+# the active scanning flow. All five are best-effort: log a warning and
+# continue.
+
+def run_mindmap(target: str, target_type: str, techs: list[str]) -> str | None:
+    """Generate the tech-stack mind map → recon/<target>/mindmap.md."""
+    try:
+        sys.path.insert(0, SCRIPT_DIR)
+        import mindmap as _mm
+        body = _mm.generate(target, target_type, techs) if hasattr(_mm, "generate") else None
+        if body is None:
+            # Older mindmap.py without generate() — fall back to a subprocess call.
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "mindmap.py"),
+                   "--target", target, "--type", target_type]
+            if techs:
+                cmd += ["--tech", ",".join(techs)]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False)
+            return os.path.join(SCRIPT_DIR, "recon", target, "mindmap.md")
+        out = os.path.join(SCRIPT_DIR, "recon", target, "mindmap.md")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w") as fh:
+            fh.write(body)
+        log("ok", f"mind map → {out}")
+        return out
+    except Exception as e:
+        log("warn", f"mindmap skipped: {e}")
+        return None
+
+
+def run_intel(target: str, techs: list[str]) -> str | None:
+    """Fetch GHSA + NVD CVE feed for `techs` → recon/<target>/intel.md.
+
+    Best-effort; never breaks if the data sources are unreachable. Used
+    after recon detects the live tech stack so the brain can ground its
+    scan plan in fresh CVE context.
+    """
+    if not techs:
+        return None
+    try:
+        sys.path.insert(0, SCRIPT_DIR)
+        cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "intel.py"),
+               "--tech", ",".join(techs), "--target", target]
+        out = os.path.join(SCRIPT_DIR, "recon", target, "intel.md")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        cmd += ["--output", out]
+        subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=120)
+        if os.path.exists(out):
+            log("ok", f"CVE intel → {out}")
+            return out
+    except Exception as e:
+        log("warn", f"intel skipped: {e}")
+    return None
+
+
+def run_oauth_audit(target_url: str) -> str | None:
+    """Run oauth_tester.py against `target_url` → findings/<host>/oauth_audit/.
+
+    Probes: state CSRF, redirect_uri bypass, PKCE enforcement, CORS on
+    auth endpoints, password-reset host header injection, token reuse
+    after logout. Generic — works against any OAuth/OIDC implementation
+    (the upstream H1-specific oauth.py is intentionally NOT used).
+    """
+    if not target_url:
+        return None
+    try:
+        sys.path.insert(0, SCRIPT_DIR)
+        host = urlparse(target_url).netloc or target_url
+        out_dir = os.path.join(SCRIPT_DIR, "findings", host, "oauth_audit")
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "oauth_tester.py"),
+               target_url, "--output-dir", out_dir]
+        subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=180)
+        log("ok", f"oauth_tester → {out_dir}")
+        return out_dir
+    except Exception as e:
+        log("warn", f"oauth_audit skipped: {e}")
+        return None
+
+
+def run_race_audit(target_url: str, threads: int = 20,
+                   method: str = "GET", body: str | None = None,
+                   headers: list[str] | None = None) -> str | None:
+    """Generic threaded race-condition test against `target_url`.
+
+    Intended for explicit operator invocation via --race-test (not auto-run)
+    because firing N parallel requests at a client endpoint is louder than
+    the rest of the pipeline and may be blocked by WAFs.
+    """
+    if not target_url:
+        return None
+    try:
+        host = urlparse(target_url).netloc or target_url.replace("/", "_")
+        out = os.path.join(SCRIPT_DIR, "findings", host, "race_audit.json")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "race_audit.py"),
+               "--url", target_url, "--method", method, "--threads", str(threads),
+               "--output", out]
+        if body:
+            cmd += ["--json", body]
+        for h in (headers or []):
+            cmd += ["--header", h]
+        subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=120)
+        log("ok", f"race_audit → {out}")
+        return out
+    except Exception as e:
+        log("warn", f"race_audit skipped: {e}")
+        return None
+
+
+def run_cicd_audit(repo_or_org: str) -> str | None:
+    """Wrap cicd_scanner.sh (sisakulint) for GitHub Actions security audit.
+
+    Accepts `owner/repo` or `org:orgname` per upstream CLI. Output lands in
+    findings/<repo-or-org>/cicd/. Useful when the engagement scope includes
+    the client's public GitHub org or selected repos.
+    """
+    if not repo_or_org:
+        return None
+    try:
+        safe = repo_or_org.replace("/", "_").replace(":", "_")
+        out_dir = os.path.join(SCRIPT_DIR, "findings", safe, "cicd")
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = ["bash", os.path.join(SCRIPT_DIR, "cicd_scanner.sh"),
+               repo_or_org, "--output-dir", out_dir]
+        subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=600)
+        log("ok", f"cicd_audit → {out_dir}")
+        return out_dir
+    except Exception as e:
+        log("warn", f"cicd_audit skipped: {e}")
+        return None
 
 
 # ── Passive recon (v9.3.0 — Google dork catalogue) ────────────────────────────
@@ -918,6 +1108,28 @@ def main():
         return
 
     banner()
+
+    # ── v9.4.0 standalone tools — run and exit before anything else ─────
+    # These are operator-driven point tools, not part of the autonomous
+    # pipeline. They produce findings/<host>/ artifacts and then return.
+    if cli["cicd_audit"]:
+        log("info", f"--cicd-audit: scanning {cli['cicd_audit']}")
+        run_cicd_audit(cli["cicd_audit"])
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["oauth_audit"]:
+        log("info", f"--oauth-audit: probing {cli['oauth_audit']}")
+        run_oauth_audit(cli["oauth_audit"])
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["race_test"]:
+        log("info", f"--race-test: {cli['race_threads']} parallel reqs → {cli['race_test']}")
+        run_race_audit(
+            cli["race_test"],
+            threads=cli["race_threads"],
+            method=cli["race_method"],
+            body=cli["race_body"] or None,
+            headers=cli["extra_headers"],
+        )
+        print(f"\n  {D}Done.{N}\n"); return
 
     has_ollama = ollama_available()
 
@@ -964,6 +1176,22 @@ def main():
         log("ok", "--passive-only set; exiting before active phases")
         print(f"\n  {D}Done.{N}\n")
         return
+
+    # ── v9.4.0 — Phase 0b: tech-stack mind map artifact ──────────────────
+    # Generated from the fingerprint we'll do anyway in Step 3 below; emit
+    # an early stub now so the operator has a Methodology checklist while
+    # active scanning runs. Refreshed later if --skip-mindmap is not set.
+    if not cli["skip_mindmap"] and target_info["type"] in ("domain", "url"):
+        mm_target = (
+            target_info["value"]
+            if target_info["type"] == "domain"
+            else urlparse(
+                target_info["value"]
+                if "://" in target_info["value"]
+                else f"http://{target_info['value']}"
+            ).netloc or target_info["value"]
+        )
+        run_mindmap(mm_target, "website", techs=[])
 
     # ── Step 2: Route based on target type ────────────────────────────────
 
@@ -1060,6 +1288,18 @@ def main():
     if not autonomous and not confirm("Proceed?"):
         print(f"  {D}Aborted.{N}")
         return
+
+    # ── v9.4.0 — refresh mind map with detected tech, fetch CVE intel ────
+    # show_summary populates fp["tech"] with the techs we just detected.
+    # Refresh the early-stub mindmap.md with that real list so the
+    # operator's Methodology checklist is accurate. Auto-fetch CVE intel
+    # from GHSA + NVD when --intel is set or autonomous mode is on.
+    detected_techs = [t.lower() for t in (fp.get("tech") or [])]
+    detected_host = urlparse(url).netloc or url
+    if not cli["skip_mindmap"] and detected_techs:
+        run_mindmap(detected_host, "website", detected_techs)
+    if (cli["intel"] or autonomous) and detected_techs:
+        run_intel(detected_host, detected_techs)
 
     # ── Whitebox: offer cloud audit if target matches a configured profile ─
     _maybe_run_whitebox_for_target(urlparse(url).netloc, os.path.join(SCRIPT_DIR, "recon", urlparse(url).netloc), autonomous=autonomous)

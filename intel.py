@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-learn.py  Fetches recent bug intelligence for a tech stack.
-Queries GitHub Advisory Database, NVD CVE API, and HackerOne Hacktivity.
+intel.py — CVE intelligence feed for a tech stack (v9.4.0 wired).
+
+Queries GitHub Security Advisory Database + NVD CVE API and writes a
+prioritized markdown report to `recon/<target>/intel.md`. Used by
+`hunt.py` after recon detects the live tech stack so the brain has fresh
+CVE context before generating the scan plan.
+
+No traffic is sent to the client target — both data sources are
+public CVE databases.
 
 Usage:
-  python3 tools/learn.py --tech "nextjs,graphql"
-  python3 tools/learn.py --tech "nextjs,graphql" --target target.com --output recon/target.com/intel.md
-  python3 tools/learn.py --tech "solidity" --hackerone-program target-program
+    python3 intel.py --tech "iis,aspnet,jwt"
+    python3 intel.py --tech "nextjs,graphql" --target adfactorspr.com
+    python3 intel.py --tech "wordpress" --target site.com --output custom/path.md
 """
 
 import argparse
