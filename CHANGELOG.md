@@ -1,5 +1,70 @@
 # Changelog
 
+## v9.4.0 — Tier-1 power-up bundle: mindmap + intel + oauth + race + cicd wired (2026-05-05)
+
+Five upstream tools (`mindmap.py`, `intel.py`, `oauth_tester.py`, `race_audit.py`, `cicd_scanner.sh`) shipped in the initial repo release as orphan scripts but were never wired into the orchestrator. v9.4.0 adapts them for VAPT framing, replaces HackerOne-specific paths with generic ones, and integrates each into the appropriate phase of `vikramaditya.py`.
+
+### What's wired now
+
+| Tool | When it runs | New flag |
+|---|---|---|
+| `mindmap.py` | Phase 0b — early stub before active scan, refreshed after fingerprint with detected tech | `--skip-mindmap` |
+| `intel.py` | After fingerprint reveals tech stack — auto-fetches GHSA + NVD CVE feed → `recon/<target>/intel.md` | `--intel` (auto in autonomous mode) |
+| `oauth_tester.py` | Operator-driven point tool — state CSRF, redirect_uri bypass, password-reset host header injection, PKCE enforcement, CORS on auth endpoints, token reuse | `--oauth-audit URL` |
+| `race_audit.py` | Operator-driven — N parallel requests at URL+method+body via `threading.Barrier(N)` to surface coupon/wallet/OTP race conditions | `--race-test URL --race-threads N --race-method M --race-body JSON --header "K: V"` |
+| `cicd_scanner.sh` | Operator-driven — wraps `sisakulint -remote` for GitHub Actions security audit on `owner/repo` or `org:name` | `--cicd-audit OWNER/REPO` |
+
+### Adaptations from upstream
+
+- **`mindmap.py`**: replaced 50+ `bug-bounty-hunt → X section` references with concrete Vikramaditya tool-paths (e.g. `scanner.sh ssrf + oast`, `oauth_tester.py + scanner.sh auth_bypass`, `race_audit.py`, `recon.sh Phase 11 takeover`). Added `generate(target, type, techs)` importable function so reporter.py can render a Methodology chapter without re-shelling. Quick-Start Commands block now shows real Vikramaditya invocations instead of upstream slash-commands. Title changed from "Bug Bounty Mind Map" to "Attack-Surface Mind Map".
+- **`intel.py`**: docstring rewritten — was upstream `learn.py` template referencing `--hackerone-program`. Now framed as VAPT-engagement CVE feed ("public CVE databases — no traffic to client"). Functional code unchanged (still queries GHSA + NVD).
+- **`race_audit.py`** (NEW, 240 lines): generic threaded race tester. Replaces the HackerOne-specific `race.py` with a tool that takes any `--url --method --json/--data --header --threads N` and reports per-request `(status, length, sha12, elapsed_ms)` + a race-signal verdict (`STRONG`/`WEAK`/`NONE` based on status-code variance and body-hash variance). Smoke-tested against `httpbin.org/status/200` (5 threads, identical responses → `NONE: identical responses`). The H1-specific `race.py` and `oauth.py` files remain in the repo for archive but are no longer invoked by the orchestrator.
+- **`oauth_tester.py`**: already generic in the repo; added the wrapper `run_oauth_audit(target_url)` that emits findings to `findings/<host>/oauth_audit/`.
+- **`cicd_scanner.sh`**: works as-is; new wrapper `run_cicd_audit(repo_or_org)` directs output to `findings/<safe-name>/cicd/`.
+
+### `vikramaditya.py` orchestrator wiring
+
+- 5 new helper functions: `run_mindmap`, `run_intel`, `run_oauth_audit`, `run_race_audit`, `run_cicd_audit`. All lazy-import their module so a malformed sub-tool never breaks the active flow; all log a warning and continue on failure.
+- 9 new CLI flags: `--skip-mindmap`, `--intel`, `--oauth-audit URL`, `--race-test URL`, `--race-threads N`, `--race-method M`, `--race-body JSON`, `--header "K: V"`, `--cicd-audit OWNER/REPO`.
+- Phase 0b — mindmap stub emitted right after the dork catalogue (before Step 2 routing) for `domain`/`url` targets.
+- After fingerprint succeeds, mindmap is refreshed with `fp["tech"]` so the Methodology checklist reflects actually-detected tech.
+- After fingerprint succeeds, `run_intel(detected_host, detected_techs)` runs when `--intel` is set or autonomous mode is on.
+- Three "run-and-exit" point tools (`--cicd-audit`, `--oauth-audit`, `--race-test`) short-circuit `main()` immediately after the banner so they don't trip the active pipeline.
+
+### Sample invocations
+
+```bash
+# Standard flow — passive dorks → mindmap stub → cloud audit → blackbox → mindmap+intel refresh
+python3 vikramaditya.py clienta.com
+
+# Standalone OAuth audit
+python3 vikramaditya.py --oauth-audit https://login.clienta.com/oauth/authorize
+
+# Standalone race-condition probe (coupon double-spend)
+python3 vikramaditya.py --race-test https://example.com/api/redeem \
+    --race-method POST --race-body '{"code":"WELCOME10"}' --race-threads 30
+
+# Standalone CI/CD audit (GitHub org)
+python3 vikramaditya.py --cicd-audit "org:clienta-pr"
+
+# Just refresh the CVE intel feed for a known tech list
+python3 intel.py --tech "iis,aspnet,jwt,sitefinity" --target clienta.com
+```
+
+### Affected files
+
+- `vikramaditya.py` — `__version__` 9.3.0 → 9.4.0; 9 new flags; 5 new helper functions; Phase 0b + post-fingerprint hooks
+- `mindmap.py` — VAPT framing (50+ tool-path replacements); title rename; `generate()` importable function; new Quick-Start block
+- `intel.py` — docstring + framing rewritten for VAPT
+- `race_audit.py` — NEW (240 lines)
+- `README.md`, `CHANGELOG.md` — this entry
+
+### Validation
+
+`python3 -m py_compile` clean across `vikramaditya.py`, `mindmap.py`, `race_audit.py`, `intel.py`, `oauth_tester.py`. `vikramaditya.__version__` returns `9.4.0`. `--help` lists all 9 new v9.4.0 flags. `python3 race_audit.py --url https://httpbin.org/status/200 --threads 5` smoke-test produced clean output with `race_signal: NONE: identical responses`. `python3 mindmap.py --target test.example.com --type api --tech "jwt,openapi"` produced a valid markdown file with the new "Attack-Surface Mind Map" title.
+
+---
+
 ## v9.3.0 — Passive recon: Google dork catalogue (2026-05-05)
 
 Added a passive intel phase that runs before any active scan. Adapted from `shuvonsec/claude-bug-bounty/scripts/dork_runner.py` (MIT) with VAPT framing — replaced bug-bounty branding, dropped the auto-generation of arbitrary search URLs against `target.com` directly, and added two engagement-relevant categories.

@@ -9,6 +9,33 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.4.0 — Tier-1 power-up bundle: mindmap + intel + oauth + race + cicd wired (2026-05-05)**
+
+Five upstream tools (`mindmap.py`, `intel.py`, `oauth_tester.py`, `race_audit.py`, `cicd_scanner.sh`) shipped in the initial release as orphan scripts but were never wired into the orchestrator. v9.4.0 adapts them for VAPT framing and integrates each into `vikramaditya.py`.
+
+| Tool | When | Flag |
+|---|---|---|
+| `mindmap.py` | Phase 0b stub + post-fingerprint refresh | `--skip-mindmap` |
+| `intel.py` | Auto-fetches GHSA + NVD CVEs after fingerprint | `--intel` (auto in autonomous) |
+| `oauth_tester.py` | Operator-driven OAuth/OIDC audit | `--oauth-audit URL` |
+| `race_audit.py` (NEW) | Operator-driven threaded race tester | `--race-test URL --race-threads N --race-method M --race-body JSON --header "K: V"` |
+| `cicd_scanner.sh` | Operator-driven GitHub Actions audit | `--cicd-audit OWNER/REPO` |
+
+Adaptation highlights: `mindmap.py` had 50+ `bug-bounty-hunt → X` references replaced with concrete Vikramaditya tool paths and gained a `generate()` importable function for reporter.py. `race_audit.py` is a brand-new 240-line generic threaded tester (the upstream `race.py` was 100% HackerOne GraphQL API tests). `oauth_tester.py` was already generic in the repo, just got a wrapper. The H1-specific `race.py` and `oauth.py` remain for archive but are no longer invoked.
+
+```bash
+python3 vikramaditya.py clienta.com           # mindmap + intel auto-run in autonomous
+python3 vikramaditya.py --oauth-audit https://login.clienta.com/oauth/authorize
+python3 vikramaditya.py --race-test https://example.com/api/redeem \
+    --race-method POST --race-body '{"code":"WELCOME10"}' --race-threads 30
+python3 vikramaditya.py --cicd-audit "org:clienta-pr"
+python3 intel.py --tech "iis,aspnet,jwt,sitefinity" --target clienta.com
+```
+
+See [CHANGELOG.md](CHANGELOG.md#v940) for full wiring details and per-tool adaptation notes.
+
+---
+
 **v9.3.0 — Passive recon: Google dork catalogue (2026-05-05)**
 
 Added a Phase-0 passive recon step. New `dorks.py` (adapted from `shuvonsec/claude-bug-bounty` MIT) renders a clickable HTML+JSON+TXT catalogue of search-engine queries that surface common engagement-relevant exposures — `.env` files, admin panels, PII spreadsheets, M365 tenant SAML metadata, leaked compliance PDFs, CI runbooks. No traffic is issued from the host; every query is a `https://www.google.com/search?q=...` URL the operator clicks through after confirming scope.
