@@ -690,6 +690,19 @@ Keep it under 80 words total."""
             return True
         if len(clean) < 12:
             return True
+        # v9.2.0 (P0-3) — when sqlmap itself has tagged a candidate as
+        # "false positive or unexploitable" in the Note column of its CSV
+        # results, the brain's 7-Question Gate previously still chewed through
+        # those lines and could rationalise a SUBMIT verdict during gate
+        # thinking (final verdict was usually NO_REPORTS, but the live log
+        # was misleading and triage CSV listed every FP as [UNKNOWN]). Skip
+        # them at the candidate-collection layer so the brain never sees
+        # something its own scanner already rejected.
+        if "false positive or unexploitable" in lower:
+            return True
+        # CSV header lines from sqlmap_results.txt are also noise.
+        if lower.startswith("target url,place,parameter,technique"):
+            return True
         noisy_terms = (
             "traceback", "modulenotfounderror", "requestsdependencywarning",
             "warnings.warn", "from bs4 import", "spooling to file",
@@ -1409,6 +1422,21 @@ IF DROP: What would need to change for this to become viable?"""
                     verdict = v
                 break
 
+        # v9.2.0 (P2-10) — append every gate cycle to brain/gate_workings.md
+        # so the operator can audit phi4:14b's intermediate Q1-Q7 reasoning
+        # without scrolling through 100KB of streamed model output in the
+        # main log. The high-level verdict still reaches the caller via the
+        # tuple return; this just persists the body to a file.
+        try:
+            wf = getattr(self, "_gate_workings_path", None)
+            if wf:
+                with open(wf, "a") as fh:
+                    fh.write(f"\n## {datetime.now().isoformat(timespec='seconds')} — VERDICT={verdict}\n")
+                    fh.write(f"FINDING: {finding_description[:400]}\n\n")
+                    fh.write(result.strip() + "\n\n---\n")
+        except Exception:
+            pass
+
         return verdict, result
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1984,6 +2012,17 @@ Based on this:
             return []
 
         print(f"{CYAN}[Brain] {len(all_findings)} filtered finding candidates — triaging...{NC}")
+
+        # v9.2.0 (P2-10) — point gate-cycle persistence at this triage run
+        # so all 7-question worksheets land in brain/gate_workings.md.
+        gate_path = findings_path / "brain" / "gate_workings.md"
+        gate_path.parent.mkdir(parents=True, exist_ok=True)
+        if not gate_path.exists():
+            gate_path.write_text(
+                f"# 7-Question Gate Workings — {target}\n"
+                f"Auto-appended by brain.triage_finding() during auto_triage_and_exploit().\n\n"
+            )
+        self._gate_workings_path = str(gate_path)
 
         triage_summary = []
         for cat, line in all_findings:

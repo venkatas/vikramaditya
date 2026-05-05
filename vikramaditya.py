@@ -41,6 +41,39 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# v9.2.0 — single-source-of-truth for the orchestrator version. Bumped from
+# v9.1.4 for the engagement-driven fix bundle (see CHANGELOG.md v9.2.0).
+__version__ = "9.2.0"
+
+
+# ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
+
+def _append_run_log(target: str, started_at: float, exit_code: int) -> None:
+    """Append one CSV row per vikramaditya invocation to logs/vikram_runs.csv.
+
+    Cheap session bookkeeping for multi-target sweeps so we can answer
+    "how long did adfactorspr take last week" without re-parsing per-domain
+    log files. Created on first run; never rotated (operator's responsibility).
+    """
+    try:
+        log_dir = os.path.join(SCRIPT_DIR, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "vikram_runs.csv")
+        write_header = not os.path.exists(path)
+        ended_at = time.time()
+        duration_s = int(ended_at - started_at)
+        with open(path, "a") as fh:
+            if write_header:
+                fh.write("started_iso,ended_iso,duration_s,target,exit_code,version\n")
+            fh.write(
+                f"{datetime.fromtimestamp(started_at).isoformat(timespec='seconds')},"
+                f"{datetime.fromtimestamp(ended_at).isoformat(timespec='seconds')},"
+                f"{duration_s},{target},{exit_code},{__version__}\n"
+            )
+    except Exception:
+        # Bookkeeping is best-effort; never break the run.
+        pass
+
 
 # ── Whitebox integration (Task 22) ────────────────────────────────────────────
 
@@ -100,6 +133,52 @@ def _maybe_run_whitebox_for_target(target: str, session_dir, autonomous: bool = 
             # Use target-level dir so cloud/ is session-agnostic
             argv += ["--session-dir", str(session_dir), "--allowlist", host]
             _cloud_main(argv)
+            # v9.2.0 (P0-1) — when the same AWS profile maps to multiple
+            # targets in one sweep (e.g. adfactorspr.com + adfactorsadvertising.com
+            # both → adf-erp), cloud_hunt's per-account phase cache short-
+            # circuits the SECOND target's run because the manifest from the
+            # first run is still fresh. The previous behaviour created the
+            # second target's recon/<domain>/cloud/<acct>/ directory but
+            # left it empty (no findings JSON, no manifest), which broke
+            # reporter.py's "Cloud Posture" chapter. Symlink the existing
+            # cached account_dir into the second target's cloud/ subtree so
+            # the report can still find it.
+            try:
+                from pathlib import Path as _P
+                this_cloud = _P(session_dir) / "cloud"
+                for p in matched:
+                    acct_id = (cfg.get("profiles", {}).get(p, {}) or {}).get("account_id")
+                    if not acct_id:
+                        continue
+                    dst = this_cloud / acct_id
+                    if dst.exists() and any(dst.iterdir()):
+                        continue  # cloud_hunt populated this already
+                    # Hunt for a sibling target that has a populated cloud/<acct>/
+                    repo_recon = _P(SCRIPT_DIR) / "recon"
+                    src_dir = None
+                    for sibling in repo_recon.iterdir():
+                        if not sibling.is_dir() or sibling.name == _P(session_dir).name:
+                            continue
+                        cand = sibling / "cloud" / acct_id
+                        if cand.exists() and (cand / "manifest.json").exists():
+                            src_dir = cand
+                            break
+                    if src_dir is None:
+                        continue
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.exists() and dst.is_symlink():
+                        dst.unlink()
+                    elif dst.exists():
+                        # Empty real dir from cloud_hunt's account_dir.mkdir;
+                        # remove and re-create as symlink.
+                        try:
+                            dst.rmdir()
+                        except OSError:
+                            continue
+                    dst.symlink_to(src_dir.resolve())
+                    print(f"[whitebox] linked cached audit: {dst} -> {src_dir}", flush=True)
+            except Exception as _link_e:
+                print(f"[whitebox] cache-link skipped: {_link_e}", flush=True)
     except Exception as _e:
         # Whitebox is optional — never break the blackbox flow
         print(f"[whitebox] integration skipped: {_e}")
@@ -612,15 +691,23 @@ def ollama_available() -> bool:
 # ── Engine Routing ────────────────────────────────────────────────────────────
 
 def run_hunt(target: str, full: bool = False, scope_lock: bool = False):
-    """Route to hunt.py for domain/IP/CIDR recon + scan."""
-    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "hunt.py"),
+    """Route to hunt.py for domain/IP/CIDR recon + scan.
+
+    v9.2.0 — pass PYTHONUNBUFFERED=1 to subprocess so phase markers flush in
+    real time when the parent is being tee'd or run under nohup. Without this,
+    long phases (cloud audit, sqlmap) appear stuck on the prior line for
+    minutes because Python line-buffers stdout when it's not a TTY.
+    """
+    cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "hunt.py"),
            "--target", target]
     if full:
         cmd.append("--full")
     if scope_lock:
         cmd.append("--scope-lock")
-    print(f"\n  {B}[»]{N} Launching hunt.py → {target}\n")
-    subprocess.run(cmd, cwd=SCRIPT_DIR)
+    print(f"\n  {B}[»]{N} Launching hunt.py → {target}\n", flush=True)
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    subprocess.run(cmd, cwd=SCRIPT_DIR, env=env)
 
 
 def run_legacy_crawl(target_url: str, creds: str, creds_b: str = None,
@@ -871,6 +958,16 @@ def main():
             if not autonomous and not confirm("Proceed with recon + vulnerability scan?"):
                 print(f"  {D}Aborted.{N}")
                 return
+            # v9.2.0 (P0-1) — previously the whitebox audit was only invoked
+            # in the URL-fingerprint-success branch below, which meant
+            # autonomous runs against bare domains whose HTTPS apex returned
+            # 0 (or errored) silently skipped cloud audit even when the
+            # profile mapped. Fire it here too.
+            _maybe_run_whitebox_for_target(
+                target_info["value"],
+                os.path.join(SCRIPT_DIR, "recon", target_info["value"]),
+                autonomous=autonomous,
+            )
             run_hunt(target_info["value"], full=True)
             return
         else:
@@ -1145,8 +1242,24 @@ def main():
 
 
 if __name__ == "__main__":
+    # v9.2.0 (P3-11) — record per-run wall-time and exit status to
+    # logs/vikram_runs.csv. Used to answer "how long did $domain take?" without
+    # re-parsing the per-domain log file.
+    _started = time.time()
+    _target_for_log = sys.argv[1] if len(sys.argv) > 1 else "(interactive)"
+    _exit_code = 0
     try:
         main()
     except KeyboardInterrupt:
         print(f"\n\n  {Y}Interrupted.{N}\n")
-        sys.exit(130)
+        _exit_code = 130
+    except SystemExit as _se:
+        _exit_code = int(_se.code) if isinstance(_se.code, int) else 1
+        raise
+    except Exception:
+        _exit_code = 1
+        raise
+    finally:
+        _append_run_log(_target_for_log, _started, _exit_code)
+    if _exit_code:
+        sys.exit(_exit_code)

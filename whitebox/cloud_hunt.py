@@ -19,6 +19,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="Authorized in-scope domain (repeatable; required unless --no-scope-lock)")
     parser.add_argument("--no-scope-lock", action="store_true",
                         help="Disable Route53 scope-lock (audit ALL public zones in the account)")
+    # v9.2.0 (P2-8) — let the operator force a full secrets sweep when the
+    # name-heuristic skips too many buckets / log groups (47/57 in our last
+    # adf-pranapr engagement). Default stays "heuristic".
+    parser.add_argument("--secrets-mode", choices=("heuristic", "exhaustive"),
+                        default="heuristic",
+                        help=("Secrets phase target selection. 'heuristic' "
+                              "(default) only scans buckets / log groups "
+                              "whose names look secret-y; 'exhaustive' scans "
+                              "every bucket and every log group in the "
+                              "account."))
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     if not args.profile:
@@ -49,7 +59,8 @@ def main(argv: list[str] | None = None) -> int:
         rc |= run_for_profile(profile_name=prof,
                               session_dir=Path(args.session_dir),
                               refresh=args.refresh,
-                              authorized_allowlist=allowlist)
+                              authorized_allowlist=allowlist,
+                              secrets_mode=args.secrets_mode)
     return rc
 
 
