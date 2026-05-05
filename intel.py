@@ -245,10 +245,71 @@ def fetch_hackerone_hacktivity(keyword: str, limit: int = 5) -> list[dict]:
     return results
 
 
+def fetch_cvemap(tech: str, limit: int = 20) -> list[dict]:
+    """v9.5.0 — query ProjectDiscovery cvemap CLI for CVEs by product.
+
+    cvemap maintains a continuously-updated CVE database with KEV /
+    public-PoC / EPSS metadata. Faster than NVD's HTTPS API and richer
+    metadata than GHSA. Falls back silently if the binary isn't on PATH.
+    Outputs are normalized to the same dict shape as the NVD/GHSA
+    fetchers so downstream rendering doesn't care about the source.
+
+    Requires a free PDCP API key (set via `cvemap -auth` or
+    PDCP_API_KEY env var). If the key is missing, cvemap exits 2 with
+    "api key cannot be empty" — we swallow that and return [], so the
+    GHSA + NVD fallback paths still produce intel.
+    """
+    import shutil as _shutil
+    import subprocess as _sub
+    binary = _shutil.which("cvemap")
+    if not binary:
+        return []
+    try:
+        proc = _sub.run(
+            [binary, "-product", tech, "-json", "-silent",
+             "-limit", str(limit), "-disable-update-check"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    out: list[dict] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            cve = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cvss = (cve.get("cvss_metrics") or {}).get("cvss31") or {}
+        sev = (cvss.get("severity") or cve.get("severity") or "unknown").upper()
+        cve_id = cve.get("cve_id") or cve.get("id") or ""
+        out.append({
+            "tech": tech,
+            "source": "cvemap",
+            "id": cve_id,
+            "severity": sev,
+            "summary": (cve.get("description") or "")[:300],
+            "published": (cve.get("published_date") or "")[:10],
+            "grep": [cve_id] if cve_id else [],
+            "kev": bool(cve.get("is_kev") or cve.get("in_kev")),
+            "epss": (cve.get("epss") or {}).get("score"),
+        })
+    return out
+
+
 def fetch_intel(techs: list[str]) -> list[dict]:
     """Collect intel from all sources for all techs."""
     all_results = []
     for tech in techs:
+        # v9.5.0 — cvemap first (local PD cache, fast); fall back to GHSA + NVD
+        cvm = fetch_cvemap(tech)
+        if cvm:
+            print(f"  {CYAN}[{tech}]{RESET} cvemap returned {len(cvm)} CVEs")
+            all_results.extend(cvm)
+
         print(f"  {CYAN}[{tech}]{RESET} Querying GitHub Advisory Database...")
         all_results.extend(fetch_github_advisories(tech))
 
