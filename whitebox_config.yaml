@@ -1,16 +1,17 @@
 # Vikramaditya Whitebox — profile ↔ in-scope domain mapping
 # Auto-populated from Route53 on first run; edit to override.
 profiles:
-  client-erp:
-    account_id: "111122223333"
+  client-a:
+    account_id: "000000000001"
     display: "Client-A"
     domains:
-      - example-prod.invalid
-  example-example-data:
-    account_id: "444455556666"
+      - clienta.com
+      - clienta-adv.com
+  client-b:
+    account_id: "000000000002"
     display: "Client-B"
     domains:
-      - example-data.invalid
+      - clientb.com
 
 # Per-engagement runtime defaults
 defaults:
@@ -24,4 +25,4 @@ whitebox:
   # When set true, autonomous runs (driven by Ollama brain) will run cloud
   # whitebox alongside blackbox without prompting. Default false: explicit
   # opt-in only.
-  autonomous_default: false
+  autonomous_default: true

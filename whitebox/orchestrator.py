@@ -74,10 +74,18 @@ def _build_instance_sg_map(inv_dir: Path) -> dict[str, list[str]]:
 
 def run_for_profile(profile_name: str, session_dir: Path,
                     refresh: bool = False, brain=None,
-                    authorized_allowlist: list[str] | None = None) -> int:
+                    authorized_allowlist: list[str] | None = None,
+                    secrets_mode: str = "heuristic") -> int:
     """End-to-end whitebox audit for one profile.
     Returns 0 if all phases completed successfully; nonzero (bitfield of failed phases) otherwise.
     Caller MUST pass authorized_allowlist explicitly. Pass ['*'] to disable scope-lock.
+
+    v9.2.0 (P2-8) — secrets_mode={"heuristic","exhaustive"}. Default "heuristic"
+    keeps the previous name-match behaviour (only scans buckets/log groups
+    whose names look secret-y); "exhaustive" scans every bucket and every log
+    group in the account regardless of name. Required for engagements that
+    need a complete posture picture (e.g. compliance audit) at the cost of
+    longer wall time and bigger evidence dump.
     """
     if authorized_allowlist is None:
         raise ValueError(
@@ -251,7 +259,14 @@ def run_for_profile(profile_name: str, session_dir: Path,
                     except Exception:
                         continue
 
-            if brain is not None:
+            if secrets_mode == "exhaustive":
+                # v9.2.0 (P2-8) — scan every bucket and every log group, no
+                # name filtering. For compliance / full-posture engagements.
+                targets = {
+                    "buckets": list(all_buckets),
+                    "log_groups": list(all_log_groups),
+                }
+            elif brain is not None:
                 bo = BrainOrchestrator(brain=brain, trace_path=account_dir / "brain_trace.jsonl")
                 targets = bo.select_secret_targets({
                     "buckets": [{"name": n} for n in all_buckets],
@@ -279,7 +294,10 @@ def run_for_profile(profile_name: str, session_dir: Path,
             _persist_phase_findings(account_dir, "secrets", phase_findings)
             # Record coverage so operators see what was scanned vs skipped
             secrets_artifacts = {
-                "selection_mode": "brain" if brain is not None else "heuristic",
+                "selection_mode": (
+                    "exhaustive" if secrets_mode == "exhaustive"
+                    else ("brain" if brain is not None else "heuristic")
+                ),
                 "buckets_total": len(all_buckets),
                 "buckets_scanned": len(targets["buckets"]),
                 "buckets_skipped": len(all_buckets) - len(targets["buckets"]),
@@ -337,6 +355,38 @@ def run_for_profile(profile_name: str, session_dir: Path,
     except Exception as e:
         cache.mark_failed("report", error=str(e))
         failed_phases.append("report")
+
+    # v9.2.0 (P3-12) — emit a precomputed severity rollup so reporter.py and
+    # external dashboards don't have to `jq` over phase_*_findings.json.
+    # Lives next to the manifest. Best-effort; never breaks the run.
+    try:
+        rollup: dict[str, dict[str, int]] = {}
+        for phase in ("prowler", "iam", "exposure", "secrets"):
+            phase_findings = _load_phase_findings(account_dir, phase)
+            counts: dict[str, int] = {}
+            for f in phase_findings:
+                sev = getattr(f.severity, "name", str(f.severity)).title()
+                counts[sev] = counts.get(sev, 0) + 1
+            counts["total"] = sum(counts.values())
+            rollup[phase] = counts
+        # Top-level totals across phases
+        all_counts: dict[str, int] = {}
+        for phase, counts in rollup.items():
+            for sev, n in counts.items():
+                if sev == "total":
+                    continue
+                all_counts[sev] = all_counts.get(sev, 0) + n
+        all_counts["total"] = sum(all_counts.values())
+        rollup["all_phases"] = all_counts
+        rollup["_meta"] = {
+            "account_id": profile.account_id,
+            "failed_phases": failed_phases,
+        }
+        (account_dir / "severity_rollup.json").write_text(
+            _json.dumps(rollup, indent=2, default=str)
+        )
+    except Exception:
+        pass
 
     # Return code: bitfield of failed phases. 0 if all good.
     PHASE_BITS = {"inventory": 1, "prowler": 2, "iam": 4, "exposure": 8,

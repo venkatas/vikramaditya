@@ -4326,21 +4326,46 @@ check
 
     # Live-verify WordPress hosts before running recon — historical GAU URLs
     # can trigger WP detection for sites that have since migrated away from WordPress.
-    # A 200 on wp-login.php or a JSON response from wp-json confirms it's still active.
+    #
+    # v9.2.0 (P1-6) — tightened the gate to require *body content* proof of
+    # WordPress, not just a 200/401/403 status code. The previous version
+    # promoted any non-404 response on /wp-login.php to "WordPress confirmed",
+    # which was the bug behind the noisy `wp_admin_shell_upload`
+    # auto-Metasploit run on clienta.com (Cloudflare/IIS fronting an
+    # ASP.NET site that returns 200 with a generic page on /wp-login.php).
+    #
+    # Confirmation now requires either:
+    #   • /wp-login.php body containing wp-content/wp-includes/wordpress, OR
+    #   • /wp-json/wp/v2/ body containing valid WP REST namespace (`namespace`
+    #     or `routes` key), OR
+    #   • whatweb fingerprint already in the per-host tech_matches AND a 200
+    #     on a wp-* path.
     confirmed_wp_hosts = []
     for host in wp_hosts[:5]:
-        for probe in (f"{host}/wp-login.php", f"{host}/wp-json/wp/v2/"):
-            ok_p, probe_out = run_cmd(
-                f'curl -sk -o /dev/null -w "%{{http_code}}" --max-time 8 --max-redirs 1 "{probe}"',
-                timeout=12
+        confirmed = False
+        # Probe 1: wp-login.php must return WP markers in body
+        ok_p, body = run_cmd(
+            f'curl -sk -L --max-time 10 --max-redirs 2 "{host}/wp-login.php" 2>/dev/null | head -c 4000',
+            timeout=14
+        )
+        body_l = (body or "").lower()
+        if any(marker in body_l for marker in ("wp-content", "wp-includes", "wordpress", "wp-submit")):
+            confirmed_wp_hosts.append(host)
+            log("crit", f"WordPress confirmed live at {host} (body markers on /wp-login.php)")
+            confirmed = True
+        if not confirmed:
+            # Probe 2: wp-json must return a real WP REST namespace
+            ok_p, body = run_cmd(
+                f'curl -sk -L --max-time 10 --max-redirs 2 "{host}/wp-json/wp/v2/" 2>/dev/null | head -c 4000',
+                timeout=14
             )
-            status = probe_out.strip()
-            if status in ("200", "401", "403"):
+            body_l = (body or "").lower()
+            if '"namespace"' in body_l and "wp/v2" in body_l:
                 confirmed_wp_hosts.append(host)
-                log("crit", f"WordPress confirmed live at {host} (probe={probe} status={status})")
-                break
-        else:
-            log("warn", f"WordPress fingerprint found for {host} but live probes returned no WP response — skipping WP recon (likely migrated)")
+                log("crit", f"WordPress confirmed live at {host} (wp/v2 namespace JSON)")
+                confirmed = True
+        if not confirmed:
+            log("warn", f"WordPress fingerprint found for {host} but body proof missing — skipping WP recon (likely false positive, e.g. ASP.NET behind Cloudflare returning a generic 200 on /wp-login.php)")
     wp_hosts = confirmed_wp_hosts
 
     if wp_hosts:
