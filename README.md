@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.10.0 — LLM red-teaming (Garak + PyRIT + Promptfoo) (2026-05-05)**
+
+`llm_hunt.py` — every B2B SaaS now ships AI features. Garak for breadth, PyRIT for depth, Promptfoo for CI regression.
+```bash
+python3 vikramaditya.py --llm-hunt https://api.client.com/chat --llm-auth 'Authorization: Bearer $TOK'
+```
+See [CHANGELOG.md](CHANGELOG.md#v9100).
+
+---
+
 **v9.9.0 — IaC dedicated scanner (Checkov + KICS) (2026-05-05)**
 
 `iac_audit.py` — deeper than Trivy config. Checkov graph-based + KICS Rego policies.
