@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.9.0 — IaC dedicated scanner (Checkov + KICS) (2026-05-05)**
+
+`iac_audit.py` — deeper than Trivy config. Checkov graph-based + KICS Rego policies.
+```bash
+python3 vikramaditya.py --iac-deep path/to/terraform --iac-frameworks terraform,kubernetes
+```
+See [CHANGELOG.md](CHANGELOG.md#v990).
+
+---
+
 **v9.8.0 — Kubernetes audit (Kubescape + Trivy + Falco) (2026-05-05)**
 
 `k8s_audit.py` — Kubescape posture (NSA/CISA/MITRE), Trivy cluster + image + IaC, Falco eBPF runtime.
