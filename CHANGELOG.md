@@ -1,5 +1,57 @@
 # Changelog
 
+## v9.3.0 — Passive recon: Google dork catalogue (2026-05-05)
+
+Added a passive intel phase that runs before any active scan. Adapted from `shuvonsec/claude-bug-bounty/scripts/dork_runner.py` (MIT) with VAPT framing — replaced bug-bounty branding, dropped the auto-generation of arbitrary search URLs against `target.com` directly, and added two engagement-relevant categories.
+
+### What's new
+
+- **`dorks.py`** at repo root — generates a clickable HTML + JSON + TXT catalogue of search-engine queries that surface common engagement-relevant exposures (creds in `.env`, exposed admin panels, PII in spreadsheets, M365 tenant SAML metadata, CI runbook PDFs, etc.). No traffic is issued from the host running the tool — every query is rendered as a `https://www.google.com/search?q=...` URL the operator clicks through manually after confirming scope. Lives in `recon/<target>/sessions/<id>/passive/dorks_<target>.{html,json,txt}`.
+- **13 categories**, 124 dorks total in `--category all`:
+  - `credentials` (14) — `.env`, AWS/GCP keys, RSA private keys, service-account JSON
+  - `pii` (11) — CSV/XLS dumps, Aadhaar/PAN (India-specific, our common engagement type)
+  - `admin` (14) — admin/login panels, phpMyAdmin, Jenkins, Grafana, Tomcat manager, JBoss JMX
+  - `errors` (11) — SQL errors, stack traces, debug pages, phpinfo, log files
+  - `cloud` (6) — S3/Azure-blob/GCS/Firebase indexed buckets
+  - `subdomains` (9) — subdomain enumeration via `site:*.target` patterns incl. `uat`
+  - `params` (12) — SSRF/redirect/SQLi/LFI parameter shapes
+  - `leaks` (12) — Pastebin/GitHub/Notion/Trello/Replit/CodePen/Postman platform leaks
+  - `github` (8) — GitHub code-search dorks
+  - `juicy` (9) — backups, SQL dumps, confidential PDFs
+  - `microsoft365` (8, NEW) — tenant enum, SharePoint sites, Power BI public reports, OneDrive/Teams shares
+  - `compliance` (10, NEW) — leaked ISO 27001 / SOC 2 / PCI / DPA audit PDFs, runbooks, IR docs
+- **`vikramaditya.py` --passive-only** — runs the dork catalogue and exits without active scanning. Useful for the scoping/reconnaissance call before client signs the SOW.
+- **`vikramaditya.py` --skip-passive** — skips the Phase 0 dork generation when running a full scan (default behaviour: passive runs once per session before active phases).
+- **Phase 0 wiring** — `main()` now calls `run_passive_dorks(target)` for `domain` and `url` targets after target classification, before any active path. IP / CIDR / HAR targets skip the phase (no apex to dork).
+
+### Why VAPT-relevant
+
+Indian client engagements routinely have leaked PII (Aadhaar/PAN in CSVs), runbooks/policy docs published to public extranets by mistake, and indexed M365 tenant config (SharePoint, Power BI). Surface them in the scoping window so the SOW conversation includes "we already see X publicly". CERT-In allows passive intel in the pre-engagement window.
+
+### Importable API
+
+`dorks.py` exposes `generate(target, category)` and `write_outputs(target, category, results, out_dir)` so other tools (e.g. reporter.py) can render an "Open-Source Intelligence" chapter from the same data without re-shelling.
+
+```bash
+python3 dorks.py --list                        # 13 categories, 124 dorks total
+python3 dorks.py -d clienta.com            # all categories → recon/<target>/sessions/<id>/passive/
+python3 dorks.py -d clienta.com -c microsoft365   # M365 tenant only
+python3 vikramaditya.py clienta.com --passive-only  # scoping-call mode
+python3 vikramaditya.py clienta.com --skip-passive  # legacy behaviour
+```
+
+### Affected files
+
+- `dorks.py` (NEW, 320 lines)
+- `vikramaditya.py` — `__version__` 9.2.0 → 9.3.0; `--passive-only` / `--skip-passive` flags; `run_passive_dorks()` helper; main() Phase 0 invocation
+- `README.md`, `CHANGELOG.md` — this entry
+
+### Validation
+
+`python3 -m py_compile dorks.py vikramaditya.py` clean. `python3 dorks.py --list` returns 13 categories with counts. `python3 dorks.py -d clienta.com -c credentials --output-dir /tmp/smoke` produces 14 queries with valid HTML+JSON+TXT artifacts.
+
+---
+
 ## v9.2.0 — Engagement-driven fix bundle: 12 issues from full-sweep retro (2026-05-05)
 
 Drove a full Vikramaditya sweep across `clienta.com`, `clientb.com`, `clienta-adv.com` plus `client-a` + `client-b` AWS profiles. Total wall time 4h 39m. Surfaced 12 issues split P0/P1/P2/P3; this release ships fixes for all of them.

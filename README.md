@@ -9,6 +9,25 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.3.0 — Passive recon: Google dork catalogue (2026-05-05)**
+
+Added a Phase-0 passive recon step. New `dorks.py` (adapted from `shuvonsec/claude-bug-bounty` MIT) renders a clickable HTML+JSON+TXT catalogue of search-engine queries that surface common engagement-relevant exposures — `.env` files, admin panels, PII spreadsheets, M365 tenant SAML metadata, leaked compliance PDFs, CI runbooks. No traffic is issued from the host; every query is a `https://www.google.com/search?q=...` URL the operator clicks through after confirming scope.
+
+- **13 categories** (124 dorks in `all`): `credentials`, `pii` (incl. Aadhaar/PAN for Indian engagements), `admin`, `errors`, `cloud`, `subdomains`, `params`, `leaks`, `github`, `juicy`, **`microsoft365`** (tenant enum, SharePoint, Power BI, OneDrive/Teams), **`compliance`** (leaked ISO/PCI/SOC2 PDFs, runbooks, IR docs).
+- **`vikramaditya.py --passive-only`** — generate the dork catalogue and exit. Use during the scoping call before active SOW signing.
+- **`vikramaditya.py --skip-passive`** — old behaviour. Default now runs Phase 0 automatically for `domain`/`url` targets.
+
+```bash
+python3 dorks.py --list                              # 13 categories
+python3 dorks.py -d clienta.com                  # all → recon/<target>/sessions/<id>/passive/
+python3 dorks.py -d clienta.com -c microsoft365  # M365 tenant queries only
+python3 vikramaditya.py clienta.com --passive-only
+```
+
+See [CHANGELOG.md](CHANGELOG.md#v930) for the full category list and rationale.
+
+---
+
 **v9.2.0 — Engagement-driven fix bundle: 12 issues from full-sweep retro (2026-05-05)**
 
 Drove a full Vikramaditya sweep across 3 client domains + 2 AWS profiles in one shot. Wall time 4h 39m. Surfaced 12 issues, all fixed in this release. Highlights:
