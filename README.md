@@ -9,6 +9,18 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.15.0 — Brain benchmark vs Buttercup (DARPA AIxCC) (2026-05-05)**
+
+`brain_benchmark.py` — head-to-head vs Trail of Bits' Buttercup. CSV log tracks capability drift as Ollama models update.
+```bash
+python3 vikramaditya.py --brain-bench https://example.com \
+    --brain-bench-recon recon/example.com/sessions/<id>
+python3 vikramaditya.py --brain-bench-integrate
+```
+See [CHANGELOG.md](CHANGELOG.md#v9150).
+
+---
+
 **v9.14.0 — Deep SAST (CodeQL + Bearer) (2026-05-05)**
 
 `sast_audit.py` — semantic taint-tracking (CodeQL, 10 languages) + PII flow (Bearer for DPDP/GDPR).

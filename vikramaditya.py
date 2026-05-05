@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # v9.10.0 — single-source-of-truth for the orchestrator version. Bumped from
 # v9.9.0 for llm_hunt.py (Garak + PyRIT + Promptfoo LLM red-teaming).
 # See CHANGELOG.md v9.10.0.
-__version__ = "9.14.0"
+__version__ = "9.15.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -918,6 +918,12 @@ Options:
                           --sast-language py,js,go,..., --sast-tools.
   --sast-language CSV     CodeQL languages (python,javascript,go,java,...)
   --sast-tools CSV        all | codeql | bearer
+  --brain-bench TARGET    v9.15.0 — benchmark our brain.py vs Trail of Bits
+                          Buttercup (DARPA AIxCC 2nd place) on the same
+                          target. --brain-bench-recon, --brain-bench-findings.
+  --brain-bench-recon DIR Recon dir to feed both engines
+  --brain-bench-findings DIR  Findings dir for our brain.py auto_triage
+  --brain-bench-integrate Print integration design for Buttercup fallback
 """
 
 
@@ -993,6 +999,11 @@ def parse_cli_args() -> dict:
         "sast": "",
         "sast_language": "",
         "sast_tools": "all",
+        # v9.15.0 — brain benchmark
+        "brain_bench": "",
+        "brain_bench_recon": "",
+        "brain_bench_findings": "",
+        "brain_bench_integrate": False,
     }
     argv = sys.argv[1:]
     i = 0
@@ -1117,6 +1128,14 @@ def parse_cli_args() -> dict:
             args["sast_language"] = argv[i + 1]; i += 2
         elif argv[i] == "--sast-tools" and i + 1 < len(argv):
             args["sast_tools"] = argv[i + 1]; i += 2
+        elif argv[i] == "--brain-bench" and i + 1 < len(argv):
+            args["brain_bench"] = argv[i + 1]; i += 2
+        elif argv[i] == "--brain-bench-recon" and i + 1 < len(argv):
+            args["brain_bench_recon"] = argv[i + 1]; i += 2
+        elif argv[i] == "--brain-bench-findings" and i + 1 < len(argv):
+            args["brain_bench_findings"] = argv[i + 1]; i += 2
+        elif argv[i] == "--brain-bench-integrate":
+            args["brain_bench_integrate"] = True; i += 1
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1445,6 +1464,22 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["brain_bench"] or cli["brain_bench_integrate"]:
+        log("info", f"--brain-bench: {cli['brain_bench'] or '(integration design)'}")
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "brain_benchmark.py")]
+            if cli["brain_bench_integrate"]:
+                cmd += ["--integrate"]
+            else:
+                cmd += ["--target", cli["brain_bench"]]
+                if cli["brain_bench_recon"]:
+                    cmd += ["--recon-dir", cli["brain_bench_recon"]]
+                if cli["brain_bench_findings"]:
+                    cmd += ["--findings-dir", cli["brain_bench_findings"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=7200)
+        except Exception as e:
+            log("warn", f"brain_benchmark failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["sast"]:
         log("info", f"--sast: {cli['sast']}")
