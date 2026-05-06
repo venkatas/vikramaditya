@@ -1,5 +1,70 @@
 # Changelog
 
+## v9.16.0 — Brain LLM bake-off harness (2026-05-06)
+
+New `brain_model_bench.py`. Replays `brain.py scan <findings>` against the **same** pre-computed findings + recon directory using each candidate Ollama model in turn. Replaces the swap-and-pray model-switch pattern with deterministic head-to-head benching grounded in scanner output, not vibes.
+
+### Why this exists
+
+Recommendations like "switch to model X for offensive security" are commonly bundled with marketing claims that don't survive contact with real engagement output. This harness produces the kind of numbers the v9.1.3 phi4-vs-gemma4 head-to-head produced, generalised to N candidates.
+
+### Scoring
+
+For each model, after running brain auto_triage on the same findings dir:
+
+| Metric | What it measures |
+|---|---|
+| `elapsed_s` | Wall time for `brain.py scan` |
+| `submit` / `drop` / `unknown` | Verdict tally from `auto_triage.md` |
+| `no_reports` | Did `04_h1_reports.md` end with `NO_REPORTS`? |
+| `brain_bytes` | Total byte sum across `brain/*.md` (proxy for engagement depth) |
+| **`halluc_rate`** | **Of the SUBMIT verdicts, how many target a URL `sqlmap` already labelled `false positive or unexploitable`?** Lower = better. **The decisive metric.** |
+
+Per-model `brain/` artifacts are snapshotted under `logs/brain_model_bench/<run_id>/<model_safe>/brain/` so the operator can read each model's full reasoning side-by-side. A leaderboard markdown ranks by hallucination rate (tie-break: elapsed time).
+
+### Watch mode (auto-fire)
+
+`--watch-log PATH --watch-pattern "==== END"` polls a runner log for a completion marker, then auto-resolves the latest matching `--findings-glob` / `--recon-glob` and fires the bake-off. Used to chain automatically off the end of a vikramaditya.py run without operator intervention.
+
+### Vikramaditya integration
+
+- `--brain-model-bench` flag with `--bmb-findings DIR --bmb-recon DIR --bmb-models CSV`
+- Default candidate list: `phi4:14b,qwen3:14b,deepseek-r1:14b,xploiter/the-xploiter:latest`
+- Honours `BRAIN_MODEL` / `TRIAGE_MODEL` env-var overrides set in v9.1.4
+
+### Output
+
+`logs/brain_model_bench/<run_id>/leaderboard.md` (markdown ranking) + per-row `result.json` per model + appended row in `logs/brain_model_bench.csv` (capability drift over time).
+
+### Sample
+
+```bash
+ollama pull qwen3:14b deepseek-r1:14b xploiter/the-xploiter:latest
+
+# Direct invocation
+python3 vikramaditya.py --brain-model-bench \
+    --bmb-findings findings/clientb.com/sessions/<id> \
+    --bmb-recon recon/clientb.com/sessions/<id>
+
+# Watch-and-auto-fire chained off a long run
+python3 brain_model_bench.py \
+    --watch-log logs/vikram_clientb_fresh_20260506_082437.log \
+    --watch-pattern "==== END" \
+    --findings-glob "findings/clientb.com/sessions/2026050*" \
+    --recon-glob    "recon/clientb.com/sessions/2026050*"
+```
+
+### Affected files
+
+- `brain_model_bench.py` — NEW (300 lines)
+- `vikramaditya.py` — `__version__` 9.15.0 → 9.16.0; new `--brain-model-bench` + 3 ancillary flags
+
+### Validation
+
+`python3 -m py_compile` clean. `vikramaditya.__version__` returns `9.16.0`. Auto-fire watcher launched against current clientb-fresh run; will produce the first leaderboard once that run completes.
+
+---
+
 ## v9.15.0 — Brain benchmark vs Buttercup (DARPA AIxCC) (2026-05-05)
 
 New `brain_benchmark.py` — benchmarks our `brain.py` (Ollama / phi4:14b) against the open-source autonomous Cyber Reasoning Systems that emerged from DARPA AIxCC 2024-2025. Closes the v9.5.0 research gap on emerging tools (Neo / XBOW / Buttercup).
