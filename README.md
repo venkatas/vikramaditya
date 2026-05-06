@@ -9,6 +9,22 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.16.0 — Brain LLM bake-off harness (2026-05-06)**
+
+New `brain_model_bench.py` — replays `brain.py scan` against the same findings dir using each candidate Ollama model and ranks by **hallucination rate** (SUBMIT verdicts that target sqlmap-flagged false-positive URLs). Replaces swap-and-pray with deterministic ground-truth benching.
+```bash
+python3 vikramaditya.py --brain-model-bench \
+    --bmb-findings findings/clientb.com/sessions/<id> \
+    --bmb-recon    recon/clientb.com/sessions/<id>
+# or watch-and-auto-fire after a long run completes:
+python3 brain_model_bench.py --watch-log <runner.log> --watch-pattern "==== END" \
+    --findings-glob "findings/<target>/sessions/2026*" \
+    --recon-glob    "recon/<target>/sessions/2026*"
+```
+See [CHANGELOG.md](CHANGELOG.md#v9160).
+
+---
+
 **v9.15.0 — Brain benchmark vs Buttercup (DARPA AIxCC) (2026-05-05)**
 
 `brain_benchmark.py` — head-to-head vs Trail of Bits' Buttercup. CSV log tracks capability drift as Ollama models update.

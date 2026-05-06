@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # v9.10.0 — single-source-of-truth for the orchestrator version. Bumped from
 # v9.9.0 for llm_hunt.py (Garak + PyRIT + Promptfoo LLM red-teaming).
 # See CHANGELOG.md v9.10.0.
-__version__ = "9.15.0"
+__version__ = "9.16.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -924,6 +924,14 @@ Options:
   --brain-bench-recon DIR Recon dir to feed both engines
   --brain-bench-findings DIR  Findings dir for our brain.py auto_triage
   --brain-bench-integrate Print integration design for Buttercup fallback
+  --brain-model-bench     v9.16.0 — bake off Ollama brain models on the
+                          same findings dir. --bmb-findings, --bmb-recon,
+                          --bmb-models. Scores hallucination rate vs
+                          sqlmap FP ground truth.
+  --bmb-findings DIR      Findings dir for the bake-off
+  --bmb-recon DIR         Recon dir for the bake-off
+  --bmb-models CSV        Ollama model tags (default: phi4:14b,qwen3:14b,
+                          deepseek-r1:14b,xploiter/the-xploiter:latest)
 """
 
 
@@ -1004,6 +1012,11 @@ def parse_cli_args() -> dict:
         "brain_bench_recon": "",
         "brain_bench_findings": "",
         "brain_bench_integrate": False,
+        # v9.16.0 — brain model bake-off
+        "brain_model_bench": False,
+        "bmb_findings": "",
+        "bmb_recon": "",
+        "bmb_models": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -1136,6 +1149,14 @@ def parse_cli_args() -> dict:
             args["brain_bench_findings"] = argv[i + 1]; i += 2
         elif argv[i] == "--brain-bench-integrate":
             args["brain_bench_integrate"] = True; i += 1
+        elif argv[i] == "--brain-model-bench":
+            args["brain_model_bench"] = True; i += 1
+        elif argv[i] == "--bmb-findings" and i + 1 < len(argv):
+            args["bmb_findings"] = argv[i + 1]; i += 2
+        elif argv[i] == "--bmb-recon" and i + 1 < len(argv):
+            args["bmb_recon"] = argv[i + 1]; i += 2
+        elif argv[i] == "--bmb-models" and i + 1 < len(argv):
+            args["bmb_models"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1464,6 +1485,21 @@ def main():
                            cwd=SCRIPT_DIR, check=False, timeout=1800)
         except Exception as e:
             log("warn", f"ad_hunt failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["brain_model_bench"]:
+        log("info", f"--brain-model-bench: findings={cli['bmb_findings']}")
+        if not (cli["bmb_findings"] and cli["bmb_recon"]):
+            log("err", "missing --bmb-findings / --bmb-recon")
+            return
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "brain_model_bench.py"),
+                   "--findings", cli["bmb_findings"],
+                   "--recon", cli["bmb_recon"]]
+            if cli["bmb_models"]:
+                cmd += ["--models"] + [m.strip() for m in cli["bmb_models"].split(",") if m.strip()]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=14400)
+        except Exception as e:
+            log("warn", f"brain_model_bench failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["brain_bench"] or cli["brain_bench_integrate"]:
         log("info", f"--brain-bench: {cli['brain_bench'] or '(integration design)'}")
