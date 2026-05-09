@@ -1,5 +1,91 @@
 # Changelog
 
+## v9.18.0 — TOTP-aware MFA login (clientk + generic) (2026-05-09)
+
+Adds RFC-6238 TOTP support so Vikramaditya can authenticate to MFA-protected
+APIs **without disabling MFA** on the target. Built for clientk's
+`POST /auth/login` contract (workspace + superadmin surfaces) but the
+generic fallback shapes used for every other app now also carry the TOTP
+code when one was minted.
+
+### Why this exists
+
+clientk (and increasingly every B2B SaaS we engage) enforces TOTP at
+login. Previously the autopilot tried to log in with email+password and
+got `{"requiresTotp": true}` 100% of the time. The only legitimate VAPT
+options are (a) mint a code from a test-account TOTP secret, or
+(b) accept a bearer token the operator already generated via the
+application's normal MFA flow. Vikramaditya now does both.
+
+### What it does
+
+- **`auth_utils.totp_code(secret, ...)`** — stdlib-only RFC 6238
+  implementation (HMAC-SHA1, 30-second period, 6 digits, zero-padded).
+  Accepts base32 secrets with whitespace and lowercase letters. No
+  pyotp dependency.
+- **`AuthSession.auto_login()`** now takes
+  `totp_secret`, `totp_code_value`, `login_surface`, `admin_path`. When
+  the login path is `auth/login` the clientk JSON shape is tried
+  first; legacy generic fallbacks still run, with TOTP injected when
+  available. When the server replies `requiresTotp: true` and no
+  TOTP was supplied, **a `RuntimeError` is raised** (no silent
+  fallback that would mask the misconfiguration).
+- **`autopilot_api_hunt.py`** new flags: `--auth-token`, `--auth-token-b`
+  (skip password login entirely), `--totp-secret`, `--totp-secret-b`,
+  `--totp-code`, `--totp-code-b`, `--login-surface workspace|superadmin`,
+  `--admin-path`. `--auth-creds` is no longer hard-required when an
+  `--auth-token` is supplied; superadmin surface requires an explicit
+  `--admin-path`.
+- **No secret leakage** — the new authentication path never echoes
+  password, token or TOTP secret. Only the email/principal is logged.
+
+### Usage
+
+```bash
+# Workspace login with TOTP
+python3 autopilot_api_hunt.py \
+    --base-url https://app.clientk.com/api \
+    --login-url auth/login \
+    --auth-creds   "vapt-org-admin@example.com:PasswordHere" \
+    --totp-secret  "$clientk_VAPT_ADMIN_TOTP_SECRET" \
+    --auth-creds-b "vapt-org-user@example.com:PasswordHere" \
+    --totp-secret-b "$clientk_VAPT_USER_TOTP_SECRET" \
+    --frontend-url https://app.clientk.com \
+    --output findings/clientk-vapt
+
+# Token-only mode (no password endpoint touched at all)
+python3 autopilot_api_hunt.py \
+    --base-url https://app.clientk.com/api \
+    --auth-token   "$ORG_ADMIN_TOKEN" \
+    --auth-token-b "$ORG_USER_TOKEN" \
+    --frontend-url https://app.clientk.com \
+    --output findings/clientk-vapt
+```
+
+### Acceptance tests
+
+`tests/test_totp_clientk.py` (17 tests, all passing):
+- RFC 6238 Appendix B vectors at T=59 and T=1111111109 reproduce
+  exactly (`287082`, `081804`).
+- Spaces, lowercase, padding edge cases handled.
+- clientk workspace JSON shape includes `loginSurface=workspace`,
+  omits `adminPath`, includes a 6-digit `totp`.
+- Superadmin shape includes `adminPath` only when explicitly requested.
+- `requiresTotp=true` surfaces as a clear `RuntimeError`.
+- `--auth-token` bypasses login (verified: zero POSTs to `auth/login`).
+- `--auth-creds` + `--totp-secret` submits the clientk shape with a
+  6-digit code.
+- Logs do not contain password, token or TOTP secret values.
+
+### Safety
+
+- Superadmin testing is opt-in: must pass both `--login-surface superadmin`
+  AND `--admin-path`. Defaults route to `workspace`.
+- The `requiresTotp=true` failure path is loud — no fallback to
+  password-only login that would falsely report MFA as broken.
+
+---
+
 ## v9.17.0 — Lifecycle / EOL checker (endoflife.date) (2026-05-09)
 
 New `eol_check.py` — wraps the public **[endoflife.date](https://endoflife.date/)** metadata API and produces `recon/<target>/eol.md` plus an optional JSON artefact summarising whether each detected tech is supported, near EOL, or already past it. Auto-invoked from `intel.py`, so every `intel.md` now leads with a "Lifecycle / End-of-Life Status" table.

@@ -3,13 +3,16 @@ from __future__ import annotations
 """
 Shared utilities for authenticated API testing modules.
 
-Provides: RateLimiter, JWTHelper, AuthSession, FindingSaver.
-No PyJWT dependency — JWT decode/tamper is manual base64.
+Provides: RateLimiter, JWTHelper, AuthSession, FindingSaver, totp_code.
+No PyJWT / pyotp dependency — JWT and TOTP are stdlib-only.
 """
 
 import base64
+import hashlib
+import hmac
 import json
 import os
+import struct
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +21,67 @@ from pathlib import Path
 # verification; allow opt-out via VAPT_INSECURE_SSL=1 for engagements that
 # legitimately target self-signed staging hosts.
 VERIFY_TLS = os.environ.get("VAPT_INSECURE_SSL", "0") != "1"
+
+
+# ── TOTP (RFC 6238) — stdlib only ─────────────────────────────────────────────
+def totp_code(
+    secret: str,
+    step: int | None = None,
+    period: int = 30,
+    digits: int = 6,
+) -> str:
+    """Generate an RFC-6238 TOTP code for a base32-encoded shared secret.
+
+    Used by Vikramaditya to log in to MFA-protected applications (e.g.
+    clientk) during authorised VAPT, where the client provides a
+    test-account TOTP secret. The scanner must not disable MFA on the
+    target — it must mint a valid code.
+
+    Parameters
+    ----------
+    secret : str
+        Base32 secret as exported by the authenticator app. Whitespace is
+        stripped and the value is uppercased before decoding so values
+        copy/pasted with spaces ("JBSW Y3DP EHPK 3PXP") still work.
+    step : int | None
+        Override the time-step counter (mostly used in tests). When
+        ``None`` (the default) the current Unix time is used.
+    period : int
+        Time step in seconds. RFC 6238 default is 30.
+    digits : int
+        Number of digits in the produced code. RFC 6238 default is 6.
+
+    Returns
+    -------
+    str
+        Zero-padded ``digits``-character numeric string.
+
+    Notes
+    -----
+    Caller should treat the returned value as one-time and short-lived.
+    This function intentionally does **not** brute-force adjacent windows
+    — that belongs in a dedicated MFA-replay tool, not in scan paths.
+    """
+    if not secret:
+        raise ValueError("totp_code: secret is required")
+
+    cleaned = "".join(secret.split()).upper()
+    # Right-pad to a multiple of 8 with base32 padding so partial-length
+    # secrets from QR scans still decode.
+    padding = (-len(cleaned)) % 8
+    cleaned += "=" * padding
+    try:
+        key = base64.b32decode(cleaned, casefold=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise ValueError("totp_code: secret is not valid base32") from exc
+
+    counter = int(time.time() // period) if step is None else int(step)
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    truncated = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    code = truncated % (10 ** digits)
+    return str(code).zfill(digits)
 
 
 class RateLimiter:
@@ -134,53 +198,162 @@ class AuthSession:
         self.token = token
         self._session.headers["Authorization"] = f"Bearer {token}"
 
-    def auto_login(self, login_path: str, username: str, password: str) -> str:
-        """Login and extract JWT token from response body or cookies.
+    def auto_login(
+        self,
+        login_path: str,
+        username: str,
+        password: str,
+        totp_secret: str = "",
+        totp_code_value: str = "",
+        login_surface: str = "workspace",
+        admin_path: str = "",
+    ) -> str:
+        """Login and extract a bearer token from response body or cookies.
 
-        Tries JSON body first, then form-data. Checks response body for token,
-        then cookies (cf_at, access_token, token, jwt).
+        Supports MFA-protected apps such as clientk. When the supplied
+        ``login_path`` is the clientk contract (``auth/login``), the
+        clientk JSON shape is tried first:
+
+            {
+              "email":         <username>,
+              "password":      <password>,
+              "totp":          <generated_or_supplied_code>,
+              "loginSurface":  workspace | superadmin,
+              "adminPath":     <only sent for superadmin tests>
+            }
+
+        For all other endpoints the legacy generic-shape fallbacks (JSON
+        + form-data, ``email``/``username`` keys) are tried in turn,
+        with the TOTP code injected when present.
+
+        Parameters
+        ----------
+        totp_secret
+            Base32 secret. When non-empty and ``totp_code_value`` is empty,
+            ``totp_code()`` is called to mint the current code.
+        totp_code_value
+            Pre-minted 6-digit TOTP code (overrides ``totp_secret``).
+        login_surface
+            clientk workspace selector. Defaults to ``workspace``;
+            callers must explicitly request ``superadmin`` to test the
+            admin surface.
+        admin_path
+            clientk admin path, only sent when ``login_surface`` is
+            ``superadmin``.
+
+        Returns
+        -------
+        str
+            The bearer token or ``"cookie-auth"`` sentinel. Empty string
+            on hard failure.
+
+        Raises
+        ------
+        RuntimeError
+            When the server replies with ``requiresTotp=true`` and no
+            usable TOTP was supplied / generated. We fail loudly rather
+            than silently fall back, to avoid masking misconfigured
+            engagements.
         """
         self._login_url = login_path
         self._creds = (username, password)
         url = f"{self.base_url}/{login_path.lstrip('/')}"
-        self._limiter.wait()
 
-        # Try JSON first, then form-data
-        for payload_kwargs in [
-            {"json": {"email": username, "password": password}},
-            {"data": {"email": username, "password": password}},
-            {"json": {"username": username, "password": password}},
-        ]:
+        # Mint the TOTP code once for this login attempt, if a secret was
+        # supplied and no code was passed in directly. Codes are not logged.
+        code = totp_code_value
+        if not code and totp_secret:
+            try:
+                code = totp_code(totp_secret)
+            except ValueError as exc:
+                raise RuntimeError(f"auto_login: cannot derive TOTP code: {exc}") from exc
+
+        # clientk path — explicit JSON contract for /auth/login.
+        is_clientk_path = login_path.strip("/").lower() == "auth/login"
+        payload_attempts: list[dict] = []
+        if is_clientk_path:
+            evid_body: dict = {
+                "email": username,
+                "password": password,
+                "loginSurface": login_surface or "workspace",
+            }
+            if code:
+                evid_body["totp"] = code
+            if (login_surface or "").lower() == "superadmin":
+                # Only include adminPath when a superadmin test is explicitly requested.
+                evid_body["adminPath"] = admin_path or ""
+            payload_attempts.append({"json": evid_body})
+
+        # Generic fallback shapes — also include totp when minted.
+        generic_email_json = {"email": username, "password": password}
+        generic_email_form = {"email": username, "password": password}
+        generic_user_json = {"username": username, "password": password}
+        if code:
+            generic_email_json["totp"] = code
+            generic_email_form["totp"] = code
+            generic_user_json["totp"] = code
+        payload_attempts.extend([
+            {"json": generic_email_json},
+            {"data": generic_email_form},
+            {"json": generic_user_json},
+        ])
+
+        last_requires_totp = False
+        last_error: str = ""
+
+        for payload_kwargs in payload_attempts:
+            self._limiter.wait()
             try:
                 resp = self._session.post(url, timeout=15, **payload_kwargs)
-                # Check response body for token
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = {}
-                token = (body.get("token") or body.get("access_token")
-                         or (body.get("data") or {}).get("token")
-                         or (body.get("data") or {}).get("access_token") or "")
-                if token:
-                    self.set_token(token)
-                    return token
-
-                # Check cookies for JWT (common patterns: cf_at, access_token, jwt, token)
-                for cookie_name in ("cf_at", "access_token", "jwt", "token", "session"):
-                    cookie_val = resp.cookies.get(cookie_name) or self._session.cookies.get(cookie_name)
-                    if cookie_val and cookie_val.count(".") == 2:  # JWT format: header.payload.sig
-                        self.token = cookie_val
-                        # Keep cookies in session (already stored by requests.Session)
-                        return cookie_val
-
-                # If we got a success response but no token, cookies may handle auth
-                if body.get("status") is True or resp.status_code in (200, 201):
-                    # Check if session cookies were set
-                    if self._session.cookies:
-                        self.token = "cookie-auth"
-                        return "cookie-auth"
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — generic transport guard
+                last_error = type(exc).__name__
                 continue
+
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+
+            # Server explicitly asked for TOTP and we don't have one — surface it.
+            if isinstance(body, dict) and body.get("requiresTotp") is True and not code:
+                last_requires_totp = True
+                continue
+
+            # clientk / generic: response body token (JWT or opaque).
+            token = ""
+            if isinstance(body, dict):
+                data = body.get("data") if isinstance(body.get("data"), dict) else {}
+                token = (
+                    body.get("token")
+                    or body.get("access_token")
+                    or data.get("token")
+                    or data.get("access_token")
+                    or ""
+                )
+            if token:
+                self.set_token(token)
+                return token
+
+            # JWT-shaped cookie fallback.
+            for cookie_name in ("cf_at", "access_token", "jwt", "token", "session"):
+                cookie_val = resp.cookies.get(cookie_name) or self._session.cookies.get(cookie_name)
+                if cookie_val and cookie_val.count(".") == 2:
+                    self.token = cookie_val
+                    return cookie_val
+
+            # Cookie-auth fallback when the server replied 2xx without a token.
+            if resp.status_code in (200, 201) or (isinstance(body, dict) and body.get("status") is True):
+                if self._session.cookies:
+                    self.token = "cookie-auth"
+                    return "cookie-auth"
+
+        if last_requires_totp:
+            # Don't swallow MFA enforcement — caller must supply secret/code.
+            raise RuntimeError(
+                "auto_login: server requires TOTP (requiresTotp=true) but no "
+                "totp_secret/totp_code was supplied. Pass --totp-secret or "
+                "--totp-code (or --auth-token to skip password login)."
+            )
         return ""
 
     def request(self, method: str, path: str, token: str = None,
