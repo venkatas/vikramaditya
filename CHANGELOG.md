@@ -1,86 +1,125 @@
 # Changelog
 
-## v9.18.0 — TOTP-aware MFA login (clientk + generic) (2026-05-09)
+## v9.18.1 — Generalised MFA login docs and tests (2026-05-09)
+
+Removed private target branding from the public MFA examples; generalised
+TOTP login support so Vikramaditya stays application-agnostic.
+
+### What changed
+
+- **CLI rename.** Replaced the per-application `--login-surface` /
+  `--admin-path` flags on `autopilot_api_hunt.py` with a generic
+  `--login-extra-json` (and `--login-extra-json-b` for the second
+  account). The flag takes a JSON object that is merged into the
+  primary login body, letting the operator pass any per-target
+  metadata the application needs (workspace selector, tenant id,
+  admin path, …) without Vikramaditya hardcoding a single field.
+- **`AuthSession.auto_login`** signature collapsed: dropped
+  `login_surface` / `admin_path` in favour of a generic
+  `extra_fields: dict | None` parameter. Caller supplies; library
+  doesn't interpret. The legacy `auth/login` JSON-shape special-case
+  is gone — the standard candidate body shapes (email-JSON,
+  email-form, username-JSON) now carry both the TOTP code and any
+  `extra_fields` automatically.
+- **Public docs** scrubbed of private product names, branded URLs,
+  branded env-var names, and admin-only examples. All MFA examples
+  now use `https://app.example.com/api` and
+  `VAPT_MFA_ADMIN_TOTP_SECRET` / `VAPT_MFA_USER_TOTP_SECRET`.
+- **Test rename.** The TOTP/MFA test module is now
+  `tests/test_totp_mfa_login.py` (renamed from a private-target-named
+  draft). 20 tests, all passing — the three new ones cover
+  `extra_fields` merging, default-omits-extra-fields, and the
+  autopilot end-to-end `--login-extra-json` integration.
+
+### Usage
+
+```bash
+# Generic MFA login — TOTP minted, no extra fields
+python3 autopilot_api_hunt.py \
+    --base-url https://app.example.com/api --login-url auth/login \
+    --auth-creds  "vapt-admin@example.com:PasswordHere" \
+    --totp-secret "$VAPT_MFA_ADMIN_TOTP_SECRET"
+
+# Target login expects extra body fields (workspace, tenant, …)
+python3 autopilot_api_hunt.py \
+    --base-url https://app.example.com/api --login-url auth/login \
+    --auth-creds  "vapt-admin@example.com:PasswordHere" \
+    --totp-secret "$VAPT_MFA_ADMIN_TOTP_SECRET" \
+    --login-extra-json '{"loginSurface":"workspace"}'
+
+# Private admin surface (operator-driven; no autopilot defaults)
+python3 autopilot_api_hunt.py \
+    --base-url https://app.example.com/api --login-url auth/login \
+    --auth-creds  "vapt-admin@example.com:PasswordHere" \
+    --totp-secret "$VAPT_MFA_ADMIN_TOTP_SECRET" \
+    --login-extra-json '{"loginSurface":"admin","adminPath":"/private-path"}'
+
+# Token-only mode (operator already minted bearers via the normal MFA flow)
+python3 autopilot_api_hunt.py \
+    --base-url https://app.example.com/api \
+    --auth-token   "$ORG_ADMIN_TOKEN" \
+    --auth-token-b "$ORG_USER_TOKEN"
+```
+
+### Verification
+
+- ripgrep for any private target name / branded URL / branded env-var
+  prefix across the repo returns zero hits.
+- `python3 -m pytest tests/test_totp_mfa_login.py -q` → **20 passed**.
+- `python3 -m py_compile auth_utils.py autopilot_api_hunt.py vikramaditya.py` → clean.
+- `vikramaditya.__version__` returns `9.18.1`.
+
+---
+
+## v9.18.0 — TOTP-aware MFA login (2026-05-09)
 
 Adds RFC-6238 TOTP support so Vikramaditya can authenticate to MFA-protected
-APIs **without disabling MFA** on the target. Built for clientk's
-`POST /auth/login` contract (workspace + superadmin surfaces) but the
-generic fallback shapes used for every other app now also carry the TOTP
-code when one was minted.
+APIs **without disabling MFA** on the target. The autopilot supports two
+authentication paths: mint a TOTP code from a test-account secret at login
+time, or accept a bearer token the operator already generated via the
+target application's normal MFA flow.
 
 ### Why this exists
 
-clientk (and increasingly every B2B SaaS we engage) enforces TOTP at
-login. Previously the autopilot tried to log in with email+password and
-got `{"requiresTotp": true}` 100% of the time. The only legitimate VAPT
-options are (a) mint a code from a test-account TOTP secret, or
-(b) accept a bearer token the operator already generated via the
-application's normal MFA flow. Vikramaditya now does both.
+Every B2B SaaS we engage now enforces TOTP at login. Previously the
+autopilot tried email+password and got `{"requiresTotp": true}` 100% of
+the time. The only legitimate VAPT options are (a) mint a code from a
+test-account TOTP secret, or (b) accept a bearer token. Vikramaditya now
+does both.
 
-### What it does
+### What it does (initial shape — see v9.18.1 for the generalised CLI)
 
 - **`auth_utils.totp_code(secret, ...)`** — stdlib-only RFC 6238
   implementation (HMAC-SHA1, 30-second period, 6 digits, zero-padded).
   Accepts base32 secrets with whitespace and lowercase letters. No
   pyotp dependency.
-- **`AuthSession.auto_login()`** now takes
-  `totp_secret`, `totp_code_value`, `login_surface`, `admin_path`. When
-  the login path is `auth/login` the clientk JSON shape is tried
-  first; legacy generic fallbacks still run, with TOTP injected when
-  available. When the server replies `requiresTotp: true` and no
-  TOTP was supplied, **a `RuntimeError` is raised** (no silent
-  fallback that would mask the misconfiguration).
+- **`AuthSession.auto_login()`** takes optional
+  `totp_secret` / `totp_code_value`. When the server replies
+  `requiresTotp: true` and no TOTP was supplied, **a `RuntimeError`
+  is raised** (no silent fallback that would mask the
+  misconfiguration).
 - **`autopilot_api_hunt.py`** new flags: `--auth-token`, `--auth-token-b`
   (skip password login entirely), `--totp-secret`, `--totp-secret-b`,
-  `--totp-code`, `--totp-code-b`, `--login-surface workspace|superadmin`,
-  `--admin-path`. `--auth-creds` is no longer hard-required when an
-  `--auth-token` is supplied; superadmin surface requires an explicit
-  `--admin-path`.
+  `--totp-code`, `--totp-code-b`. `--auth-creds` is no longer
+  hard-required when an `--auth-token` is supplied.
 - **No secret leakage** — the new authentication path never echoes
-  password, token or TOTP secret. Only the email/principal is logged.
-
-### Usage
-
-```bash
-# Workspace login with TOTP
-python3 autopilot_api_hunt.py \
-    --base-url https://app.clientk.com/api \
-    --login-url auth/login \
-    --auth-creds   "vapt-org-admin@example.com:PasswordHere" \
-    --totp-secret  "$clientk_VAPT_ADMIN_TOTP_SECRET" \
-    --auth-creds-b "vapt-org-user@example.com:PasswordHere" \
-    --totp-secret-b "$clientk_VAPT_USER_TOTP_SECRET" \
-    --frontend-url https://app.clientk.com \
-    --output findings/clientk-vapt
-
-# Token-only mode (no password endpoint touched at all)
-python3 autopilot_api_hunt.py \
-    --base-url https://app.clientk.com/api \
-    --auth-token   "$ORG_ADMIN_TOKEN" \
-    --auth-token-b "$ORG_USER_TOKEN" \
-    --frontend-url https://app.clientk.com \
-    --output findings/clientk-vapt
-```
+  password, token or TOTP secret. Only the email / principal is logged.
 
 ### Acceptance tests
 
-`tests/test_totp_clientk.py` (17 tests, all passing):
-- RFC 6238 Appendix B vectors at T=59 and T=1111111109 reproduce
-  exactly (`287082`, `081804`).
+`tests/test_totp_mfa_login.py` (renamed from the original draft;
+20 tests, all passing):
+- RFC 6238 Appendix B vectors at T=59 / T=1111111109 reproduce exactly
+  (`287082`, `081804`).
 - Spaces, lowercase, padding edge cases handled.
-- clientk workspace JSON shape includes `loginSurface=workspace`,
-  omits `adminPath`, includes a 6-digit `totp`.
-- Superadmin shape includes `adminPath` only when explicitly requested.
+- TOTP injected into every JSON-shaped login attempt.
 - `requiresTotp=true` surfaces as a clear `RuntimeError`.
-- `--auth-token` bypasses login (verified: zero POSTs to `auth/login`).
-- `--auth-creds` + `--totp-secret` submits the clientk shape with a
-  6-digit code.
+- `--auth-token` bypasses login (zero POSTs to `auth/login`).
+- `--auth-creds` + `--totp-secret` submits a 6-digit `totp` field.
 - Logs do not contain password, token or TOTP secret values.
 
 ### Safety
 
-- Superadmin testing is opt-in: must pass both `--login-surface superadmin`
-  AND `--admin-path`. Defaults route to `workspace`.
 - The `requiresTotp=true` failure path is loud — no fallback to
   password-only login that would falsely report MFA as broken.
 
