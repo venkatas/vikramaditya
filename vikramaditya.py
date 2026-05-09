@@ -41,10 +41,11 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# v9.10.0 — single-source-of-truth for the orchestrator version. Bumped from
-# v9.9.0 for llm_hunt.py (Garak + PyRIT + Promptfoo LLM red-teaming).
-# See CHANGELOG.md v9.10.0.
-__version__ = "9.16.0"
+# v9.10.0 — single-source-of-truth for the orchestrator version. Emitted in
+# the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
+# correlate findings to a tool build.
+# See CHANGELOG.md for the version-by-version delta.
+__version__ = "9.18.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
