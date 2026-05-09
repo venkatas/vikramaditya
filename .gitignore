@@ -110,3 +110,6 @@ schemathesis-report/
 # ── Claude Code ───────────────────────────────────────────────────────────────
 .claude/scheduled_tasks.lock
 .claude/projects/
+
+# ── Operator-only drafts (never publish) ──────────────────────────────────────
+.github-support-request.md
