@@ -9,44 +9,47 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
-**v9.18.0 — TOTP-aware MFA login (clientk + generic) (2026-05-09)**
+**v9.18.1 — Generalised MFA login docs and tests (2026-05-09)**
 
-`auth_utils.totp_code()` (stdlib-only, RFC 6238) + an extended `AuthSession.auto_login()` + token-first CLI flags on `autopilot_api_hunt.py` let Vikramaditya log in to MFA-protected applications **without disabling MFA** on the target. Two paths:
+Removed private-target branding from the public MFA examples and replaced the per-application `--login-surface` / `--admin-path` flags with a generic `--login-extra-json` (`-b`) escape hatch the operator drives. The TOTP / token-first plumbing is unchanged.
 
 ```bash
 # 1. Mint TOTP from the test-account secret at login time
 python3 autopilot_api_hunt.py \
-    --base-url https://app.clientk.com/api \
+    --base-url https://app.example.com/api \
     --login-url auth/login \
-    --auth-creds   "vapt-org-admin@example.com:PasswordHere" \
-    --totp-secret  "$clientk_VAPT_ADMIN_TOTP_SECRET" \
-    --auth-creds-b "vapt-org-user@example.com:PasswordHere" \
-    --totp-secret-b "$clientk_VAPT_USER_TOTP_SECRET" \
-    --frontend-url https://app.clientk.com \
-    --output findings/clientk-vapt
+    --auth-creds   "vapt-admin@example.com:PasswordHere" \
+    --totp-secret  "$VAPT_MFA_ADMIN_TOTP_SECRET" \
+    --auth-creds-b "vapt-user@example.com:PasswordHere" \
+    --totp-secret-b "$VAPT_MFA_USER_TOTP_SECRET" \
+    --frontend-url https://app.example.com \
+    --output findings/example-vapt
 
-# 2. Token-only mode (operator already minted bearers via the normal MFA flow)
+# 2. Target login endpoint expects extra body fields (workspace, tenant, etc.)
 python3 autopilot_api_hunt.py \
-    --base-url https://app.clientk.com/api \
+    --base-url https://app.example.com/api --login-url auth/login \
+    --auth-creds  "vapt-admin@example.com:Password" \
+    --totp-secret "$VAPT_MFA_ADMIN_TOTP_SECRET" \
+    --login-extra-json '{"loginSurface":"workspace"}'
+
+# 3. Token-only mode (operator already minted bearers via the normal MFA flow)
+python3 autopilot_api_hunt.py \
+    --base-url https://app.example.com/api \
     --auth-token   "$ORG_ADMIN_TOKEN" \
     --auth-token-b "$ORG_USER_TOKEN" \
-    --frontend-url https://app.clientk.com \
-    --output findings/clientk-vapt
+    --frontend-url https://app.example.com \
+    --output findings/example-vapt
 
-# 3. Second-account token for IDOR / priv-esc in api_idor_scanner.py
+# 4. Second-account token for IDOR / priv-esc in api_idor_scanner.py
 python3 api_idor_scanner.py \
-    --base-url https://app.clientk.com/api \
+    --base-url https://app.example.com/api \
     --token-a "$ORG_ADMIN_TOKEN" --token-b "$ORG_USER_TOKEN" \
-    --endpoints clientk-endpoints.json
+    --endpoints endpoints.json
 ```
 
-When the clientk login path (`auth/login`) is in use, the autopilot sends the contracted JSON shape:
-```json
-{ "email": "...", "password": "...", "totp": "123456", "loginSurface": "workspace" }
-```
-`adminPath` is only sent when the operator explicitly passes `--login-surface superadmin --admin-path /…`; the autopilot never assumes superadmin scope. If the server replies `requiresTotp: true` and no secret/code was supplied, the autopilot **fails loudly** rather than silently retrying with a non-MFA fallback. Token, password and TOTP secret are never echoed to logs.
+`--login-extra-json` decodes to a JSON object that is merged into the login body — use it to pass any per-target metadata the application needs (workspace selector, tenant id, private admin surface path, etc.). Vikramaditya ships no per-target hardcoded fields. If the server replies `requiresTotp: true` and no secret/code was supplied, the autopilot **fails loudly** rather than silently retrying with a non-MFA fallback. Token, password and TOTP secret are never echoed to logs.
 
-See [CHANGELOG.md](CHANGELOG.md#v9180).
+See [CHANGELOG.md](CHANGELOG.md#v9181).
 
 ---
 

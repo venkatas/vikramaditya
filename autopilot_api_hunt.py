@@ -1874,7 +1874,8 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
                   auth_token: str = "", auth_token_b: str = "",
                   totp_secret: str = "", totp_secret_b: str = "",
                   totp_code: str = "", totp_code_b: str = "",
-                  login_surface: str = "workspace", admin_path: str = "") -> dict:
+                  extra_login_fields: dict | None = None,
+                  extra_login_fields_b: dict | None = None) -> dict:
     """Run all 12 phases of the autonomous API VAPT.
 
     Authentication
@@ -1884,18 +1885,18 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
     1. **Token-first.** When ``auth_token`` (and optionally
        ``auth_token_b``) is supplied, the password-login dance is
        skipped entirely — useful when the operator already has a valid
-       bearer token from the application's normal MFA flow and does not
-       want Vikramaditya touching the password endpoint at all.
+       bearer token from the target application's normal MFA flow and
+       does not want Vikramaditya touching the password endpoint at all.
     2. **Credential + TOTP.** When ``auth_creds`` is supplied, the
        autopilot calls ``AuthSession.auto_login`` with the optional
-       ``totp_secret``/``totp_code`` so that MFA-protected logins
-       (e.g. clientk workspace logins at ``/auth/login``) succeed
-       **without disabling** TOTP on the target.
+       ``totp_secret`` / ``totp_code`` so that MFA-protected logins
+       succeed **without disabling** TOTP on the target.
 
-    ``login_surface`` and ``admin_path`` are passed through to the
-    clientk-shaped JSON body and default to safe ``workspace`` values.
-    Superadmin testing requires the operator to set ``login_surface``
-    explicitly; the autopilot never assumes superadmin scope.
+    ``extra_login_fields`` (and ``_b``) is an optional dict merged into
+    the JSON login body, letting the operator hand the autopilot any
+    target-specific metadata the login endpoint requires (workspace
+    selector, tenant id, admin path, …). The autopilot is otherwise
+    application-agnostic and ships no per-target hardcoded fields.
     """
 
     O = "\033[38;5;208m"  # Orange/amber
@@ -1948,7 +1949,7 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
             token = session.auto_login(
                 login_url, parts[0], parts[1],
                 totp_secret=totp_secret, totp_code_value=totp_code,
-                login_surface=login_surface, admin_path=admin_path,
+                extra_fields=extra_login_fields,
             )
         except RuntimeError as exc:
             # MFA enforcement: surface clearly, do not silently continue.
@@ -1982,7 +1983,7 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
                 token_b = session_b.auto_login(
                     login_url, parts_b[0], parts_b[1],
                     totp_secret=totp_secret_b, totp_code_value=totp_code_b,
-                    login_surface=login_surface, admin_path=admin_path,
+                    extra_fields=extra_login_fields_b,
                 )
             except RuntimeError as exc:
                 log("warn", f"Second account: {exc}")
@@ -1995,7 +1996,7 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
                     token_b = session_b.auto_login(
                         login_url, parts_b[0], parts_b[1],
                         totp_secret=totp_secret_b, totp_code_value=totp_code_b,
-                        login_surface=login_surface, admin_path=admin_path,
+                        extra_fields=extra_login_fields_b,
                     )
                 except RuntimeError as exc:
                     log("warn", f"Second account (learner API): {exc}")
@@ -2387,30 +2388,37 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Standard workspace login (no MFA)
+  # Standard login (no MFA)
   python3 autopilot_api_hunt.py --base-url https://api.example.com --auth-creds user:pass
 
   # Two accounts for IDOR / priv-esc
-  python3 autopilot_api_hunt.py --base-url URL --auth-creds admin:pass --auth-creds-b learner:pass
+  python3 autopilot_api_hunt.py --base-url URL --auth-creds admin:pass --auth-creds-b user:pass
 
-  # clientk workspace login with TOTP — secret minted server-side from the test account
+  # MFA-protected target — TOTP minted at login time from the test-account secret
   python3 autopilot_api_hunt.py \\
-      --base-url https://app.clientk.com/api \\
+      --base-url https://app.example.com/api \\
       --login-url auth/login \\
-      --auth-creds   "vapt-org-admin@example.com:PasswordHere" \\
-      --totp-secret  "$clientk_VAPT_ADMIN_TOTP_SECRET" \\
-      --auth-creds-b "vapt-org-user@example.com:PasswordHere" \\
-      --totp-secret-b "$clientk_VAPT_USER_TOTP_SECRET" \\
-      --frontend-url https://app.clientk.com \\
-      --output findings/clientk-vapt
+      --auth-creds   "vapt-admin@example.com:PasswordHere" \\
+      --totp-secret  "$VAPT_MFA_ADMIN_TOTP_SECRET" \\
+      --auth-creds-b "vapt-user@example.com:PasswordHere" \\
+      --totp-secret-b "$VAPT_MFA_USER_TOTP_SECRET" \\
+      --frontend-url https://app.example.com \\
+      --output findings/example-vapt
+
+  # Target login endpoint expects extra body fields (workspace, tenant, etc.)
+  python3 autopilot_api_hunt.py \\
+      --base-url https://app.example.com/api --login-url auth/login \\
+      --auth-creds "vapt-admin@example.com:Password" \\
+      --totp-secret "$VAPT_MFA_ADMIN_TOTP_SECRET" \\
+      --login-extra-json '{"loginSurface":"workspace"}'
 
   # Token-only mode — operator already minted bearers via the normal MFA flow
   python3 autopilot_api_hunt.py \\
-      --base-url https://app.clientk.com/api \\
+      --base-url https://app.example.com/api \\
       --auth-token   "$ORG_ADMIN_TOKEN" \\
       --auth-token-b "$ORG_USER_TOKEN" \\
-      --frontend-url https://app.clientk.com \\
-      --output findings/clientk-vapt
+      --frontend-url https://app.example.com \\
+      --output findings/example-vapt
         """)
     parser.add_argument("--base-url", required=True, help="API base URL")
     parser.add_argument("--auth-creds", help="user:pass for primary account "
@@ -2429,12 +2437,13 @@ Examples:
                         help="Pre-minted TOTP code for primary account (overrides --totp-secret)")
     parser.add_argument("--totp-code-b", default="",
                         help="Pre-minted TOTP code for second account")
-    parser.add_argument("--login-surface", default="workspace",
-                        choices=["workspace", "superadmin"],
-                        help="clientk login surface (default workspace). "
-                             "'superadmin' must be requested explicitly and paired with --admin-path.")
-    parser.add_argument("--admin-path", default="",
-                        help="clientk adminPath, only sent when --login-surface=superadmin")
+    parser.add_argument("--login-extra-json", default="",
+                        help="Extra JSON body fields merged into the primary login request, "
+                             "e.g. '{\"loginSurface\":\"workspace\"}' or "
+                             "'{\"loginSurface\":\"admin\",\"adminPath\":\"/private-path\"}'. "
+                             "Caller-supplied; the autopilot ships no per-target hardcoded fields.")
+    parser.add_argument("--login-extra-json-b", default="",
+                        help="Extra JSON body fields merged into the second-account login request")
     parser.add_argument("--login-url", default="login-view/", help="Login endpoint path")
     parser.add_argument("--frontend-url", help="Frontend URL for JS bundle scraping")
     parser.add_argument("--output", help="Output directory for findings")
@@ -2449,9 +2458,19 @@ Examples:
     if not args.auth_creds and not args.auth_token:
         parser.error("either --auth-creds or --auth-token must be provided for the primary account")
 
-    if args.login_surface == "superadmin" and not args.admin_path:
-        parser.error("--login-surface=superadmin requires --admin-path "
-                     "(superadmin testing must be requested explicitly)")
+    def _parse_extra(label: str, raw: str) -> dict:
+        if not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--{label} is not valid JSON: {exc}")
+        if not isinstance(value, dict):
+            parser.error(f"--{label} must decode to a JSON object")
+        return value
+
+    extra_a = _parse_extra("login-extra-json", args.login_extra_json)
+    extra_b = _parse_extra("login-extra-json-b", args.login_extra_json_b)
 
     run_autopilot(
         base_url=args.base_url,
@@ -2469,8 +2488,8 @@ Examples:
         totp_secret_b=args.totp_secret_b,
         totp_code=args.totp_code,
         totp_code_b=args.totp_code_b,
-        login_surface=args.login_surface,
-        admin_path=args.admin_path,
+        extra_login_fields=extra_a,
+        extra_login_fields_b=extra_b,
     )
 
 

@@ -32,10 +32,10 @@ def totp_code(
 ) -> str:
     """Generate an RFC-6238 TOTP code for a base32-encoded shared secret.
 
-    Used by Vikramaditya to log in to MFA-protected applications (e.g.
-    clientk) during authorised VAPT, where the client provides a
-    test-account TOTP secret. The scanner must not disable MFA on the
-    target — it must mint a valid code.
+    Used by Vikramaditya to log in to MFA-protected target applications
+    during authorised VAPT, where the client provides a test-account
+    TOTP secret. The scanner must not disable MFA on the target — it
+    must mint a valid code.
 
     Parameters
     ----------
@@ -205,26 +205,28 @@ class AuthSession:
         password: str,
         totp_secret: str = "",
         totp_code_value: str = "",
-        login_surface: str = "workspace",
-        admin_path: str = "",
+        extra_fields: dict | None = None,
     ) -> str:
         """Login and extract a bearer token from response body or cookies.
 
-        Supports MFA-protected apps such as clientk. When the supplied
-        ``login_path`` is the clientk contract (``auth/login``), the
-        clientk JSON shape is tried first:
+        Supports MFA-protected target applications. The scanner mints a
+        TOTP code at login time (RFC 6238) so MFA does **not** have to
+        be disabled on the target.
 
-            {
-              "email":         <username>,
-              "password":      <password>,
-              "totp":          <generated_or_supplied_code>,
-              "loginSurface":  workspace | superadmin,
-              "adminPath":     <only sent for superadmin tests>
-            }
+        Login body shapes attempted, in order:
 
-        For all other endpoints the legacy generic-shape fallbacks (JSON
-        + form-data, ``email``/``username`` keys) are tried in turn,
-        with the TOTP code injected when present.
+        1. ``{"email": …, "password": …}`` (JSON) — with ``totp`` injected
+           when a code was minted, and any caller-supplied ``extra_fields``
+           merged in.
+        2. The same fields as form-data.
+        3. ``{"username": …, "password": …}`` (JSON) — JSON variant for
+           targets that key off ``username`` instead of ``email``.
+
+        ``extra_fields`` is a free-form dict that lets callers supply
+        application-specific metadata the target's login endpoint
+        requires (e.g. a workspace / surface selector, an admin path,
+        a tenant id). Vikramaditya stays application-agnostic — the
+        operator decides what extra fields the target needs.
 
         Parameters
         ----------
@@ -233,13 +235,9 @@ class AuthSession:
             ``totp_code()`` is called to mint the current code.
         totp_code_value
             Pre-minted 6-digit TOTP code (overrides ``totp_secret``).
-        login_surface
-            clientk workspace selector. Defaults to ``workspace``;
-            callers must explicitly request ``superadmin`` to test the
-            admin surface.
-        admin_path
-            clientk admin path, only sent when ``login_surface`` is
-            ``superadmin``.
+        extra_fields
+            Optional mapping of additional JSON body fields to merge into
+            the login request. Caller-supplied; not interpreted here.
 
         Returns
         -------
@@ -268,35 +266,23 @@ class AuthSession:
             except ValueError as exc:
                 raise RuntimeError(f"auto_login: cannot derive TOTP code: {exc}") from exc
 
-        # clientk path — explicit JSON contract for /auth/login.
-        is_clientk_path = login_path.strip("/").lower() == "auth/login"
-        payload_attempts: list[dict] = []
-        if is_clientk_path:
-            evid_body: dict = {
-                "email": username,
-                "password": password,
-                "loginSurface": login_surface or "workspace",
-            }
-            if code:
-                evid_body["totp"] = code
-            if (login_surface or "").lower() == "superadmin":
-                # Only include adminPath when a superadmin test is explicitly requested.
-                evid_body["adminPath"] = admin_path or ""
-            payload_attempts.append({"json": evid_body})
+        extra = dict(extra_fields) if extra_fields else {}
 
-        # Generic fallback shapes — also include totp when minted.
-        generic_email_json = {"email": username, "password": password}
-        generic_email_form = {"email": username, "password": password}
-        generic_user_json = {"username": username, "password": password}
-        if code:
-            generic_email_json["totp"] = code
-            generic_email_form["totp"] = code
-            generic_user_json["totp"] = code
-        payload_attempts.extend([
-            {"json": generic_email_json},
-            {"data": generic_email_form},
-            {"json": generic_user_json},
-        ])
+        # Build the standard candidate payloads. Caller-supplied extra_fields
+        # are merged into every JSON-shaped attempt so app-specific metadata
+        # (workspace selector, tenant id, admin path, …) reaches the server.
+        def _with(base: dict) -> dict:
+            merged = dict(base)
+            if code:
+                merged["totp"] = code
+            merged.update(extra)
+            return merged
+
+        payload_attempts: list[dict] = [
+            {"json": _with({"email": username, "password": password})},
+            {"data": _with({"email": username, "password": password})},
+            {"json": _with({"username": username, "password": password})},
+        ]
 
         last_requires_totp = False
         last_error: str = ""
@@ -319,7 +305,7 @@ class AuthSession:
                 last_requires_totp = True
                 continue
 
-            # clientk / generic: response body token (JWT or opaque).
+            # Response body token (JWT or opaque).
             token = ""
             if isinstance(body, dict):
                 data = body.get("data") if isinstance(body.get("data"), dict) else {}
