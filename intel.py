@@ -26,6 +26,13 @@ import urllib.parse
 import urllib.error
 from datetime import datetime
 
+# v9.17.0 — endoflife.date lifecycle integration (credits: https://endoflife.date)
+try:
+    import eol_check  # type: ignore
+    _EOL_AVAILABLE = True
+except ImportError:
+    _EOL_AVAILABLE = False
+
 # macOS: Python may not have system SSL certs. Use unverified context for API queries.
 _SSL_CTX = ssl.create_default_context()
 try:
@@ -336,11 +343,44 @@ def build_markdown(techs: list[str], results: list[dict]) -> str:
         f"",
         f"**Technologies:** {', '.join(techs)}",
         f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"**Sources:** GitHub Advisory DB, NVD CVE API, HackerOne Hacktivity",
+        f"**Sources:** GitHub Advisory DB, NVD CVE API, HackerOne Hacktivity, endoflife.date (lifecycle)",
         f"",
         f"---",
         f"",
     ]
+
+    # v9.17.0 — Lifecycle / EOL block (data: endoflife.date, MIT licensed)
+    if _EOL_AVAILABLE:
+        try:
+            eol_results = eol_check.lookup_many([(t, None) for t in techs])
+            mapped = [r for r in eol_results if r.get("slug")]
+            if mapped:
+                lines += [
+                    "## Lifecycle / End-of-Life Status",
+                    "",
+                    f"_Data source: [endoflife.date]({eol_check.ENDOFLIFE_HOMEPAGE}) — please credit when redistributing._",
+                    "",
+                    "| Tech | Slug | Latest cycle | EOL | Status |",
+                    "|---|---|---|---|---|",
+                ]
+                for r in eol_results:
+                    if not r.get("slug"):
+                        continue
+                    cyc = r.get("matched_cycle") or {}
+                    eol_v = cyc.get("eol")
+                    eol_s = ("supported" if eol_v is False else
+                             "expired"  if eol_v is True  else (eol_v or "—"))
+                    icon = {"expired": "🔴 EOL", "soon": "🟠 Ending soon",
+                            "supported": "🟢 Supported", "unknown": "⚪ Unknown",
+                            "no_data": "⚪ Not tracked"}.get(r["status"], r["status"])
+                    lines.append(
+                        f"| {r['tech']} | `{r['slug']}` | "
+                        f"{cyc.get('cycle','—')} (rel {cyc.get('releaseDate','—')}) | "
+                        f"{eol_s} | {icon} |"
+                    )
+                lines += ["", "---", ""]
+        except Exception as exc:  # never block the rest of intel on this
+            lines += [f"_Lifecycle lookup skipped — endoflife.date error: {exc}_", "", "---", ""]
 
     # Group by tech
     by_tech: dict[str, list[dict]] = {}
