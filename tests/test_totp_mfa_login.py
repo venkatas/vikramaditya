@@ -1,26 +1,23 @@
-"""Acceptance tests for TOTP + EvidPrism login support.
+"""Acceptance tests for the generic TOTP / MFA login support.
 
 Covers:
-- auth_utils.totp_code() against RFC 6238 vectors and edge cases.
-- AuthSession.auto_login EvidPrism JSON shape (workspace + superadmin).
-- requiresTotp=true is surfaced as a clear error, not silent fallback.
-- Token returned in body is captured.
-- autopilot --auth-token bypasses login entirely (no HTTP to login URL).
-- autopilot --auth-creds + --totp-secret submits the EvidPrism shape.
-- Second account token / creds path works for IDOR/priv-esc phases.
+- ``auth_utils.totp_code()`` against RFC 6238 vectors and edge cases.
+- ``AuthSession.auto_login`` injects TOTP into the standard candidate
+  body shapes (email-JSON, email-form, username-JSON).
+- ``extra_fields`` is merged into every JSON-shaped login attempt.
+- ``requiresTotp=true`` is surfaced as a clear ``RuntimeError`` when
+  no code was supplied — no silent password-only fallback.
+- A token returned in the response body is captured.
+- ``autopilot_api_hunt`` token-only mode bypasses the login URL entirely.
+- ``autopilot_api_hunt`` credential + TOTP mode submits the JSON body
+  with the TOTP code and any ``--login-extra-json`` fields merged in.
 - Logs do not echo password / token / TOTP secret.
 """
 
 from __future__ import annotations
 
 import base64
-import io
-import json
-import logging
-import sys
 import types
-from contextlib import redirect_stderr, redirect_stdout
-from unittest import mock
 
 import pytest
 
@@ -28,7 +25,7 @@ import auth_utils
 from auth_utils import AuthSession, totp_code
 
 
-# ─── Fake requests Session capturing every POST ────────────────────────────────
+# ─── Fake requests Session capturing every POST ───────────────────────────────
 class _FakeResponse:
     def __init__(self, status_code=200, body=None, cookies=None):
         self.status_code = status_code
@@ -93,7 +90,6 @@ class TestTotpCode:
         assert code.isdigit()
 
     def test_zero_padded(self):
-        # Force a step that yields a small numeric code; just assert padding shape.
         for step in range(0, 200):
             code = totp_code(self.SECRET_B32, step=step)
             assert len(code) == 6, f"step={step} returned {code!r}"
@@ -122,103 +118,122 @@ class TestTotpCode:
             totp_code("!!!notbase32!!!")
 
 
-# ─── AuthSession.auto_login — EvidPrism contract ──────────────────────────────
-class TestEvidPrismAutoLogin:
+# ─── AuthSession.auto_login — TOTP injection + extra_fields ───────────────────
+class TestMfaAutoLogin:
 
-    def test_workspace_login_with_totp_secret_returns_token(self, monkeypatch):
-        scripted = [_FakeResponse(200, {"token": "ey.workspace.token"})]
+    BASE = "https://app.example.com/api"
+
+    def test_login_with_totp_secret_returns_token(self, monkeypatch):
+        scripted = [_FakeResponse(200, {"token": "ey.primary.token"})]
         fake = _patch_requests(monkeypatch, scripted)
 
-        sess = AuthSession("https://app.evidprism.com/api")
+        sess = AuthSession(self.BASE)
         secret = base64.b32encode(b"12345678901234567890").decode()
 
         token = sess.auto_login(
-            "auth/login", "vapt-org-admin@example.com", "PasswordHere",
+            "auth/login", "vapt-admin@example.com", "PasswordHere",
             totp_secret=secret,
         )
 
-        assert token == "ey.workspace.token"
-        assert sess.token == "ey.workspace.token"
-        assert sess._session.headers.get("Authorization") == "Bearer ey.workspace.token"
+        assert token == "ey.primary.token"
+        assert sess.token == "ey.primary.token"
+        assert sess._session.headers.get("Authorization") == "Bearer ey.primary.token"
 
         body = fake.calls[0]["json"]
-        assert body["email"] == "vapt-org-admin@example.com"
+        assert body["email"] == "vapt-admin@example.com"
         assert body["password"] == "PasswordHere"
-        assert body["loginSurface"] == "workspace"
-        assert "adminPath" not in body, "adminPath must not be sent for workspace logins"
         assert body["totp"].isdigit() and len(body["totp"]) == 6
 
-    def test_workspace_login_with_pre_minted_code_uses_it(self, monkeypatch):
+    def test_login_with_pre_minted_code_uses_it(self, monkeypatch):
         scripted = [_FakeResponse(200, {"token": "ey.preminted.token"})]
         fake = _patch_requests(monkeypatch, scripted)
 
-        sess = AuthSession("https://app.evidprism.com/api")
+        sess = AuthSession(self.BASE)
         token = sess.auto_login(
             "auth/login", "u@x", "p",
             totp_code_value="654321",
         )
-
         assert token == "ey.preminted.token"
         assert fake.calls[0]["json"]["totp"] == "654321"
 
-    def test_requires_totp_without_secret_raises(self, monkeypatch):
-        scripted = [
-            _FakeResponse(200, {"requiresTotp": True, "message": "TOTP code required."}),
-            _FakeResponse(200, {"requiresTotp": True, "message": "TOTP code required."}),
-            _FakeResponse(200, {"requiresTotp": True, "message": "TOTP code required."}),
-            _FakeResponse(200, {"requiresTotp": True, "message": "TOTP code required."}),
-        ]
-        _patch_requests(monkeypatch, scripted)
-
-        sess = AuthSession("https://app.evidprism.com/api")
-        with pytest.raises(RuntimeError, match="requires TOTP"):
-            sess.auto_login("auth/login", "u@x", "p")
-
-    def test_superadmin_path_is_explicit_only(self, monkeypatch):
-        scripted = [_FakeResponse(200, {"token": "ey.superadmin.token"})]
+    def test_extra_fields_merged_into_login_body(self, monkeypatch):
+        scripted = [_FakeResponse(200, {"token": "ey.workspace.token"})]
         fake = _patch_requests(monkeypatch, scripted)
 
-        sess = AuthSession("https://app.evidprism.com/api")
+        sess = AuthSession(self.BASE)
+        sess.auto_login(
+            "auth/login", "u@x", "p",
+            totp_code_value="123456",
+            extra_fields={"loginSurface": "workspace"},
+        )
+        body = fake.calls[0]["json"]
+        assert body["loginSurface"] == "workspace"
+        assert body["totp"] == "123456"
+
+    def test_extra_fields_admin_path_only_when_caller_supplies(self, monkeypatch):
+        # The autopilot ships no per-target hardcoded fields — admin-style
+        # metadata only travels when the operator explicitly merges it in.
+        scripted = [_FakeResponse(200, {"token": "ey.admin.token"})]
+        fake = _patch_requests(monkeypatch, scripted)
+        sess = AuthSession(self.BASE)
         sess.auto_login(
             "auth/login", "su@x", "p",
             totp_code_value="123456",
-            login_surface="superadmin",
-            admin_path="/private-superadmin-path",
+            extra_fields={"loginSurface": "admin", "adminPath": "/private-path"},
         )
-
         body = fake.calls[0]["json"]
-        assert body["loginSurface"] == "superadmin"
-        assert body["adminPath"] == "/private-superadmin-path"
+        assert body["loginSurface"] == "admin"
+        assert body["adminPath"] == "/private-path"
+
+    def test_default_login_omits_extra_fields(self, monkeypatch):
+        # Without extra_fields the body must not carry loginSurface / adminPath.
+        scripted = [_FakeResponse(200, {"token": "ey.plain.token"})]
+        fake = _patch_requests(monkeypatch, scripted)
+        sess = AuthSession(self.BASE)
+        sess.auto_login("auth/login", "u@x", "p", totp_code_value="123456")
+        body = fake.calls[0]["json"]
+        assert "loginSurface" not in body
+        assert "adminPath" not in body
+
+    def test_requires_totp_without_secret_raises(self, monkeypatch):
+        scripted = [_FakeResponse(200, {"requiresTotp": True, "message": "TOTP code required."})] * 4
+        _patch_requests(monkeypatch, scripted)
+
+        sess = AuthSession(self.BASE)
+        with pytest.raises(RuntimeError, match="requires TOTP"):
+            sess.auto_login("auth/login", "u@x", "p")
 
     def test_token_in_data_field_is_extracted(self, monkeypatch):
         scripted = [_FakeResponse(200, {"data": {"token": "ey.nested.token"}})]
         _patch_requests(monkeypatch, scripted)
-        sess = AuthSession("https://app.evidprism.com/api")
+        sess = AuthSession(self.BASE)
         token = sess.auto_login("auth/login", "u@x", "p", totp_code_value="111111")
         assert token == "ey.nested.token"
 
-    def test_generic_login_paths_still_work_without_totp(self, monkeypatch):
-        # Non-EvidPrism path: server replies on the second attempt (form-data).
+    def test_legacy_login_paths_still_work_without_totp(self, monkeypatch):
+        # Non-MFA target: server replies on the second attempt (form-data).
         scripted = [
             _FakeResponse(401, {}),
             _FakeResponse(200, {"access_token": "legacy.token"}),
         ]
         fake = _patch_requests(monkeypatch, scripted)
-        sess = AuthSession("https://api.legacy.com")
+        sess = AuthSession("https://api.legacy.example.com")
         token = sess.auto_login("login-view/", "u@x", "p")
         assert token == "legacy.token"
-        # First call should NOT include adminPath (non-EvidPrism) and no TOTP.
-        assert "totp" not in fake.calls[0].get("json", {})
+        # First call should NOT include TOTP and no extra fields.
+        first_body = fake.calls[0].get("json", {})
+        assert "totp" not in first_body
+        assert "loginSurface" not in first_body
 
 
 # ─── autopilot CLI integration — token-first + TOTP creds ─────────────────────
 class TestAutopilotCli:
-    """Run the run_autopilot() entry point through monkeypatched HTTP and
-    verify the auth wiring without spinning up the full 12-phase pipeline."""
+    """Drive ``run_autopilot`` through monkeypatched HTTP and verify the auth
+    wiring without spinning up the full 12-phase pipeline."""
+
+    BASE = "https://app.example.com/api"
 
     def _stub_phases(self, monkeypatch):
-        # Short-circuit phase work by patching the discovery stage to return
-        # an empty endpoints list; the autopilot then exits cleanly.
         monkeypatch.setattr(
             "autopilot_api_hunt._discover_endpoints",
             lambda *a, **k: [],
@@ -237,24 +252,22 @@ class TestAutopilotCli:
         from autopilot_api_hunt import run_autopilot
 
         run_autopilot(
-            base_url="https://app.evidprism.com/api",
+            base_url=self.BASE,
             auth_token="ORG-ADMIN-TOKEN-123",
             auth_token_b="ORG-USER-TOKEN-456",
             login_url="auth/login",
             output_dir=None,
             with_brain=False,
         )
-        # No POSTs to login were issued.
         login_calls = [c for c in fake.calls if "auth/login" in c["url"]]
         assert login_calls == []
 
         out = capsys.readouterr().out
-        # Logs must not echo the token value.
         assert "ORG-ADMIN-TOKEN-123" not in out
         assert "ORG-USER-TOKEN-456" not in out
         assert "supplied bearer token" in out.lower()
 
-    def test_auth_creds_with_totp_secret_submits_evidprism_shape(self, monkeypatch, capsys):
+    def test_auth_creds_with_totp_secret_submits_mfa_body(self, monkeypatch, capsys):
         secret = base64.b32encode(b"12345678901234567890").decode()
         scripted = [
             _FakeResponse(200, {"token": "primary.token"}),
@@ -265,7 +278,7 @@ class TestAutopilotCli:
         from autopilot_api_hunt import run_autopilot
 
         run_autopilot(
-            base_url="https://app.evidprism.com/api",
+            base_url=self.BASE,
             auth_creds="vapt-admin@example.com:PrimarySecret",
             auth_creds_b="vapt-user@example.com:SecondarySecret",
             totp_secret=secret,
@@ -274,13 +287,11 @@ class TestAutopilotCli:
             output_dir=None,
         )
 
-        # Both logins should hit auth/login with EvidPrism JSON shape.
         bodies = [c["json"] for c in fake.calls if "auth/login" in c["url"] and "json" in c]
         assert len(bodies) >= 2
         for b in bodies[:2]:
-            assert b["loginSurface"] == "workspace"
-            assert "adminPath" not in b
-            assert b["totp"].isdigit()
+            assert b["email"].startswith("vapt-")
+            assert b["totp"].isdigit() and len(b["totp"]) == 6
 
         out = capsys.readouterr().out
         assert "PrimarySecret" not in out
@@ -289,6 +300,27 @@ class TestAutopilotCli:
         assert "primary.token" not in out
         assert "secondary.token" not in out
 
+    def test_auth_creds_with_extra_login_fields(self, monkeypatch):
+        """--login-extra-json fields land in the JSON login body."""
+        scripted = [_FakeResponse(200, {"token": "primary.token"})]
+        fake = _patch_requests(monkeypatch, scripted)
+        self._stub_phases(monkeypatch)
+        from autopilot_api_hunt import run_autopilot
+
+        run_autopilot(
+            base_url=self.BASE,
+            auth_creds="vapt-admin@example.com:PasswordHere",
+            totp_code="123456",
+            login_url="auth/login",
+            extra_login_fields={"loginSurface": "workspace", "tenantId": "t1"},
+            output_dir=None,
+        )
+
+        json_call = next(c for c in fake.calls if "json" in c)
+        assert json_call["json"]["loginSurface"] == "workspace"
+        assert json_call["json"]["tenantId"] == "t1"
+        assert json_call["json"]["totp"] == "123456"
+
     def test_requires_totp_without_secret_aborts_cleanly(self, monkeypatch, capsys):
         scripted = [_FakeResponse(200, {"requiresTotp": True})] * 4
         _patch_requests(monkeypatch, scripted)
@@ -296,12 +328,11 @@ class TestAutopilotCli:
         from autopilot_api_hunt import run_autopilot
 
         out_dict = run_autopilot(
-            base_url="https://app.evidprism.com/api",
+            base_url=self.BASE,
             auth_creds="vapt-admin@example.com:PrimarySecret",
             login_url="auth/login",
             output_dir=None,
         )
-        # Aborts cleanly (returns empty result rather than raising).
         assert out_dict == {}
-        captured = capsys.readouterr().out + capsys.readouterr().err
-        assert "requires TOTP" in captured or "requires TOTP" in capsys.readouterr().out
+        captured = capsys.readouterr().out
+        assert "requires TOTP" in captured

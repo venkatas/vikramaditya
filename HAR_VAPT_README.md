@@ -168,46 +168,62 @@ python3 demo_har_vapt.py
 # Results: 4 HAR files processed, 86+ vulnerabilities found
 ```
 
-### **Example 4: MFA-protected target via TOTP secret (v9.18.0)**
+### **Example 4: MFA-protected target via TOTP secret (v9.18.x)**
 
-When the customer hands you a HAR captured against an MFA-protected app, the
-HAR will only carry a session cookie that may already be expired. To re-auth
-without disabling MFA, hand Vikramaditya the test-account TOTP secret and let
-it mint a code at login time:
+When the customer hands you a HAR captured against an MFA-protected target
+application, the HAR will only carry a session cookie that may already be
+expired. To re-auth without disabling MFA on the target, hand Vikramaditya
+the test-account TOTP secret and let it mint a code at login time:
 
 ```bash
-# EvidPrism workspace — TOTP minted from the test account's base32 secret
+# TOTP minted from the test account's base32 secret
 python3 autopilot_api_hunt.py \
-  --base-url https://app.evidprism.com/api \
+  --base-url https://app.example.com/api \
   --login-url auth/login \
-  --auth-creds   "vapt-org-admin@example.com:PasswordHere" \
-  --totp-secret  "$EVIDPRISM_VAPT_ADMIN_TOTP_SECRET" \
-  --auth-creds-b "vapt-org-user@example.com:PasswordHere" \
-  --totp-secret-b "$EVIDPRISM_VAPT_USER_TOTP_SECRET" \
+  --auth-creds   "vapt-admin@example.com:PasswordHere" \
+  --totp-secret  "$VAPT_MFA_ADMIN_TOTP_SECRET" \
+  --auth-creds-b "vapt-user@example.com:PasswordHere" \
+  --totp-secret-b "$VAPT_MFA_USER_TOTP_SECRET" \
   --har-file     admin_session.har \
-  --frontend-url https://app.evidprism.com \
-  --output       findings/evidprism-vapt
+  --frontend-url https://app.example.com \
+  --output       findings/example-vapt
 ```
 
-### **Example 5: Token-only mode for HAR replay (v9.18.0)**
+### **Example 5: Token-only mode for HAR replay (v9.18.x)**
 
 If the operator already minted bearer tokens via the application's normal
 MFA flow, skip Vikramaditya's password endpoint entirely:
 
 ```bash
 python3 autopilot_api_hunt.py \
-  --base-url https://app.evidprism.com/api \
+  --base-url https://app.example.com/api \
   --auth-token   "$ORG_ADMIN_TOKEN" \
   --auth-token-b "$ORG_USER_TOKEN" \
   --har-file     admin_session.har \
-  --frontend-url https://app.evidprism.com \
-  --output       findings/evidprism-vapt
+  --frontend-url https://app.example.com \
+  --output       findings/example-vapt
 ```
 
-> **Superadmin testing.** The autopilot defaults to `--login-surface workspace`.
-> Superadmin testing is **opt-in** and must pass both `--login-surface superadmin`
-> *and* `--admin-path /your-private-superadmin-path`. The autopilot never
-> assumes superadmin scope on its own.
+### **Example 6: Target needs extra login-body fields (v9.18.1)**
+
+Some target applications expect additional fields in the login JSON body
+(workspace selector, tenant id, a private admin-surface path, …). Pass
+them through `--login-extra-json` — the operator decides what the target
+needs; Vikramaditya ships no per-target hardcoded fields.
+
+```bash
+python3 autopilot_api_hunt.py \
+  --base-url https://app.example.com/api --login-url auth/login \
+  --auth-creds   "vapt-admin@example.com:Password" \
+  --totp-secret  "$VAPT_MFA_ADMIN_TOTP_SECRET" \
+  --login-extra-json '{"loginSurface":"workspace"}' \
+  --har-file     admin_session.har
+```
+
+> **Private admin surfaces.** If the target exposes a private admin surface
+> that requires extra login fields (an admin path, a separate scope flag),
+> request it explicitly via `--login-extra-json '{"loginSurface":"admin","adminPath":"/private-path"}'`.
+> The autopilot does not assume admin scope on its own.
 
 ---
 
