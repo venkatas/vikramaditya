@@ -29,6 +29,7 @@ the AI brain if Ollama is installed, and routes to the right scan engine.
 | `auth_utils.py` | JWT helper, rate limiter, authenticated session management |
 | `prioritize.py` | CVE risk scoring and host prioritization |
 | `whitebox/cloud_hunt.py` | **Whitebox VAPT** — AWS audit (Prowler + PMapper + secrets), feeds blackbox |
+| `eol_check.py` | **Lifecycle / EOL lookup** — wraps endoflife.date, feeds intel.md and Phase-4 prioritisation |
 
 ## Advanced Usage (Direct Engine Access)
 
@@ -196,3 +197,37 @@ the allowlist before being treated as in-scope.
 **Real-account smoke test:** set `WHITEBOX_SMOKE=1` to run
 `tests/whitebox/smoke/test_real_aws.py` against `client-erp` and
 `example-example-data` profiles.
+
+## Lifecycle / EOL Checks (v9.17.0)
+
+`eol_check.py` queries the public **[endoflife.date](https://endoflife.date/)**
+metadata API and produces a per-engagement `recon/<target>/eol.md` plus an
+optional JSON artefact summarising whether the deployed software is still
+supported, near EOL, or already past it. The same module is auto-invoked
+from `intel.py` so every `intel.md` now leads with a "Lifecycle / EOL
+Status" table.
+
+```bash
+# Standalone — supply detected tech (versions optional, with =version)
+python3 eol_check.py --tech "asp.net,iis,dotnetfx=4.8,php=5.6" \
+                     --target client-portal.example.com \
+                     --json recon/<target>/eol.json
+
+# Show fingerprint→endoflife.date slug map
+python3 eol_check.py --list-products
+
+# Bust the 24h cache and re-fetch
+python3 eol_check.py --refresh --tech "ubuntu=20.04"
+```
+
+Cache lives at `~/.cache/vikramaditya/eol/<slug>.json` (TTL 24h).
+The module degrades gracefully on outage / unknown product (returns
+`status: no_data` rather than crashing).
+
+**Credits.** Lifecycle data is sourced from
+[endoflife.date](https://endoflife.date/) (MIT-licensed,
+[github.com/endoflife-date/endoflife.date](https://github.com/endoflife-date/endoflife.date)).
+The credit string is embedded automatically in every `eol.md` and in the
+"Lifecycle / EOL Status" block prepended to `intel.md`. Please retain
+this credit when redistributing client-facing reports that include
+lifecycle data.
