@@ -1,5 +1,49 @@
 # Changelog
 
+## v9.17.0 — Lifecycle / EOL checker (endoflife.date) (2026-05-09)
+
+New `eol_check.py` — wraps the public **[endoflife.date](https://endoflife.date/)** metadata API and produces `recon/<target>/eol.md` plus an optional JSON artefact summarising whether each detected tech is supported, near EOL, or already past it. Auto-invoked from `intel.py`, so every `intel.md` now leads with a "Lifecycle / End-of-Life Status" table.
+
+### Why this exists
+
+Engagement-driven gap. The 2026-05-08 eSSL VAPT flagged "trial-licence software" but had no programmatic answer for *"is the underlying ASP.NET / IIS / .NET Framework still in vendor support?"* — a hard-required data point for **PCI-DSS 6.2** and **ISO 27001 A.12.6.1** evidence and one of the first questions asked at every read-out.
+
+### What it does
+
+- Maps ~80 whatweb / httpx / wappalyzer-style fingerprint terms to endoflife.date product slugs (Microsoft stack, web servers, language runtimes, CMS, databases, Linux distros, cloud services).
+- Version-prefix matching picks the longest cycle prefix (`php=8.1.12` → cycle `8.1`).
+- Classifies each tech as **🔴 EOL**, **🟠 Ending soon** (within 90 days), **🟢 Supported**, or ⚪ unknown / not tracked.
+- Writes `recon/<target>/eol.md` (markdown table + per-product cycle expansion) and an optional slim `eol.json`.
+- Caches API responses at `~/.cache/vikramaditya/eol/<slug>.json` (24h TTL). Use `--refresh` to bust.
+- Degrades gracefully on outage (returns `status: no_data` rather than crashing).
+- Auto-invoked from `intel.py` — every `intel.md` now opens with the Lifecycle / EOL block.
+
+### Usage
+
+```bash
+# Standalone — supply detected tech (versions optional, with =version)
+python3 eol_check.py --tech "asp.net,iis,dotnetfx=4.8,php=5.6" \
+                     --target client-portal.example.com \
+                     --json recon/<target>/eol.json
+
+# Show fingerprint→endoflife.date slug map and exit
+python3 eol_check.py --list-products
+
+# Bust the 24h cache and re-fetch
+python3 eol_check.py --refresh --tech "ubuntu=20.04"
+```
+
+### Smoke-test (real run)
+
+- `asp.net, iis, dotnetfx=4.8, windows-server` (the 198.51.100.10:8443 eSSL target) → all 🟢 Supported (asp.net→`dotnetfx`, iis→`windows-server` via host OS).
+- `php=5.6, centos=7, wordpress=5.0, nodejs=12` → all 🔴 expired with negative `days_to_eol` populated correctly.
+
+### Credits
+
+Lifecycle data courtesy of **[endoflife.date](https://endoflife.date/)** ([github.com/endoflife-date/endoflife.date](https://github.com/endoflife-date/endoflife.date), MIT-licensed). The credit string is embedded automatically in every `eol.md` and in the "Lifecycle / EOL Status" block prepended to `intel.md`. Please retain this credit when redistributing client-facing reports that include lifecycle data.
+
+---
+
 ## v9.16.0 — Brain LLM bake-off harness (2026-05-06)
 
 New `brain_model_bench.py`. Replays `brain.py scan <findings>` against the **same** pre-computed findings + recon directory using each candidate Ollama model in turn. Replaces the swap-and-pray model-switch pattern with deterministic head-to-head benching grounded in scanner output, not vibes.

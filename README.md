@@ -9,6 +9,24 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.17.0 — Lifecycle / EOL checker (endoflife.date) (2026-05-09)**
+
+New `eol_check.py` — wraps the public **[endoflife.date](https://endoflife.date/)** metadata API and produces a per-engagement `recon/<target>/eol.md` flagging EOL'd / near-EOL / supported software for every detected tech (~80 fingerprint→slug mappings). Auto-invoked from `intel.py`, so every `intel.md` now leads with a "Lifecycle / End-of-Life Status" block — gives PCI-DSS 6.2 / ISO 27001 A.12.6.1 evidence on tap. Cached at `~/.cache/vikramaditya/eol/<slug>.json` (24h TTL); degrades to `status: no_data` on outage.
+```bash
+# Standalone — supply detected tech (versions optional, with =version)
+python3 eol_check.py --tech "asp.net,iis,dotnetfx=4.8,php=5.6" \
+                     --target client-portal.example.com \
+                     --json recon/<target>/eol.json
+# Show fingerprint→slug map / bust 24h cache
+python3 eol_check.py --list-products
+python3 eol_check.py --refresh --tech "ubuntu=20.04"
+```
+**Credits.** Lifecycle data courtesy of [endoflife.date](https://endoflife.date/) ([github.com/endoflife-date/endoflife.date](https://github.com/endoflife-date/endoflife.date), MIT-licensed). Credit string is embedded automatically in every `eol.md` and the lifecycle block of `intel.md` — please retain when redistributing client-facing reports.
+
+See [CHANGELOG.md](CHANGELOG.md#v9170).
+
+---
+
 **v9.16.0 — Brain LLM bake-off harness (2026-05-06)**
 
 New `brain_model_bench.py` — replays `brain.py scan` against the same findings dir using each candidate Ollama model and ranks by **hallucination rate** (SUBMIT verdicts that target sqlmap-flagged false-positive URLs). Replaces swap-and-pray with deterministic ground-truth benching.
