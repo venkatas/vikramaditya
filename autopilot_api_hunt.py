@@ -1867,11 +1867,36 @@ def _auto_detect_api_base(domain_url: str, rate_limit: float = 5.0) -> str:
     return domain_url.rstrip("/")
 
 
-def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/",
+def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-view/",
                   auth_creds_b: str = None, frontend_url: str = None,
                   output_dir: str = None, rate_limit: float = 5.0,
-                  with_brain: bool = False, har_file: str = None) -> dict:
-    """Run all 12 phases of the autonomous API VAPT."""
+                  with_brain: bool = False, har_file: str = None,
+                  auth_token: str = "", auth_token_b: str = "",
+                  totp_secret: str = "", totp_secret_b: str = "",
+                  totp_code: str = "", totp_code_b: str = "",
+                  login_surface: str = "workspace", admin_path: str = "") -> dict:
+    """Run all 12 phases of the autonomous API VAPT.
+
+    Authentication
+    --------------
+    Two authentication paths, in priority order:
+
+    1. **Token-first.** When ``auth_token`` (and optionally
+       ``auth_token_b``) is supplied, the password-login dance is
+       skipped entirely — useful when the operator already has a valid
+       bearer token from the application's normal MFA flow and does not
+       want Vikramaditya touching the password endpoint at all.
+    2. **Credential + TOTP.** When ``auth_creds`` is supplied, the
+       autopilot calls ``AuthSession.auto_login`` with the optional
+       ``totp_secret``/``totp_code`` so that MFA-protected logins
+       (e.g. EvidPrism workspace logins at ``/auth/login``) succeed
+       **without disabling** TOTP on the target.
+
+    ``login_surface`` and ``admin_path`` are passed through to the
+    EvidPrism-shaped JSON body and default to safe ``workspace`` values.
+    Superadmin testing requires the operator to set ``login_surface``
+    explicitly; the autopilot never assumes superadmin scope.
+    """
 
     O = "\033[38;5;208m"  # Orange/amber
     W = "\033[1;37m"     # White bold
@@ -1901,41 +1926,80 @@ def run_autopilot(base_url: str, auth_creds: str, login_url: str = "login-view/"
     limiter = RateLimiter(rate_limit)
     session = AuthSession(base_url, limiter)
 
-    # ── Fix #2: Auto-detect login URL ─────────────────────────────────────────
-    parts = auth_creds.split(":", 1)
-    if len(parts) != 2:
-        log("err", f"Invalid creds format (use user:pass)")
-        return {}
+    # ── Primary account authentication (token-first, then creds + TOTP) ───────
+    # Tokens / secrets are never echoed; only the email/principal is logged.
+    primary_principal = ""
+    if auth_token:
+        session.set_token(auth_token)
+        token = auth_token
+        primary_principal = "<token-supplied>"
+        log("ok", "Authenticated via supplied bearer token (skipping password login)")
+    else:
+        if not auth_creds:
+            log("err", "No --auth-token and no --auth-creds — cannot authenticate")
+            return {}
+        parts = auth_creds.split(":", 1)
+        if len(parts) != 2:
+            log("err", "Invalid creds format (use user:pass)")
+            return {}
+        primary_principal = parts[0]
 
-    # Try the specified login URL first
-    token = session.auto_login(login_url, parts[0], parts[1])
-    if not token:
-        # Auto-detect login URL by probing common patterns
-        log("info", "Specified login URL failed — auto-detecting...")
-        session._session.cookies.clear()
-        session.token = None
-        if "Authorization" in session._session.headers:
-            del session._session.headers["Authorization"]
-        token, login_url = _auto_detect_login_url(session, parts[0], parts[1])
-    if not token:
-        log("err", "Login failed (tried all common login URLs)")
-        return {}
-    log("ok", f"Authenticated as {parts[0]}")
+        try:
+            token = session.auto_login(
+                login_url, parts[0], parts[1],
+                totp_secret=totp_secret, totp_code_value=totp_code,
+                login_surface=login_surface, admin_path=admin_path,
+            )
+        except RuntimeError as exc:
+            # MFA enforcement: surface clearly, do not silently continue.
+            log("err", str(exc))
+            return {}
 
-    # Second account login (for IDOR/priv esc)
-    # Try org API first, then learner API (different user tables)
+        if not token:
+            log("info", "Specified login URL failed — auto-detecting...")
+            session._session.cookies.clear()
+            session.token = None
+            if "Authorization" in session._session.headers:
+                del session._session.headers["Authorization"]
+            token, login_url = _auto_detect_login_url(session, parts[0], parts[1])
+        if not token:
+            log("err", "Login failed (tried all common login URLs)")
+            return {}
+        log("ok", f"Authenticated as {parts[0]}")
+
+    # ── Second account (IDOR / priv-esc) — same priority order ────────────────
     token_b = None
-    if auth_creds_b:
+    if auth_token_b:
+        session_b = AuthSession(base_url, limiter)
+        session_b.set_token(auth_token_b)
+        token_b = auth_token_b
+        log("ok", "Second account authenticated via supplied bearer token")
+    elif auth_creds_b:
         parts_b = auth_creds_b.split(":", 1)
         if len(parts_b) == 2:
-            # Try 1: same API (org)
             session_b = AuthSession(base_url, limiter)
-            token_b = session_b.auto_login(login_url, parts_b[0], parts_b[1])
+            try:
+                token_b = session_b.auto_login(
+                    login_url, parts_b[0], parts_b[1],
+                    totp_secret=totp_secret_b, totp_code_value=totp_code_b,
+                    login_surface=login_surface, admin_path=admin_path,
+                )
+            except RuntimeError as exc:
+                log("warn", f"Second account: {exc}")
+                token_b = None
             if not token_b:
-                # Try 2: learner API (replace /organization/ with /learner/)
+                # Learner API fallback (different user table)
                 learner_base = base_url.replace("/organization", "/learner")
                 session_b = AuthSession(learner_base, limiter)
-                token_b = session_b.auto_login(login_url, parts_b[0], parts_b[1])
+                try:
+                    token_b = session_b.auto_login(
+                        login_url, parts_b[0], parts_b[1],
+                        totp_secret=totp_secret_b, totp_code_value=totp_code_b,
+                        login_surface=login_surface, admin_path=admin_path,
+                    )
+                except RuntimeError as exc:
+                    log("warn", f"Second account (learner API): {exc}")
+                    token_b = None
             if token_b:
                 log("ok", f"Second account: {parts_b[0]} (role: learner)")
             else:
@@ -2323,13 +2387,54 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Standard workspace login (no MFA)
   python3 autopilot_api_hunt.py --base-url https://api.example.com --auth-creds user:pass
+
+  # Two accounts for IDOR / priv-esc
   python3 autopilot_api_hunt.py --base-url URL --auth-creds admin:pass --auth-creds-b learner:pass
-  python3 autopilot_api_hunt.py --base-url URL --auth-creds user:pass --with-brain
+
+  # EvidPrism workspace login with TOTP — secret minted server-side from the test account
+  python3 autopilot_api_hunt.py \\
+      --base-url https://app.evidprism.com/api \\
+      --login-url auth/login \\
+      --auth-creds   "vapt-org-admin@example.com:PasswordHere" \\
+      --totp-secret  "$EVIDPRISM_VAPT_ADMIN_TOTP_SECRET" \\
+      --auth-creds-b "vapt-org-user@example.com:PasswordHere" \\
+      --totp-secret-b "$EVIDPRISM_VAPT_USER_TOTP_SECRET" \\
+      --frontend-url https://app.evidprism.com \\
+      --output findings/evidprism-vapt
+
+  # Token-only mode — operator already minted bearers via the normal MFA flow
+  python3 autopilot_api_hunt.py \\
+      --base-url https://app.evidprism.com/api \\
+      --auth-token   "$ORG_ADMIN_TOKEN" \\
+      --auth-token-b "$ORG_USER_TOKEN" \\
+      --frontend-url https://app.evidprism.com \\
+      --output findings/evidprism-vapt
         """)
     parser.add_argument("--base-url", required=True, help="API base URL")
-    parser.add_argument("--auth-creds", required=True, help="user:pass for primary account")
-    parser.add_argument("--auth-creds-b", help="user:pass for second account (IDOR/priv esc)")
+    parser.add_argument("--auth-creds", help="user:pass for primary account "
+                                             "(not required if --auth-token is supplied)")
+    parser.add_argument("--auth-creds-b", help="user:pass for second account (IDOR / priv esc)")
+    parser.add_argument("--auth-token", default="",
+                        help="Bearer token for primary account — bypasses password login")
+    parser.add_argument("--auth-token-b", default="",
+                        help="Bearer token for second account — bypasses password login")
+    parser.add_argument("--totp-secret", default="",
+                        help="Base32 TOTP secret for primary account (RFC 6238). "
+                             "Used to mint a code at login time without disabling MFA.")
+    parser.add_argument("--totp-secret-b", default="",
+                        help="Base32 TOTP secret for second account")
+    parser.add_argument("--totp-code", default="",
+                        help="Pre-minted TOTP code for primary account (overrides --totp-secret)")
+    parser.add_argument("--totp-code-b", default="",
+                        help="Pre-minted TOTP code for second account")
+    parser.add_argument("--login-surface", default="workspace",
+                        choices=["workspace", "superadmin"],
+                        help="EvidPrism login surface (default workspace). "
+                             "'superadmin' must be requested explicitly and paired with --admin-path.")
+    parser.add_argument("--admin-path", default="",
+                        help="EvidPrism adminPath, only sent when --login-surface=superadmin")
     parser.add_argument("--login-url", default="login-view/", help="Login endpoint path")
     parser.add_argument("--frontend-url", help="Frontend URL for JS bundle scraping")
     parser.add_argument("--output", help="Output directory for findings")
@@ -2340,9 +2445,17 @@ Examples:
                              "the 6-probe NoSQL/operator-injection differential")
     args = parser.parse_args()
 
+    # Token-or-creds: --auth-creds is no longer hard-required; one of the two must exist.
+    if not args.auth_creds and not args.auth_token:
+        parser.error("either --auth-creds or --auth-token must be provided for the primary account")
+
+    if args.login_surface == "superadmin" and not args.admin_path:
+        parser.error("--login-surface=superadmin requires --admin-path "
+                     "(superadmin testing must be requested explicitly)")
+
     run_autopilot(
         base_url=args.base_url,
-        auth_creds=args.auth_creds,
+        auth_creds=args.auth_creds or "",
         auth_creds_b=args.auth_creds_b,
         login_url=args.login_url,
         frontend_url=args.frontend_url,
@@ -2350,6 +2463,14 @@ Examples:
         rate_limit=args.rate_limit,
         with_brain=args.with_brain,
         har_file=args.har_file,
+        auth_token=args.auth_token,
+        auth_token_b=args.auth_token_b,
+        totp_secret=args.totp_secret,
+        totp_secret_b=args.totp_secret_b,
+        totp_code=args.totp_code,
+        totp_code_b=args.totp_code_b,
+        login_surface=args.login_surface,
+        admin_path=args.admin_path,
     )
 
 

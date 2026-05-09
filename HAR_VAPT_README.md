@@ -168,6 +168,47 @@ python3 demo_har_vapt.py
 # Results: 4 HAR files processed, 86+ vulnerabilities found
 ```
 
+### **Example 4: MFA-protected target via TOTP secret (v9.18.0)**
+
+When the customer hands you a HAR captured against an MFA-protected app, the
+HAR will only carry a session cookie that may already be expired. To re-auth
+without disabling MFA, hand Vikramaditya the test-account TOTP secret and let
+it mint a code at login time:
+
+```bash
+# EvidPrism workspace — TOTP minted from the test account's base32 secret
+python3 autopilot_api_hunt.py \
+  --base-url https://app.evidprism.com/api \
+  --login-url auth/login \
+  --auth-creds   "vapt-org-admin@example.com:PasswordHere" \
+  --totp-secret  "$EVIDPRISM_VAPT_ADMIN_TOTP_SECRET" \
+  --auth-creds-b "vapt-org-user@example.com:PasswordHere" \
+  --totp-secret-b "$EVIDPRISM_VAPT_USER_TOTP_SECRET" \
+  --har-file     admin_session.har \
+  --frontend-url https://app.evidprism.com \
+  --output       findings/evidprism-vapt
+```
+
+### **Example 5: Token-only mode for HAR replay (v9.18.0)**
+
+If the operator already minted bearer tokens via the application's normal
+MFA flow, skip Vikramaditya's password endpoint entirely:
+
+```bash
+python3 autopilot_api_hunt.py \
+  --base-url https://app.evidprism.com/api \
+  --auth-token   "$ORG_ADMIN_TOKEN" \
+  --auth-token-b "$ORG_USER_TOKEN" \
+  --har-file     admin_session.har \
+  --frontend-url https://app.evidprism.com \
+  --output       findings/evidprism-vapt
+```
+
+> **Superadmin testing.** The autopilot defaults to `--login-surface workspace`.
+> Superadmin testing is **opt-in** and must pass both `--login-surface superadmin`
+> *and* `--admin-path /your-private-superadmin-path`. The autopilot never
+> assumes superadmin scope on its own.
+
 ---
 
 ## 🔧 Integration with Existing Workflow
