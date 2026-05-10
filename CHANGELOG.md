@@ -1,5 +1,94 @@
 # Changelog
 
+## v9.18.2 — Scanner-quality fixes: endpoint inventory, false-positive rate-limit, NUL-safe upload, opaque tokens (2026-05-10)
+
+Five generic scanner defects surfaced during a real authenticated VAPT run
+where `Endpoints tested: 0` despite Phase-1 discovery succeeding, plus
+`missing_rate_limit` findings raised against URL paths that were 404-only.
+
+### What changed
+
+- **`autopilot_api_hunt.py` — `--endpoints-file` / `--endpoints` CLI flag.**
+  Operator can now hand the autopilot a JSON inventory of `{method, path}`
+  entries. Inventory is merged with whatever `EndpointDiscovery` (Phase 1)
+  found; inventory wins on metadata; the source of every endpoint is
+  recorded as `inventory` or `discovery` in the merged output. The
+  caller-supplied file is **never overwritten**, and an empty discovery
+  result is no longer allowed to clobber a non-empty inventory.
+- **`_normalize_endpoint_entry`** — paths in the inventory are normalised
+  against `--base-url`. `/api/auth/me` against `https://host/api`
+  collapses to `auth/me` (rather than the duplicated
+  `https://host/api/api/auth/me`). Absolute URLs on the same host are
+  collapsed too. External hosts pass through untouched.
+- **`RateLimitTester` (Phase 9)** — only emits `missing_rate_limit`
+  against endpoints that are actually live (HTTP 200/400/401/403/422/429
+  on the initial probe). Endpoints that respond with 404 are reported as
+  *skipped*, not vulnerable. The `SENSITIVE_PATHS` list was generalised
+  away from the legacy single-tenant naming; common auth surfaces now
+  include `auth/login`, `auth/password-reset/request`,
+  `auth/accept-invite`, `auth/forgot-password`, `contact`, and the
+  prior legacy paths. Findings now carry an `endpoint_live` flag. The
+  phase also accepts an `extra_paths=` argument so paths from the
+  endpoint inventory can be probed alongside the built-in list.
+- **Upload phase** — `tempfile.NamedTemporaryFile(suffix=…payload.filename…)`
+  no longer crashes when a payload filename contains a literal NUL byte
+  (used in the `shell.php\x00.jpg` evasion test). The local temp file
+  uses a sanitised name; the original NUL-bearing filename still travels
+  in the multipart `filename=` header so the server-side evasion test
+  is unaffected. If `tempfile` rejects for any other reason, the
+  payload is logged and skipped instead of crashing the run.
+- **`TokenSecurityTester` (Phase 10)** — the bearer is now classified
+  via the new `JWTHelper.is_jwt()` helper. Opaque bearers (random
+  strings, signed cookies, the `cookie-auth` sentinel, etc.) skip JWT
+  alg/exp inspection cleanly and the misleading `JWT alg: None,
+  exp: None` log line is gone — replaced with
+  *"Bearer token does not parse as a JWT — treating as opaque,
+  skipping JWT alg/exp checks"*.
+
+### Acceptance tests
+
+`tests/test_scanner_quality_fixes.py` (15 new tests, all passing):
+- `JWTHelper.is_jwt` correctly classifies opaque vs. JWT (5 tests).
+- `TokenSecurityTester` skips for opaque bearers; old log line gone (1).
+- 404-only paths in `RateLimitTester` are bursted exactly once (probe),
+  no `missing_rate_limit` finding, operator log surfaces the skip count;
+  live paths emit findings with `endpoint_live=True` (1).
+- `tempfile` natively rejects NUL filenames; sanitiser produces a usable
+  suffix (2).
+- `_normalize_endpoint_entry` strips a duplicate base prefix, leaves
+  no-prefix paths alone, handles a leading slash, collapses same-host
+  absolute URLs, leaves external hosts raw (5).
+- End-to-end `run_autopilot` smoke: a 3-entry inventory file is
+  honoured even when discovery returns nothing, source attribution
+  is preserved, and the input file is not modified (1).
+
+### Verification on the v9.18.1 baseline
+
+- `python3 -m pytest tests/test_totp_mfa_login.py tests/test_scanner_quality_fixes.py -q` → **35 passed**.
+- `python3 -m py_compile auth_utils.py autopilot_api_hunt.py api_idor_scanner.py vikramaditya.py` → clean.
+- ripgrep for any private target name across the repo returns zero hits.
+- `vikramaditya.__version__` returns `9.18.2`.
+
+### Operator-visible behaviour change
+
+```bash
+# Before (v9.18.1): autopilot ignored a provided inventory and could
+# emit missing_rate_limit on 404-only paths.
+
+# After (v9.18.2):
+python3 autopilot_api_hunt.py \
+    --base-url https://app.example.com/api \
+    --auth-token "$ADMIN_TOKEN" \
+    --auth-token-b "$USER_TOKEN" \
+    --endpoints-file path/to/endpoints.json
+# Logs:
+#   inventory loaded: N endpoints from path/to/endpoints.json
+#   endpoint inventory: total=M (discovery=X, inventory=Y)
+#   rate-limit candidates: K (tested=A, skipped 404-only=B)
+```
+
+---
+
 ## v9.18.1 — Generalised MFA login docs and tests (2026-05-09)
 
 Removed private target branding from the public MFA examples; generalised
