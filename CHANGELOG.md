@@ -1,5 +1,74 @@
 # Changelog
 
+## v9.18.4 — Phase 9 rate-limit probe must send JSON, not form-encoded (2026-05-10)
+
+A retest engagement surfaced a generic Vikramaditya bug: `RateLimitTester`
+(Phase 9) sent `application/x-www-form-urlencoded` bodies via
+`requests.post(..., data=...)`. Many modern auth / contact endpoints are
+JSON-only and have rate-limit middleware *after* content-type / schema
+validation, so form-encoded probes 400 at the parser before the RL
+bucket increments. The scanner saw `10 × 400` and falsely concluded
+"no rate limit" — when in fact the target's RL was working perfectly
+for JSON-bodied requests.
+
+### Bug
+
+```python
+# old (v9.18.3)
+probe = _req.post(url, data={"email":"...", "password":"wrong"}, ...)
+# 12/12 → HTTP 400; never observed 429 → false-positive missing_rate_limit
+```
+
+### Fix
+
+```python
+# new (v9.18.4)
+probe = _req.post(url, json=self._body_for(path), ...)
+# JSON content-type → request reaches the RL middleware → 429 surfaces
+```
+
+`_body_for(path)` returns an endpoint-aware minimal body so schema
+validation has the right field set (avoids spurious 400 from missing
+required fields):
+
+| Path family | Body |
+|---|---|
+| `auth/login` (or generic) | `{email, password}` |
+| `auth/password-reset/request`, `forgot-password` | `{email}` |
+| `auth/accept-invite` | `{token, password}` |
+| `contact` | `{name, email, subject, message}` |
+
+Findings now also carry `request_body_shape: "application/json"` so an
+operator reading the JSON evidence can reason about the wire shape used.
+
+### Side benefit — surfaces a real target-side defense-in-depth gap
+
+A target that *does* throttle JSON requests but *not* form-encoded ones
+has its rate-limit middleware ordered after body parsing — a real
+defense-in-depth bug that a careful operator can spot by running the
+v9.18.4 scanner alongside a manual `data=`-shaped probe. The scanner
+itself now uses JSON only, so its verdict reflects the route the
+target actually rate-limits.
+
+### Acceptance tests
+
+Two new tests in `tests/test_scanner_quality_fixes.py` (46 total,
+all passing):
+
+- `test_rate_limit_phase_uses_json_body` — every captured POST in
+  Phase 9 carries `json=`, never `data=`.
+- `test_rate_limit_body_shape_is_endpoint_aware` — `_body_for(path)`
+  returns the right field set for `/contact`, `/auth/accept-invite`,
+  `/auth/password-reset/request`, and `/auth/login`.
+
+### Operational impact
+
+A real retest of a target whose rate-limit fix was JSON-keyed went from
+4 false `missing_rate_limit` findings under v9.18.3 to **0** under
+v9.18.4 — matching the manual-curl-with-JSON ground truth.
+
+---
+
 ## v9.18.3 — Suppress two more scanner false-positives: NoSQL TYPE_CONFUSION and IDOR shape-only similarity (2026-05-10)
 
 Two false-positive classes surfaced during a real run on top of the

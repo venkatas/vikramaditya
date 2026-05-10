@@ -45,7 +45,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
 # See CHANGELOG.md for the version-by-version delta.
-__version__ = "9.18.3"
+__version__ = "9.18.4"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
