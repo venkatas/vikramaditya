@@ -1,5 +1,73 @@
 # Changelog
 
+## v9.18.3 — Suppress two more scanner false-positives: NoSQL TYPE_CONFUSION and IDOR shape-only similarity (2026-05-10)
+
+Two false-positive classes surfaced during a real run on top of the
+v9.18.2 fixes. Both are generic logic bugs in Vikramaditya, not target-
+specific patches.
+
+### Bug 6 — `NoSQL TYPE_CONFUSION` shouldn't be a security finding
+
+The 6-probe NoSQL differential's `TYPE_CONFUSION` verdict means *"both
+the object payload and the operator payload return 5xx — server can't
+handle non-string input, **not NoSQL**"*. The probe was already saying
+this in its `reason` field, but `to_finding()` still emitted a
+`nosql_type_confusion` finding at severity LOW, which operators read
+as "NoSQL injection found". `whitebox/nosql_probe.py:to_finding()`
+now returns `None` for `TYPE_CONFUSION` (alongside the existing
+`NOT_VULNERABLE`). `OPERATOR_INJECTION` (HIGH) and `AUTH_BYPASS`
+(CRITICAL) still emit. Server input-validation crashes belong in a
+different bucket; this function no longer pretends they are NoSQL bugs.
+
+### Bug 7 — IDOR shape-only similarity false-positives
+
+`api_idor_scanner.py` previously emitted `idor_probable` whenever
+token A's response and token B's response shared a similar key-shape
+(`jaccard_keys() > 0.5`) and both were 200. That fires for every
+endpoint that returns a per-user view of the same shape — `/auth/me`,
+`/dashboard`, `/audit-programs`, list endpoints with `{data: [...]}`,
+etc. — none of which are IDORs.
+
+Replaced the shape-only verdict with `shared_resource_signal()`,
+which returns "same resource" only when:
+
+1. The two normalised bodies are byte-equal, OR
+2. At least one ID-bearing field (`id`, `uuid`, `email`,
+   `project_id`, `tenant_id`, `slug`, …) carries the same value
+   across both tokens' responses.
+
+Same shape with different values = benign per-user endpoint, suppressed.
+This single change removed all 9 false `idor_probable` findings on
+the engagement that motivated the v9.18.x line.
+
+### Acceptance tests
+
+Added 9 new tests to `tests/test_scanner_quality_fixes.py` (44 tests
+total, all passing):
+
+- `to_finding(TYPE_CONFUSION, ...)` → `None`.
+- `to_finding(NOT_VULNERABLE, ...)` → `None`.
+- `to_finding(OPERATOR_INJECTION, ...)` still emits HIGH finding.
+- `to_finding(AUTH_BYPASS, ...)` still emits CRITICAL finding.
+- `shared_resource_signal` detects byte-equal bodies.
+- `shared_resource_signal` detects matched `project_id` across tokens.
+- `shared_resource_signal` returns `(False, ...)` for the `/auth/me`
+  pattern (same shape, different identity values per caller).
+- `shared_resource_signal` returns `(False, ...)` for list endpoints
+  with different per-row IDs.
+- `shared_resource_signal` returns `(True, ...)` when the first row
+  of a list response shares an `id` across both tokens.
+
+### Operational impact
+
+Re-running the same authenticated VAPT command on the same target
+that produced 7 NoSQL FPs across 4 autopilot runs and 9 IDOR FPs
+in `api_idor_scanner` now produces zero of either FP class. The 4
+genuine `missing_rate_limit` findings (auth/login, password-reset,
+accept-invite, contact) remain unchanged.
+
+---
+
 ## v9.18.2 — Scanner-quality fixes: endpoint inventory, false-positive rate-limit, NUL-safe upload, opaque tokens (2026-05-10)
 
 Five generic scanner defects surfaced during a real authenticated VAPT run
