@@ -105,6 +105,28 @@ class JWTHelper:
     """Manual JWT manipulation without PyJWT."""
 
     @staticmethod
+    def is_jwt(token: str) -> bool:
+        """
+        Return True if ``token`` looks like a JWT (three dot-separated
+        base64url segments where the header and payload decode to JSON
+        objects). Returns False for opaque bearers, empty strings, the
+        ``cookie-auth`` sentinel, etc. Used by scanners that want to
+        skip JWT-specific checks (alg/exp inspection, alg=none flips,
+        signature tampering) on non-JWT tokens.
+        """
+        if not isinstance(token, str) or token.count(".") != 2:
+            return False
+        head, payload, sig = token.split(".")
+        if not head or not payload or not sig:
+            return False
+        try:
+            header_obj = json.loads(JWTHelper._b64_decode(head))
+            payload_obj = json.loads(JWTHelper._b64_decode(payload))
+        except Exception:
+            return False
+        return isinstance(header_obj, dict) and isinstance(payload_obj, dict)
+
+    @staticmethod
     def _b64_decode(data: str) -> bytes:
         padding = 4 - len(data) % 4
         if padding != 4:

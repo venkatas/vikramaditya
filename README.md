@@ -9,6 +9,26 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.18.2 — Scanner-quality fixes (endpoint inventory, false-positive rate-limit, NUL-safe upload, opaque tokens) (2026-05-10)**
+
+Five engagement-driven defects fixed in `autopilot_api_hunt.py` + `auth_utils.py`. New `--endpoints-file` / `--endpoints` flag merges a caller-supplied JSON inventory with what `EndpointDiscovery` finds (inventory wins on metadata, source-attributed in the merged output, never clobbers the input file). Inventory paths are normalised against `--base-url` so `/api/auth/me` against `https://host/api` collapses to `auth/me` instead of the duplicated `…/api/api/auth/me`. Phase 9 only emits `missing_rate_limit` against live endpoints (HTTP 200/400/401/403/422/429); 404-only paths are reported as skipped rather than vulnerable, and the `SENSITIVE_PATHS` list was generalised. Phase 10 detects opaque bearers via the new `JWTHelper.is_jwt()` helper and skips JWT-only checks cleanly (no more misleading `JWT alg: None, exp: None`). Upload phase no longer crashes on NUL-byte filenames (`shell.php\x00.jpg` evasion) — local temp file uses a sanitised name; the wire payload is unchanged. 15 new acceptance tests (`tests/test_scanner_quality_fixes.py`).
+
+```bash
+python3 autopilot_api_hunt.py \
+    --base-url https://app.example.com/api \
+    --auth-token "$ADMIN_TOKEN" \
+    --auth-token-b "$USER_TOKEN" \
+    --endpoints-file path/to/endpoints.json
+# Logs surface:
+#   inventory loaded: N endpoints from path/to/endpoints.json
+#   endpoint inventory: total=M (discovery=X, inventory=Y)
+#   rate-limit candidates: K (tested=A, skipped 404-only=B)
+```
+
+See [CHANGELOG.md](CHANGELOG.md#v9182).
+
+---
+
 **v9.18.1 — Generalised MFA login docs and tests (2026-05-09)**
 
 Removed private-target branding from the public MFA examples and replaced the per-application `--login-surface` / `--admin-path` flags with a generic `--login-extra-json` (`-b`) escape hatch the operator drives. The TOTP / token-first plumbing is unchanged.
