@@ -9,6 +9,14 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.18.4 — Phase 9 rate-limit probe must send JSON, not form-encoded (2026-05-10)**
+
+A retest surfaced that `RateLimitTester` was sending `application/x-www-form-urlencoded` via `requests.post(..., data=...)`. Modern auth / contact endpoints are JSON-only and have rate-limit middleware after content-type / schema validation, so form-encoded probes 400 at the parser before the RL bucket increments — false-negative "10×400, never 429". v9.18.4 switches Phase 9 to `json=` with endpoint-aware body shapes (`/contact` → `{name,email,subject,message}`, `/auth/accept-invite` → `{token,password}`, `/auth/password-reset/request` → `{email}`, `/auth/login` → `{email,password}`). Findings now carry `request_body_shape: "application/json"`. 2 new tests; 46 total scanner-quality + TOTP, all passing.
+
+See [CHANGELOG.md](CHANGELOG.md#v9184).
+
+---
+
 **v9.18.3 — Suppress two more scanner FPs: NoSQL TYPE_CONFUSION and IDOR shape-only similarity (2026-05-10)**
 
 Two follow-on false-positive classes from the v9.18.2 baseline. (1) `whitebox/nosql_probe.py:to_finding()` now returns `None` for the `TYPE_CONFUSION` verdict — the probe's own `reason` string already says *"server can't handle non-string input, not NoSQL"*, so emitting a `nosql_type_confusion` finding for it was misleading. `OPERATOR_INJECTION` (HIGH) and `AUTH_BYPASS` (CRITICAL) still emit. (2) `api_idor_scanner.py` replaces the shape-only `jaccard_keys` verdict with `shared_resource_signal()` — token B is treated as having accessed token A's resource only when the two bodies are byte-equal OR an ID-bearing field (`id`, `uuid`, `email`, `project_id`, `tenant_id`, `slug`, …) has the same value across both responses. Same shape with different values = benign per-user endpoint (e.g. `GET /auth/me`), suppressed. 9 new acceptance tests; 44 total in the scanner-quality + TOTP suites, all passing.

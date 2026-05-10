@@ -99,6 +99,49 @@ class TestOpaqueBearerDetection:
 # ─── Bug 2: 404-only rate-limit endpoints suppressed ──────────────────────────
 class TestRateLimit404Skip:
 
+    def test_rate_limit_phase_uses_json_body(self, monkeypatch):
+        """v9.18.4 — Phase 9 must send `application/json` to the target's
+        auth / contact endpoints. Form-encoded probes were missed by RL
+        middleware that runs after content-type / schema validation,
+        producing false negatives ('10 × 400, never 429')."""
+        captured: list[dict] = []
+
+        def fake_post(url, *a, **kw):
+            captured.append(kw)
+            return _FakeResponse(status_code=200)
+
+        class _StubSess:
+            def __init__(self):
+                self.headers = {}
+                self.cookies = _FakeCookieJar()
+                self.verify = False
+
+        fake_requests = types.SimpleNamespace(Session=_StubSess, post=fake_post)
+        fake_urllib3 = types.SimpleNamespace(
+            disable_warnings=lambda *a, **k: None,
+            exceptions=types.SimpleNamespace(InsecureRequestWarning=Exception),
+        )
+        monkeypatch.setitem(sys.modules, "requests", fake_requests)
+        monkeypatch.setitem(sys.modules, "urllib3", fake_urllib3)
+
+        sess = AuthSession("https://app.example.com/api")
+        RateLimitTester().run(sess, saver=None)
+
+        # Every captured POST must have used `json=`, not `data=`.
+        for kw in captured:
+            assert "json" in kw, f"Phase 9 POST missing json=: {kw.keys()}"
+            assert "data" not in kw, f"Phase 9 POST should not use data=: {kw.keys()}"
+
+    def test_rate_limit_body_shape_is_endpoint_aware(self):
+        """The body for /contact must include name+subject+message;
+        for /auth/accept-invite must include token; for password-reset
+        must include email; for /auth/login must include password."""
+        body_for = RateLimitTester._body_for
+        assert set(body_for("/api/contact")) >= {"name", "email", "subject", "message"}
+        assert "token" in body_for("/api/auth/accept-invite")
+        assert "email" in body_for("/api/auth/password-reset/request")
+        assert {"email", "password"}.issubset(body_for("/auth/login"))
+
     def test_endpoint_returning_404_is_skipped(self, monkeypatch, capsys):
         # Pretend the target only has /api/auth/login (200), all other
         # SENSITIVE_PATHS return 404. AuthSession.base_url ends with /api
