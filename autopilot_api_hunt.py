@@ -955,10 +955,24 @@ class FileTypeEvasionTester:
                     if hasattr(session, '_session') and hasattr(session._session, 'cookies'):
                         cookies = dict(session._session.cookies)
 
-                    # Upload the payload
-                    tmp = tempfile.NamedTemporaryFile(
-                        suffix=f"_{payload.filename}", delete=False
-                    )
+                    # v9.18.2 — payload.filename intentionally contains
+                    # bypass tricks like a literal NUL byte ("shell.php\x00.jpg")
+                    # which POSIX rejects in real filenames. Use a sanitised
+                    # copy purely for the local temp file; the original
+                    # filename still travels in the multipart body so the
+                    # server-side evasion test is unaffected.
+                    safe_local = (payload.filename
+                                  .replace("\x00", "_NUL_")
+                                  .replace("/", "_")
+                                  .replace("\\", "_")) or "payload"
+                    try:
+                        tmp = tempfile.NamedTemporaryFile(
+                            suffix=f"_{safe_local}", delete=False
+                        )
+                    except (ValueError, OSError) as exc:
+                        log("warn", f"  Skipping upload payload "
+                                    f"{payload.filename!r}: tempfile error: {exc}")
+                        continue
                     tmp.write(payload.content)
                     tmp.close()
 
@@ -1443,43 +1457,93 @@ class InfoDisclosureScanner:
 class RateLimitTester:
     """Test rate limiting on authentication and sensitive endpoints."""
 
-    SENSITIVE_PATHS = ["login-view/", "change-learner-password/",
-                       "reset-password-request/"]
+    # v9.18.2 — auth/security-sensitive paths Vikramaditya should rate-test
+    # whenever they exist on the target. The list is intentionally
+    # framework-neutral; private-app naming has been removed.
+    SENSITIVE_PATHS = [
+        "auth/login",
+        "auth/password-reset/request",
+        "auth/accept-invite",
+        "auth/forgot-password",
+        "auth/login/",
+        "login-view/",
+        "login/",
+        "contact",
+        "contact/",
+        "reset-password-request/",
+        "change-learner-password/",
+    ]
 
-    def run(self, session: AuthSession, saver: FindingSaver = None) -> list[dict]:
+    # v9.18.2 — only treat these statuses as "endpoint is live and worth
+    # rate-testing". A 404-only endpoint is treated as not present and
+    # produces a *skipped* outcome, not a missing_rate_limit finding.
+    LIVE_STATUSES = {200, 400, 401, 403, 405, 422, 429}
+
+    def run(self, session: AuthSession, saver: FindingSaver = None,
+            extra_paths: list[str] | None = None) -> list[dict]:
         log("phase", "Phase 9: Rate Limiting Testing")
         findings = []
         import requests as _req
 
-        for path in self.SENSITIVE_PATHS:
-            statuses = []
-            for i in range(10):
+        # Merge declared paths with any caller-supplied extras (e.g. paths
+        # pulled from a provided endpoint inventory in run_autopilot).
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for p in list(self.SENSITIVE_PATHS) + list(extra_paths or []):
+            key = p.strip("/").lower()
+            if key and key not in seen:
+                seen.add(key)
+                candidates.append(p)
+
+        skipped_404 = 0
+        tested = 0
+        for path in candidates:
+            # 9a. Probe once to learn whether the endpoint exists.
+            try:
+                probe_url = f"{session.base_url.rstrip('/')}/{path.lstrip('/')}"
+                cookies = dict(session._session.cookies) if hasattr(session, "_session") else {}
+                probe = _req.post(probe_url,
+                                  data={"email": "vapt-probe@example.invalid",
+                                        "password": "wrong"},
+                                  cookies=cookies, verify=VERIFY_TLS, timeout=5)
+            except Exception:
+                continue
+
+            if probe.status_code == 404:
+                skipped_404 += 1
+                continue
+            if probe.status_code not in self.LIVE_STATUSES:
+                # Unknown shape (e.g. 5xx, 0) — don't claim missing rate-limit.
+                continue
+
+            # 9b. Endpoint is live. Burst it to look for absence of throttling.
+            statuses = [probe.status_code]
+            for _ in range(9):
                 try:
-                    if path == "login-view/":
-                        resp = _req.post(f"{session.base_url}/{path}",
-                                         data={"email": "test@test.com", "password": "wrong"},
-                                         verify=VERIFY_TLS, timeout=5)
-                    else:
-                        cookies = dict(session._session.cookies) if hasattr(session, '_session') else {}
-                        resp = _req.post(f"{session.base_url}/{path}",
-                                         data={"email": "test@test.com", "id": "1"},
-                                         cookies=cookies, verify=VERIFY_TLS, timeout=5)
+                    resp = _req.post(probe_url,
+                                     data={"email": "vapt-probe@example.invalid",
+                                           "password": "wrong"},
+                                     cookies=cookies, verify=VERIFY_TLS, timeout=5)
                     statuses.append(resp.status_code)
                     if resp.status_code == 429:
                         break
                 except Exception:
                     break
 
+            tested += 1
             if 429 not in statuses and len(statuses) >= 8:
                 f = {"type": "missing_rate_limit", "severity": MEDIUM,
                      "detail": f"No rate limiting on {path} after {len(statuses)} rapid requests",
-                     "url": f"{session.base_url}/{path}",
-                     "evidence": f"{len(statuses)} requests, statuses: {set(statuses)}"}
+                     "url": probe_url,
+                     "endpoint_live": True,
+                     "evidence": f"{len(statuses)} requests, statuses: {sorted(set(statuses))}"}
                 findings.append(f)
                 if saver:
                     saver.save(f)
                     saver.save_txt(f)
 
+        log("info", f"  rate-limit candidates: {len(candidates)} "
+                    f"(tested={tested}, skipped 404-only={skipped_404})")
         log("ok", f"  {len(findings)} rate limit findings")
         return findings
 
@@ -1495,6 +1559,18 @@ class TokenSecurityTester:
             saver: FindingSaver = None) -> list[dict]:
         log("phase", "Phase 10: Token Security Testing")
         findings = []
+
+        # v9.18.2 — distinguish JWT bearers from opaque bearers. Opaque
+        # tokens (e.g. random-string API keys, signed cookies, a sentinel
+        # like "cookie-auth") have no header/payload to inspect, so JWT
+        # alg/exp checks are inapplicable and "JWT alg: None, exp: None"
+        # would be a misleading log line.
+        is_jwt = JWTHelper.is_jwt(token)
+        if not is_jwt:
+            log("info", "  Bearer token does not parse as a JWT — "
+                        "treating as opaque, skipping JWT alg/exp checks")
+            log("ok", f"  {len(findings)} token security findings")
+            return findings
 
         payload = JWTHelper.decode_payload(token)
         header = JWTHelper.decode_header(token)
@@ -1801,6 +1877,56 @@ def _auto_detect_login_url(session: AuthSession, username: str, password: str) -
     return "", ""
 
 
+def _normalize_endpoint_entry(entry: dict, base_url: str) -> dict:
+    """
+    Normalise an inventory entry against the API base URL.
+
+    The endpoint inventory file may carry paths in any of these shapes::
+
+        {"method": "POST", "path": "auth/login"}
+        {"method": "POST", "path": "/auth/login"}
+        {"method": "POST", "path": "/api/auth/login"}
+        {"method": "POST", "path": "https://app.example.com/api/auth/login"}
+
+    All of these need to collapse to the relative path the
+    ``AuthSession.request`` joiner expects (``auth/login``) so that
+    ``base_url`` of ``https://app.example.com/api`` plus path
+    ``auth/login`` resolves to ``https://app.example.com/api/auth/login``
+    — never the duplicated ``…/api/api/auth/login``.
+    """
+    out = dict(entry)
+    method = (out.get("method") or "GET").upper()
+    out["method"] = method
+
+    path = out.get("path") or ""
+    if not isinstance(path, str):
+        out["path"] = ""
+        return out
+
+    base_parsed = urlparse(base_url)
+    base_path = base_parsed.path.rstrip("/")  # e.g. "/api" or ""
+    base_host_root = f"{base_parsed.scheme}://{base_parsed.netloc}".rstrip("/")
+
+    # Absolute URL on the same host: strip host + base path prefix.
+    if path.lower().startswith(("http://", "https://")):
+        ep_parsed = urlparse(path)
+        if ep_parsed.netloc == base_parsed.netloc:
+            path = ep_parsed.path
+        else:
+            # External host — keep raw, AuthSession.request will join naively.
+            out["path"] = path
+            return out
+
+    # Strip a leading base-path prefix so it isn't double-joined.
+    if base_path and path.startswith(base_path + "/"):
+        path = path[len(base_path):]
+    elif base_path and path == base_path:
+        path = ""
+
+    out["path"] = path.lstrip("/")
+    return out
+
+
 def _auto_detect_api_base(domain_url: str, rate_limit: float = 5.0) -> str:
     """Probe common API base paths and return the one that responds.
 
@@ -1875,7 +2001,8 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
                   totp_secret: str = "", totp_secret_b: str = "",
                   totp_code: str = "", totp_code_b: str = "",
                   extra_login_fields: dict | None = None,
-                  extra_login_fields_b: dict | None = None) -> dict:
+                  extra_login_fields_b: dict | None = None,
+                  endpoints_file: str = "") -> dict:
     """Run all 12 phases of the autonomous API VAPT.
 
     Authentication
@@ -2030,12 +2157,66 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
         log("info", f"Frontend URL inferred: {frontend_url}")
 
     discovery = EndpointDiscovery(session, frontend_url)
-    endpoints = discovery.run()
+    discovered = discovery.run()
 
-    # Save endpoints
+    # v9.18.2 — merge a caller-supplied endpoint inventory with whatever
+    # discovery turned up. Inventory paths are normalised against the API
+    # base so e.g. inventory `/api/auth/login` joined to base
+    # `https://host/api` collapses to `https://host/api/auth/login`
+    # rather than the duplicated `…/api/api/auth/login`.
+    inventory: list[dict] = []
+    if endpoints_file:
+        try:
+            with open(endpoints_file, "r") as fh:
+                raw = json.load(fh)
+            if not isinstance(raw, list):
+                raise ValueError("endpoints file must be a JSON array")
+            inventory = [_normalize_endpoint_entry(e, base_url) for e in raw if isinstance(e, dict)]
+            log("ok", f"  inventory loaded: {len(inventory)} endpoints from {endpoints_file}")
+        except Exception as exc:
+            log("warn", f"  failed to load --endpoints-file {endpoints_file}: {exc}")
+
+    # Merge by (method, path) so an inventory entry doesn't double-count
+    # something we already found via JS / OpenAPI / debug-page discovery.
+    by_key: dict[tuple[str, str], dict] = {}
+    inventory_paths: set[str] = set()
+    for e in inventory:
+        m = e.get("method", "GET").upper()
+        p = e.get("path", "")
+        if not p:
+            continue
+        e["source"] = "inventory"
+        by_key[(m, p)] = e
+        inventory_paths.add(p)
+    for e in discovered:
+        m = e.get("method", "GET").upper()
+        p = e.get("path", "")
+        key = (m, p)
+        if key in by_key:
+            # Inventory wins on metadata; keep its source label.
+            continue
+        e["source"] = e.get("source", "discovery")
+        by_key[key] = e
+    endpoints = list(by_key.values())
+
+    # Source-attribution counts (for the operator).
+    src_counts: dict[str, int] = {}
+    for e in endpoints:
+        src_counts[e.get("source", "unknown")] = src_counts.get(e.get("source", "unknown"), 0) + 1
+    log("info", f"  endpoint inventory: total={len(endpoints)} "
+                f"({', '.join(f'{k}={v}' for k, v in sorted(src_counts.items()))})")
+
+    # Save endpoints — but never clobber a non-empty inventory file with
+    # an empty discovery result. The merged list is always written to the
+    # output dir (different file path, never the input file).
     if output_dir:
-        with open(os.path.join(output_dir, "endpoints.json"), "w") as f:
-            json.dump(endpoints, f, indent=2)
+        out_path = os.path.join(output_dir, "endpoints.json")
+        if endpoints or not endpoints_file:
+            with open(out_path, "w") as f:
+                json.dump(endpoints, f, indent=2)
+        elif endpoints_file and not endpoints:
+            log("warn", f"  not writing {out_path} (would clobber non-empty "
+                        f"inventory with empty result)")
 
     # ── Brain-Supervised Dynamic Loop ──────────────────────────────────────────
     saver = FindingSaver(output_dir, "autopilot") if output_dir else None
@@ -2452,6 +2633,13 @@ Examples:
     parser.add_argument("--har-file", default=None,
                         help="HAR file: replay every in-scope JSON POST/PUT through "
                              "the 6-probe NoSQL/operator-injection differential")
+    parser.add_argument("--endpoints-file", "--endpoints", dest="endpoints_file",
+                        default="",
+                        help="Path to a JSON inventory of {method,path} entries. "
+                             "Merged with discovery; inventory wins on metadata. "
+                             "Paths are normalised against --base-url so a duplicated "
+                             "base prefix (e.g. '/api/auth/me' against '.../api') "
+                             "is collapsed to the correct join.")
     args = parser.parse_args()
 
     # Token-or-creds: --auth-creds is no longer hard-required; one of the two must exist.
@@ -2490,6 +2678,7 @@ Examples:
         totp_code_b=args.totp_code_b,
         extra_login_fields=extra_a,
         extra_login_fields_b=extra_b,
+        endpoints_file=args.endpoints_file,
     )
 
 
