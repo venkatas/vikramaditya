@@ -9,6 +9,14 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.18.3 — Suppress two more scanner FPs: NoSQL TYPE_CONFUSION and IDOR shape-only similarity (2026-05-10)**
+
+Two follow-on false-positive classes from the v9.18.2 baseline. (1) `whitebox/nosql_probe.py:to_finding()` now returns `None` for the `TYPE_CONFUSION` verdict — the probe's own `reason` string already says *"server can't handle non-string input, not NoSQL"*, so emitting a `nosql_type_confusion` finding for it was misleading. `OPERATOR_INJECTION` (HIGH) and `AUTH_BYPASS` (CRITICAL) still emit. (2) `api_idor_scanner.py` replaces the shape-only `jaccard_keys` verdict with `shared_resource_signal()` — token B is treated as having accessed token A's resource only when the two bodies are byte-equal OR an ID-bearing field (`id`, `uuid`, `email`, `project_id`, `tenant_id`, `slug`, …) has the same value across both responses. Same shape with different values = benign per-user endpoint (e.g. `GET /auth/me`), suppressed. 9 new acceptance tests; 44 total in the scanner-quality + TOTP suites, all passing.
+
+See [CHANGELOG.md](CHANGELOG.md#v9183).
+
+---
+
 **v9.18.2 — Scanner-quality fixes (endpoint inventory, false-positive rate-limit, NUL-safe upload, opaque tokens) (2026-05-10)**
 
 Five engagement-driven defects fixed in `autopilot_api_hunt.py` + `auth_utils.py`. New `--endpoints-file` / `--endpoints` flag merges a caller-supplied JSON inventory with what `EndpointDiscovery` finds (inventory wins on metadata, source-attributed in the merged output, never clobbers the input file). Inventory paths are normalised against `--base-url` so `/api/auth/me` against `https://host/api` collapses to `auth/me` instead of the duplicated `…/api/api/auth/me`. Phase 9 only emits `missing_rate_limit` against live endpoints (HTTP 200/400/401/403/422/429); 404-only paths are reported as skipped rather than vulnerable, and the `SENSITIVE_PATHS` list was generalised. Phase 10 detects opaque bearers via the new `JWTHelper.is_jwt()` helper and skips JWT-only checks cleanly (no more misleading `JWT alg: None, exp: None`). Upload phase no longer crashes on NUL-byte filenames (`shell.php\x00.jpg` evasion) — local temp file uses a sanitised name; the wire payload is unchanged. 15 new acceptance tests (`tests/test_scanner_quality_fixes.py`).
