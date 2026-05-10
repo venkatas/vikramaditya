@@ -45,6 +45,73 @@ def jaccard_keys(a: dict, b: dict) -> float:
     return len(intersection) / len(union) if union else 0.0
 
 
+# v9.18.3 — Identity-bearing fields the IDOR verdict logic compares
+# across the two tokens' responses. When *the same* identity value
+# appears in both responses, token B is genuinely seeing token A's
+# specific resource (real IDOR). When the keys match but the identity
+# values differ, both users are reading their own private copy of a
+# shared endpoint shape (e.g. ``GET /auth/me``) and that is benign.
+ID_FIELDS = (
+    "id", "uuid", "pk", "_id", "user_id", "userId", "owner_id", "ownerId",
+    "email", "username", "name", "slug", "tenant_id", "tenantId",
+    "company_id", "companyId", "project_id", "projectId",
+)
+
+
+def _flat_id_values(body: dict, depth: int = 0) -> dict:
+    """Walk a JSON body and collect every value attached to an ID-like
+    key. Used to decide whether two responses describe *the same*
+    underlying resource (real IDOR) or merely the *same shape* of a
+    per-user resource (benign).
+    """
+    out: dict = {}
+    if depth > 4 or not isinstance(body, dict):
+        return out
+    for k, v in body.items():
+        kl = k.lower()
+        if any(idf == kl for idf in ID_FIELDS):
+            if isinstance(v, (str, int, float)) and v not in ("", None):
+                out[kl] = v
+        if isinstance(v, dict):
+            for sub_k, sub_v in _flat_id_values(v, depth + 1).items():
+                out.setdefault(sub_k, sub_v)
+        elif isinstance(v, list) and v and isinstance(v[0], dict):
+            # Common case: {"data": [{...}, {...}]}.  Pull the first row's
+            # identifiers so two identical lists collapse to a hit.
+            for sub_k, sub_v in _flat_id_values(v[0], depth + 1).items():
+                out.setdefault(sub_k, sub_v)
+    return out
+
+
+def shared_resource_signal(body_a, body_b) -> tuple[bool, str]:
+    """
+    Returns ``(same_resource, reason)``.
+
+    ``same_resource`` is True when token B's response describes *the
+    same* resource as token A's — i.e. token B got token A's data.
+
+    Detection ladder (cheapest first):
+      1. Both bodies are byte-equal after normalisation.
+      2. They share at least one non-empty ID-bearing field whose value
+         is identical across A and B.
+      3. Otherwise: shape may match but contents differ → benign.
+    """
+    if not isinstance(body_a, dict) or not isinstance(body_b, dict):
+        return (False, "non-dict body")
+    if body_a == body_b:
+        return (True, "identical normalised body")
+    ids_a = _flat_id_values(body_a)
+    ids_b = _flat_id_values(body_b)
+    overlap: list[str] = []
+    for k, va in ids_a.items():
+        vb = ids_b.get(k)
+        if vb is not None and va == vb:
+            overlap.append(k)
+    if overlap:
+        return (True, f"shared id field(s): {','.join(sorted(overlap)[:4])}")
+    return (False, "same shape, different values per token (benign)")
+
+
 def has_pii(body: dict) -> bool:
     """Check if response contains PII-like fields."""
     if not isinstance(body, dict):
@@ -109,32 +176,47 @@ def test_idor(session: AuthSession, endpoint: dict, token_a: str, token_b: str,
     if resp_b["status"] in (200, 201):
         norm_a = normalize_response(resp_a["body"]) if isinstance(resp_a["body"], dict) else {}
         norm_b = normalize_response(resp_b["body"]) if isinstance(resp_b["body"], dict) else {}
+
+        # v9.18.3 — Don't fire on shape similarity alone. Many endpoints
+        # (`GET /auth/me`, `/dashboard`, `/audit-programs`, …) return the
+        # same response *shape* for every authenticated caller while
+        # serving each user's own data. Real IDOR requires that token B
+        # actually receive token A's resource. We confirm that by either
+        # byte-equality of normalised bodies, or by an ID-bearing field
+        # carrying the same value across A and B.
+        same_resource, reason = shared_resource_signal(norm_a, norm_b)
         similarity = jaccard_keys(norm_a, norm_b)
 
-        if similarity > 0.7 and has_pii(resp_b["body"] if isinstance(resp_b["body"], dict) else {}):
+        if same_resource and has_pii(resp_b["body"] if isinstance(resp_b["body"], dict) else {}):
             finding = {
                 "type": "idor_confirmed",
                 "severity": "high",
                 "detail": f"Cross-user IDOR: token_b accessed token_a's resource ({method} {path})",
                 "url": resp_b["url"],
-                "evidence": f"Similarity={similarity:.0%}, PII exposed, B got HTTP {resp_b['status']}",
+                "evidence": f"{reason}; PII exposed; similarity={similarity:.0%}; "
+                            f"B got HTTP {resp_b['status']}",
             }
             findings.append(finding)
             if saver:
                 saver.save(finding)
                 saver.save_txt(finding)
-        elif similarity > 0.5:
+        elif same_resource:
             finding = {
                 "type": "idor_probable",
                 "severity": "medium",
-                "detail": f"Probable IDOR: different user got similar response ({method} {path})",
+                "detail": f"Probable IDOR: token_b received token_a's identifying data "
+                          f"({method} {path})",
                 "url": resp_b["url"],
-                "evidence": f"Similarity={similarity:.0%}, B got HTTP {resp_b['status']}",
+                "evidence": f"{reason}; similarity={similarity:.0%}; "
+                            f"B got HTTP {resp_b['status']}",
             }
             findings.append(finding)
             if saver:
                 saver.save(finding)
                 saver.save_txt(finding)
+        # else: same shape, different values across the two tokens —
+        # benign per-user endpoint. Suppress to avoid the FP that
+        # plagued earlier runs on `/auth/me`, `/dashboard`, etc.
 
     # Phase 3: ID mutation (if id_field specified in body)
     if id_field and id_field in body:

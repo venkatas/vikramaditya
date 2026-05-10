@@ -332,3 +332,109 @@ class TestEndpointsFileInventory:
 
         # Input file is byte-for-byte identical.
         assert inv_path.read_text() == original
+
+
+# ─── Bug 6 (v9.18.3): NoSQL TYPE_CONFUSION verdict suppressed ─────────────────
+class TestNoSqlTypeConfusionSuppressed:
+    """The NoSQL probe's TYPE_CONFUSION verdict means *not a NoSQL bug*
+    (the probe's own reason text says so). It must not be turned into a
+    security finding."""
+
+    def test_type_confusion_returns_none(self):
+        from whitebox.nosql_probe import to_finding
+        result = {
+            "verdict": "TYPE_CONFUSION",
+            "reason": "object payload and operator payload both 5xx — "
+                      "server can't handle non-string input, not NoSQL",
+            "baseline": {"status": 500, "length": 46},
+            "probes": [],
+        }
+        assert to_finding(result, "https://app.example.com/api/x", "email") is None
+
+    def test_not_vulnerable_returns_none(self):
+        from whitebox.nosql_probe import to_finding
+        result = {"verdict": "NOT_VULNERABLE", "reason": "no signal", "probes": []}
+        assert to_finding(result, "https://app.example.com/api/x", "email") is None
+
+    def test_operator_injection_still_emits_finding(self):
+        from whitebox.nosql_probe import to_finding
+        result = {
+            "verdict": "OPERATOR_INJECTION",
+            "reason": "$ne accepted; object rejected with 400",
+            "baseline": {"status": 200, "length": 50},
+            "probes": [],
+        }
+        finding = to_finding(result, "https://app.example.com/api/x", "email")
+        assert finding is not None
+        assert finding["type"] == "nosql_operator_injection"
+        assert finding["severity"] == "high"
+
+    def test_auth_bypass_still_emits_finding(self):
+        from whitebox.nosql_probe import to_finding
+        result = {
+            "verdict": "AUTH_BYPASS",
+            "reason": "$gt flipped 401→200",
+            "baseline": {"status": 401, "length": 30},
+            "probes": [],
+        }
+        finding = to_finding(result, "https://app.example.com/api/x", "email")
+        assert finding is not None
+        assert finding["type"] == "nosql_auth_bypass"
+        assert finding["severity"] == "critical"
+
+
+# ─── Bug 7 (v9.18.3): IDOR shape-only similarity FP suppressed ────────────────
+class TestIdorRequiresValueEquality:
+    """``GET /auth/me``-style endpoints respond with the *same shape* but
+    different values per caller. shape-only IDOR detection used to fire
+    on every such endpoint. Now the verdict needs body-equality or a
+    matched ID-bearing field across the two tokens."""
+
+    def test_shared_resource_detects_byte_equal_bodies(self):
+        from api_idor_scanner import shared_resource_signal
+        a = {"id": "abc", "owner": "alice", "data": {"x": 1}}
+        b = {"id": "abc", "owner": "alice", "data": {"x": 1}}
+        same, reason = shared_resource_signal(a, b)
+        assert same is True
+        assert "identical" in reason
+
+    def test_shared_resource_detects_matched_id_field(self):
+        from api_idor_scanner import shared_resource_signal
+        # Token A and token B both received the same project_id,
+        # but the rest of the payload differs (timestamps, server-side
+        # enrichment) — still real IDOR.
+        a = {"project_id": "proj-1", "title": "x", "ts": 100}
+        b = {"project_id": "proj-1", "title": "x", "ts": 200}
+        same, reason = shared_resource_signal(a, b)
+        assert same is True
+        assert "project_id" in reason
+
+    def test_same_shape_different_values_is_benign(self):
+        # The exact pattern that produced 9 false IDOR findings on a
+        # real engagement: GET /auth/me — both tokens get a profile with
+        # the same shape but different identity values per caller.
+        from api_idor_scanner import shared_resource_signal
+        a = {"id": "user-a-id", "email": "alice@example.com", "name": "Alice"}
+        b = {"id": "user-b-id", "email": "bob@example.com",   "name": "Bob"}
+        same, reason = shared_resource_signal(a, b)
+        assert same is False
+        assert "different values" in reason
+
+    def test_dashboard_listing_differs_per_user(self):
+        # Same shape ({data: [...]}), different per-row identifiers.
+        from api_idor_scanner import shared_resource_signal
+        a = {"data": [{"id": "row-a", "name": "A"}], "count": 1}
+        b = {"data": [{"id": "row-b", "name": "B"}], "count": 1}
+        same, reason = shared_resource_signal(a, b)
+        assert same is False
+
+    def test_dashboard_listing_overlap_first_row_id(self):
+        # If the first row's id is identical across both tokens, that
+        # is real cross-user data exposure — flag as IDOR.
+        from api_idor_scanner import shared_resource_signal
+        a = {"data": [{"id": "shared-row", "name": "A"}], "count": 1}
+        b = {"data": [{"id": "shared-row", "name": "B"}], "count": 1}
+        same, reason = shared_resource_signal(a, b)
+        assert same is True
+        assert "id" in reason
+

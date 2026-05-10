@@ -207,19 +207,30 @@ class NoSQLProbe:
 def to_finding(probe_result: dict, url: str, param: str) -> dict | None:
     """Convert a probe result into the finding dict ``reporter.py`` expects.
 
-    Returns ``None`` for NOT_VULNERABLE so callers can ``filter(None, ...)``.
+    Returns ``None`` for verdicts that the probe itself classifies as
+    *not a NoSQL vulnerability*:
+
+    * ``NOT_VULNERABLE`` — no differential signal across the six probes.
+    * ``TYPE_CONFUSION`` — the probe's own reason text concludes
+      *"server can't handle non-string input, not NoSQL"*. Emitting a
+      ``nosql_type_confusion`` security finding for this verdict was
+      misleading (operators read it as a NoSQL vuln) and directly
+      contradicted by the evidence string. Server input-validation 5xx
+      crashes belong in a different bucket; this function suppresses
+      them so they do not appear as security findings.
+
+    OPERATOR_INJECTION and AUTH_BYPASS — real NoSQL vulns — still
+    produce findings.
     """
     verdict = probe_result.get("verdict")
-    if verdict == "NOT_VULNERABLE":
+    if verdict in ("NOT_VULNERABLE", "TYPE_CONFUSION"):
         return None
 
     severity_map = {
-        "TYPE_CONFUSION":     "low",
         "OPERATOR_INJECTION": "high",
         "AUTH_BYPASS":        "critical",
     }
     type_map = {
-        "TYPE_CONFUSION":     "nosql_type_confusion",
         "OPERATOR_INJECTION": "nosql_operator_injection",
         "AUTH_BYPASS":        "nosql_auth_bypass",
     }
