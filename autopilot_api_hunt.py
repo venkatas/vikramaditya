@@ -1479,6 +1479,28 @@ class RateLimitTester:
     # produces a *skipped* outcome, not a missing_rate_limit finding.
     LIVE_STATUSES = {200, 400, 401, 403, 405, 422, 429}
 
+    # v9.18.4 — best-effort minimal JSON bodies per path family. Modern
+    # auth/contact endpoints are JSON-only; sending form-encoded data
+    # frequently causes the request to fail content-type validation
+    # *before* any rate-limit middleware runs, which produces false
+    # negatives ("400 every time, never 429"). The scanner now uses
+    # JSON content type by default. The body deliberately includes only
+    # a few common fields so most servers parse it; missing required
+    # fields still 400 at schema validation, but JSON-routed 400s do
+    # increment a properly-installed rate-limit bucket.
+    @staticmethod
+    def _body_for(path: str) -> dict:
+        p = path.strip("/").lower()
+        if "contact" in p:
+            return {"name": "vapt-probe", "email": "vapt-probe@example.invalid",
+                    "subject": "rate-limit retest", "message": "rate-limit retest"}
+        if "accept-invite" in p:
+            return {"token": "vapt-probe-token", "password": "Vapt-Probe-Throwaway-1!"}
+        if "password-reset" in p or "forgot-password" in p:
+            return {"email": "vapt-probe@example.invalid"}
+        # login, change-password, generic auth surface
+        return {"email": "vapt-probe@example.invalid", "password": "wrong"}
+
     def run(self, session: AuthSession, saver: FindingSaver = None,
             extra_paths: list[str] | None = None) -> list[dict]:
         log("phase", "Phase 9: Rate Limiting Testing")
@@ -1498,13 +1520,14 @@ class RateLimitTester:
         skipped_404 = 0
         tested = 0
         for path in candidates:
-            # 9a. Probe once to learn whether the endpoint exists.
+            body = self._body_for(path)
+            # 9a. Probe once with JSON to learn whether the endpoint exists
+            # AND to ensure subsequent burst requests use the same body shape
+            # the target's rate-limit middleware actually counts.
             try:
                 probe_url = f"{session.base_url.rstrip('/')}/{path.lstrip('/')}"
                 cookies = dict(session._session.cookies) if hasattr(session, "_session") else {}
-                probe = _req.post(probe_url,
-                                  data={"email": "vapt-probe@example.invalid",
-                                        "password": "wrong"},
+                probe = _req.post(probe_url, json=body,
                                   cookies=cookies, verify=VERIFY_TLS, timeout=5)
             except Exception:
                 continue
@@ -1516,13 +1539,11 @@ class RateLimitTester:
                 # Unknown shape (e.g. 5xx, 0) — don't claim missing rate-limit.
                 continue
 
-            # 9b. Endpoint is live. Burst it to look for absence of throttling.
+            # 9b. Endpoint is live. Burst it (JSON) to look for absence of throttling.
             statuses = [probe.status_code]
             for _ in range(9):
                 try:
-                    resp = _req.post(probe_url,
-                                     data={"email": "vapt-probe@example.invalid",
-                                           "password": "wrong"},
+                    resp = _req.post(probe_url, json=body,
                                      cookies=cookies, verify=VERIFY_TLS, timeout=5)
                     statuses.append(resp.status_code)
                     if resp.status_code == 429:
@@ -1536,7 +1557,8 @@ class RateLimitTester:
                      "detail": f"No rate limiting on {path} after {len(statuses)} rapid requests",
                      "url": probe_url,
                      "endpoint_live": True,
-                     "evidence": f"{len(statuses)} requests, statuses: {sorted(set(statuses))}"}
+                     "evidence": f"{len(statuses)} requests, statuses: {sorted(set(statuses))}",
+                     "request_body_shape": "application/json"}
                 findings.append(f)
                 if saver:
                     saver.save(f)
