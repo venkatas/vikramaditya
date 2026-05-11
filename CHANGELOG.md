@@ -1,5 +1,79 @@
 # Changelog
 
+## v9.21.0 — Lock-safe size-based file-rotation primitive (2026-05-11)
+
+New `util_rotation.py` — pure-stdlib rotation helper for the
+append-only files Vikramaditya writes during long engagements
+(`logs/runner.log`, the per-engagement audit CSV, anything that
+grows unbounded across multiple `hunt.py --autonomous` calls).
+
+### Why this matters
+
+`logging.handlers.RotatingFileHandler` has known races under
+multi-process workloads — two `hunt.py` processes that happen to
+hit the size threshold at the same time will both try to rotate,
+both rename `path → path.1`, and one of them will lose its
+appended bytes. We see this pattern any time the operator runs
+two engagements in parallel from the same checkout. The new
+primitive uses an `fcntl.LOCK_EX` around the size-check + rename
+window so the rotation chain stays consistent under load.
+
+### Public API
+
+```python
+from util_rotation import rotate_if_needed, RotatingAppender
+
+# Plain functional API — call before each append.
+rotate_if_needed("logs/audit.csv", max_bytes=50_000_000, keep=3)
+
+# Context-manager wrapper — combines rotation + open in one call.
+with RotatingAppender("logs/audit.csv", max_bytes=50_000_000) as fh:
+    fh.write("…")
+```
+
+Rotation chain: `path → path.1 → path.2 → … → path.<keep>` (oldest
+dropped). Defaults: 10 MiB cap, 3 backups.
+
+### Design
+
+- **Stdlib only.** Same dependency posture as the rest of the
+  toolkit.
+- **`fcntl.LOCK_EX`** around the size-check + rename window;
+  re-checks the size under the lock so two writers can't both
+  rotate.
+- **Bytes-only.** Works on JSONL, CSV, plain logs — anything line-
+  oriented. No JSON parsing inside rotation.
+- **`OSError` propagated.** Disk-full (`ENOSPC`) or read-only
+  filesystem doesn't silently leave the rotation chain half-done.
+- **Lockfile is best-effort.** On platforms without `flock` (rare
+  in the Vikramaditya operator set — macOS / Linux) the rotation
+  still happens, just without cross-process serialisation.
+
+### Acceptance tests
+
+`tests/test_util_rotation.py` — 8 tests, all passing:
+
+- No-op when below threshold.
+- Rotation at threshold.
+- `keep=3` correctly drops the oldest backup.
+- Non-existent path is a no-op.
+- Invalid args (`max_bytes ≤ 0`, `keep < 1`) raise `ValueError`.
+- `RotatingAppender` creates parent dirs + writes appendably.
+- Threshold-crossing during an append sequence rotates correctly.
+- Multi-process concurrent writers under rotation produce zero
+  byte loss (`4 procs × 50 writes` end-to-end check).
+
+### Credit
+
+The size-bounded rotation pattern is inspired by
+[`memory/rotation.py`](https://github.com/shuvonsec/claude-bug-bounty)
+in `shuvonsec/claude-bug-bounty` (MIT). This is a generalised
+stdlib rewrite — none of their code is imported or copied — that
+works on any append-only file Vikramaditya owns rather than being
+tied to a specific JSONL schema.
+
+---
+
 ## v9.20.0 — CVSS 4.0 support (parse, severity, 3.1→4.0 migration) (2026-05-11)
 
 New `cvss40.py` module — pure-stdlib CVSS v4.0 vector parser /

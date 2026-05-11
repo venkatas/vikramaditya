@@ -9,6 +9,14 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.21.0 — Lock-safe size-based file-rotation primitive (2026-05-11)**
+
+New `util_rotation.py` — `fcntl.LOCK_EX`-protected size-based rotator for the append-only files Vikramaditya writes during long engagements (`logs/runner.log`, per-engagement audit CSV, JSONL state). `rotate_if_needed(path, max_bytes, keep=3)` for functional use; `RotatingAppender` context manager combines rotation + open in one call. Defaults: 10 MiB cap, 3 backups, chain `path → path.1 → … → path.<keep>`. Fixes the multi-process race in `logging.handlers.RotatingFileHandler` that two parallel `hunt.py --autonomous` runs were hitting. 8 acceptance tests including a 4-process concurrent-write byte-loss check. Stdlib only.
+
+See [CHANGELOG.md](CHANGELOG.md#v9210).
+
+---
+
 **v9.20.0 — CVSS 4.0 support (parse, severity, 3.1→4.0 migration) (2026-05-11)**
 
 New `cvss40.py` — pure-stdlib parser / validator / severity-bucket scorer for CVSS v4.0 vectors, plus a `from_3_1_hint()` helper that prefills the 8 shared axes from a 3.1 vector and leaves the 4.0-only metrics (`AT`, `SC`, `SI`, `SA`) for the operator to set. Numeric `score()` delegates to the maintained [PyPI `cvss`](https://pypi.org/project/cvss/) package when installed (exact FIRST value, `approximate=False`); otherwise returns a bucket-midpoint approximation flagged `approximate=True`. The severity bucket is always returned. 16 new acceptance tests; pure stdlib at runtime, optional PyPI accelerator.
