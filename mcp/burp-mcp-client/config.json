@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "burp": {
+      "command": "java",
+      "args": ["-jar", "${BURP_MCP_JAR:-/usr/local/lib/burp-mcp-server.jar}"],
+      "env": {
+        "BURP_API_URL": "${BURP_API_URL:-http://127.0.0.1:1337}",
+        "BURP_API_KEY": "${BURP_API_KEY}"
+      }
+    }
+  }
+}
