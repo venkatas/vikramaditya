@@ -1,5 +1,57 @@
 # Changelog
 
+## v9.22.0 — methodology + token-scanner wire-up (2026-05-11)
+
+Two skill modules and one CLI tool were imported earlier from the
+[shuvonsec/claude-bug-bounty](https://github.com/shuvonsec/claude-bug-bounty)
+ecosystem but were never properly wired into the documented
+workflow. This release fixes the path mismatches, references them
+in the README, and confirms the existing test suites cover both.
+
+### What was already present
+
+- **`skills/bb-methodology/SKILL.md`** (352 lines) — 5-phase
+  non-linear hunting workflow + 4 thinking domains + 20-min
+  rotation clock + "I'm stuck because…" decision tree. Drop-in
+  skill for any Claude Code session driving Vikramaditya at the
+  start of an engagement.
+- **`skills/meme-coin-audit/SKILL.md`** (294 lines) — rug-pull
+  detection knowledge layer covering 8 token bug classes:
+  honeypot, hidden mint, fee manipulation, LP lock bypass,
+  authority retention, fake renounce, Token-2022 transfer-hook
+  abuse, MEV sandwich amplification.
+- **`token_scanner.py`** (29 KB) — regex-based scanner for EVM
+  (Solidity) and Solana (Anchor / Rust) contracts. CLI:
+  `python3 token_scanner.py <path> [--chain solana] [--recursive]
+  [--json|--output report.md]`. Outputs terminal / JSON /
+  markdown. **39 acceptance tests** in
+  `tests/test_token_scanner.py`, all passing.
+
+### What this release fixes
+
+- **Path references in `skills/meme-coin-audit/SKILL.md`** and
+  inside `token_scanner.py`'s own usage docstring corrected from
+  `tools/token_scanner.py` → `token_scanner.py` (the file lives
+  at repo root, matching every other Vikramaditya CLI).
+- **README + CLAUDE.md** now list `token_scanner.py` alongside
+  the other engagement tools, and reference both skills under
+  the "Skills" section.
+- **Version bump** so the audit-CSV `__version__` column
+  attributes any token-scan output to v9.22.0+.
+
+### Credit
+
+The methodology skill and meme-coin audit content were derived
+from the `bb-methodology` and `meme-coin-audit` skills in
+[`shuvonsec/claude-bug-bounty`](https://github.com/shuvonsec/claude-bug-bounty)
+(MIT). The token-scanner regex catalogue and CLI follow the same
+project's `tools/token_scanner.py` design — we hand-imported the
+file rather than vendor-importing, kept the MIT licence intact,
+and rebadged in keeping with Vikramaditya's "repo-root CLI"
+convention.
+
+---
+
 ## v9.21.0 — Lock-safe size-based file-rotation primitive (2026-05-11)
 
 New `util_rotation.py` — pure-stdlib rotation helper for the
