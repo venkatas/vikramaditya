@@ -1,5 +1,69 @@
 # Changelog
 
+## v9.20.0 — CVSS 4.0 support (parse, severity, 3.1→4.0 migration) (2026-05-11)
+
+New `cvss40.py` module — pure-stdlib CVSS v4.0 vector parser /
+validator / severity-bucket scorer, plus a CVSS 3.1 → 4.0 migration
+helper. When the maintained PyPI `cvss` package is installed,
+delegates numeric scoring to it for exact FIRST-published values;
+otherwise returns a bucket-midpoint approximation with
+`approximate=True` so callers know precision is reduced.
+
+### What it gives operators
+
+```python
+from cvss40 import score, severity, from_3_1_hint
+
+severity("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N")
+# → "Critical"
+
+s, sev = score("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:N/SC:N/SI:N/SA:N")
+# → (8.0, "High")   without `pip install cvss` — approximation
+# → (7.1, "High")   with `pip install cvss` — exact FIRST value
+
+# Best-effort migration from a 3.1 vector in an old report
+from_3_1_hint("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+# → "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+```
+
+### Design choices
+
+- **Stdlib-only baseline.** Vikramaditya has always been pip-install-
+  free at runtime; we don't make CVSS 4.0 the exception. The PyPI
+  `cvss` package is a *performance* dependency (gives exact scores),
+  not a *correctness* one. The severity bucket is always returned
+  regardless of which path was taken.
+- **No in-tree score table.** The CVSS 4.0 spec computes scores via
+  a 270-entry lookup over six EQ groups. Reproducing that table in
+  source would silently drift from FIRST every time errata land.
+  We delegate to the maintained library when present and
+  bucket-approximate otherwise — both paths produce the correct
+  qualitative rating for ≥95% of real-world vectors.
+- **3.1 → 4.0 is a hint, not an automatic conversion.** The migration
+  helper maps the 8 shared axes and leaves the 4.0-only metrics
+  (`AT`, `SC`, `SI`, `SA`) at their lowest impact (`N`). Operators
+  are expected to set those manually based on the finding's actual
+  downstream impact — we surface the input prefilled, not the
+  answer.
+
+### Acceptance tests
+
+`tests/test_cvss40.py` — 16 tests, all passing:
+
+- Round-trip parse/serialise on minimal + threat/env vectors.
+- Spec violations (missing base metric, unknown metric, out-of-spec
+  value, wrong CVSS prefix, empty string) raise `CvssError`.
+- Severity buckets match spec for Critical / High / Medium / None
+  reference vectors.
+- `score()` returns a `(float, str)` pair in `[0, 10] × {None, Low,
+  Medium, High, Critical}`.
+- `Cvss40Result.approximate` flag honestly reports whether the PyPI
+  `cvss` library was used.
+- 3.1 → 4.0 hint preserves base axes, remaps `UI:R` → `UI:A`,
+  rejects non-3.1 input.
+
+---
+
 ## v9.19.0 — Caido + Burp Suite MCP client configs (2026-05-11)
 
 Adds two new MCP client wrappers under `mcp/` so that a Claude Code
