@@ -9,6 +9,16 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.22.0 — methodology skill + token-scanner wire-up (2026-05-11)**
+
+Two skill modules and one CLI tool that had been imported earlier from [shuvonsec/claude-bug-bounty][cbb] are now properly wired into the documented workflow: `skills/bb-methodology/SKILL.md` (5-phase non-linear hunting workflow + 4 thinking domains + 20-min rotation clock), `skills/meme-coin-audit/SKILL.md` (rug-pull detection across 8 token bug classes), and `token_scanner.py` (EVM + Solana regex scanner with 39 passing acceptance tests). Path references corrected from `tools/token_scanner.py` → `token_scanner.py` (repo-root CLI convention). MIT-licensed credit to claude-bug-bounty retained throughout. `python3 token_scanner.py contracts/Token.sol --output token-report.md`.
+
+[cbb]: https://github.com/shuvonsec/claude-bug-bounty
+
+See [CHANGELOG.md](CHANGELOG.md#v9220).
+
+---
+
 **v9.21.0 — Lock-safe size-based file-rotation primitive (2026-05-11)**
 
 New `util_rotation.py` — `fcntl.LOCK_EX`-protected size-based rotator for the append-only files Vikramaditya writes during long engagements (`logs/runner.log`, per-engagement audit CSV, JSONL state). `rotate_if_needed(path, max_bytes, keep=3)` for functional use; `RotatingAppender` context manager combines rotation + open in one call. Defaults: 10 MiB cap, 3 backups, chain `path → path.1 → … → path.<keep>`. Fixes the multi-process race in `logging.handlers.RotatingFileHandler` that two parallel `hunt.py --autonomous` runs were hitting. 8 acceptance tests including a 4-process concurrent-write byte-loss check. Stdlib only.
