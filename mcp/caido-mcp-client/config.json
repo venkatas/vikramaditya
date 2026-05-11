@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "caido": {
+      "command": "caido-mcp-server",
+      "args": ["--stdio"],
+      "env": {
+        "CAIDO_URL": "${CAIDO_URL:-http://127.0.0.1:8080}",
+        "CAIDO_PAT": "${CAIDO_PAT}"
+      }
+    }
+  }
+}

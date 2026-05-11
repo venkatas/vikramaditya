@@ -1,5 +1,59 @@
 # Changelog
 
+## v9.19.0 — Caido + Burp Suite MCP client configs (2026-05-11)
+
+Adds two new MCP client wrappers under `mcp/` so that a Claude Code
+session driving Vikramaditya can see the operator's proxy traffic
+without re-crawling the target. Both wrappers ship documentation
+plus a `config.json` fragment that the operator merges into
+`~/.claude/settings.json`; the actual MCP servers are upstream
+projects.
+
+### Why this exists
+
+Bug-bounty and VAPT operators drive Caido or Burp by hand for the
+auth / business-flow capture, then expect the autonomous scanner to
+pick up from there. Without an MCP bridge the scanner is blind to
+that traffic. With one of these wired in, the brain agent reads
+the operator's captured proxy history, can re-send via Replay /
+Repeater, and pulls Scanner findings as a second opinion alongside
+Vikramaditya's own 12-phase output.
+
+### What landed
+
+- **`mcp/caido-mcp-client/`** — README + `config.json` that points
+  Claude Code at the upstream community
+  [`c0tton-fluff/caido-mcp-server`](https://github.com/c0tton-fluff/caido-mcp-server)
+  (MIT). Exposes proxy history, Replay, parallel-send up to 50/batch,
+  fuzzing sessions, search/filter, project state. The upstream MCP
+  auto-redacts `Authorization`, `Cookie`, `Set-Cookie` and API-key
+  headers before returning data to the model.
+- **`mcp/burp-mcp-client/`** — README + `config.json` for
+  PortSwigger's official
+  [Burp Suite MCP server](https://portswigger.net/burp/documentation/desktop/automated-scanning/mcp-server).
+  Exposes proxy history, REST-API request send, Collaborator OOB
+  payload generation, Scanner findings, project read/write.
+
+### Coexistence
+
+Both servers can run side-by-side; the agent picks whichever has
+traffic for the current target. Most operators run one daily proxy —
+remove the other entry from `mcpServers` to keep the tool surface
+small.
+
+### Credit
+
+- [c0tton-fluff/caido-mcp-server](https://github.com/c0tton-fluff/caido-mcp-server)
+  (MIT) for the Caido MCP server.
+- PortSwigger for the Burp Suite MCP server (use under the Burp
+  Suite licence).
+- The two-folder config pattern and the upstream-wrapper style mirror
+  the same shape used by
+  [shuvonsec/claude-bug-bounty](https://github.com/shuvonsec/claude-bug-bounty);
+  we drew on their integration when designing ours.
+
+---
+
 ## v9.18.4 — Phase 9 rate-limit probe must send JSON, not form-encoded (2026-05-10)
 
 A retest engagement surfaced a generic Vikramaditya bug: `RateLimitTester`

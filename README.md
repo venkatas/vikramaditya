@@ -9,6 +9,17 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+**v9.19.0 — Caido + Burp Suite MCP client configs (2026-05-11)**
+
+New `mcp/caido-mcp-client/` and `mcp/burp-mcp-client/` directories ship documentation + a `config.json` fragment that a Claude Code session driving Vikramaditya merges into `~/.claude/settings.json`. The actual servers are upstream projects ([c0tton-fluff/caido-mcp-server][caido] for Caido — MIT; PortSwigger's official Burp Suite MCP server for Burp). With one of these wired in the brain agent sees the operator's proxy history, can re-send via Replay / Repeater, and pulls Scanner findings as a second opinion — no re-crawling. Both servers coexist; most operators wire one. Credit: [shuvonsec/claude-bug-bounty][cbb] for the wrapper pattern we mirrored.
+
+[caido]: https://github.com/c0tton-fluff/caido-mcp-server
+[cbb]: https://github.com/shuvonsec/claude-bug-bounty
+
+See [CHANGELOG.md](CHANGELOG.md#v9190).
+
+---
+
 **v9.18.4 — Phase 9 rate-limit probe must send JSON, not form-encoded (2026-05-10)**
 
 A retest surfaced that `RateLimitTester` was sending `application/x-www-form-urlencoded` via `requests.post(..., data=...)`. Modern auth / contact endpoints are JSON-only and have rate-limit middleware after content-type / schema validation, so form-encoded probes 400 at the parser before the RL bucket increments — false-negative "10×400, never 429". v9.18.4 switches Phase 9 to `json=` with endpoint-aware body shapes (`/contact` → `{name,email,subject,message}`, `/auth/accept-invite` → `{token,password}`, `/auth/password-reset/request` → `{email}`, `/auth/login` → `{email,password}`). Findings now carry `request_body_shape: "application/json"`. 2 new tests; 46 total scanner-quality + TOTP, all passing.
