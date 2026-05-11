@@ -9,11 +9,11 @@ LP lock bypasses, authority retention, fake renounce, and MEV amplification.
 Uses regex pattern matching (no LLM, no API calls) for fast, reproducible results.
 
 Usage:
-    python3 tools/token_scanner.py <contract_path>
-    python3 tools/token_scanner.py <contract_path> --chain solana
-    python3 tools/token_scanner.py <contract_path> --json
-    python3 tools/token_scanner.py src/ --recursive
-    python3 tools/token_scanner.py <contract_path> --output findings/token-report.md
+    python3 token_scanner.py <contract_path>
+    python3 token_scanner.py <contract_path> --chain solana
+    python3 token_scanner.py <contract_path> --json
+    python3 token_scanner.py src/ --recursive
+    python3 token_scanner.py <contract_path> --output findings/token-report.md
 
 Known limitations:
     - Regex-based: can miss obfuscated patterns or produce false positives
@@ -716,10 +716,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 tools/token_scanner.py contracts/Token.sol
-  python3 tools/token_scanner.py programs/token/ --chain solana --recursive
-  python3 tools/token_scanner.py src/ --recursive --json
-  python3 tools/token_scanner.py src/ --recursive --output report.md
+  python3 token_scanner.py contracts/Token.sol
+  python3 token_scanner.py programs/token/ --chain solana --recursive
+  python3 token_scanner.py src/ --recursive --json
+  python3 token_scanner.py src/ --recursive --output report.md
         """,
     )
     parser.add_argument(
