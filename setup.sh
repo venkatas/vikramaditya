@@ -18,6 +18,14 @@ log_ok()   { echo -e "${GREEN}[+]${NC} $1"; }
 log_err()  { echo -e "${RED}[-]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 
+# Check for Xcode Command Line Tools
+if ! xcode-select -p &>/dev/null; then
+    log_warn "Xcode Command Line Tools not found. Prompting installation..."
+    xcode-select --install
+    log_warn "Please complete the Xcode Command Line Tools installation and run this script again."
+    exit 1
+fi
+
 echo "============================================="
 echo "  Vikramaditya — Tool Installer"
 echo "============================================="
@@ -27,6 +35,38 @@ if ! command -v brew &>/dev/null; then
     log_warn "Homebrew not found. Installing..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
+
+# Ensure brew is available in the current execution context (especially on Apple Silicon)
+if [ -f "/opt/homebrew/bin/brew" ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -f "/usr/local/bin/brew" ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+fi
+
+# Set up a virtual environment to prevent PEP 668 managed environment conflicts on modern macOS
+VENV_DIR="$SCRIPT_DIR/.venv"
+if [ ! -d "$VENV_DIR" ]; then
+    log_warn "Creating Python virtual environment at $VENV_DIR to satisfy PEP 668..."
+    python3 -m venv "$VENV_DIR"
+fi
+set +u
+source "$VENV_DIR/bin/activate"
+set -u
+log_ok "Activated virtual environment: $VENV_DIR"
+
+# Install core dependencies from requirements.txt
+if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+    echo "[*] Installing core dependencies from requirements.txt..."
+    if pip3 install --quiet -r "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
+        log_ok "Core dependencies installed successfully"
+    else
+        log_err "Failed to install some dependencies from requirements.txt"
+    fi
+fi
+
+# Propagate Go Path to running session
+export GOPATH="${GOPATH:-$HOME/go}"
+export PATH="$PATH:$GOPATH/bin"
 
 # Check for Go (needed for some tools)
 if ! command -v go &>/dev/null; then
@@ -172,10 +212,10 @@ fi
 # Tools to install via pip
 echo ""
 echo "[*] Installing Python tools..."
-PIP_TOOLS=("arjun" "httpx[cli]" "waymore" "puredns")
+PIP_TOOLS=("arjun" "waymore")
 for pkg in "${PIP_TOOLS[@]}"; do
     name="${pkg%%[*}"   # strip extras like [cli]
-    if command -v "$name" &>/dev/null || python3 -c "import ${name//-/_}" &>/dev/null 2>&1; then
+    if pip3 show "$name" &>/dev/null; then
         log_ok "$name already installed"
     else
         echo "    Installing $pkg..."
@@ -268,10 +308,10 @@ else
     echo "    Installing gf patterns..."
     mkdir -p "$GF_PATTERNS_DIR"
     # 1ndianl33t community patterns — primary source (reliable, no GOPATH dependency)
-    rm -rf /tmp/gf-patterns
-    if git clone --quiet https://github.com/1ndianl33t/Gf-Patterns.git /tmp/gf-patterns 2>/dev/null; then
-        cp /tmp/gf-patterns/*.json "$GF_PATTERNS_DIR/" 2>/dev/null || true
-        rm -rf /tmp/gf-patterns
+    TMP_GF=$(mktemp -d 2>/dev/null || mktemp -d -t 'gf-patterns')
+    if git clone --quiet https://github.com/1ndianl33t/Gf-Patterns.git "$TMP_GF" 2>/dev/null; then
+        cp "$TMP_GF"/*.json "$GF_PATTERNS_DIR/" 2>/dev/null || true
+        rm -rf "$TMP_GF"
     else
         log_warn "1ndianl33t/Gf-Patterns clone failed — trying tomnomnom examples..."
     fi
@@ -387,6 +427,6 @@ done
 
 echo ""
 echo "============================================="
-echo "  Installed: $INSTALLED / $((${#ALL_TOOLS[@]} + 1)) tools"
+echo "  Installed: $INSTALLED / $((${#ALL_TOOLS[@]} + 4)) tools"
 [ "$MISSING" -gt 0 ] && echo "  Missing: $MISSING (check errors above)"
 echo "============================================="
