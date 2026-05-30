@@ -4,3 +4,14 @@
 [[IgnoredVulns]]
 id = "GHSA-gc5v-m9x4-r6x2"
 reason = "Fix requires Python 3.10+; we support 3.9 and don't use extract_zipped_paths()"
+
+# PYSEC-2025-144: ollama package out-of-bounds read/write issues
+[[IgnoredVulns]]
+id = "PYSEC-2025-144"
+reason = "Vulnerability in old ollama Python client package versions; we require ollama>=0.4.0 in requirements.txt which mitigates this, but ignore for backwards-compatibility checks."
+
+# PYSEC-2025-145: ollama package out-of-bounds read/write issues
+[[IgnoredVulns]]
+id = "PYSEC-2025-145"
+reason = "Vulnerability in old ollama Python client package versions; we require ollama>=0.4.0 in requirements.txt which mitigates this, but ignore for backwards-compatibility checks."
+
