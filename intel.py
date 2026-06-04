@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import ssl
 import sys
 import urllib.request
@@ -85,7 +86,24 @@ NON_PRODUCT_TECHS = {
 AMBIGUOUS_BARE_TECHS = {
     "bootstrap", "jquery", "parsley.js", "parsley", "modernizr",
     "underscore", "moment", "select2",
+    # v9.23 — JS frameworks whose bare NVD keyword collides with unrelated products:
+    # "vue" matched HP-UX VUE 3.0 (1994), Pearson VUE, Carestream Vue RIS.
+    "vue", "vuejs", "vue.js", "react", "angular", "ember",
 }
+
+# v9.23 — drop ancient version-less keyword matches. A bare "wordpress"/"php"
+# search returns WordPress 1.2 (2004) / php.cgi (1999) CVEs on a stack actually
+# running WordPress 6.8 / PHP 7.4. CVEs published before this year are treated as
+# keyword noise unless a version correlation is present.
+NVD_MIN_YEAR = 2012
+
+
+def _split_tech(token: str) -> tuple[str, str]:
+    """'php=7.4.33' / 'php:7.4.33' -> ('php', '7.4.33'); bare 'php' -> ('php', '')."""
+    m = re.match(r"^\s*(.+?)\s*[=:]\s*([0-9][\w.\-]*)\s*$", token or "")
+    if m:
+        return m.group(1).strip().lower(), m.group(2).strip()
+    return (token or "").strip().lower(), ""
 
 
 def _nvd_searchable(tech: str) -> bool:
@@ -224,6 +242,13 @@ def fetch_nvd_cves(tech: str) -> list[dict]:
                 severity = m.get("cvssData", {}).get("baseSeverity", "UNKNOWN")
                 break
         published = cve.get("published", "")[:10]
+        # v9.23 — drop ancient version-less keyword noise (WordPress 1.2 / php.cgi
+        # 1999) that a bare-name search returns for a modern stack.
+        try:
+            if published and int(published[:4]) < NVD_MIN_YEAR:
+                continue
+        except ValueError:
+            pass
         results.append({
             "id":        cve_id,
             "source":    "NVD",
@@ -346,7 +371,10 @@ def fetch_cvemap(tech: str, limit: int = 20) -> list[dict]:
 def fetch_intel(techs: list[str]) -> list[dict]:
     """Collect intel from all sources for all techs."""
     all_results = []
-    for tech in techs:
+    for raw in techs:
+        # v9.23 — CVE/advisory searches use the bare product NAME; any attached
+        # version (e.g. "php=7.4.33") is consumed by the EOL block instead.
+        tech, _ver = _split_tech(raw)
         # v9.5.0 — cvemap first (local PD cache, fast); fall back to GHSA + NVD
         cvm = fetch_cvemap(tech)
         if cvm:
@@ -388,7 +416,12 @@ def build_markdown(techs: list[str], results: list[dict]) -> str:
     # v9.17.0 — Lifecycle / EOL block (data: endoflife.date, MIT licensed)
     if _EOL_AVAILABLE:
         try:
-            eol_results = eol_check.lookup_many([(t, None) for t in techs])
+            # v9.23 — pass the DETECTED VERSION so the EOL check matches the right
+            # lifecycle cycle. Previously this hardcoded None, so e.g. "php=7.4.33"
+            # was looked up as bare "php" and reported the generic latest cycle as
+            # "Supported" — false-negativing that PHP 7.4 is end-of-life.
+            eol_results = eol_check.lookup_many(
+                [(name, ver or None) for name, ver in (_split_tech(t) for t in techs)])
             mapped = [r for r in eol_results if r.get("slug")]
             if mapped:
                 lines += [

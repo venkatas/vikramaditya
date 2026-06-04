@@ -367,6 +367,27 @@ def fingerprint_webapp(url: str) -> dict:
     elif "apache" in server:
         result["tech"].append(f"Apache ({result['server']})")
 
+    # v9.23 — capture VERSIONS so the lifecycle/EOL check (intel.py -> eol_check)
+    # can match the right cycle. Without this the EOL check saw bare "php" and
+    # reported the generic latest cycle as Supported, false-negativing that the
+    # deployed PHP/7.4.33 is end-of-life. Tag as "Name=version".
+    def _tag_version(name: str, version: str):
+        if not version:
+            return
+        tagged = f"{name}={version}"
+        for i, t in enumerate(result["tech"]):
+            if t == name or t.split("=")[0] == name:
+                result["tech"][i] = tagged
+                return
+        result["tech"].append(tagged)
+
+    m_php = re.search(r"PHP/([0-9][0-9.]*)", resp.headers.get("X-Powered-By", ""), re.IGNORECASE)
+    if m_php:
+        _tag_version("PHP", m_php.group(1))
+    m_wp = re.search(r'generator["\'][^>]*content=["\']WordPress\s+([0-9][0-9.]*)', html, re.IGNORECASE)
+    if m_wp:
+        _tag_version("WordPress", m_wp.group(1))
+
     # ── JS chunk counting ─────────────────────────────────────────────────
     js_patterns = [
         r'src="(/static/js/[^"]+\.js)"',
