@@ -532,23 +532,46 @@ if ! skip_has ssti; then
     if [ -s "$PARAMS_FILE" ]; then
         # Removed associative array for Bash 3.2 compatibility
         # engines: jinja2, freemarker, thymeleaf, erb
+        # v9.23 — robust SSTI confirmation. The old check grepped the injected
+        # response for "\b49\b" (7*7), which matched coincidental "49" in minified
+        # CSS/JS and any HTML — producing fake "SSTI CONFIRMED jinja2" on WordPress
+        # STATIC assets (e.g. elementor-icons.min.css?ver={{7*7}}). Now we:
+        #   (1) skip static-asset URLs (.css/.js/...) and pure cache-bust ?ver= params,
+        #   (2) use a DISTINCTIVE canary (887*913=809831) unlikely to appear by chance,
+        #   (3) confirm only when the RESULT appears in the injected response AND is
+        #       ABSENT from a clean baseline fetch AND the literal expression is NOT
+        #       reflected (reflected != evaluated).
         SSTI_ENGINES=("jinja2" "freemarker" "thymeleaf" "erb")
-        SSTI_PAYLOADS=("{{7*7}}" "\${7*7}" "*{7*7}" "<%= 7*7 %>")
-        
+        SSTI_PAYLOADS=("{{887*913}}" "\${887*913}" "*{887*913}" "<%= 887*913 %>")
+        SSTI_EXPR="887*913"        # literal expression — if reflected verbatim, NOT evaluated
+        SSTI_RESULT="809831"       # 887*913 — distinctive evaluated result
+
         SSTI_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 20 || echo 50)
         log_step "Testing SSTI payloads on up to $SSTI_LIMIT URLs..."
         hit=0
         while IFS= read -r url; do
             [ -z "$url" ] && continue
+            # Skip static assets — a ?ver= cache-buster on a .css/.js file is not a
+            # template sink; injecting there and matching content is a false positive.
+            base_path="${url%%\?*}"
+            case "$base_path" in
+                *.css|*.js|*.mjs|*.map|*.png|*.jpg|*.jpeg|*.gif|*.svg|*.ico|*.webp|*.woff|*.woff2|*.ttf|*.eot|*.pdf) continue ;;
+            esac
+            # Baseline (clean) response — if it already contains the canary result,
+            # the match would be coincidental, so skip this URL.
+            baseline=$(curl -sk --max-time 10 "$url" 2>/dev/null || true)
+            echo "$baseline" | grep -qF "$SSTI_RESULT" && continue
             for idx in "${!SSTI_ENGINES[@]}"; do
                 engine="${SSTI_ENGINES[$idx]}"
                 payload="${SSTI_PAYLOADS[$idx]}"
                 enc_payload=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$payload'''))" 2>/dev/null || echo "$payload")
                 injected=$(echo "$url" | sed "s/=\([^&]*\)/=${enc_payload}/g")
                 body=$(curl -sk --max-time 10 "$injected" 2>/dev/null || true)
-                if echo "$body" | grep -qE '(\b49\b|7777777)'; then
+                # CONFIRM only if the engine EVALUATED the canary: result present, and
+                # the literal expression NOT reflected verbatim (reflection != execution).
+                if echo "$body" | grep -qF "$SSTI_RESULT" && ! echo "$body" | grep -qF "$SSTI_EXPR"; then
                     log_crit "SSTI confirmed [$engine]: $injected"
-                    echo "[SSTI-CONFIRMED] engine=$engine url=$injected" >> "$SSTI_OUT"
+                    echo "[SSTI-CONFIRMED] engine=$engine url=$injected result=$SSTI_RESULT" >> "$SSTI_OUT"
                     hit=$(( hit + 1 ))
                     break
                 fi
