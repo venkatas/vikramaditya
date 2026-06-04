@@ -1,5 +1,65 @@
 # Changelog
 
+## v9.23.0 — detector / report / brain false-positive purge (2026-06-04)
+
+A full-pipeline audit (triggered by a clean-target run against
+`clientc.com`) found that several detectors were reporting fabricated
+signal and the report was simultaneously full of junk and missing real
+findings. All fixes were validated end-to-end on a fresh autonomous run
+(exit 0): the report went from **25 bogus findings** (two fake CVSS-10) to
+**8 real ones**.
+
+### Detectors (`hunt.py`)
+
+- **jsluice** — the installed BishopFox jsluice has no `--input-format`
+  flag (raw stdin is `-j`). The old call printed `unknown flag` to stdout,
+  which `tee` captured and the counter reported as secrets ("5 secrets
+  found" = 5 error lines). Now uses `-j` and counts only valid JSON.
+- **SecretFinder** — `-o cli` prints a `[ + ] URL:` banner per URL even
+  with zero matches; the counter counted banners as hits. Now counts only
+  real `\t->\t` match lines (labelled unverified).
+- **whatweb** — produced a silent 0-byte file because whatweb 0.6.3
+  **crashes on HTTPS under Ruby 3.4+/4.x** ("can't modify frozen Hash")
+  and all stderr was discarded. Now runs per-URL, logs stderr to
+  `whatweb_errors.log`, and falls back to the httpx tech tags.
+- **Drupal detection** — accepted a `301/302/403` on `/user/login` etc. as
+  proof of Drupal; an nginx http→https redirect fires on every path and
+  misclassified plain PHP/nginx hosts. Now requires an HTTP 200 whose body
+  contains `drupal`.
+- **cvemap** — skips cleanly when `PDCP_API_KEY` is unset (was a confusing
+  `rc=1`).
+
+### CVE / intel (`cve.py`, `intel.py`)
+
+- Dropped non-product tokens (`hsts`) and ambiguous bare framework names
+  (`bootstrap`, `jquery`, `parsley`) from keyword CVE search; mapped
+  `vite → npm/vite`. (`hsts` was being matched as if it were a product.)
+
+### Fingerprint (`vikramaditya.py`)
+
+- Tightened the Vite signature — it matched any `/assets/*.js` (e.g.
+  `jquery.min.js`), false-flagging Bootstrap/jQuery/PHP sites as Vite and
+  pulling ViteMoneyCoin / VITEC / Vitess junk into intel. Now requires a
+  real Vite marker. The report prompt is auto-skipped under `--autonomous`.
+
+### Reporting (`reporter.py`)
+
+- Version-less keyword CVEs are no longer emitted as findings (collapsed
+  into one clearly-labelled INFO context line); `email_auth/findings.json`
+  (No-DMARC etc.) is now loaded instead of silently ignored; HTML uses the
+  per-finding title.
+
+### Brain (`brain.py`, `brain_scanner.py`)
+
+- Added `NARRATION_SYSTEM` + grounding clauses so per-phase narration can no
+  longer fabricate findings ("permissive CORS" on a 0-finding scan, "a real
+  estate company in San Francisco").
+- The active scanner now validates generated scripts (`bash -n` / `compile`)
+  and refuses a verdict with zero successful runs — it was declaring "NOT
+  VULNERABLE" from a script that died on a syntax error and bailed at
+  iteration 2/15. Scan-plan placeholders are stripped and `bash -n`
+  validated before the file is marked executable.
+
 ## v9.22.0 — methodology + token-scanner wire-up (2026-05-11)
 
 Two skill modules and one CLI tool were imported earlier from the
