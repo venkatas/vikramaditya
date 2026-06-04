@@ -689,7 +689,7 @@ class ProcessWatchdog:
                         f"EARLY WARNING — {diag_secs}s no output. Asking brain to diagnose...\033[0m",
                         flush=True,
                     )
-                    _brain.watchdog_diagnose(
+                    diag_result = _brain.watchdog_diagnose(
                         self.phase, self.proc.pid, diag_secs,
                         self.watch_file, current_size,
                         meta={
@@ -705,6 +705,37 @@ class ProcessWatchdog:
                             "recent_files": changed_files,
                         }
                     )
+                    # v9.22.1 — Active Brain Supervisor Integration
+                    # Parse brain assessment and adapt timeouts dynamically
+                    if diag_result:
+                        assessment = "uncertain"
+                        for diag_line in diag_result.splitlines():
+                            if diag_line.startswith("ASSESSMENT:"):
+                                val = diag_line.split(":", 1)[1].strip().lower()
+                                if any(x in val for x in ("likely-stuck", "misconfigured")):
+                                    assessment = "stuck"
+                                elif any(x in val for x in ("likely-slow", "healthy-but-quiet")):
+                                    assessment = "slow"
+                                break
+                        
+                        if assessment == "stuck":
+                            print(
+                                f"\033[0;31m\033[1m[Watchdog/{self.phase}] Brain assessment: STUCK or MISCONFIGURED. "
+                                f"Triggering early SIGKILL to prevent resource exhaustion...\033[0m",
+                                flush=True,
+                            )
+                            _brain.watchdog_kill(self.phase, self.proc.pid, diag_secs)
+                            self._kill_proc()
+                            self.killed = True
+                            break
+                        elif assessment == "slow":
+                            extended_stale = self.max_stale * 2
+                            print(
+                                f"\033[0;32m\033[1m[Watchdog/{self.phase}] Brain assessment: HEALTHY-BUT-SLOW. "
+                                f"Dynamically extending max_stale from {self.max_stale} to {extended_stale} checks...\033[0m",
+                                flush=True,
+                            )
+                            self.max_stale = extended_stale
                 else:
                     print(
                         f"\033[0;36m[Watchdog/{self.phase}] {diag_secs}s without new bytes, "
@@ -3419,29 +3450,60 @@ def run_js_analysis(domain: str) -> bool:
     secretfinder = _tool_bin("secretfinder")
     trufflehog   = _tool_bin("trufflehog")
 
+    def _count_json_findings(path):
+        """Count only valid JSON-object lines. jsluice/trufflehog emit one JSON
+        object per finding; tool error lines (e.g. 'unknown flag') and blanks are
+        skipped instead of being miscounted as findings."""
+        n = 0
+        try:
+            with open(path, errors="ignore") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln.startswith("{"):
+                        continue
+                    try:
+                        json.loads(ln)
+                        n += 1
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+        return n
+
     # ── jsluice: endpoints + secrets ──
+    # v9.23 — the installed BishopFox jsluice has NO --input-format flag; raw stdin
+    # is -j/--raw-input. The old `secrets --input-format=js` made jsluice print
+    # "unknown flag: --input-format" to STDOUT (not stderr, so 2>/dev/null did not
+    # hide it); tee captured those error lines and the counter reported them as
+    # "secrets" (e.g. "5 secrets found" = 5 error lines). Use -j, dedup, and count
+    # only valid JSON objects.
     if _which(jsluice_bin):
         jsluice_out = os.path.join(js_dir, "jsluice_secrets.txt")
         endpoints_out = os.path.join(js_dir, "jsluice_endpoints.txt")
         cmd = (
             f'cat "{js_urls_file}" | while read url; do '
-            f'  curl -sk "$url" | {jsluice_bin} secrets --input-format=js 2>/dev/null; '
-            f'done | tee "{jsluice_out}"'
+            f'  curl -sk "$url" | {jsluice_bin} secrets -j 2>/dev/null; '
+            f'done | sort -u | tee "{jsluice_out}"'
         )
         run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         cmd2 = (
             f'cat "{js_urls_file}" | while read url; do '
-            f'  curl -sk "$url" | {jsluice_bin} urls --input-format=js 2>/dev/null; '
+            f'  curl -sk "$url" | {jsluice_bin} urls -j 2>/dev/null; '
             f'done | sort -u | tee "{endpoints_out}"'
         )
         run_cmd(cmd2, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         if os.path.exists(jsluice_out):
-            count = sum(1 for _ in open(jsluice_out) if _.strip())
-            log("ok", f"jsluice: {count} secrets found → {jsluice_out}")
+            count = _count_json_findings(jsluice_out)
+            log("ok", f"jsluice: {count} secret(s) found → {jsluice_out}")
     else:
         log("warn", "jsluice not found — skipping")
 
     # ── SecretFinder ──
+    # v9.23 — SecretFinder -o cli prints a "[ + ] URL: <url>" banner for EVERY
+    # scanned URL even with zero matches; real matches are printed on their own
+    # lines using a tab->tab separator. The old counter counted every non-blank
+    # line, so N URLs => "N hits". Count only the separator lines, and mark them
+    # unverified (most raw regex matches are noise: CSS, GUIDs, asset URLs).
     if os.path.isfile(secretfinder):
         sf_out = os.path.join(js_dir, "secretfinder.txt")
         cmd = (
@@ -3451,8 +3513,12 @@ def run_js_analysis(domain: str) -> bool:
         )
         run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         if os.path.exists(sf_out):
-            count = sum(1 for _ in open(sf_out) if _.strip())
-            log("ok", f"SecretFinder: {count} hits → {sf_out}")
+            count = 0
+            with open(sf_out, errors="ignore") as fh:
+                for ln in fh:
+                    if "\t->\t" in ln:
+                        count += 1
+            log("ok", f"SecretFinder: {count} raw match(es) [unverified] → {sf_out}")
     else:
         log("warn", "SecretFinder not found at ~/tools/SecretFinder/")
 
@@ -3478,7 +3544,7 @@ def run_js_analysis(domain: str) -> bool:
             watch_phase="JS ANALYSIS"
         )
         if os.path.exists(tf_out):
-            hits = sum(1 for _ in open(tf_out) if _.strip())
+            hits = _count_json_findings(tf_out)
             log("ok", f"TruffleHog: {hits} secrets → {tf_out}")
     else:
         log("warn", "trufflehog not found")
@@ -4087,16 +4153,51 @@ def run_cms_exploit(domain: str) -> bool:
         return False
 
     # ── Step 1: whatweb fingerprinting ──
+    # v9.23 — the old form `... | xargs -I{} whatweb --color=never {} 2>/dev/null
+    # | tee` silently produced a 0-byte file: ALL stderr was discarded, and whatweb
+    # 0.6.3 CRASHES on HTTPS under Ruby 3.4+/4.x ("can't modify frozen Hash"), so
+    # every https target failed invisibly. Now: run per-URL, keep stderr in a log,
+    # and fall back to the (reliable) httpx tech tags so the fingerprint file is
+    # never silently empty and downstream CMS detection still has data.
     whatweb_out = os.path.join(exploit_dir, "whatweb.txt")
+    whatweb_err = os.path.join(exploit_dir, "whatweb_errors.log")
     if _which(whatweb_bin):
         log("info", "whatweb: fingerprinting live hosts...")
-        run_cmd(
-            f'cat "{live_urls}" 2>/dev/null | head -50 | '
-            f'xargs -I{{}} {whatweb_bin} --color=never {{}} 2>/dev/null | tee "{whatweb_out}"',
-            timeout=300,
-            watch_file=exploit_dir,
-            watch_phase="CMS EXPLOIT"
-        )
+        open(whatweb_out, "w").close()
+        open(whatweb_err, "w").close()
+        targets = []
+        if os.path.isfile(live_urls):
+            with open(live_urls, errors="ignore") as fh:
+                targets = [u.strip() for u in fh
+                           if u.strip().startswith(("http://", "https://"))][:50]
+        for url in targets:
+            run_cmd(
+                f'{whatweb_bin} -a1 --color=never --follow-redirect=always '
+                f'--max-redirects=3 --open-timeout=25 --read-timeout=25 '
+                f'"{url}" >> "{whatweb_out}" 2>> "{whatweb_err}"',
+                timeout=70,
+                watch_file=exploit_dir,
+                watch_phase="CMS EXPLOIT"
+            )
+        wc = (sum(1 for _ in open(whatweb_out, errors="ignore") if _.strip())
+              if os.path.exists(whatweb_out) else 0)
+        if wc == 0:
+            note = ""
+            if os.path.exists(whatweb_err) and os.path.getsize(whatweb_err):
+                err_head = open(whatweb_err, errors="ignore").readline().strip()
+                if "frozen Hash" in err_head:
+                    note = (" (whatweb 0.6.3 incompatible with Ruby 3.4+/4.x on HTTPS — "
+                            "pin ruby<=3.3 or upgrade whatweb)")
+            # Fall back to httpx tech tags so the fingerprint is not lost.
+            if os.path.exists(live_file):
+                with open(whatweb_out, "a") as wf, open(live_file, errors="ignore") as lf:
+                    for line in lf:
+                        if line.strip():
+                            wf.write(f"# fallback(httpx): {line.strip()}\n")
+            log("warn", f"whatweb produced no output{note}; "
+                        f"using httpx tech tags (see {whatweb_err})")
+        else:
+            log("ok", f"whatweb: {wc} host line(s) → {whatweb_out}")
     else:
         log("warn", "whatweb not installed — skipping fingerprint step")
 
@@ -4153,8 +4254,11 @@ def run_cms_exploit(domain: str) -> bool:
         with open(source_file, errors="ignore") as fh:
             for line in fh:
                 lower = line.lower()
+                # v9.23 — dropped "/user/login": it is a generic path present on
+                # countless non-Drupal apps and was a single weak signal. The
+                # /misc/drupal.js|ajax.js|progress.js paths are Drupal-specific.
                 if any(marker in lower for marker in (
-                    "/misc/drupal.js", "/misc/ajax.js?v=", "/misc/progress.js?v=", "/user/login",
+                    "/misc/drupal.js", "/misc/ajax.js?v=", "/misc/progress.js?v=",
                 )):
                     remember_host(drupal_hosts_map, line.strip())
 
@@ -4180,17 +4284,31 @@ def run_cms_exploit(domain: str) -> bool:
                 remember_host(drupal_hosts_map, host.strip())
 
     if not drupal_hosts_map and os.path.isfile(live_urls):
+        # v9.23 — CONTENT-verified probe. The old version accepted 200/301/302/403
+        # on /misc/drupal.js, /user/login or /CHANGELOG.txt as proof of Drupal. An
+        # nginx http->https 301 fires on EVERY path, so it misclassified plain
+        # PHP/nginx hosts (e.g. http://clientc.com/user/login -> 301) as
+        # Drupal. Now require a real HTTP 200 whose BODY contains "drupal" on a
+        # Drupal-specific file — a redirect, 403, or SPA catch-all no longer counts.
         for host in open(live_urls, errors="ignore"):
-            host = host.strip()
+            host = host.strip().rstrip("/")
             if not host.startswith(("http://", "https://")):
                 continue
-            for path in ("/misc/drupal.js", "/user/login", "/CHANGELOG.txt"):
-                ok, status = run_cmd(
-                    f'curl -sk -o /dev/null -w "%{{http_code}}" --max-time 8 "{host}{path}"',
+            for path in ("/misc/drupal.js", "/core/misc/drupal.js",
+                         "/CHANGELOG.txt", "/core/CHANGELOG.txt"):
+                ok, body = run_cmd(
+                    f'curl -sk -L --max-redirs 3 --max-time 8 '
+                    f'-w "\\nHTTP_STATUS:%{{http_code}}" "{host}{path}"',
                     timeout=12
                 )
-                if ok and status in {"200", "301", "302", "403"}:
+                if not ok or not body:
+                    continue
+                m = re.search(r"HTTP_STATUS:(\d+)\s*$", body)
+                status = m.group(1) if m else ""
+                content = body[:m.start()] if m else body
+                if status == "200" and "drupal" in content.lower():
                     remember_host(drupal_hosts_map, host)
+                    break
                     break
 
     drupal_hosts = list(drupal_hosts_map.values())
@@ -5879,7 +5997,17 @@ def run_cve_hunt(domain: str) -> bool:
     # ── cvemap: cross-reference live hosts against NVD/EPSS/Shodan CVE data ───
     # Installed: go install github.com/projectdiscovery/cvemap/cmd/cvemap@latest
     cvemap_bin = shutil.which("cvemap") or os.path.join(GOBIN, "cvemap")
-    if os.path.exists(cvemap_bin):
+    # v9.23 — cvemap >= v0.0.7 requires a ProjectDiscovery Cloud (PDCP) API key;
+    # without it the binary exits with "api key cannot be empty", which previously
+    # surfaced as a confusing rc=1 phase failure. Skip cleanly with a hint instead.
+    pdcp_key = os.environ.get("PDCP_API_KEY") or os.environ.get("CVEMAP_API_KEY")
+    if not os.path.exists(cvemap_bin):
+        pass
+    elif not pdcp_key:
+        log("warn", "cvemap: skipped — no PDCP_API_KEY set "
+                    "(get a free key at https://cloud.projectdiscovery.io, then "
+                    "`export PDCP_API_KEY=...`)")
+    else:
         cvemap_out   = os.path.join(cve_dir, "cvemap_results.txt")
         httpx_file   = os.path.join(recon_dir, "live", "httpx_full.txt")
 

@@ -329,7 +329,15 @@ def fingerprint_webapp(url: str) -> dict:
 
     # ── Tech stack detection ──────────────────────────────────────────────
     tech_signals = {
-        "Vite":     [r'/assets/[^"]+\.js', r'modulepreload'],
+        # v9.23 — the old Vite signature r'/assets/[^"]+\.js' matched ANY script
+        # under an /assets/ folder (e.g. /assets/js/jquery.min.js), false-flagging
+        # Bootstrap/jQuery/PHP sites as Vite and pulling junk "vite" CVEs into intel.
+        # Require a real Vite marker: dev client, a hashed module entry, the manifest,
+        # or a runtime token.
+        "Vite":     [r'/@vite/client', r'/@vite/env', r'\.vite/manifest\.json',
+                     r'<script[^>]+type=["\']module["\'][^>]+src=["\'][^"\']*/assets/'
+                     r'[A-Za-z0-9_.-]+-[A-Za-z0-9]{8}\.js',
+                     r'__vite__', r'import\.meta\.env'],
         "React":    [r'react', r'__NEXT_DATA__', r'_reactRoot'],
         "Next.js":  [r'/_next/static', r'__NEXT_DATA__'],
         "Vue":      [r'vue', r'__vue__', r'/js/app\.[a-f0-9]+\.js'],
@@ -1976,8 +1984,9 @@ def main():
 
         # Post-scan: check if there are findings to report
         # hunt.py stores findings in findings/<domain>/sessions/<id>/ (not recon/)
+        # v9.23 — in autonomous mode never block on this prompt; always generate.
         print()
-        if confirm("Generate report from scan results?", default_yes=False):
+        if autonomous or confirm("Generate report from scan results?", default_yes=False):
             # Try both findings/ and recon/ paths (hunt.py uses findings/)
             found_dir = None
             for base_name in ["findings", "recon"]:

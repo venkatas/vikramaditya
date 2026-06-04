@@ -66,12 +66,12 @@ def log(level: str, msg: str):
 def pick_model() -> str:
     """Pick the best available Ollama model for security tasks.
 
-    Priority: bugtraceai-apex (security-tuned, <thinking> blocks, 0% refusal)
-    Fallback: gemma4:26b (fast all-rounder)
+    Priority: aya-expanse:latest (newly configured default)
+    Fallback: bugtraceai-apex (security-tuned, <thinking> blocks, 0% refusal)
     """
     try:
         import ollama
-        for m in ["bugtraceai-apex", "gemma4:26b", "qwen3:14b", "qwen3:8b", "gemma4:e4b"]:
+        for m in ["aya-expanse:latest", "bugtraceai-apex", "gemma4:26b", "qwen3:14b", "qwen3:8b", "gemma4:e4b"]:
             try:
                 ollama.show(m)
                 return m
@@ -124,11 +124,35 @@ def extract_code_blocks(text: str) -> list[dict]:
 
 
 def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> dict:
-    """Execute a code block and capture output."""
+    """Execute a code block and capture output.
+
+    v9.23 — validate syntax BEFORE running. The LLM frequently emits malformed
+    shell (e.g. an unterminated quote: --data="username=admin'--) which bash
+    aborts with "unexpected EOF" having run nothing. Previously that crash was fed
+    back as if it were a target result and the model concluded "NOT VULNERABLE"
+    from a script that never executed. We now flag syntax errors distinctly
+    (``syntax_error: True``) so the caller can force a rewrite instead of treating
+    it as evidence — and never partially execute a broken script.
+    """
     if lang in ("bash", "sh", "curl"):
         cmd = ["bash", "-c", code]
+        # `bash -n` parses without executing — catches unbalanced quotes / EOF.
+        try:
+            chk = subprocess.run(["bash", "-n", "-c", code],
+                                 capture_output=True, text=True, timeout=15)
+            if chk.returncode != 0:
+                return {"stdout": "", "stderr": f"SCRIPT SYNTAX ERROR (not executed): "
+                                                f"{chk.stderr.strip()[:500]}",
+                        "returncode": 2, "syntax_error": True}
+        except Exception:
+            pass
     elif lang == "python":
         cmd = [sys.executable, "-c", code]
+        try:
+            compile(code, "<brain_script>", "exec")
+        except SyntaxError as e:
+            return {"stdout": "", "stderr": f"SCRIPT SYNTAX ERROR (not executed): {e}",
+                    "returncode": 2, "syntax_error": True}
     else:
         return {"stdout": "", "stderr": f"Unsupported language: {lang}", "returncode": -1}
 
@@ -486,6 +510,7 @@ Then test the most promising attack vectors."""
 
     findings = []
     iteration = 0
+    successful_runs = 0   # scripts that actually executed (no syntax/tooling error)
 
     mode_labels = {
         "scan": "Active LLM-Driven Vulnerability Testing",
@@ -521,11 +546,30 @@ Then test the most promising attack vectors."""
         if not code_blocks:
             # Brain didn't write code — check if it's giving a final verdict
             if any(kw in response.upper() for kw in ["CONFIRMED", "VERDICT:", "FINAL ASSESSMENT", "SUMMARY OF FINDINGS"]):
+                # v9.23 — refuse a final verdict that rests on ZERO successful tests.
+                # The model used to declare "NOT VULNERABLE" right after its only
+                # script died with a syntax error — concluding from a run that never
+                # happened. Require at least one script to have actually executed.
+                if successful_runs == 0:
+                    log("warn", "Verdict rejected — no script has executed successfully yet "
+                                "(a script/syntax error is NOT evidence about the target)")
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content":
+                        "You have not run a single SUCCESSFUL test yet — every script so far "
+                        "failed to execute (syntax/tooling error), which tells us NOTHING about "
+                        "the target's security. Do NOT issue a verdict. Write a corrected, "
+                        "self-contained script (mind your quotes) in a ```bash or ```python "
+                        "block so it actually runs."})
+                    continue
                 log("ok", "Brain issued final verdict")
-                # Extract findings
+                # Only accept verdict-prose lines as findings if they are explicitly
+                # CONFIRMED/EXPLOITABLE; tag them as model claims pending PoC review so
+                # they are never mistaken for tool-verified findings.
                 for line in response.split('\n'):
-                    if any(sev in line.upper() for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]):
-                        findings.append(line.strip())
+                    up = line.upper()
+                    if any(sev in up for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]) \
+                       and any(k in up for k in ["CONFIRMED", "EXPLOITABLE", "VULNERABLE"]):
+                        findings.append(f"[MODEL CLAIM — verify PoC] {line.strip()}")
                 break
             else:
                 # Ask brain to write code
@@ -565,19 +609,36 @@ Then test the most promising attack vectors."""
                 print(f"  {R}└──────────────────────────────────────────────{N}")
 
             all_results += f"\n=== Script {i+1} ({lang}) — exit code {result['returncode']} ===\n"
-            all_results += f"STDOUT:\n{result['stdout']}\n"
-            if result["stderr"]:
+            if result.get("syntax_error"):
+                # Make it unmistakable that this is a SCRIPT defect, not a target result.
+                all_results += ("SCRIPT DID NOT RUN — shell/python SYNTAX ERROR in YOUR script "
+                                "(e.g. an unterminated quote). This is NOT evidence about the "
+                                "target. Rewrite the script correctly and try again.\n")
                 all_results += f"STDERR:\n{result['stderr']}\n"
-
-            # Check for findings in output
-            for line in result["stdout"].split('\n'):
-                if any(kw in line.upper() for kw in ["VULNERABLE", "CONFIRMED", "CRITICAL", "EXPLOITABLE"]):
-                    findings.append(line.strip())
+            else:
+                all_results += f"STDOUT:\n{result['stdout']}\n"
+                if result["stderr"]:
+                    all_results += f"STDERR:\n{result['stderr']}\n"
+                # A script that ran (rc 0, or non-zero but not a syntax error) counts
+                # as a real test the model may reason from.
+                if result["returncode"] == 0:
+                    successful_runs += 1
+                # Grounded findings: only from ACTUAL script stdout.
+                for line in result["stdout"].split('\n'):
+                    if any(kw in line.upper() for kw in ["VULNERABLE", "CONFIRMED", "CRITICAL", "EXPLOITABLE"]):
+                        findings.append(line.strip())
 
         # Feed results back to brain
+        had_syntax_error = any(b for b in code_blocks) and "SCRIPT DID NOT RUN" in all_results
+        guidance = ("Analyze these results. If a script DID NOT RUN due to a syntax error, that is "
+                    "NOT a finding — fix the script and re-run it. " if had_syntax_error else
+                    "Analyze these results. ")
         messages.append({
             "role": "user",
-            "content": f"Here are the execution results:\n\n{all_results}\n\nAnalyze these results. If you found a vulnerability, document it clearly with CONFIRMED status. If you need more testing, write the next test script. If you've tested enough, give your FINAL ASSESSMENT with all findings."
+            "content": f"Here are the execution results:\n\n{all_results}\n\n{guidance}"
+                       "If you genuinely confirmed a vulnerability via script OUTPUT, document it "
+                       "with CONFIRMED status. If you need more testing, write the next test script. "
+                       "Only give a FINAL ASSESSMENT once at least one script has actually executed."
         })
 
         # Trim context if getting long (keep system + last 10 messages)

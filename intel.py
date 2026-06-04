@@ -68,7 +68,38 @@ TECH_TO_PACKAGE = {
     "flask":     ("pip", "flask"),
     "rails":     ("gem", "rails"),
     "spring":    ("maven", "spring"),
+    # v9.23 — map the JS bundler so it resolves to the real npm package instead of
+    # a bare "vite" keyword (which NVD matched to ViteMoneyCoin / VITEC / Vitess).
+    "vite":      ("npm", "vite"),
 }
+
+# v9.23 — tokens that are protocols/headers/transport features, not products, plus
+# generic framework names whose bare NVD keyword search collides with unrelated
+# products. Mirrors cve.py. These get NO bare-keyword NVD search.
+NON_PRODUCT_TECHS = {
+    "hsts", "https", "http", "http/1.1", "http/2", "http/3", "h2", "h3",
+    "ssl", "tls", "preload", "gzip", "deflate", "br", "chunked", "keep-alive",
+    "cors", "csp", "set-cookie", "cookie", "etag", "cache-control",
+    "strict-transport-security",
+}
+AMBIGUOUS_BARE_TECHS = {
+    "bootstrap", "jquery", "parsley.js", "parsley", "modernizr",
+    "underscore", "moment", "select2",
+}
+
+
+def _nvd_searchable(tech: str) -> bool:
+    """True if a token is safe to send to NVD as a free-text keyword search."""
+    tl = (tech or "").lower().strip()
+    if not tl or len(tl) < 2:
+        return False
+    if tl in TECH_TO_PACKAGE:        # explicitly mapped -> trusted
+        return True
+    if tl in NON_PRODUCT_TECHS:
+        return False
+    if tl in AMBIGUOUS_BARE_TECHS:   # unmapped + ambiguous -> skip the keyword noise
+        return False
+    return True
 
 # ─── Tech → grep patterns to search for in source code ────────────────────────
 TECH_GREP_PATTERNS = {
@@ -167,6 +198,11 @@ def fetch_github_advisories(tech: str) -> list[dict]:
 
 def fetch_nvd_cves(tech: str) -> list[dict]:
     """Query NVD CVE API by keyword."""
+    # v9.23 — skip protocol/header tokens (e.g. "hsts") and unmapped ambiguous
+    # framework names (e.g. bare "bootstrap"/"jquery") whose keyword search returns
+    # unrelated products. Mapped tokens (TECH_TO_PACKAGE) still run.
+    if not _nvd_searchable(tech):
+        return []
     query = TECH_TO_PACKAGE.get(tech.lower(), (None, tech))[1]
     url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={urllib.parse.quote(query)}&resultsPerPage=5"
     data = fetch_url(url, timeout=15)
