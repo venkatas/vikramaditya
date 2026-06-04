@@ -64,14 +64,30 @@ def log(level: str, msg: str):
 
 
 def pick_model() -> str:
-    """Pick the best available Ollama model for security tasks.
+    """Pick the best available Ollama model for active exploit CODE GENERATION.
 
-    Priority: aya-expanse:latest (newly configured default)
-    Fallback: bugtraceai-apex (security-tuned, <thinking> blocks, 0% refusal)
+    v9.23 — this role WRITES and EXECUTES bash/python PoCs, so it needs a CODER.
+    The old default aya-expanse:latest is Cohere's MULTILINGUAL chat model (8B,
+    8K ctx) — it produced malformed bash that never ran and the loop then
+    concluded "NOT VULNERABLE" from its own crash. Demoted to last resort.
+    Order: env override -> Devstral (agentic SWE, if pulled) -> installed qwen
+    coders. Override with BRAIN_SCANNER_MODEL=<name>.
     """
+    import os as _os
+    env = _os.environ.get("BRAIN_SCANNER_MODEL", "").strip()
     try:
         import ollama
-        for m in ["aya-expanse:latest", "bugtraceai-apex", "gemma4:26b", "qwen3:14b", "qwen3:8b", "gemma4:e4b"]:
+        candidates = ([env] if env else []) + [
+            "devstral-small-2:24b",        # agentic SWE coder (68% SWE-bench) if pulled
+            "qwen2.5-coder:14b",           # installed, fast, purpose-built coder
+            "qwen3-coder:30b",             # installed, stronger MoE coder
+            "qwen2.5-coder:14b-instruct",
+            "bugtraceai-apex",             # security-tuned fallback
+            "aya-expanse:latest",          # LAST resort — not a coder
+        ]
+        for m in candidates:
+            if not m:
+                continue
             try:
                 ollama.show(m)
                 return m

@@ -47,6 +47,22 @@ wget -c 'https://huggingface.co/BugTraceAI/BugTraceAI-Apex-G4-26B-Q4/resolve/mai
 ollama create bugtraceai-apex -f Modelfiles/BugTraceAI-Modelfile
 ```
 
+#### Recommended models per role (v9.23 — benchmarked + live-validated)
+
+Each role wants a different model. These are env-overridable with **no code change**:
+
+| Role | Model | Why | Env var |
+|:--|:--|:--|:--|
+| **Narration / analysis** | `phi4:14b` | Lowest hallucination of any local model (Vectara 3.7 %) — won't fabricate findings | `BRAIN_MODEL=phi4:14b` |
+| **Triage** (submit/drop) | `bugtraceai-apex` | Security-DPO judgement; empirically beat phi4 + Foundation-Sec on a triage A/B | `TRIAGE_MODEL=bugtraceai-apex` |
+| **Exploit code-gen** | `qwen2.5-coder:14b` (or `devstral-small-2:24b`, 68 % SWE-bench) | A real coder — writes valid, runnable PoCs instead of malformed shell | `BRAIN_SCANNER_MODEL=qwen2.5-coder:14b` |
+
+```bash
+ollama pull phi4:14b            # faithful narrator (default since v9.23)
+ollama pull qwen2.5-coder:14b   # real coder for the active scanner
+```
+> ⚠️ A `claude-*` tag in your local Ollama is **not** Claude (Claude weights are not downloadable, so any such tag is a mislabeled local model). Always confirm with `ollama show <tag>`.
+
 ### **3. Run Scans**
 Start a scan in one of these modes:
 ```bash
@@ -486,8 +502,14 @@ git checkout -b feature/new-testing-module
 ## 📜 Collapsible Release History
 
 <details>
-<summary><b>Click to expand historical release notes (v9.22.0 down to v8.0.0)</b></summary>
+<summary><b>Click to expand historical release notes (v9.23.0 down to v8.0.0)</b></summary>
 
+
+**v9.23.0 — detector/report/brain false-positive purge + model right-sizing (2026-06-04)**
+
+A full-pipeline audit (triggered by a clean-target run) found several detectors reporting fabricated signal while the report simultaneously dropped real findings. Fixed and validated end-to-end on two live targets: jsluice (`--input-format` → `-j`), SecretFinder banner-counting, whatweb 0-byte output (Ruby-4 HTTPS crash → httpx fallback), Drupal false-positive (nginx 301 mistaken for `/user/login`), version-less keyword CVEs no longer reported as findings, `email_auth` findings now surfaced, and cvemap graceful skip. The AI brain was also right-sized per role: **`phi4:14b`** is now the default narrator (lowest local hallucination, stops the "permissive CORS"/"San Francisco" fabrications), **`qwen2.5-coder:14b`** drives exploit code-gen (replacing the multilingual aya-expanse that emitted malformed shell), and **`bugtraceai-apex`** is kept for triage (it won a live triage A/B vs phi4 and Foundation-Sec). All overridable via `BRAIN_MODEL` / `TRIAGE_MODEL` / `BRAIN_SCANNER_MODEL`. See [CHANGELOG.md](CHANGELOG.md).
+
+---
 
 **v9.22.0 — methodology skill + token-scanner wire-up (2026-05-11)**
 
