@@ -308,17 +308,23 @@ class LLMClient:
 #     deepseek-r1:14b    T1=17.0s T2=31.5s  3.18 tok/s  Strong reasoning, slow, <think> blocks
 #     gemma4:26b         T1=16.1s T2=22.0s  0 tok/s     SILENT FAIL: eats num_predict on internal reasoning
 #                                                       (use only with num_predict>=2048)
-#   bugtraceai-apex / qwen3-coder-64k retained as deep-analysis tier when needed.
+# v9.23 — phi4:14b is now FIRST (the default narrator/analyst). It was benchmarked
+# #0 above yet the list still led with xploiter, an "uncensored exploit" finetune
+# that is WEIGHT-biased to assert vulns and fabricated findings on real runs
+# ("permissive CORS" on a 0-finding scan, "a real estate company in San Francisco").
+# phi4 also tops the Vectara hallucination leaderboard for local models (3.7%).
+# Validated on clientc-cat3.com (honest "no findings", zero fabrication). xploiter is
+# retained ONLY as an exploit-IDEATION fallback, never the default narrator.
 MODEL_PRIORITY = [
-    "xploiter/the-xploiter:latest",  # Primary exploit generation model
-    "bugtraceai-apex:latest",       # Zero-refusal security DPO reasoning model
-    "vapt-qwen25:latest",           # Custom 32B VAPT-tuned model
-    "aya-expanse:latest",           # Cohere Aya Expanse 8B Multilingual flagship model
-    "phi4:14b",                  # ★ #0 v9.1.3 — fastest + most consistent JSON, no hidden thinking
-    "bugtraceai-apex",           # #1 — security-tuned, DPO on bug bounty reports, 0% refusal
-    "qwen3-coder-64k:latest",    # #2 — 64K context, best for code/JS analysis
-    "deepseek-r1:14b",           # #3 — strong chain-of-thought, use for deep reasoning
-    "gemma4:26b",                # #5 — kept as fallback; needs num_predict>=2048 to avoid silent truncation
+    "phi4:14b",                      # ★ v9.23 DEFAULT — faithful narration/analysis, no hidden thinking
+    "qwen3:14b",                     # faithful long-context fallback (40K native ctx; run /no_think)
+    "bugtraceai-apex:latest",        # security DPO reasoning — deep-analysis tier
+    "xploiter/the-xploiter:latest",  # exploit-IDEATION only — hallucinates on faithful narration
+    "vapt-qwen25:latest",            # Custom 32B VAPT-tuned model
+    "aya-expanse:latest",            # Cohere Aya Expanse 8B (multilingual — weak for analysis)
+    "qwen3-coder-64k:latest",        # 64K context, best for code/JS analysis
+    "deepseek-r1:14b",               # strong chain-of-thought, use for deep reasoning
+    "gemma4:26b",                    # needs num_predict>=2048 to avoid silent truncation
     "vikramaditya-custom:latest",
     "vapt-model:latest",
     "qwen3-coder:30b",
@@ -327,7 +333,6 @@ MODEL_PRIORITY = [
     "qwen2.5-coder:32b",
     "qwen2.5:32b",
     "gemma4:e4b",
-    "qwen3:14b",
     "baron-llm:latest",
     "qwen3:8b",
     "mistral:7b-instruct-v0.3-q8_0",
