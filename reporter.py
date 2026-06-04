@@ -315,6 +315,16 @@ VULN_TEMPLATES = {
             ("NVD", "https://nvd.nist.gov/"),
         ],
     },
+    "email_auth": {
+        "title": "Email Authentication Weakness on {host}",
+        "severity": "medium", "cvss": "5.3", "cwe": "CWE-290",
+        "impact": "Missing or weak email authentication (SPF/DKIM/DMARC) lets an attacker spoof mail from this domain, enabling phishing and business-email-compromise against staff, customers, and partners.",
+        "remediation": "Publish a DMARC record (start p=none with rua reporting, then move to quarantine/reject), tighten SPF toward -all once all senders are covered, and ensure DKIM signing on all sending sources.",
+        "references": [
+            ("DMARC.org", "https://dmarc.org/"),
+            ("RFC 7489 (DMARC)", "https://datatracker.ietf.org/doc/html/rfc7489"),
+        ],
+    },
     "misconfig": {
         "title": "Security Misconfiguration on {host}",
         "severity": "medium", "cvss": "5.3", "cwe": "CWE-16",
@@ -668,6 +678,11 @@ SUBDIR_VTYPE = {
     "jwt": "jwt",                    # hunt.py JWT audit
     "graphql": "graphql",            # upstream graphql findings dir
     "smuggling": "smuggling",        # HTTP request smuggling
+    # v9.23 — email_auth/findings.json (subspace_sentinel) was silently dropped
+    # from every report because the dir was unmapped. Mapped here; the JSON itself
+    # is parsed by the dedicated "Method 1d" loader below (Method 1's .txt scan
+    # finds nothing in this dir, which is harmless).
+    "email_auth": "email_auth",      # SPF/DKIM/DMARC/DNSSEC/MTA-STS posture
 }
 
 
@@ -734,7 +749,8 @@ def load_findings(findings_dir: str) -> list:
         known_tops = {s.split("/")[0] for s in SUBDIR_VTYPE}
         # Meta dirs that are never findings — suppress from the warning.
         meta_dirs = {"summary", "manual_review", "ordered_scan_targets", "brain",
-                      "exploits", "screenshots", ".async", ".tmp"}
+                      "exploits", "screenshots", ".async", ".tmp",
+                      "cves_custom"}   # cves_custom/ is handled by Method 1c below
         for entry in sorted(os.listdir(findings_dir)):
             full = os.path.join(findings_dir, entry)
             if not os.path.isdir(full):
@@ -801,7 +817,17 @@ def load_findings(findings_dir: str) -> list:
     # Method 1b: CVE database matches (cves/ subdirectory)
     # v9.1.2 — handles both schemas: bare list AND
     # {target, scan_date, technologies_detected, cves_found:[...]} (current cve.py format).
+    #
+    # v9.23 — cve.py populates cves_found via NVD *keyword* search on bare tech
+    # tokens (e.g. "php", "bootstrap", "hsts") with NO version correlation and NO
+    # active confirmation. Emitting each as a finding produced 25 bogus rows on
+    # clientc.com — including two "CVSS 10.0" php.cgi-1999 entries and the
+    # HSTS *header* matched as a product. We now only promote a match to a real
+    # finding when it is version-correlated or confirmed (e.g. by nuclei); the
+    # remaining unverified keyword matches are collapsed into ONE clearly-labelled
+    # INFORMATIONAL context item so the findings table stays trustworthy.
     cve_path = os.path.join(findings_dir, "cves")
+    unconfirmed_cves = []
     if os.path.isdir(cve_path):
         for fn in sorted(os.listdir(cve_path)):
             if not fn.endswith(".json"):
@@ -818,21 +844,46 @@ def load_findings(findings_dir: str) -> list:
                     cve_list = []
                 for item in cve_list:
                     cve_id = item.get("cve_id", item.get("id", ""))
+                    if not cve_id:
+                        continue
                     desc = item.get("description", item.get("summary", ""))
-                    sev = item.get("severity", "medium").lower()
+                    sev = str(item.get("severity", "")).lower()
                     score = item.get("cvss_score", item.get("score", ""))
                     product = item.get("product", item.get("software", item.get("technology", "")))
-                    if cve_id:
+                    # Only a version-correlated or actively-confirmed match is a finding.
+                    confirmed = bool(item.get("confirmed") or item.get("nuclei_confirmed")
+                                     or item.get("verified"))
+                    version_correlated = bool(item.get("matched_version") or item.get("version"))
+                    if confirmed or version_correlated:
                         results.append({
-                            "severity": sev,
+                            "severity": sev if sev in SEVERITY_ORDER else "medium",
                             "vtype": "cves",
                             "title": f"{cve_id} — {product}" if product else cve_id,
                             "detail": desc[:300] if desc else f"Known CVE: {cve_id}",
                             "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
                             "poc": f"CVE: {cve_id}\nCVSS: {score}\nProduct: {product}\n{desc[:500]}",
                         })
+                    else:
+                        unconfirmed_cves.append((cve_id, product, score))
             except Exception:
                 pass
+
+    # Collapse unconfirmed keyword matches into a single INFO context item.
+    if unconfirmed_cves:
+        sample = ", ".join(f"{c} ({p})" if p else c for c, p, _ in unconfirmed_cves[:8])
+        results.append({
+            "severity": "info",
+            "vtype": "misconfig",
+            "title": (f"Unconfirmed tech-stack CVE keyword matches ({len(unconfirmed_cves)}) "
+                      "— version verification required"),
+            "detail": ("These CVEs were matched by technology NAME only (NVD keyword search) "
+                       "with no version correlation and no active confirmation, so they are NOT "
+                       "verified findings and must not be reported as-is. Validate each against "
+                       "the actually-deployed version before including it. "
+                       f"Examples: {sample}."),
+            "url": "N/A",
+            "poc": "Source: cves/cve_database_matches.json (keyword matches; not version-verified).",
+        })
 
     # Method 1c: cves_custom/ — output of scanner.sh Check 1.5 (nuclei custom templates)
     # v9.1.2 — added to surface findings from /Users/venkatasatish/Documents/GitHub/obsidian/nuclei-templates/
@@ -863,6 +914,36 @@ def load_findings(findings_dir: str) -> list:
                             })
             except Exception:
                 pass
+
+    # Method 1d: Email authentication posture (email_auth/findings.json)
+    # v9.23 — subspace_sentinel writes SPF/DKIM/DMARC/DNSSEC/MTA-STS results as a
+    # JSON list, which Method 1's .txt scan never picked up. These are real,
+    # confirmed DNS-level findings (e.g. "No DMARC record published" = MEDIUM) and
+    # belong in the report.
+    email_auth_path = os.path.join(findings_dir, "email_auth", "findings.json")
+    if os.path.isfile(email_auth_path):
+        try:
+            with open(email_auth_path, errors="replace") as f:
+                ea_data = _json.load(f)
+            for item in (ea_data if isinstance(ea_data, list) else []):
+                sev = str(item.get("severity", "low")).lower()
+                if sev in ("informational", "information"):
+                    sev = "info"
+                if sev not in SEVERITY_ORDER:
+                    sev = "low"
+                results.append({
+                    "severity": sev,
+                    "vtype": "email_auth",
+                    "title": item.get("title", "Email authentication weakness"),
+                    "detail": item.get("notes", ""),
+                    "url": item.get("endpoint", "N/A"),
+                    "poc": (f"Class : {item.get('vuln_class','')}\n"
+                            f"Area  : {item.get('area','')}\n"
+                            f"Result: {item.get('result','')}\n\n"
+                            f"{item.get('notes','')}"),
+                })
+        except Exception:
+            pass
 
     # Method 1c: HAR VAPT / Legacy crawler results (har_vapt_*.json / legacy_vapt_*.json)
     for fn in sorted(os.listdir(findings_dir)):
@@ -1478,7 +1559,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
         tmpl  = VULN_TEMPLATES.get(f["vtype"], VULN_TEMPLATES["misconfig"])
         host  = re.search(r'https?://([^/]+)', f["url"])
         host  = host.group(1) if host else target
-        vtitle = tmpl["title"].format(host=host)
+        vtitle = f.get("title") or tmpl["title"].format(host=host)
         cvss  = tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A")
         tbl  += (f'<tr><td><a href="#VN-{i:03d}">VN-{i:03d}</a></td>'
                  f'<td>{vtitle}</td><td>{_badge(f["severity"])}</td>'
@@ -1493,7 +1574,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
         tmpl   = VULN_TEMPLATES.get(vtype, VULN_TEMPLATES["misconfig"])
         host   = re.search(r'https?://([^/]+)', f["url"])
         host   = host.group(1) if host else target
-        vtitle = tmpl["title"].format(host=host)
+        vtitle = f.get("title") or tmpl["title"].format(host=host)
         sev    = f["severity"]
         cvss   = tmpl.get("cvss") or CVSS_DEFAULT.get(sev, "N/A")
         refs   = "".join(f'<li><a href="{u}" target="_blank">{n}</a></li>'

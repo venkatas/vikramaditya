@@ -197,7 +197,11 @@ def detect_technologies(domain, recon_dir=None):
             f'curl -s -o /dev/null -w "%{{http_code}}" "https://{domain}{path}" --max-time 5',
             timeout=10
         )
-        if success and output in ("200", "301", "302", "403"):
+        # v9.23 — only a real 200 counts. nginx http->https setups 301-redirect
+        # EVERY path, so accepting 301/302/403 here misclassified plain PHP/nginx
+        # hosts as Drupal (e.g. /user/login). A redirect/forbidden is not evidence
+        # the CMS path exists.
+        if success and output == "200":
             add_tech(techs, tech)
 
     if techs:
@@ -208,6 +212,42 @@ def detect_technologies(domain, recon_dir=None):
         print("    [!] No technologies detected")
 
     return techs
+
+
+# v9.23 — tokens that are protocols, transport features, or HTTP *headers* rather
+# than software products. Searching them as CVE keywords yields nonsense: "hsts"
+# (a response header) returned Firefox/Chrome HSTS CVEs that the report then listed
+# as if the site ran a product called HSTS. Never CVE-search these.
+NON_PRODUCT_TECHS = {
+    "hsts", "https", "http", "http/1.1", "http/2", "http/3", "h2", "h3",
+    "ssl", "tls", "tls1.2", "tls1.3", "preload", "hsts preload",
+    "gzip", "deflate", "br", "chunked", "keep-alive", "cors", "csp",
+    "x-frame-options", "x-content-type-options", "referrer-policy",
+    "permissions-policy", "set-cookie", "cookie", "etag", "cache-control",
+    "strict-transport-security",
+}
+
+# v9.23 — generic framework/library tokens whose bare-keyword NVD search collides
+# with unrelated products ("bootstrap" -> Cisco UCCX / BitTorrent bootstrap-dht,
+# "jquery" -> jQuery-in-TYPO3). Only worth searching when a version is attached
+# (e.g. "jquery/3.4.1"); the version-less token is pure noise.
+AMBIGUOUS_BARE_TECHS = {
+    "bootstrap", "jquery", "parsley.js", "parsley", "modernizr", "lodash",
+    "underscore", "moment", "select2",
+}
+
+
+def _is_searchable_tech(tech_name: str) -> bool:
+    """Gate which detected tech tokens are worth a CVE-database keyword search."""
+    tl = (tech_name or "").lower().strip()
+    if not tl or len(tl) < 2:
+        return False
+    if tl in NON_PRODUCT_TECHS:
+        return False
+    # Ambiguous framework name with no version digit -> skip (keyword noise).
+    if tl in AMBIGUOUS_BARE_TECHS and not re.search(r"\d", tl):
+        return False
+    return True
 
 
 def search_cves(tech_name, max_results=10):
@@ -390,8 +430,13 @@ def hunt_cves(domain, recon_dir=None, findings_root=None):
     # Step 2: Search CVE databases for each technology
     all_cves = []
     if techs:
-        print(f"\n[*] Searching CVE databases for {len(techs)} technologies...")
-        for tech in techs:
+        searchable = [t for t in techs if _is_searchable_tech(t)]
+        skipped = [t for t in techs if t not in searchable]
+        if skipped:
+            print(f"    [>] Skipping non-product/ambiguous tokens (no CVE keyword search): "
+                  f"{', '.join(skipped)}")
+        print(f"\n[*] Searching CVE databases for {len(searchable)} technologies...")
+        for tech in searchable:
             cves = search_cves(tech, max_results=5)
             if cves:
                 all_cves.extend(cves)

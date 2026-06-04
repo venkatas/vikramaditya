@@ -310,11 +310,14 @@ class LLMClient:
 #                                                       (use only with num_predict>=2048)
 #   bugtraceai-apex / qwen3-coder-64k retained as deep-analysis tier when needed.
 MODEL_PRIORITY = [
+    "xploiter/the-xploiter:latest",  # Primary exploit generation model
+    "bugtraceai-apex:latest",       # Zero-refusal security DPO reasoning model
+    "vapt-qwen25:latest",           # Custom 32B VAPT-tuned model
+    "aya-expanse:latest",           # Cohere Aya Expanse 8B Multilingual flagship model
     "phi4:14b",                  # ★ #0 v9.1.3 — fastest + most consistent JSON, no hidden thinking
     "bugtraceai-apex",           # #1 — security-tuned, DPO on bug bounty reports, 0% refusal
     "qwen3-coder-64k:latest",    # #2 — 64K context, best for code/JS analysis
     "deepseek-r1:14b",           # #3 — strong chain-of-thought, use for deep reasoning
-    "vapt-qwen25:latest",        # #4 — custom 32B VAPT-tuned
     "gemma4:26b",                # #5 — kept as fallback; needs num_predict>=2048 to avoid silent truncation
     "vikramaditya-custom:latest",
     "vapt-model:latest",
@@ -344,6 +347,9 @@ MLX_MODEL_PRIORITY = [
 # Used by triage_finding() and next_action() where speed > depth
 # 03 May 2026 bench: phi4:14b T1=4.3s vs baron-llm 17s — 4× faster, 100% valid JSON
 TRIAGE_MODEL_PRIORITY = [
+    "bugtraceai-apex:latest",       # Zero-refusal security DPO reasoning model
+    "xploiter/the-xploiter:latest",  # Primary exploit generation model
+    "aya-expanse:latest",           # Cohere Aya Expanse 8B Multilingual flagship model
     "phi4:14b",                  # ★ v9.1.3 — fastest triage, consistent JSON, no hidden thinking
     "baron-llm:latest",          # BaronLLM — RLHF on offensive security data
     "gemma4:e4b",                # Gemma 4 4B — fast triage with tool calling
@@ -415,6 +421,22 @@ When asked to analyze data:
 - Be decisive about cutting dead ends — wasted time means missed critical findings
 - Think about what a tired developer at 2am might have broken
 - Output the analysis and nothing else — no preamble, no disclaimers, no closing remarks"""
+
+
+# v9.23 — narration/description system prompt. BRAIN_SYSTEM above forbids caveats
+# and pushes the model to ASSERT findings, which is wrong for neutral phase
+# narration: with it, the model reported "permissive CORS" on a 0-finding scan and
+# invented "a real estate company in San Francisco". Used for descriptive narration
+# only — it permits (and requires) honest "no findings / unknown" answers.
+NARRATION_SYSTEM = """You are a penetration-testing assistant summarising tool output for an authorized VAPT engagement.
+You are DESCRIBING what the provided artifacts show — you are not hunting, guessing, or selling impact.
+
+ABSOLUTE RULES:
+- Describe ONLY what the provided Summary/Artifacts text actually states.
+- If the data shows no findings, empty files, or files=0, you MUST say the phase produced no signal. "No findings" is a correct, expected answer — never invent one to seem useful.
+- NEVER claim a vulnerability (CORS, SQLi, IDOR, SSRF, upload, etc.) unless a specific line in the provided text supports it. With only weak/ambiguous data, label it an UNVERIFIED hypothesis and name the missing evidence. A result file existing (files>0) does NOT mean a finding exists — these files are written even when empty.
+- NEVER state the target's industry, location, company type, or business purpose unless that exact fact appears in the artifact text. If unknown, say "business context unknown from recon data".
+- Do not add authorization disclaimers. Be concise and factual. Output only the requested summary — no preamble."""
 
 
 def _get_available_models() -> list[str]:
@@ -576,27 +598,45 @@ Summary:
 {summary or "(no summary provided)"}
 {phase_rules}
 
+Ground every statement in the Summary text above. If the Summary shows no
+findings, empty output, or only file counts (not actual findings), say the phase
+produced no signal — do NOT infer a vulnerability from a file existing. Do not
+guess the target's industry or location.
+
 Respond in 2 short bullets only:
-- whether the phase produced useful signal
+- whether the phase produced useful signal (say "no signal" if the summary shows none)
 - the immediate next best action
 
 Keep it under 80 words total."""
 
-        return self._stream(prompt, f"Phase Complete → {phase}", max_tokens=140)
+        # v9.23 — narration uses NARRATION_SYSTEM (honest "no findings" allowed) and
+        # low temperature, instead of the exploit-tuned BRAIN_SYSTEM that pushed the
+        # model to fabricate findings (e.g. "permissive CORS" on a 0-finding scan).
+        return self._stream(prompt, f"Phase Complete → {phase}",
+                            max_tokens=140, system=NARRATION_SYSTEM, temperature=0.1)
 
     # ── Internal streaming helper ──────────────────────────────────────────────
-    def _stream_fast(self, user_prompt: str, label: str, max_tokens: int = 1500) -> str:
+    def _stream_fast(self, user_prompt: str, label: str, max_tokens: int = 1500,
+                     system: str = None, temperature: float = 0.3) -> str:
         """Stream using the fast triage model (BaronLLM if installed)."""
         orig = self.model
         self.model = self.triage_model
-        result = self._stream(user_prompt, label, max_tokens)
+        result = self._stream(user_prompt, label, max_tokens, system=system,
+                              temperature=temperature)
         self.model = orig
         return result
 
-    def _stream(self, user_prompt: str, label: str, max_tokens: int = MAX_RESP) -> str:
-        """Call the active LLM provider, print response live (Ollama streams; cloud APIs print after)."""
+    def _stream(self, user_prompt: str, label: str, max_tokens: int = MAX_RESP,
+                system: str = None, temperature: float = 0.3) -> str:
+        """Call the active LLM provider, print response live (Ollama streams; cloud APIs print after).
+
+        v9.23 — ``system`` defaults to the exploit-tuned BRAIN_SYSTEM, but
+        descriptive narration passes NARRATION_SYSTEM so the model is allowed to
+        say "no findings" instead of being pushed to assert one.
+        """
         if not self.enabled:
             return ""
+        system = system or BRAIN_SYSTEM
 
         print(f"\n{MAGENTA}{BOLD}[BRAIN/{self._llm.provider.upper()}/{self.model}] {label}{NC}")
         print(f"{DIM}{'─'*60}{NC}")
@@ -608,13 +648,13 @@ Keep it under 80 words total."""
                 stream = self.client.chat(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": BRAIN_SYSTEM},
+                        {"role": "system", "content": system},
                         {"role": "user",   "content": user_prompt},
                     ],
                     stream=True,
                     options={
                         "num_predict": max_tokens,
-                        "temperature": 0.3,
+                        "temperature": temperature,
                         "top_p": 0.9,
                         "num_ctx": MAX_CTX,
                     },
@@ -626,8 +666,8 @@ Keep it under 80 words total."""
             else:
                 # Non-streaming path for cloud providers
                 full_text = self._llm.chat(
-                    self.model, BRAIN_SYSTEM, user_prompt,
-                    max_tokens=max_tokens, temperature=0.3,
+                    self.model, system, user_prompt,
+                    max_tokens=max_tokens, temperature=temperature,
                 )
                 print(full_text, flush=True)
 
@@ -1077,9 +1117,13 @@ Be specific. Reference actual hostnames/endpoints/params from the data above.
 CRITICAL GROUNDING RULE: You MUST only reference hosts, paths, and parameters that
 appear verbatim in the data sections above. Do NOT invent, guess, or fabricate
 endpoints, URLs, APIs, credentials, or findings. If the data shows "(none)" or
-"(empty)", state that explicitly and do not substitute hypothetical examples."""
+"(empty)", state that explicitly and do not substitute hypothetical examples.
+- Do NOT state the target's industry, location, company type, or business purpose
+  unless that exact fact appears in the data above. If unknown, say so.
+- Only list a vulnerability class as a priority if a specific data line supports it;
+  otherwise label it an UNVERIFIED hypothesis and name the missing evidence."""
 
-        result = self._stream(prompt, f"Recon Analysis → {target}", MAX_RESP)
+        result = self._stream(prompt, f"Recon Analysis → {target}", MAX_RESP, temperature=0.15)
         self._save_analysis(recon_dir, "01_recon_analysis.md", result)
         return result
 
@@ -2096,6 +2140,14 @@ Based on this:
         httpx_sample     = self._read_file_sample(str(httpx_file), 3000)
         priority_sample  = self._read_file_sample(str(priority_file), 2000)
 
+        # v9.23 — give the model the REAL installed tool paths so it stops emitting
+        # /path/to/ placeholders and fake flags.
+        import shutil as _sh
+        _tools = {t: _sh.which(t) for t in
+                  ("nuclei", "dalfox", "sqlmap", "ffuf", "gau", "katana", "curl", "httpx")}
+        tool_lines = "\n".join(f"- {t}  (installed)" for t, p in _tools.items() if p) \
+                     or "- use bare binary names on $PATH"
+
         prompt = f"""Based on recon of {target}, generate a targeted scan plan.
 
 ## Recon Analysis
@@ -2107,18 +2159,23 @@ Based on this:
 ## Priority hosts
 {priority_sample or "(none)"}
 
+## Installed tools (call these by bare name — they are on $PATH)
+{tool_lines}
+
 ---
 
 Output a bash script (#!/bin/bash) with 8–15 targeted commands.
 Rules:
-- Use real tool names: nuclei, dalfox, sqlmap, ffuf, gau, katana, curl
-- Each command must be targeted at a specific host or endpoint from the data above
-- Include flags/payloads appropriate for the tech stack detected
-- Comment each command with what it is testing
-- Wrap commands in reasonable timeouts (timeout 120 cmd)
-- Output ONLY the bash script, nothing else."""
+- Use the bare tool names above (e.g. `nuclei`, `sqlmap`). NEVER use /path/to/ or any
+  placeholder path. If a path is unknown, use the bare binary name.
+- Use ONLY hosts/URLs that appear verbatim in the data above — never invent targets.
+- Each command targets a specific host or endpoint from the data above.
+- Include flags/payloads appropriate for the detected tech stack.
+- Comment each command with what it is testing.
+- Wrap commands in reasonable timeouts (timeout 120 cmd).
+- Output ONLY the bash script — no prose, no explanations, no ethics disclaimers."""
 
-        result = self._stream(prompt, f"Scan Plan → {target}", MAX_RESP)
+        result = self._stream(prompt, f"Scan Plan → {target}", MAX_RESP, temperature=0.15)
 
         # Save as executable script
         plan_path = recon_path / "brain" / "scan_plan.sh"
@@ -2127,11 +2184,27 @@ Rules:
         import re
         code = re.sub(r"^```(?:bash|sh)?\s*\n?", "", result.strip(), flags=re.MULTILINE)
         code = re.sub(r"\n?```\s*$", "", code.strip(), flags=re.MULTILINE)
+        # v9.23 — drop any leftover placeholder lines so the saved script never ships
+        # /path/to/ junk, then validate syntax before marking it executable.
+        code = "\n".join(ln for ln in code.splitlines() if "/path/to/" not in ln).strip()
         if not code.startswith("#!"):
             code = "#!/bin/bash\n" + code
+        import subprocess as _sp
+        try:
+            _chk = _sp.run(["bash", "-n", "-c", code], capture_output=True, text=True, timeout=15)
+            valid = (_chk.returncode == 0)
+        except Exception:
+            valid = False
+        if not valid:
+            code = ("#!/bin/bash\n# ⚠ SCAN PLAN FAILED VALIDATION (bash -n) — the model "
+                    "produced invalid/placeholder shell. Review manually before running.\n\n"
+                    + code)
         plan_path.write_text(code)
-        plan_path.chmod(0o755)
-        print(f"{GREEN}[Brain] Scan plan saved only → {plan_path}  (not executed automatically){NC}")
+        if valid:
+            plan_path.chmod(0o755)
+        status_note = "validated" if valid else "FAILED validation — not marked executable"
+        print(f"{GREEN}[Brain] Scan plan saved only → {plan_path} "
+              f"({status_note}; not executed automatically){NC}")
         return result
 
     def post_scan_hook(self, findings_dir: str, recon_dir: str = "") -> None:
