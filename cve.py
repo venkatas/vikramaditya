@@ -244,8 +244,9 @@ def _is_searchable_tech(tech_name: str) -> bool:
         return False
     if tl in NON_PRODUCT_TECHS:
         return False
-    # Ambiguous framework name with no version digit -> skip (keyword noise).
-    if tl in AMBIGUOUS_BARE_TECHS and not re.search(r"\d", tl):
+    # Ambiguous framework name with no attached version -> skip (keyword noise).
+    base = tl.split('/', 1)[0]
+    if base in AMBIGUOUS_BARE_TECHS and '/' not in tl:
         return False
     return True
 
@@ -266,7 +267,11 @@ def search_cves(tech_name, max_results=10):
         )
         if success and output:
             data = json.loads(output)
-            for vuln in data.get("vulnerabilities", []):
+            # NVD returns a non-object payload (e.g. [], null, an error string)
+            # on rate-limit / maintenance — guard like the circl.lu block below
+            # so a non-dict response can't raise an uncaught AttributeError.
+            vulnerabilities = data.get("vulnerabilities", []) if isinstance(data, dict) else []
+            for vuln in vulnerabilities:
                 cve_data = vuln.get("cve", {})
                 cve_id = cve_data.get("id", "")
                 descriptions = cve_data.get("descriptions", [])
@@ -296,8 +301,8 @@ def search_cves(tech_name, max_results=10):
                         "severity": severity,
                         "technology": tech_name
                     })
-    except (json.JSONDecodeError, Exception):
-        pass
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError, IndexError) as e:
+        print(f"    [!] CVE search parse error for {tech_name}: {e}")
 
     # Method 2: cve.circl.lu API (fallback)
     if not cves:
@@ -314,15 +319,19 @@ def search_cves(tech_name, max_results=10):
                     for item in data[:max_results]:
                         cve_id = item.get("id", item.get("cve_id", ""))
                         if cve_id:
+                            try:
+                                cvss_val = float(item.get("cvss", 0) or 0)
+                            except (TypeError, ValueError):
+                                cvss_val = 0.0
                             cves.append({
                                 "id": cve_id,
                                 "description": item.get("summary", "")[:200],
                                 "cvss_score": item.get("cvss", 0),
-                                "severity": "high" if float(item.get("cvss", 0) or 0) >= 7 else "medium",
+                                "severity": "high" if cvss_val >= 7 else "medium",
                                 "technology": tech_name
                             })
-        except (json.JSONDecodeError, Exception):
-            pass
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError, IndexError) as e:
+            print(f"    [!] CVE search parse error for {tech_name}: {e}")
 
     return cves
 

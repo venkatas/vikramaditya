@@ -693,12 +693,21 @@ def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
     tmpl = VULN_TEMPLATES.get(default_vtype, {})
     sev = tmpl.get("severity", "medium")
 
-    # Override with explicit severity keywords in the raw finding text
-    if any(k in line for k in ("SQLI-POC-VERIFIED", "RCE-POC", "CRITICAL", "CONFIRMED")):
+    # Override with explicit severity keywords in the raw finding text.
+    # Use word-boundary regex so severity tokens are not matched inside
+    # payload/evidence text — e.g. INFORMATION_SCHEMA must not match "INFO",
+    # HIGHCHARTS must not match "HIGH", SLOWLORIS/yellow must not match "LOW".
+    # Hyphen counts as a \b boundary, so RCE-POC / SSTI-CONFIRMED still match.
+    if re.search(r'\b(SQLI-POC-VERIFIED|RCE-POC|CRITICAL|CONFIRMED)\b', line):
         sev = "critical"
-    elif "HIGH" in line:
+    elif re.search(r'\bHIGH\b', line):
         sev = "high"
-    elif "LOW" in line or "INFO" in line:
+    elif re.search(r'\bINFO\b', line):
+        # Explicit INFO is context, not a low-severity vuln. Mapping it to "low"
+        # turned benign informational lines (e.g. "CORS-INFO" for a wildcard
+        # ACAO without credentials) into LOW findings in the report.
+        sev = "info"
+    elif re.search(r'\bLOW\b', line):
         sev = "low"
     url = "N/A"
     m = re.search(r'https?://\S+', line)
@@ -750,7 +759,8 @@ def load_findings(findings_dir: str) -> list:
         # Meta dirs that are never findings — suppress from the warning.
         meta_dirs = {"summary", "manual_review", "ordered_scan_targets", "brain",
                       "exploits", "screenshots", ".async", ".tmp",
-                      "cves_custom"}   # cves_custom/ is handled by Method 1c below
+                      "cves_custom",   # cves_custom/ is handled by Method 1c below
+                      "brain_active"}  # brain_active/ is handled by Method 1e below
         for entry in sorted(os.listdir(findings_dir)):
             full = os.path.join(findings_dir, entry)
             if not os.path.isdir(full):
@@ -787,6 +797,10 @@ def load_findings(findings_dir: str) -> list:
             "auth_required.txt",          # upload/ — paths protected by auth, not vulnerable
             "timebased_candidates.txt",   # sqli/ — unverified timing candidates
             "auth-required.txt",
+            # cves/ — cvemap writes global "high-EPSS CVEs worth testing" (CVE IDs,
+            # one per line via -lsi); they are NOT host/version-confirmed, so the
+            # generic loader must not promote each ID to a CRITICAL cves finding.
+            "cvemap_results.txt",
         }
         # Line-prefix markers used by scanner.sh to record state, not findings.
         NON_FINDING_PREFIXES = (
@@ -794,6 +808,8 @@ def load_findings(findings_dir: str) -> list:
             "[SQLI-CANDIDATE]",          # unverified time-based candidate, needs follow-up
             "[SQLI-TIMEOUT-CANDIDATE]",  # timeout was server-side slow, not necessarily SQLi
             "[GIT-FLAG-INJECTION-CANDIDATE]",  # candidate, not confirmed
+            "[JAVA-RMI-CANDIDATE]",      # deserialize/ — manual ysoserial follow-up lead,
+                                         # NOT a confirmed HIGH deserialization finding
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
@@ -904,8 +920,19 @@ def load_findings(findings_dir: str) -> list:
                         m = _re.search(r"\[([^\]]+)\]\s+\[\w+\]\s+\[(\w+)\]\s+(\S+)", line)
                         if m:
                             template_id, sev, url = m.group(1), m.group(2), m.group(3)
+                            # Normalize severity (nuclei emits "unknown"/"informational"
+                            # for some templates). Without this an "unknown" finding is
+                            # counted in `total` but excluded from the per-severity
+                            # counts dict (which only iterates SEVERITY_COLOR keys), so
+                            # the Executive Summary table fails to reconcile with Total.
+                            # Mirrors the Method 1d normalization below.
+                            sev = sev.lower()
+                            if sev in ("informational", "information"):
+                                sev = "info"
+                            if sev not in SEVERITY_ORDER:
+                                sev = "info"
                             results.append({
-                                "severity": sev.lower(),
+                                "severity": sev,
                                 "vtype": "cves",
                                 "title": f"{template_id} (custom template)",
                                 "detail": f"Custom nuclei template fired: {template_id}",
@@ -945,6 +972,65 @@ def load_findings(findings_dir: str) -> list:
         except Exception:
             pass
 
+    # Method 1e: Brain active scanner output (brain_active/iteration_*.json)
+    # brain_scanner.run_brain_scanner writes iteration_NN.json files whose
+    # cumulative "findings_so_far" list previously had NO ingestion path, so
+    # confirmed LLM active-scan findings were silently dropped from the report.
+    # We read the latest iteration (which carries the full findings list) and,
+    # critically, respect the scanner's grounding contract: lines prefixed
+    # "[MODEL CLAIM — verify PoC]" are model claims, not tool-verified, so they
+    # are collapsed into ONE clearly-labelled INFO context item (mirroring the
+    # unconfirmed-CVE collapse above). Only script-output-grounded lines become
+    # real findings so the findings table stays trustworthy.
+    brain_active_path = os.path.join(findings_dir, "brain_active")
+    if os.path.isdir(brain_active_path):
+        try:
+            iter_files = sorted(fn for fn in os.listdir(brain_active_path)
+                                if fn.startswith("iteration_") and fn.endswith(".json"))
+            brain_findings = []
+            if iter_files:
+                # The last iteration carries the cumulative findings_so_far list.
+                with open(os.path.join(brain_active_path, iter_files[-1]),
+                          errors="replace") as f:
+                    brain_data = _json.load(f)
+                brain_findings = brain_data.get("findings_so_far", []) or []
+            model_claims = []
+            for line in brain_findings:
+                line = (line or "").strip()
+                if not line:
+                    continue
+                if line.startswith("[MODEL CLAIM"):
+                    # Strip the marker prefix for the collapsed context item.
+                    model_claims.append(re.sub(r"^\[MODEL CLAIM[^\]]*\]\s*", "", line))
+                    continue
+                # Script-output-grounded line → real finding. Reuse the custom-line
+                # parser so its vtype/severity are derived from any [tag]/keywords.
+                vtype = "rce"
+                tags = [t.strip().lower() for t in re.findall(r'\[([^\]]+)\]', line)]
+                if tags and tags[0] in SUBDIR_VTYPE:
+                    vtype = SUBDIR_VTYPE[tags[0]]
+                finding = parse_custom_line(line, vtype)
+                finding["title"] = "Brain active-scan finding (script-confirmed)"
+                finding["detail"] = line
+                results.append(finding)
+            if model_claims:
+                sample = "; ".join(model_claims[:8])
+                results.append({
+                    "severity": "info",
+                    "vtype": "misconfig",
+                    "title": (f"Unconfirmed brain active-scan model claims "
+                              f"({len(model_claims)}) — PoC verification required"),
+                    "detail": ("These statements were produced by the LLM active scanner "
+                               "but are NOT grounded in tool/script output, so they are "
+                               "model claims pending manual PoC review and must not be "
+                               "reported as confirmed findings. "
+                               f"Examples: {sample}."),
+                    "url": "N/A",
+                    "poc": "Source: brain_active/iteration_*.json (model claims; not script-verified).",
+                })
+        except Exception:
+            pass
+
     # Method 1c: HAR VAPT / Legacy crawler results (har_vapt_*.json / legacy_vapt_*.json)
     for fn in sorted(os.listdir(findings_dir)):
         if (fn.startswith("har_vapt_") or fn.startswith("legacy_vapt_")) and fn.endswith(".json"):
@@ -966,8 +1052,13 @@ def load_findings(findings_dir: str) -> list:
                 pass
 
     # Method 2: Flat JSON findings (autopilot_api_hunt.py output)
-    # Reads finding_*.json files directly in the findings dir
-    if not results:
+    # Reads finding_*.json files directly in the findings dir.
+    # v10: always run — no other loader reads finding_*.json, so the old
+    # `if not results:` gate silently dropped autopilot findings whenever any
+    # earlier method (a brain_active INFO row, CORS, …) had already appended a
+    # row. Dedup by (vtype,url,detail) guards against any overlap.
+    _seen_m2 = {(r.get("vtype"), r.get("url"), r.get("detail")) for r in results}
+    if os.path.isdir(findings_dir):
         for fn in sorted(os.listdir(findings_dir)):
             if not fn.startswith("finding_") or not fn.endswith(".json"):
                 continue
@@ -1242,7 +1333,10 @@ def load_findings(findings_dir: str) -> list:
                     "impact": tmpl.get("impact", ""),
                     "attack_id": "",
                 }
-                results.append(finding)
+                key = (vtype, url, detail)
+                if key not in _seen_m2:
+                    _seen_m2.add(key)
+                    results.append(finding)
             except Exception:
                 continue
 
@@ -1314,13 +1408,17 @@ def _render_upload_evasion_matrix(findings: list) -> str:
 
         result_badge = ('<span style="background:#dc3545;color:#fff;padding:2px 8px;'
                         'border-radius:3px;font-weight:bold;font-size:0.85em">VULN</span>')
+        # Compute the confidence cell first so the ternary cannot leak across
+        # the implicit f-string concatenation (which would otherwise drop the
+        # risk/result/closing cells, emitting malformed rows).
+        conf_cell = f"<td>{confidence:.0%}</td>" if isinstance(confidence, float) else "<td>—</td>"
         rows += (
             f"<tr>"
             f"<td>{technique}</td>"
             f"<td><code>{filename}</code></td>"
             f"<td>{claimed}</td>"
             f"<td><b>{true_type}</b></td>"
-            f"<td>{confidence:.0%}</td>" if isinstance(confidence, float) else f"<td>—</td>"
+            f"{conf_cell}"
             f"<td>{risk.upper()}</td>"
             f"<td>{result_badge}</td>"
             f"</tr>\n"
@@ -1560,7 +1658,11 @@ def render_html_report(findings: list, target: str, report_dir: str,
         host  = re.search(r'https?://([^/]+)', f["url"])
         host  = host.group(1) if host else target
         vtitle = f.get("title") or tmpl["title"].format(host=host)
-        cvss  = tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A")
+        # Prefer the per-finding score (CVE rows carry the real CVSS inside
+        # their poc text) over the template default — mirrors the Markdown
+        # renderer so HTML/MD agree instead of hardcoding the cves template's 9.0.
+        m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
+        cvss = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
         tbl  += (f'<tr><td><a href="#VN-{i:03d}">VN-{i:03d}</a></td>'
                  f'<td>{vtitle}</td><td>{_badge(f["severity"])}</td>'
                  f'<td>{cvss}</td>'
@@ -1576,7 +1678,11 @@ def render_html_report(findings: list, target: str, report_dir: str,
         host   = host.group(1) if host else target
         vtitle = f.get("title") or tmpl["title"].format(host=host)
         sev    = f["severity"]
-        cvss   = tmpl.get("cvss") or CVSS_DEFAULT.get(sev, "N/A")
+        # Prefer the per-finding score (CVE rows carry the real CVSS inside
+        # their poc text) over the template default — mirrors the Markdown
+        # renderer so HTML/MD agree instead of hardcoding the cves template's 9.0.
+        m      = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
+        cvss   = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(sev, "N/A"))
         refs   = "".join(f'<li><a href="{u}" target="_blank">{n}</a></li>'
                          for n, u in tmpl.get("references", []))
         details += f"""
@@ -1812,7 +1918,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         # v9.1.2 — actual CVSS from finding (CVE rows carry per-CVE score) takes
         # precedence over template default.
         m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
-        cvss = m.group(1) if m else (tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
+        cvss = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
         lines.append(f"| VN-{i:03d} | {title} | {f['severity'].upper()} | {cvss} | {host} |")
     lines += ["", "---", "", "## Detailed Findings", ""]
     for i, f in enumerate(findings, 1):
@@ -1823,7 +1929,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
             host = target
         title = f.get("title") or tmpl["title"].format(host=host)
         m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
-        cvss = m.group(1) if m else (tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
+        cvss = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
         refs  = "\n".join(f"- [{n}]({u})" for n, u in tmpl.get("references", []))
         lines += [
             f"### VN-{i:03d} — {title}",

@@ -352,16 +352,18 @@ MLX_MODEL_PRIORITY = [
 # Used by triage_finding() and next_action() where speed > depth
 # 03 May 2026 bench: phi4:14b T1=4.3s vs baron-llm 17s — 4× faster, 100% valid JSON
 TRIAGE_MODEL_PRIORITY = [
-    "bugtraceai-apex:latest",       # Zero-refusal security DPO reasoning model
-    "xploiter/the-xploiter:latest",  # Primary exploit generation model
-    "aya-expanse:latest",           # Cohere Aya Expanse 8B Multilingual flagship model
     "phi4:14b",                  # ★ v9.1.3 — fastest triage, consistent JSON, no hidden thinking
+    "bugtraceai-apex:latest",       # Zero-refusal security DPO reasoning model
     "baron-llm:latest",          # BaronLLM — RLHF on offensive security data
+    "aya-expanse:latest",           # Cohere Aya Expanse 8B Multilingual flagship model
     "gemma4:e4b",                # Gemma 4 4B — fast triage with tool calling
     "vapt-qwen25:latest",        # custom VAPT-tuned fallback
     "vapt-model:latest",
     "qwen3:8b",
     "qwen3-coder-64k:latest",    # last resort — big model for triage if nothing else
+    # xploiter/the-xploiter is intentionally NOT in this list — it is WEIGHT-biased
+    # to assert/fabricate vulns (see MODEL_PRIORITY comment) and the 7-Question Gate
+    # is a faithful-evaluation task. It remains an exploit-IDEATION-only fallback.
 ]
 
 # Token limits — qwen3-coder-64k supports 64K context
@@ -1143,17 +1145,33 @@ endpoints, URLs, APIs, credentials, or findings. If the data shows "(none)" or
         target        = self._target_from_artifact_dir(findings_dir)
 
         sections = {}
+        # Mirror _collect_candidate_findings's allowed set — rce/sqlmap/cms have
+        # their own engines that write to findings/<cat>/ (not the top-level
+        # summary.txt), so omitting them here made confirmed RCE/SQLi invisible.
         categories = [
             "xss", "sqli", "lfi", "ssti", "ssrf", "cves", "cors",
             "graphql", "jwt", "smuggling", "takeover", "misconfig",
             "exposure", "redirects", "idor", "auth_bypass", "cloud",
+            "cms", "rce", "sqlmap",
         ]
         for cat in categories:
             cat_dir = findings_path / cat
             if not cat_dir.exists():
                 continue
+            # rce/ holds a noisy summary.txt and not-confirmed candidate files;
+            # only surface the confirmed-evidence artifacts like the collectors do.
+            if cat == "rce":
+                cat_files = []
+                for pattern in ("RCE_CONFIRMED*.txt", "JBOSS_EXPOSED*.txt",
+                                "JBOSS_DEFAULTCREDS*.txt", "nuclei_rce.txt",
+                                "nuclei_tomcat_cve.txt"):
+                    cat_files.extend(sorted(cat_dir.glob(pattern)))
+            elif cat == "sqlmap":
+                cat_files = sorted(cat_dir.glob("sqlmap_results.txt")) + sorted(cat_dir.glob("results-*.csv"))
+            else:
+                cat_files = sorted(cat_dir.glob("*.txt"))
             cat_content = []
-            for f in cat_dir.glob("*.txt"):
+            for f in cat_files:
                 content = f.read_text(errors="ignore").strip()
                 if content:
                     cat_content.append(f"=== {f.name} ===\n{content[:1500]}")
@@ -1448,28 +1466,40 @@ VERDICT REASONING: Why this verdict in 2-3 sentences
 IF CHAIN: What other finding would elevate this to SUBMIT?
 IF DROP: What would need to change for this to become viable?"""
 
-        result = self._stream_fast(prompt, "Finding Triage", 1000)
+        # Markdown/whitespace-tolerant verdict parse. Local models frequently bold
+        # the verdict ('**VERDICT:** SUBMIT', 'VERDICT: **SUBMIT**'), indent it, or
+        # prefix it ('Final VERDICT: DROP'). Stay line-scoped so we don't match the
+        # VERDICT REASONING / IF DROP prose further down the response.
+        def _parse_verdict(text: str) -> str:
+            for line in (text or "").splitlines():
+                m = re.match(r"\s*\**\s*(?:final\s+)?verdict\s*\**\s*:\s*\**\s*(SUBMIT|CHAIN|DROP)\b",
+                             line, re.IGNORECASE)
+                if m:
+                    return m.group(1).upper()
+            return "UNKNOWN"
+
+        # v9.23 — the 7-Question Gate is a faithful-evaluation task, not an
+        # exploit-assertion one: pin NARRATION_SYSTEM + low temperature so a
+        # hallucination-biased triage model cannot tilt the gate toward SUBMIT.
+        result = self._stream_fast(prompt, "Finding Triage", 1000,
+                                   system=NARRATION_SYSTEM, temperature=0.1)
+        verdict = _parse_verdict(result)
 
         # v7.1.4 — baron-llm cold-start cosmetic bug: first invocation
         # sometimes returns a generic task description ("You have been tasked
         # with validating the quality of a penetration test report…") instead
-        # of running the gate. Detect the miss (no VERDICT: token anywhere)
-        # and retry once with a stricter prompt that forbids meta-narration.
-        if "VERDICT:" not in (result or ""):
+        # of running the gate. Retry once when no parseable verdict line exists
+        # (keying on the parse result, not the bare 'VERDICT:' substring — a
+        # bolded '**VERDICT:**' contains the substring yet yields no verdict).
+        if verdict == "UNKNOWN":
             strict_prompt = (
                 "DO NOT describe the task. DO NOT summarise the finding in prose.\n"
                 "Start your response with the literal token 'VERDICT:'.\n\n"
                 + prompt
             )
-            result = self._stream_fast(strict_prompt, "Finding Triage (retry)", 1000)
-
-        verdict = "UNKNOWN"
-        for line in result.splitlines():
-            if line.startswith("VERDICT:"):
-                v = line.split(":", 1)[1].strip().split()[0]
-                if v in ("SUBMIT", "CHAIN", "DROP"):
-                    verdict = v
-                break
+            result = self._stream_fast(strict_prompt, "Finding Triage (retry)", 1000,
+                                       system=NARRATION_SYSTEM, temperature=0.1)
+            verdict = _parse_verdict(result)
 
         # v9.2.0 (P2-10) — append every gate cycle to brain/gate_workings.md
         # so the operator can audit phi4:14b's intermediate Q1-Q7 reasoning
@@ -2190,7 +2220,9 @@ Rules:
         code = re.sub(r"^```(?:bash|sh)?\s*\n?", "", result.strip(), flags=re.MULTILINE)
         code = re.sub(r"\n?```\s*$", "", code.strip(), flags=re.MULTILINE)
         # v9.23 — drop any leftover placeholder lines so the saved script never ships
-        # /path/to/ junk, then validate syntax before marking it executable.
+        # /path/to/ junk, then syntax-check (bash -n) before marking it executable.
+        # NOTE: bash -n only catches gross syntax errors — it does NOT validate tool
+        # flags, hosts, or stray prose, all of which parse as valid commands.
         code = "\n".join(ln for ln in code.splitlines() if "/path/to/" not in ln).strip()
         if not code.startswith("#!"):
             code = "#!/bin/bash\n" + code
@@ -2201,13 +2233,14 @@ Rules:
         except Exception:
             valid = False
         if not valid:
-            code = ("#!/bin/bash\n# ⚠ SCAN PLAN FAILED VALIDATION (bash -n) — the model "
-                    "produced invalid/placeholder shell. Review manually before running.\n\n"
+            code = ("#!/bin/bash\n# ⚠ SCAN PLAN FAILED bash -n SYNTAX CHECK — the model "
+                    "produced unparseable shell. Review manually before running.\n\n"
                     + code)
         plan_path.write_text(code)
         if valid:
             plan_path.chmod(0o755)
-        status_note = "validated" if valid else "FAILED validation — not marked executable"
+        status_note = ("syntax-checked only (bash -n) — review before running"
+                       if valid else "FAILED bash -n syntax check — not marked executable")
         print(f"{GREEN}[Brain] Scan plan saved only → {plan_path} "
               f"({status_note}; not executed automatically){NC}")
         return result
@@ -2222,9 +2255,16 @@ Rules:
         if not self.enabled:
             return
         interp = self.interpret_scan(findings_dir)
-        # interpret_scan returns "" when findings dirs are empty — skip
-        # downstream phases entirely to avoid fabricated chains and reports.
-        if not interp or "no findings" in interp.lower()[:80]:
+        # Gate the downstream pipeline on deterministic on-disk evidence — the same
+        # collectors the chain/triage/report phases consume — not on a substring of
+        # free-form model prose. The old `'no findings' in interp.lower()[:80]` check
+        # could (a) fail to short-circuit a truly empty scan when the model prepended
+        # narration, and (b) wrongly drop a real RCE when the model opened with
+        # "No findings of XSS, but a critical RCE exists…". Only skip when BOTH the
+        # text verdict AND the structured collectors are empty.
+        has_candidates = bool(self._collect_candidate_findings(findings_dir))
+        has_report_evidence = bool(self._build_report_evidence(findings_dir, recon_dir).strip())
+        if (not interp or "no findings" in interp.lower()[:80]) and not has_candidates and not has_report_evidence:
             print(f"{YELLOW}[Brain] No scan findings — skipping chain/report phases{NC}")
             return
         self.build_chains(findings_dir)

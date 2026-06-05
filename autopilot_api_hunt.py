@@ -998,7 +998,6 @@ class FileTypeEvasionTester:
                             pass
 
                     if not row["upload_ok"]:
-                        matrix.append(row)
                         continue
 
                     # Try to access/download the uploaded file and classify
@@ -1072,10 +1071,9 @@ class FileTypeEvasionTester:
 
         # Save the upload test matrix for reporter.py
         if matrix and saver:
-            matrix_path = os.path.join(
-                os.path.dirname(saver._base_dir) if hasattr(saver, '_base_dir')
-                else ".", "upload_evasion_matrix.json"
-            )
+            # saver is guaranteed truthy by the guard above.
+            matrix_path = os.path.join(os.path.dirname(saver.dir),
+                                       "upload_evasion_matrix.json")
             try:
                 with open(matrix_path, "w") as f:
                     json.dump(matrix, f, indent=2)
@@ -1108,23 +1106,85 @@ class InjectionTester:
             kw in ep["path"] for kw in ("list", "report", "view")
         )][:10]
 
+        # Concrete DBMS error signatures only — a bare "sql"/"syntax error"
+        # substring matches innumerable benign tokens (MySQL, NoSQL, a JSON
+        # field named "sql", generic JS "syntax error", etc.) and produces FPs.
+        SQL_ERR_RE = re.compile(
+            r"you have an error in your sql syntax|unterminated quoted string|"
+            r"unclosed quotation mark|quoted string not properly terminated|"
+            r"ora-\d{5}|sqlstate\[|psqlexception|pg::syntaxerror|"
+            r"sqlite3?\.operationalerror|near \".*\": syntax error|"
+            r"warning: mysql|mysql_fetch|supplied argument is not a valid mysql|"
+            r"odbc sql server driver|microsoft ole db provider for sql server|"
+            r"unknown column .* in .field list.",
+            re.IGNORECASE,
+        )
+        # Payloads that actually inject a time delay (NOT SQLI_PAYLOADS[:2],
+        # none of which contain a sleep primitive).
+        TIME_PAYLOADS = ["1' AND (SELECT 1 FROM pg_sleep(3))--",
+                         "1'; WAITFOR DELAY '0:0:3'--",
+                         "1' OR SLEEP(3)--"]
+        # Confirmation payloads that scale the delay to ~6s to rule out jitter.
+        TIME_CONFIRM = {
+            "1' AND (SELECT 1 FROM pg_sleep(3))--": "1' AND (SELECT 1 FROM pg_sleep(6))--",
+            "1'; WAITFOR DELAY '0:0:3'--": "1'; WAITFOR DELAY '0:0:6'--",
+            "1' OR SLEEP(3)--": "1' OR SLEEP(6)--",
+        }
+
         for ep in search_endpoints:
+            # 7a-i. Baseline-anchored time-based SQLi. Measure a real baseline
+            # from a benign request. The injected-sleep deltas below (+2.5s to
+            # flag, +5.0s to confirm) are anchored to THIS per-endpoint baseline,
+            # so a steadily-slow endpoint is handled correctly — only skip
+            # pathologically-slow/unstable endpoints (>=8s) where a 3s sleep would
+            # be lost in the noise. The old <1.0 gate silently skipped exactly the
+            # list/report/view endpoints this check targets (they baseline at 1-8s).
+            b0 = time.monotonic()
+            session.request("POST", ep["path"], json_body={"search": "benign123"})
+            baseline = time.monotonic() - b0
+            # Skip only pathologically-slow endpoints (>=20s). The injected-sleep
+            # deltas below are baseline-anchored, and each probe's timeout is sized
+            # to baseline+12s so the 3s/6s sleeps stay observable even on slow (up to
+            # ~20s) list/report/view endpoints — the prior 8.0 cap (tied to the
+            # default 15s request timeout) silently skipped exactly the slow
+            # endpoints this check exists to test. The generous per-probe timeout
+            # also guarantees a genuine sleep never hits the request timeout, so a
+            # network timeout cannot masquerade as an injected delay.
+            if baseline < 20.0:
+                probe_timeout = int(baseline) + 12
+                for payload in TIME_PAYLOADS:
+                    start = time.monotonic()
+                    resp = session.request("POST", ep["path"],
+                                           json_body={"search": payload}, timeout=probe_timeout)
+                    elapsed = time.monotonic() - start
+                    # Only flag when the injected sleep is observed over
+                    # baseline + margin.
+                    if elapsed > baseline + 2.5:
+                        # Confirm with a 6s payload that scales before saving.
+                        c0 = time.monotonic()
+                        session.request("POST", ep["path"],
+                                        json_body={"search": TIME_CONFIRM[payload]}, timeout=probe_timeout)
+                        confirm = time.monotonic() - c0
+                        if confirm > baseline + 5.0:
+                            f = {"type": "sqli_time_based", "severity": CRITICAL,
+                                 "detail": f"Time-based SQLi: {elapsed:.1f}s delay on {ep['path']}",
+                                 "url": resp["url"],
+                                 "evidence": (f"search='{payload}' → {elapsed:.1f}s "
+                                              f"(baseline {baseline:.2f}s, "
+                                              f"diff {elapsed - baseline:.1f}s); "
+                                              f"6s confirm → {confirm:.1f}s")}
+                            findings.append(f)
+                            if saver:
+                                saver.save(f)
+                                saver.save_txt(f)
+                            break
+
+            # 7a-ii. Error-based SQLi via concrete DBMS error signatures.
             for payload in self.SQLI_PAYLOADS[:2]:
-                start = time.monotonic()
                 resp = session.request("POST", ep["path"],
                                        json_body={"search": payload})
-                elapsed = time.monotonic() - start
-                if elapsed > 3.0:
-                    f = {"type": "sqli_time_based", "severity": CRITICAL,
-                         "detail": f"Time-based SQLi: {elapsed:.1f}s delay on {ep['path']}",
-                         "url": resp["url"],
-                         "evidence": f"search='{payload}' → {elapsed:.1f}s (baseline <0.5s)"}
-                    findings.append(f)
-                    if saver:
-                        saver.save(f)
-                        saver.save_txt(f)
                 body_str = str(resp.get("body", ""))
-                if "syntax error" in body_str.lower() or "sql" in body_str.lower():
+                if SQL_ERR_RE.search(body_str):
                     f = {"type": "sqli_error_based", "severity": HIGH,
                          "detail": f"SQL error in response on {ep['path']}",
                          "url": resp["url"],
@@ -1261,7 +1321,20 @@ class InjectionTester:
                         for line in nf:
                             line = line.strip()
                             if line:
-                                sev = CRITICAL if "critical" in line.lower() else HIGH
+                                # nuclei -o format: [template-id] [proto] [severity] url
+                                # Read the bracketed severity token; mapping every
+                                # band avoids forcing medium/low results to HIGH.
+                                low = line.lower()
+                                if "[critical]" in low:
+                                    sev = CRITICAL
+                                elif "[high]" in low:
+                                    sev = HIGH
+                                elif "[medium]" in low:
+                                    sev = MEDIUM
+                                elif "[low]" in low:
+                                    sev = LOW
+                                else:
+                                    sev = INFO
                                 f = {"type": "nuclei_finding", "severity": sev,
                                      "detail": f"nuclei: {line[:150]}",
                                      "url": session.base_url,
@@ -2370,6 +2443,13 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
     if with_brain:
         try:
             all_findings = _brain_validate_findings(all_findings, output_dir)
+            # Rebuild the saver's on-disk artifacts from the post-validation
+            # set. _brain_validate_findings only tags removed findings and
+            # returns a filtered list — the per-finding JSON files and
+            # findings.txt that reporter.py reads still carry pre-validation
+            # severity and removed entries unless we rewrite them here.
+            if saver:
+                _rewrite_saver_artifacts(saver, all_findings)
         except Exception as e:
             log("warn", f"Brain validation failed: {e}")
 
@@ -2406,6 +2486,46 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
 
 
 # (Old _brain_supervisor_review removed — replaced by _brain_decide_next above)
+
+
+def _rewrite_saver_artifacts(saver: FindingSaver, validated: list[dict]) -> None:
+    """Rebuild a FindingSaver's on-disk artifacts from the post-validation set.
+
+    save()/save_txt() persist findings with their original (pre-validation)
+    severity, and _brain_validate_findings only tags removed findings rather
+    than dropping them from the saver. So the finding_*.json files and
+    findings.txt that reporter.py reads stay stale unless we rewrite them:
+    delete the old per-finding JSON files, re-emit one per validated finding,
+    rebuild findings.txt, and reset the saver's in-memory list so the
+    subsequent save_summary() is consistent too.
+    """
+    try:
+        # (1) Reset in-memory list so save_summary() reflects the validated set.
+        saver._findings = list(validated)
+        # (2) Drop stale per-finding JSON files (removed/downgraded ones).
+        for fname in os.listdir(saver.dir):
+            if fname.startswith("finding_") and fname.endswith(".json"):
+                try:
+                    os.unlink(os.path.join(saver.dir, fname))
+                except OSError:
+                    pass
+        # (3) Re-emit one JSON file per validated finding.
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        for idx, finding in enumerate(validated, start=1):
+            path = os.path.join(saver.dir, f"finding_{ts}_{idx:04d}.json")
+            with open(path, "w") as fh:
+                json.dump(finding, fh, indent=2, default=str)
+        # (4) Truncate and rebuild findings.txt (same one-liner format as
+        #     FindingSaver.save_txt).
+        txt_path = os.path.join(saver.dir, "findings.txt")
+        with open(txt_path, "w") as fh:
+            for finding in validated:
+                sev = finding.get("severity", "medium").upper()
+                url = finding.get("url", "N/A")
+                detail = finding.get("detail", finding.get("type", ""))
+                fh.write(f"[{sev}] {detail} {url}\n")
+    except Exception as e:
+        log("warn", f"  Could not rewrite finding artifacts: {e}")
 
 
 def _brain_validate_findings(findings: list[dict], output_dir: str = None) -> list[dict]:

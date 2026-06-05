@@ -457,11 +457,22 @@ def build_markdown(techs: list[str], results: list[dict]) -> str:
         t = r["tech"]
         by_tech.setdefault(t, []).append(r)
 
+    _seen_tech = set()
     for tech in techs:
-        tech_results = by_tech.get(tech, [])
+        # v9.23 — normalize the raw token to the same canonical key the fetchers
+        # store under (lowercased, version-stripped). Without this, version-tagged
+        # or mixed-case tokens like "php=7.4.33"/"IIS" miss the by_tech lookup and
+        # render "_No results found_" even when CVEs were fetched.
+        name = _split_tech(tech)[0]
+        # Two raw tokens can collapse to the same canonical name (e.g. both "php"
+        # and "php=7.4.33") — render each tech section only once.
+        if name in _seen_tech:
+            continue
+        _seen_tech.add(name)
+        tech_results = by_tech.get(name, [])
         tech_results.sort(key=lambda x: severity_order(x.get("severity", "UNKNOWN")))
 
-        lines.append(f"## {tech.upper()}")
+        lines.append(f"## {name.upper()}")
         lines.append("")
 
         if not tech_results:
@@ -482,9 +493,11 @@ def build_markdown(techs: list[str], results: list[dict]) -> str:
         lines.append("")
 
         # Add grep patterns if available
-        patterns = TECH_GREP_PATTERNS.get(tech.lower(), [])
+        # _split_tech already lowercased + stripped any version suffix, so this
+        # now matches for version-tagged tokens (e.g. "php=7.4.33") too.
+        patterns = TECH_GREP_PATTERNS.get(name, [])
         if patterns:
-            lines.append(f"### Grep Patterns for `{tech}` (run in target repo)")
+            lines.append(f"### Grep Patterns for `{name}` (run in target repo)")
             lines.append("")
             lines.append("```bash")
             for p in patterns:

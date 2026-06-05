@@ -430,6 +430,9 @@ class HuntMemory:
         self.observation_buf: list[dict] = []   # {tool, ts, text}
         self.completed_steps: list[str]  = []
         self.step_count      = 0
+        # In-memory dedup set for _classify_obs — NOT persisted (rebuilt per run).
+        # Prevents the same finding being re-counted on every subsequent scan walk.
+        self._classified_keys: set = set()
         self._load()
 
     def _load(self) -> None:
@@ -537,15 +540,15 @@ class ToolDispatcher:
                     quick=bool(args.get("quick", False)),
                     full=bool(args.get("full", False)),
                 )
-                obs = self._summarize_findings(domain, "scan", ok)
+                obs = self._summarize_findings(domain, "scan", ok, since=t0)
 
             elif name == "run_js_analysis":
                 ok = h.run_js_analysis(domain)
-                obs = self._summarize_findings(domain, "js", ok)
+                obs = self._summarize_findings(domain, "js", ok, since=t0)
 
             elif name == "run_secret_hunt":
                 ok = h.run_secret_hunt(domain)
-                obs = self._summarize_findings(domain, "secrets", ok)
+                obs = self._summarize_findings(domain, "secrets", ok, since=t0)
 
             elif name == "run_param_discovery":
                 ok = h.run_param_discovery(domain)
@@ -558,23 +561,23 @@ class ToolDispatcher:
 
             elif name == "run_api_fuzz":
                 ok = h.run_api_fuzz(domain)
-                obs = self._summarize_findings(domain, "api", ok)
+                obs = self._summarize_findings(domain, "api", ok, since=t0)
 
             elif name == "run_cors_check":
                 ok = h.run_cors_check(domain)
-                obs = self._summarize_findings(domain, "cors", ok)
+                obs = self._summarize_findings(domain, "cors", ok, since=t0)
 
             elif name == "run_cms_exploit":
                 ok = h.run_cms_exploit(domain)
-                obs = self._summarize_findings(domain, "cms", ok)
+                obs = self._summarize_findings(domain, "cms", ok, since=t0)
 
             elif name == "run_rce_scan":
                 ok = h.run_rce_scan(domain)
-                obs = self._summarize_findings(domain, "rce", ok)
+                obs = self._summarize_findings(domain, "rce", ok, since=t0)
 
             elif name == "run_sqlmap_targeted":
                 ok = h.run_sqlmap_targeted(domain)
-                obs = self._summarize_findings(domain, "sqlmap", ok)
+                obs = self._summarize_findings(domain, "sqlmap", ok, since=t0)
 
             elif name == "run_sqlmap_on_file":
                 req_file = args.get("request_file", "")
@@ -589,7 +592,7 @@ class ToolDispatcher:
 
             elif name == "run_jwt_audit":
                 ok = h.run_jwt_audit(domain)
-                obs = self._summarize_findings(domain, "jwt", ok)
+                obs = self._summarize_findings(domain, "jwt", ok, since=t0)
 
             elif name == "read_recon_summary":
                 obs = self._read_recon_files(domain)
@@ -668,12 +671,16 @@ class ToolDispatcher:
 
         return "\n".join(lines)
 
-    def _summarize_findings(self, domain: str, label: str, ok: bool) -> str:
+    def _summarize_findings(self, domain: str, label: str, ok: bool,
+                            since: float | None = None) -> str:
         h = _h()
         findings_dir = h._resolve_findings_dir(domain, create=False)
         lines = [f"{label}: {'OK' if ok else 'ran (check manually)'}"]
 
-        # Walk findings dir for any .txt with content
+        # Walk findings dir for any .txt with content. When `since` is given
+        # (dispatch start time), only include artifacts the just-ran tool
+        # actually produced — otherwise a benign tool (e.g. cors) would report
+        # SQLi/RCE lines written by an earlier tool (cross-attribution).
         if findings_dir and os.path.isdir(findings_dir):
             for root, _, files in os.walk(findings_dir):
                 for fn in files:
@@ -681,6 +688,8 @@ class ToolDispatcher:
                         continue
                     fp = os.path.join(root, fn)
                     try:
+                        if since is not None and os.path.getmtime(fp) < since:
+                            continue
                         content = Path(fp).read_text(errors="replace")
                         if any(kw in content.lower() for kw in
                                ("critical", "high", "vulnerable", "injectable",
@@ -788,6 +797,18 @@ class ToolDispatcher:
         for ln in obs.splitlines():
             if any(kw in ln.lower() for kw in
                    ("critical", "high", "injectable", "rce", "exposed", "found", "medium", "sql")):
+                # Dedup: the same finding line is re-walked on every subsequent scan,
+                # which otherwise re-adds it and inflates len(findings_log). Key on
+                # (tool, severity, normalized-line) so repeated walks are idempotent
+                # WITHOUT collapsing two distinct tools that happen to surface a
+                # byte-identical line head at the same severity.
+                key = (tool, sev, ln.strip()[:300])
+                if key in self.memory._classified_keys:
+                    # Already recorded — skip THIS line but keep scanning. A
+                    # previously-seen duplicate at the top of an appended file must
+                    # not hide a genuinely new finding lower in the same observation.
+                    continue
+                self.memory._classified_keys.add(key)
                 self.memory.add_finding(tool, sev, ln.strip()[:300])
                 break
 
@@ -1225,6 +1246,34 @@ class ReActAgent:
             if parsed:
                 name, args = parsed
                 print(f"{MAGENTA}[Agent] Parsed from text: {name}{NC}", flush=True)
+
+                # ── Persistence enforcement: block early finish (mirror native path) ──
+                if name == "finish" and self.memory.step_count < self.MIN_STEPS_BEFORE_FINISH:
+                    remaining_needed = self.MIN_STEPS_BEFORE_FINISH - self.memory.step_count
+                    print(f"{YELLOW}[Agent] Finish blocked (text path) — only "
+                          f"{self.memory.step_count} steps done, need {remaining_needed} more. "
+                          f"Continuing...{NC}", flush=True)
+                    return (f"[SYSTEM] Too early to finish. You have only run "
+                            f"{self.memory.step_count} tools. Run at least "
+                            f"{remaining_needed} more high-impact tools before concluding.")
+
+                # ── Loop detection (mirror native path) ──────────────────────────
+                warn, must_break = self.loop_detector.record(name, args)
+                if must_break:
+                    print(f"{RED}[Agent] Loop detected on '{name}' (text path) — forcing "
+                          f"direction change{NC}", flush=True)
+                    if self.tracer:
+                        self.tracer.loop_break(name, self.memory.step_count)
+                    self.loop_detector.reset()
+                    return (f"[SYSTEM] Loop detected: '{name}' called 5+ times with identical args. "
+                            f"You MUST switch strategy. Try a completely different tool or angle. "
+                            f"What have you NOT tried yet?")
+                if warn:
+                    print(f"{YELLOW}[Agent] Loop warning: '{name}' repeated — consider switching{NC}",
+                          flush=True)
+                    if self.tracer:
+                        self.tracer.loop_warn(name, LoopDetector.WARN_AT, self.memory.step_count)
+
                 obs = self.dispatcher.dispatch(name, args)
                 if name == "finish":
                     self.done    = True

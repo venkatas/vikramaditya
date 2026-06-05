@@ -326,9 +326,21 @@ run_phase5_port_scanning() {
                 -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
         fi
 
-        grep "open" "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null \
-            | sed -nE 's/.*[^0-9]([0-9]+)\/open.*/\1\/open/p' \
-            | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
+        # Re-derive open_ports.txt from the nmap greppable output. nmap -oG puts
+        # ALL ports for a host on ONE comma-separated "Ports:" line, so grep -oE
+        # is needed to capture every port (a leading-greedy sed would keep only
+        # the last). Only overwrite when nmap actually yielded ports — otherwise
+        # the naabu-derived list (lines 294-295) must survive an empty/failed
+        # nmap run. Merge to be safe, and stage via a temp file to avoid the
+        # truncate-before-pipeline race.
+        if [ -s "$RECON_DIR/ports/nmap_greppable.txt" ]; then
+            nmap_ports="$(grep -oE '[0-9]+/open' "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null | sort -u)"
+            if [ -n "$nmap_ports" ]; then
+                { printf '%s\n' "$nmap_ports"; cat "$RECON_DIR/ports/open_ports.txt" 2>/dev/null; } \
+                    | grep -E '^[0-9]+/open$' | sort -u > "$RECON_DIR/ports/open_ports.txt.new" 2>/dev/null \
+                    && mv "$RECON_DIR/ports/open_ports.txt.new" "$RECON_DIR/ports/open_ports.txt"
+            fi
+        fi
         log_done "Open ports: $(file_lines "$RECON_DIR/ports/open_ports.txt")"
 
         if [ -s "$RECON_DIR/priority/critical_hosts.txt" ]; then
@@ -781,6 +793,7 @@ else
                 -title \
                 -tech-detect \
                 -content-length \
+                -ip \
                 -no-fallback \
                 -no-color \
                 -threads "$THREADS" \
@@ -801,7 +814,7 @@ else
 
     # Separate by status
     grep '\[200\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_200.txt"  2>/dev/null || true
-    grep '\[30[123]\]' "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_3xx.txt" 2>/dev/null || true
+    grep -E '\[30[12378]\]' "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_3xx.txt" 2>/dev/null || true
     grep '\[403\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_403.txt"  2>/dev/null || true
     grep '\[401\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_401.txt"  2>/dev/null || true
     grep '\[429\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_429.txt"  2>/dev/null || true
@@ -1061,6 +1074,9 @@ for line in sys.stdin:
     parsed = urlparse(url)
     path = parsed.path
     query = parsed.query
+    # Collapse query params: q=12345 → q=N, id=abc → id=N, r=999 → r=N
+    # (defined here so 'q' is available to the listing-collapse check below)
+    q = re.sub(r'=[^&]+', '=N', query)
     # Collapse dates: /20260404.htm → /DATE.htm
     p = re.sub(r'/\d{8}\.\w+', '/DATE.ext', path)
     # Collapse numeric path segments: /12345 or /62094 → /NUM
@@ -1080,8 +1096,6 @@ for line in sys.stdin:
             p = parent + '/CAT'
     # Collapse UUIDs
     p = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'UUID', p)
-    # Collapse query params: q=12345 → q=N, id=abc → id=N, r=999 → r=N
-    q = re.sub(r'=[^&]+', '=N', query)
     # Build pattern key: host + collapsed path + collapsed query
     pattern = f'{parsed.netloc}{p}?{q}' if q else f'{parsed.netloc}{p}'
     if pattern not in seen_patterns:

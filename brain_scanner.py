@@ -184,7 +184,8 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
             "returncode": result.returncode,
         }
     except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": f"TIMEOUT after {timeout}s", "returncode": -9}
+        return {"stdout": "", "stderr": f"TIMEOUT after {timeout}s", "returncode": -9,
+                "timed_out": True, "timeout": timeout}
     except Exception as e:
         return {"stdout": "", "stderr": str(e), "returncode": -1}
 
@@ -580,9 +581,16 @@ Then test the most promising attack vectors."""
                 log("ok", "Brain issued final verdict")
                 # Only accept verdict-prose lines as findings if they are explicitly
                 # CONFIRMED/EXPLOITABLE; tag them as model claims pending PoC review so
-                # they are never mistaken for tool-verified findings.
+                # they are never mistaken for tool-verified findings. Substring matching
+                # alone records negative verdicts ("NOT VULNERABLE (LOW)", "No CRITICAL
+                # ... CONFIRMED") as findings — skip any line carrying a negation marker.
+                NEG_MARKERS = ("NOT VULNERABLE", "NOT EXPLOITABLE", "NO CRITICAL", "NO HIGH",
+                               "NOT CONFIRMED", "UNABLE TO CONFIRM", "NOTHING CONFIRMED",
+                               "NO VULNERABILIT", "NOT CONFIRM")
                 for line in response.split('\n'):
                     up = line.upper()
+                    if any(neg in up for neg in NEG_MARKERS):
+                        continue
                     if any(sev in up for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]) \
                        and any(k in up for k in ["CONFIRMED", "EXPLOITABLE", "VULNERABLE"]):
                         findings.append(f"[MODEL CLAIM — verify PoC] {line.strip()}")
@@ -609,7 +617,13 @@ Then test the most promising attack vectors."""
                 print(f"  {C}│{N} ... ({code.count(chr(10)) - 30} more lines)")
             print(f"  {C}└─────────────────────────────────────────────────{N}\n")
 
-            result = execute_script(lang, code)
+            # The SYSTEM_PROMPT mandates sqlmap --level/--risk, full-severity nuclei,
+            # and ffuf fuzzing — all of which routinely run for minutes. The 60s
+            # default kills them mid-run, so scale the budget when a long tool is
+            # invoked. Recon curls self-cap (--max-time 15) and stay on the default.
+            long_tools = ("sqlmap", "nuclei", "ffuf", "feroxbuster", "gobuster", "dalfox")
+            tmo = 600 if any(t in code for t in long_tools) else MAX_SCRIPT_RUNTIME
+            result = execute_script(lang, code, timeout=tmo)
 
             # Show results
             if result["stdout"]:
@@ -631,17 +645,51 @@ Then test the most promising attack vectors."""
                                 "(e.g. an unterminated quote). This is NOT evidence about the "
                                 "target. Rewrite the script correctly and try again.\n")
                 all_results += f"STDERR:\n{result['stderr']}\n"
+            elif result.get("timed_out"):
+                # A timeout TRUNCATED the test — it is NOT a negative result about the
+                # target. Tell the model so it never reads an empty/partial stdout as
+                # "not vulnerable", and steer it to a narrower scope.
+                all_results += (f"SCRIPT TIMED OUT after {result.get('timeout', tmo)}s — the test "
+                                "was TRUNCATED, NOT a negative result. Narrow the scope (single "
+                                "param / fewer templates / one URL) or it ran out of budget.\n")
+                all_results += f"STDERR:\n{result['stderr']}\n"
             else:
                 all_results += f"STDOUT:\n{result['stdout']}\n"
                 if result["stderr"]:
                     all_results += f"STDERR:\n{result['stderr']}\n"
                 # A script that ran (rc 0, or non-zero but not a syntax error) counts
-                # as a real test the model may reason from.
-                if result["returncode"] == 0:
+                # as a real test the model may reason from. Exclude TIMEOUT (-9) and
+                # internal/tooling errors (-1), which did NOT produce target evidence.
+                # Also exclude RUNTIME tooling failures (Python traceback / missing
+                # module / command-not-found): these "ran" but produced zero target
+                # evidence, so they must not satisfy the gate that lets the model
+                # issue a final verdict after no real testing.
+                # (sys.exit(1) PoCs, grep/curl --fail pipelines, sqlmap/dalfox/ffuf all
+                #  exit non-zero on a genuine run, so rc != 0 must still count.)
+                _stderr_up = (result.get("stderr") or "").upper()
+                _tooling_error = (
+                    result["returncode"] == 127
+                    or "TRACEBACK (MOST RECENT CALL LAST)" in _stderr_up
+                    or "MODULENOTFOUNDERROR" in _stderr_up
+                    or "NAMEERROR" in _stderr_up
+                    or "IMPORTERROR" in _stderr_up
+                    or "COMMAND NOT FOUND" in _stderr_up
+                )
+                if result["returncode"] not in (-9, -1) and not _tooling_error:
                     successful_runs += 1
-                # Grounded findings: only from ACTUAL script stdout.
+                # Grounded findings: only from ACTUAL script stdout. Plain substring
+                # matching records negative lines ("NOT VULNERABLE", "No critical ...")
+                # as findings — skip any line carrying a negation marker. Markers are
+                # kept narrow and unambiguous: broad phrases like "NOT FOUND" / "NO
+                # ISSUES" / "NOT AFFECTED" were dropped because they can appear inside
+                # a genuinely-confirming stdout line (e.g. "EXPLOITABLE: creds NOT
+                # FOUND but RCE works") and would silently suppress a real finding.
+                NEG_MARKERS = ("NOT VULNERABLE", "NOT EXPLOITABLE", "NOT VULN", "NO CRITICAL",
+                               "0 CRITICAL", "NO VULNERABILIT", "NOT INJECTABLE")
                 for line in result["stdout"].split('\n'):
-                    if any(kw in line.upper() for kw in ["VULNERABLE", "CONFIRMED", "CRITICAL", "EXPLOITABLE"]):
+                    up = line.upper()
+                    if any(kw in up for kw in ["VULNERABLE", "CONFIRMED", "CRITICAL", "EXPLOITABLE"]) \
+                       and not any(neg in up for neg in NEG_MARKERS):
                         findings.append(line.strip())
 
         # Feed results back to brain
