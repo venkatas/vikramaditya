@@ -1,5 +1,78 @@
 # Changelog
 
+## v10.0.0 — full-tool correctness audit (2026-06-05)
+
+A major correctness release. A multi-stage audit — an automated multi-agent
+fan-out across every engine, an adversarial self-review of the resulting fixes,
+then **independent reviews by `codex` and `grok`** tracing every code path end to
+end — found and fixed **60+ real bugs across 12 files**. Every fix was verified
+against live code and the patched `reporter.py` was smoke-tested on a real
+findings directory. Two failure classes were closed: detectors fabricating
+findings, and real findings never reaching the report.
+
+### The report-ingestion contract (the headline theme)
+
+Several detectors produced correct findings that never reached `reporter.py`, and
+a few candidate/INFO lines that *did* reach it were inflated to HIGH/CRITICAL.
+
+- **Brain active-scanner output now ingested** — `reporter.py` Method 1e parses
+  `brain_active/iteration_*.json`; `vikramaditya.py` reordered so the report runs
+  AFTER the active scanner and points at a dir that includes its output (was the
+  original report-before-testing bug).
+- **Confirmed Drupalgeddon RCE now reported** — a verified `uid=` RCE was written
+  only to the meta `exploits/` dir (ignored by the reporter); it now also writes
+  `rce/RCE_CONFIRMED_drupalgeddon2_*.txt`.
+- **Autopilot `finding_*.json` no longer silently dropped** — the Method 2 loader
+  was gated behind `if not results:` and skipped whenever any earlier loader (a
+  `brain_active` INFO row, CORS, …) had already added a row; now always ingested
+  with `(vtype,url,detail)` dedup.
+- **`CORS-INFO` (benign wildcard ACAO without credentials)** no longer rendered as
+  a LOW vuln — `parse_custom_line` maps explicit `INFO` to `info`, not `low`.
+- **`cvemap` global "worth testing" CVE IDs** no longer promoted to CRITICAL
+  findings (`cvemap_results.txt` added to the reporter's non-finding files).
+- **`[JAVA-RMI-CANDIDATE]` lead** no longer rendered as a HIGH deserialization
+  finding (added to the reporter's non-finding prefixes).
+
+### False positives eliminated (detectors)
+
+- Drupalgeddon2 "RCE CONFIRMED" required a real `uid=N(` signature, not any
+  non-empty stdout; Java RMI/JMX deser confirmed only with a corroborating
+  CT/body marker (400/500 on Java paths kept as a manual candidate, fixing both
+  an FP and the JBoss-500 FN); time-based SQLi anchored to a measured per-endpoint
+  baseline with a scaled 6s confirm; error-based SQLi keyed off concrete DBMS
+  signatures, not the bare substring `sql`; CORS made credential-aware; MFA
+  no-rate-limit requires a real HTTP response; cvemap/jsluice/SecretFinder/
+  TruffleHog counts fixed to stop counting banners/errors as findings; nuclei
+  medium no longer mislabeled HIGH; per-CVE CVSS in the HTML report (was a
+  hardcoded 9.0 for every CVE); `INFORMATION_SCHEMA` no longer demoting real
+  critical SQLi to LOW via a substring match.
+
+### False negatives eliminated
+
+- recon URL-dedup `NameError` (silently no-op'd dedup); `open_ports.txt`
+  clobbered by an empty nmap re-derivation; scheme-retry httpx missing `-ip`
+  (empty `live/ips.txt` skipped TLS-SAN/vhost); 307/308 redirects uncounted;
+  brain post-scan hook ran before the CVE/zero-day phases (triaged an incomplete
+  set); intel.md CVE tables rendered "No results" for version-tagged/mixed-case
+  techs; agent dedup collapsed two tools' identical line-heads and `break`-hid a
+  later finding.
+
+### AI brain / active scanner
+
+- Models right-sized per role (`phi4:14b` narrator, `bugtraceai-apex` triage,
+  `devstral-small-2:24b` / `qwen2.5-coder:14b` code-gen, all env-overridable);
+  verdict parsing tolerant of markdown/whitespace and no longer substring-matching
+  *negative* verdicts; the 60s hard timeout that killed sqlmap/nuclei/ffuf raised
+  for long-running tools; runtime tooling failures (traceback / missing module /
+  command-not-found) excluded from the "ran a real test" gate; HAR upload
+  severity derives only from script-grounded lines, never `[MODEL CLAIM]` prose.
+
+### Reviewed by
+
+Independent `codex` and `grok` passes (full briefing + complete diff + read-only
+repo access) traced every writer→reader path; codex's report-ingestion findings
+and grok's residual threshold/should-fix items were folded in before release.
+
 ## v9.24.0 — engagement-driven hardening (2026-06-05)
 
 Follow-up to the v9.23.0 false-positive purge, driven by the same live

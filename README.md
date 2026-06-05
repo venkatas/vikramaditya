@@ -13,7 +13,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#ai-brain--models)
-[![Version](https://img.shields.io/badge/version-9.24.0-success.svg?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-10.0.0-success.svg?style=flat-square)](CHANGELOG.md)
 
 **One target → auto-fingerprint → smart engine selection → AI writes exploit code → professional report.**
 
@@ -717,9 +717,20 @@ design.
 
 ## Changelog
 
-See **[CHANGELOG.md](CHANGELOG.md)** for the full v2.0 → v9.24 release history.
+See **[CHANGELOG.md](CHANGELOG.md)** for the full v2.0 → v10.0.0 release history.
 
-**Latest — v9.24.0 (engagement-driven hardening):** version-aware EOL detection
+**Latest — v10.0.0 (full-tool correctness audit):** a multi-stage audit
+(automated fan-out → adversarial self-review → independent codex + grok review)
+found and fixed **60+ correctness bugs across 12 files** — false positives that
+fabricated findings (Drupalgeddon "RCE" on any output, time-based SQLi with no
+baseline, CORS `ACAO:*` flagged as a vuln, candidate/INFO lines inflated to
+HIGH/CRITICAL), false negatives where real findings never reached the report
+(brain active-scanner output, confirmed Drupalgeddon RCE, autopilot
+`finding_*.json`), and the report-ingestion contract that ties every detector to
+`reporter.py`. The headline theme: **findings now reach the report with the
+correct severity, and nothing fabricated does.**
+
+**v9.24.0 (engagement-driven hardening):** version-aware EOL detection
 (now flags end-of-life PHP 7.4 instead of reporting it "supported"), an
 `intel.py` version-less junk-CVE filter (no more "vue → HP-UX VUE 1994" or
 WordPress-1.2-era matches), an SSTI false-positive fix (skip static assets +

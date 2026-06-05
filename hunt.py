@@ -3401,6 +3401,27 @@ def run_nextjs_bypass(domain: str) -> bool:
     return True
 
 
+def _count_json_findings(path):
+    """Count only valid JSON-object lines. jsluice/trufflehog emit one JSON
+    object per finding; tool error lines (e.g. 'unknown flag') and blanks are
+    skipped instead of being miscounted as findings."""
+    n = 0
+    try:
+        with open(path, errors="ignore") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln.startswith("{"):
+                    continue
+                try:
+                    json.loads(ln)
+                    n += 1
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return n
+
+
 # ── NEW: JS Analysis ───────────────────────────────────────────────────────────
 def run_js_analysis(domain: str) -> bool:
     """
@@ -3449,26 +3470,6 @@ def run_js_analysis(domain: str) -> bool:
     jsluice_bin  = _tool_bin("jsluice")
     secretfinder = _tool_bin("secretfinder")
     trufflehog   = _tool_bin("trufflehog")
-
-    def _count_json_findings(path):
-        """Count only valid JSON-object lines. jsluice/trufflehog emit one JSON
-        object per finding; tool error lines (e.g. 'unknown flag') and blanks are
-        skipped instead of being miscounted as findings."""
-        n = 0
-        try:
-            with open(path, errors="ignore") as fh:
-                for ln in fh:
-                    ln = ln.strip()
-                    if not ln.startswith("{"):
-                        continue
-                    try:
-                        json.loads(ln)
-                        n += 1
-                    except Exception:
-                        pass
-        except OSError:
-            pass
-        return n
 
     # ── jsluice: endpoints + secrets ──
     # v9.23 — the installed BishopFox jsluice has NO --input-format flag; raw stdin
@@ -3583,7 +3584,7 @@ def run_secret_hunt(domain: str) -> bool:
             watch_phase="SECRET HUNT"
         )
         if os.path.exists(tf_out):
-            hits = sum(1 for _ in open(tf_out) if _.strip())
+            hits = _count_json_findings(tf_out)
             log("ok" if hits == 0 else "crit", f"TruffleHog recon scan: {hits} secrets → {tf_out}")
     else:
         log("warn", "trufflehog not in PATH")
@@ -3887,8 +3888,21 @@ for url in urls:
             resp = urllib.request.urlopen(req, timeout=5)
             acao = resp.headers.get("Access-Control-Allow-Origin", "")
             acac = resp.headers.get("Access-Control-Allow-Credentials", "")
-            if acao == origin or acao == "*":
-                line = f"CORS | {{url}} | Origin: {{origin}} → ACAO: {{acao}} | Creds: {{acac}}"
+            cred = acac.strip().lower() == "true"
+            line = None
+            if acao == origin:
+                # Reflected attacker origin — always a real signal.
+                sev = "HIGH" if cred else "MEDIUM"
+                line = f"CORS-REFLECT | sev={{sev}} | {{url}} | Origin: {{origin}} → ACAO: {{acao}} | Creds: {{acac}}"
+            elif acao == "*":
+                if cred:
+                    # ACAO:* + ACAC:true — browsers reject this combo, but flag it.
+                    line = f"CORS-REFLECT | sev=MEDIUM | {{url}} | Origin: {{origin}} → ACAO: {{acao}} | Creds: {{acac}}"
+                else:
+                    # Wildcard without credentials is standard public behaviour,
+                    # non-exploitable (browsers refuse creds with ACAO:*) — info only.
+                    line = f"CORS-INFO | {{url}} | Origin: {{origin}} → ACAO: {{acao}} | Creds: {{acac}}"
+            if line:
                 findings.append(line)
                 print(line, flush=True)
         except Exception:
@@ -3910,9 +3924,22 @@ print(f"[CORS] {{len(findings)}} findings saved to {cors_out}")
     print(out.strip())
 
     if os.path.exists(cors_out):
-        count = sum(1 for _ in open(cors_out) if _.strip())
-        if count:
-            log("crit", f"CORS: {count} vulnerabilities → {cors_out}")
+        # Count only credentialed-reflection findings as vulnerabilities; benign
+        # public wildcards (CORS-INFO) are informational, not CRITICAL.
+        vuln_count = 0
+        info_count = 0
+        for ln in open(cors_out):
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln.startswith("CORS-INFO"):
+                info_count += 1
+            else:
+                vuln_count += 1
+        if vuln_count:
+            log("crit", f"CORS: {vuln_count} reflection vulnerabilities → {cors_out}")
+        elif info_count:
+            log("info", f"CORS: {info_count} wildcard (no-creds) endpoint(s) [informational] → {cors_out}")
         else:
             log("ok", "CORS: No misconfigurations found")
     _brain_phase_complete(
@@ -4358,8 +4385,21 @@ def run_cms_exploit(domain: str) -> bool:
                         timeout=30
                     )
                     results_text += f"\n## {cmd}\n{out}\n"
-                    if ok and out.strip():
+                    # Gate the verdict on actual command-output evidence, not
+                    # mere non-empty stdout (the PoC merges banners / "[*] ..."
+                    # status / "not vulnerable" lines into stdout via 2>&1).
+                    # The `id` command yields a deterministic `uid=N(` signature —
+                    # mirror the Tomcat CVE-2017-12615 `"uid=" in exec_out` gate.
+                    if ok and cmd == "id" and re.search(r"uid=\d+\(", out):
                         log("crit", f"RCE CONFIRMED on {host}: {cmd} → {out[:80]}")
+                        # Also emit a reporter-ingestible artifact under rce/. The
+                        # exploits/ dir is treated as meta and IGNORED by reporter.py,
+                        # so a confirmed RCE would otherwise never reach the report.
+                        rce_dir = os.path.join(findings_dir, "rce")
+                        os.makedirs(rce_dir, exist_ok=True)
+                        with open(os.path.join(rce_dir, f"RCE_CONFIRMED_drupalgeddon2_{safe}.txt"), "w") as rf:
+                            rf.write(f"[RCE-POC] RCE CONFIRMED — CVE-2018-7600 Drupalgeddon2 on "
+                                     f"{host} | cmd `id` → {out.strip()[:200]}\n")
                 with open(poc_out, "w") as f:
                     f.write(results_text)
                 log("ok", f"Drupalgeddon2 results → {poc_out}")
@@ -5863,8 +5903,12 @@ def run_jwt_audit(domain: str) -> bool:
             timeout=15
         )
         results.append(f"## alg=none\n{out2}\n")
-        if "TAMPERED" in out2 or "forged" in out2.lower():
-            log("crit", f"JWT {i+1}: alg=none ACCEPTED — potential auth bypass!")
+        # `jwt_tool -X a` (no -t) only *generates* a forged alg=none token
+        # locally — it never sends it to the server, so it proves nothing
+        # about acceptance. The old "TAMPERED"/"forged" substring match fired
+        # on every token. Emit an informational replay candidate instead of a
+        # crit; confirm acceptance manually (or via -t URL with a -cv canary).
+        log("info", f"JWT {i+1}: alg=none forge candidate generated — replay against a live endpoint to confirm acceptance")
 
         # RS256→HS256 confusion
         ok3, out3 = run_cmd(
@@ -6011,19 +6055,21 @@ def run_cve_hunt(domain: str) -> bool:
         cvemap_out   = os.path.join(cve_dir, "cvemap_results.txt")
         httpx_file   = os.path.join(recon_dir, "live", "httpx_full.txt")
 
-        # Extract unique CPE/product names from httpx tech-detect output
         if os.path.exists(httpx_file):
-            log("info", "cvemap: correlating live tech stack with EPSS-ranked CVEs...")
-            # Run cvemap for top EPSS CVEs matching common web techs found in scope
+            log("info", "cvemap: pulling EPSS-ranked critical/high CVEs (top 50, global)...")
+            # -lsi -silent emits exactly one CVE-ID per line (no table header /
+            # separator / banner chrome), so the count below is accurate. The
+            # default table output counted every decorative row as a "CVE".
             run_live(
                 f'"{cvemap_bin}" -severity critical,high -epss-score 0.5 '
-                f'-limit 50 -o "{cvemap_out}" 2>/dev/null',
+                f'-limit 50 -lsi -silent -o "{cvemap_out}" 2>/dev/null',
                 timeout=120,
                 watch_file=cve_dir,
                 watch_phase="CVE HUNT"
             )
             if os.path.exists(cvemap_out):
-                hits = sum(1 for _ in open(cvemap_out) if _.strip())
+                hits = sum(1 for ln in open(cvemap_out)
+                           if ln.strip().upper().startswith("CVE-"))
                 if hits:
                     log("crit", f"cvemap: {hits} high-EPSS CVEs worth testing → {cvemap_out}")
     _brain_phase_complete(
@@ -6378,6 +6424,19 @@ def hunt_target(
             allow_unsafe=browser_unsafe,
         )
 
+    # ── Phase 11: CVE Hunt ─────────────────────────────────────────────────
+    # Run CVE Hunt + Zero-day Fuzzer BEFORE the brain post-scan hook so its
+    # chain-building, exploit attempts, and H1 report triage over the COMPLETE
+    # findings set (including findings/cves/ and findings/zero_day/) rather than
+    # an incomplete one. (The autonomous path already orders these correctly.)
+    if cve_hunt and not skip_has(skip_items, "cve_hunt"):
+        run_cve_hunt(domain)
+
+    # ── Phase 12: Zero-day Fuzzer ───────────────────────────────────────────
+    if zero_day and not skip_has(skip_items, "zero_day"):
+        log("warn", "Zero-day fuzzer — results require manual verification")
+        run_fuzzer(domain, deep=not quick)
+
     # Brain: post-scan hook — interpret + chains + triage + exploit + report
     findings_dir = result.get("findings_dir") or _resolve_findings_dir(domain, session_id=result.get("session_id"), create=True)
     recon_dir = result.get("recon_dir") or _resolve_recon_dir(domain, session_id=resume_session_id)
@@ -6388,15 +6447,6 @@ def hunt_target(
     if _brain and _brain.enabled and os.path.isdir(findings_dir) and not selected_only_mode:
         log("info", "Brain: post-scan hook (triage + exploit + report)...")
         _brain.post_scan_hook(findings_dir, recon_dir)
-
-    # ── Phase 11: CVE Hunt ─────────────────────────────────────────────────
-    if cve_hunt and not skip_has(skip_items, "cve_hunt"):
-        run_cve_hunt(domain)
-
-    # ── Phase 12: Zero-day Fuzzer ───────────────────────────────────────────
-    if zero_day and not skip_has(skip_items, "zero_day"):
-        log("warn", "Zero-day fuzzer — results require manual verification")
-        run_fuzzer(domain, deep=not quick)
 
     # ── Phase 13: Reports ───────────────────────────────────────────────────
     if selected_only_mode:

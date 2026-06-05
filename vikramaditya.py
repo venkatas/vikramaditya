@@ -45,7 +45,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
 # See CHANGELOG.md for the version-by-version delta.
-__version__ = "9.24.0"
+__version__ = "10.0.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -1651,6 +1651,11 @@ def main():
 
     has_ollama = ollama_available()
 
+    # Where the final report reads findings from. Initialised here so the
+    # report guard near the end of main() is well-defined on every branch
+    # (creds / no-creds / legacy) instead of relying on a swallowed NameError.
+    findings_dir = None
+
     # Autonomous mode: LLM present → no prompts, brain makes all decisions
     # Interactive mode: no LLM → ask user for every decision
     autonomous = has_ollama
@@ -1775,6 +1780,10 @@ def main():
         return
 
     # --- Bare domain → hunt.py ---
+    # Carries the fingerprint computed in the domain branch forward so the
+    # URL branch below does not re-probe the identical host (each
+    # fingerprint_webapp call issues many network requests).
+    already_fp = None
     if target_info["type"] == "domain":
         url_to_check = f"https://{target_info['value']}"
         log("info", f"Checking {url_to_check} ...")
@@ -1799,14 +1808,20 @@ def main():
             return
         else:
             target_info = classify_target(url_to_check)
+            already_fp = fp  # reuse this fp below — url == url_to_check
 
     # --- URL → fingerprint and decide ---
     url = target_info["value"]
     if not url.startswith("http"):
         url = f"https://{url}"
 
-    log("info", "Fingerprinting target...")
-    fp = fingerprint_webapp(url)
+    # Reuse the bare-domain fingerprint when it is for this same URL; only
+    # probe again when arriving here directly (no prior domain fingerprint).
+    if already_fp is not None:
+        fp = already_fp
+    else:
+        log("info", "Fingerprinting target...")
+        fp = fingerprint_webapp(url)
 
     if fp["error"]:
         print(f"  {R}Error reaching target: {fp['error']}{N}")
@@ -1963,37 +1978,52 @@ def main():
             )
 
         # ── Step 6: Post-scan ─────────────────────────────────────────────
-        if result and result.get("findings"):
-            findings = result["findings"]
-            print(f"\n  {G}Autopilot complete.{N} {len(findings)} finding(s).\n")
-            findings_dir = os.path.join(output_dir, "autopilot")
-        else:
-            print(f"\n  {D}Autopilot complete. No findings.{N}")
-            findings_dir = None
-            # Fallback: run tools directly on target when autopilot finds nothing
-            # (legacy apps where REST endpoint patterns don't match)
-            if autonomous:
-                log("info", "Running direct tool scan (sqlmap + nuclei) on base URL...")
-                try:
-                    import subprocess as _sp
-                    # sqlmap on the login form
-                    log("info", "  sqlmap on login form...")
-                    _sp.run(["sqlmap", "-u", api_base,
-                             "--forms", "--batch", "--level=3", "--risk=2",
-                             "--random-agent", "--current-db",
-                             "--output-dir", os.path.join(output_dir, "sqlmap")],
-                            timeout=180, capture_output=True)
-                except Exception as e:
-                    log("warn", f"  sqlmap: {e}")
-                try:
-                    # nuclei on base URL
-                    log("info", "  nuclei CVE scan...")
-                    _sp.run(["nuclei", "-u", api_base,
-                             "-severity", "critical,high,medium", "-silent",
-                             "-o", os.path.join(output_dir, "nuclei_results.txt")],
-                            timeout=120, capture_output=True)
-                except Exception as e:
-                    log("warn", f"  nuclei: {e}")
+        # Only the API-VAPT path reaches this block. The legacy branch above
+        # (lines ~1940) already manages findings_dir itself (output_dir on
+        # success, None on no-findings); run_legacy_crawl returns a dict keyed
+        # "vulnerabilities" (not "findings"), so letting this run for the legacy
+        # path would falsely report "No findings", clobber findings_dir back to
+        # None, and re-run sqlmap/nuclei against the already-scanned app.
+        if not is_legacy:
+            if result and result.get("findings"):
+                findings = result["findings"]
+                print(f"\n  {G}Autopilot complete.{N} {len(findings)} finding(s).\n")
+                findings_dir = os.path.join(output_dir, "autopilot")
+            else:
+                print(f"\n  {D}Autopilot complete. No findings.{N}")
+                findings_dir = None
+                # Fallback: run tools directly on target when autopilot finds nothing
+                # (legacy apps where REST endpoint patterns don't match)
+                if autonomous:
+                    log("info", "Running direct tool scan (sqlmap + nuclei) on base URL...")
+                    try:
+                        import subprocess as _sp
+                        # sqlmap on the login form
+                        log("info", "  sqlmap on login form...")
+                        _sp.run(["sqlmap", "-u", api_base,
+                                 "--forms", "--batch", "--level=3", "--risk=2",
+                                 "--random-agent", "--current-db",
+                                 "--output-dir", os.path.join(output_dir, "sqlmap")],
+                                timeout=180, capture_output=True)
+                    except Exception as e:
+                        log("warn", f"  sqlmap: {e}")
+                    try:
+                        # nuclei on base URL — write into cves_custom/ so the
+                        # reporter's Method 1c picks it up ([id] [proto] [sev] url).
+                        log("info", "  nuclei CVE scan...")
+                        nuclei_dir = os.path.join(output_dir, "cves_custom")
+                        os.makedirs(nuclei_dir, exist_ok=True)
+                        _sp.run(["nuclei", "-u", api_base,
+                                 "-severity", "critical,high,medium", "-silent",
+                                 "-o", os.path.join(nuclei_dir, "nuclei_results.txt")],
+                                timeout=120, capture_output=True)
+                    except Exception as e:
+                        log("warn", f"  nuclei: {e}")
+                    # Repoint findings_dir ONLY if nuclei actually produced output,
+                    # so the empty-fallback case still skips the report.
+                    nuclei_out = os.path.join(output_dir, "cves_custom", "nuclei_results.txt")
+                    if os.path.isfile(nuclei_out) and os.path.getsize(nuclei_out) > 0:
+                        findings_dir = output_dir
 
     elif not creds:
         # No creds — run hunt.py for unauthenticated scan
@@ -2003,48 +2033,50 @@ def main():
         print()
         run_hunt(domain, full=True, scope_lock=scope_lock)
 
-        # Post-scan: check if there are findings to report
-        # hunt.py stores findings in findings/<domain>/sessions/<id>/ (not recon/)
-        # v9.23 — in autonomous mode never block on this prompt; always generate.
-        print()
-        if autonomous or confirm("Generate report from scan results?", default_yes=False):
-            # Try both findings/ and recon/ paths (hunt.py uses findings/)
-            found_dir = None
-            for base_name in ["findings", "recon"]:
-                sessions_base = os.path.join(SCRIPT_DIR, base_name, domain, "sessions")
-                if os.path.isdir(sessions_base):
-                    sessions = sorted(os.listdir(sessions_base), reverse=True)
-                    for sess in sessions:
-                        candidate = os.path.join(sessions_base, sess)
-                        # Check for findings in the session root or a findings/ subdirectory
-                        if os.path.isdir(os.path.join(candidate, "findings")):
-                            found_dir = os.path.join(candidate, "findings")
-                            break
-                        # Also check for finding_*.json or subdirs with .txt files directly in session
-                        has_data = any(
-                            f.endswith('.json') or f.endswith('.txt')
-                            for f in os.listdir(candidate)
-                            if os.path.isfile(os.path.join(candidate, f))
-                        ) or any(
-                            os.path.isdir(os.path.join(candidate, d))
-                            for d in os.listdir(candidate)
-                            if d in ('exploits', 'sqli', 'xss', 'cors', 'secrets', 'cves', 'sqlmap')
-                        )
-                        if has_data:
-                            found_dir = candidate
-                            break
-                if found_dir:
-                    break
-
+        # Post-scan: locate the hunt.py session findings dir and hand it to the
+        # single final-report block below (after the brain scanner runs), so the
+        # brain's findings — written under <found_dir>/brain_active — are included.
+        # hunt.py stores findings in findings/<domain>/sessions/<id>/ (not recon/).
+        # Try both findings/ and recon/ paths (hunt.py uses findings/)
+        found_dir = None
+        for base_name in ["findings", "recon"]:
+            sessions_base = os.path.join(SCRIPT_DIR, base_name, domain, "sessions")
+            if os.path.isdir(sessions_base):
+                sessions = sorted(os.listdir(sessions_base), reverse=True)
+                for sess in sessions:
+                    candidate = os.path.join(sessions_base, sess)
+                    if not os.path.isdir(candidate):
+                        continue  # skip stray files (e.g. .DS_Store) in sessions/
+                    # Check for findings in the session root or a findings/ subdirectory
+                    if os.path.isdir(os.path.join(candidate, "findings")):
+                        found_dir = os.path.join(candidate, "findings")
+                        break
+                    # Also check for finding_*.json or subdirs with .txt files directly in session
+                    has_data = any(
+                        f.endswith('.json') or f.endswith('.txt')
+                        for f in os.listdir(candidate)
+                        if os.path.isfile(os.path.join(candidate, f))
+                    ) or any(
+                        os.path.isdir(os.path.join(candidate, d))
+                        for d in os.listdir(candidate)
+                        if d in ('exploits', 'sqli', 'xss', 'cors', 'secrets', 'cves', 'sqlmap')
+                    )
+                    if has_data:
+                        found_dir = candidate
+                        break
             if found_dir:
-                client = prompt("Client name", "")
-                consultant = prompt("Consultant name", "")
-                run_report(found_dir, client, consultant)
-            else:
-                print(f"  {Y}No findings directory found for {domain}{N}")
-                print(f"  {D}Searched: findings/{domain}/sessions/ and recon/{domain}/sessions/{N}")
+                break
+
+        if found_dir:
+            findings_dir = found_dir
+        else:
+            print(f"  {Y}No findings directory found for {domain}{N}")
+            print(f"  {D}Searched: findings/{domain}/sessions/ and recon/{domain}/sessions/{N}")
 
     # ── Brain active scanner follow-up ───────────────────────────────────
+    # Runs BEFORE the final report so its findings are consolidated into the
+    # report. Output is written UNDER the dir the reporter consumes (findings_dir)
+    # so reporter.py's subdir walk picks it up — no orphaned session directory.
     if use_brain_scanner and has_ollama:
         # Use the API base if detected (not the SPA frontend)
         brain_target = url
@@ -2056,12 +2088,31 @@ def main():
         except NameError:
             pass
         log("info", f"Launching brain active scanner on {brain_target}...")
-        brain_out = make_output_dir(urlparse(url).netloc)
-        run_brain_scan(
+        # Reuse the existing report root rather than spawning a second session
+        # dir the reporter never reads. The brain scanner writes brain_active/
+        # iteration_*.json here, which reporter.py's Method 1e already ingests
+        # (respecting its model-claim grounding contract) — but ONLY when the
+        # brain_active/ dir lives under the findings_dir handed to run_report.
+        # Prefer findings_dir (set on the creds / no-creds paths); fall back to
+        # the creds-path session dir, then a fresh session, only if neither exists.
+        base_out = findings_dir
+        if not base_out:
+            try:
+                base_out = output_dir  # creds path, even when autopilot found nothing
+            except NameError:
+                base_out = None
+        if not base_out:
+            base_out = make_output_dir(urlparse(url).netloc)
+        brain_findings = run_brain_scan(
             target=brain_target,
             mode="scan",
-            output_dir=os.path.join(brain_out, "brain_active"),
+            output_dir=os.path.join(base_out, "brain_active"),
         )
+        # Ensure the final report fires when the brain scanner was the only
+        # producer of findings (autopilot/hunt found nothing → findings_dir None).
+        # reporter.py Method 1e reads base_out/brain_active/iteration_*.json.
+        if brain_findings and not findings_dir:
+            findings_dir = base_out
 
     # ── Report generation (after ALL testing is complete) ─────────────────
     try:
