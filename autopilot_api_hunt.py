@@ -1165,7 +1165,13 @@ class InjectionTester:
                         session.request("POST", ep["path"],
                                         json_body={"search": TIME_CONFIRM[payload]}, timeout=probe_timeout)
                         confirm = time.monotonic() - c0
-                        if confirm > baseline + 5.0:
+                        # Require the delay to SCALE with the sleep: the 6s confirm
+                        # must add ~3s over the 3s probe. A constant timeout-induced
+                        # delay (a stalled endpoint returning at ~probe_timeout for
+                        # BOTH requests — AuthSession.request swallows Timeout) clears
+                        # the baseline+5 floor but NOT this scale check, so it can't
+                        # masquerade as a real injection.
+                        if confirm > baseline + 5.0 and confirm > elapsed + 2.0:
                             f = {"type": "sqli_time_based", "severity": CRITICAL,
                                  "detail": f"Time-based SQLi: {elapsed:.1f}s delay on {ep['path']}",
                                  "url": resp["url"],

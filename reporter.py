@@ -1005,7 +1005,13 @@ def load_findings(findings_dir: str) -> list:
                     continue
                 # Script-output-grounded line → real finding. Reuse the custom-line
                 # parser so its vtype/severity are derived from any [tag]/keywords.
-                vtype = "rce"
+                # Default to a CONSERVATIVE class (misconfig = medium): brain_scanner
+                # also emits lines on "VULNERABLE"/"EXPLOITABLE", neither of which
+                # parse_custom_line treats as a severity keyword — so a default of
+                # "rce" silently inflated an untagged clickjacking/missing-header
+                # line into a CRITICAL/CVSS-9.8 RCE row. A real [tag] or a
+                # CRITICAL/CONFIRMED keyword still upgrades it to the right class.
+                vtype = "misconfig"
                 tags = [t.strip().lower() for t in re.findall(r'\[([^\]]+)\]', line)]
                 if tags and tags[0] in SUBDIR_VTYPE:
                     vtype = SUBDIR_VTYPE[tags[0]]
