@@ -994,6 +994,27 @@ def load_findings(findings_dir: str) -> list:
                           errors="replace") as f:
                     brain_data = _json.load(f)
                 brain_findings = brain_data.get("findings_so_far", []) or []
+            # Defence-in-depth: a file-access/traversal claim is only kept as a
+            # finding if the file's content actually appears in the script output.
+            # findings_so_far is cumulative, so aggregate EVERY iteration's raw
+            # output as the proof corpus (mirrors the live gate in
+            # brain_scanner._access_claim_unproven so a buggy PoC's unconditional
+            # "[CRITICAL] ... accessible" echo can't reach the client report).
+            all_iter_output = ""
+            for _fn in iter_files:
+                try:
+                    with open(os.path.join(brain_active_path, _fn), errors="replace") as _f:
+                        _blob = _json.load(_f).get("results", "")
+                    # Use the RAW string (real newlines) so the line-anchored proof
+                    # regex matches actual file-content lines; json.dumps would
+                    # escape newlines and defeat it.
+                    all_iter_output += (_blob if isinstance(_blob, str) else _json.dumps(_blob)) + "\n"
+                except Exception:
+                    continue
+            try:
+                from brain_scanner import _access_claim_unproven
+            except Exception:
+                _access_claim_unproven = None
             model_claims = []
             for line in brain_findings:
                 line = (line or "").strip()
@@ -1002,6 +1023,13 @@ def load_findings(findings_dir: str) -> list:
                 if line.startswith("[MODEL CLAIM"):
                     # Strip the marker prefix for the collapsed context item.
                     model_claims.append(re.sub(r"^\[MODEL CLAIM[^\]]*\]\s*", "", line))
+                    continue
+                # Defence-in-depth: drop a self-declared file-access/traversal claim
+                # that NO iteration's output actually proves (no file content) — a
+                # buggy PoC (`echo "[CRITICAL] ... accessible" || echo`) prints it
+                # unconditionally. Demote to unverified context, never a finding.
+                if _access_claim_unproven and _access_claim_unproven(line, all_iter_output):
+                    model_claims.append("UNVERIFIED (no file content as proof): " + line)
                     continue
                 # Script-output-grounded line → real finding. Reuse the custom-line
                 # parser so its vtype/severity are derived from any [tag]/keywords.

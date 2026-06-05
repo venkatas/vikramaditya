@@ -55,6 +55,46 @@ MAX_ITERATIONS = 15
 MAX_SCRIPT_RUNTIME = 60  # seconds
 
 
+# ── Stdout-claim corroboration ────────────────────────────────────────────────
+# A generated PoC can DECLARE success without it being true. Real example caught
+# in the field: a shell PoC ended with
+#     echo "[CRITICAL] Shadow file also accessible!" || echo "[-] Only passwd"
+# `echo` always exits 0, so the `||` fallback never runs and the CRITICAL line
+# prints UNCONDITIONALLY — even though the server returned `404 Not Found`. The
+# grounding layer trusts script stdout over model prose (the anti-hallucination
+# rule), so that buggy echo became a "confirmed" CRITICAL finding.
+#
+# Defence: a self-declared file-access / path-traversal / LFI claim is only
+# accepted as a finding when the script output actually CONTAINS the file's
+# content (proof). A genuine read prints the file (e.g. `root:x:0:0:` from
+# /etc/passwd); an unconditional echo prints nothing of the sort. This does NOT
+# touch other finding classes (SQLi/XSS/RCE confirmed by real tools), so it
+# cannot suppress those.
+_ACCESS_CLAIM_RE = re.compile(
+    r'accessib|readable|path[\s_-]*traversal|directory traversal|\blfi\b|'
+    r'arbitrary[\s_-]*file|file (?:read|disclos|retriev|leak)|local file|'
+    r'/etc/passwd|/etc/shadow|win\.ini|boot\.ini|web\.config', re.I)
+_FILE_PROOF_RE = re.compile(
+    # A real /etc/passwd or /etc/shadow read prints account LINES at line-start —
+    # user:x:UID:GID:... (passwd) or user:$hash:lastchg:min:... (shadow). Anchored
+    # to line-start (MULTILINE) so a passwd-shaped string embedded in a shell ERROR
+    # ("bash: line 3: root:x:0:0:...: No such file") is NOT miscounted as proof.
+    r'^[a-z_][a-z0-9_-]*:[^:\n]*:\d+:\d+:'
+    r'|\[boot loader\]|\[fonts\]|\[mci extensions\]'              # win.ini / boot.ini
+    r'|<\?xml\b|<configuration\b|<connectionStrings|<appSettings',  # web.config
+    re.I | re.M)
+
+
+def _access_claim_unproven(line: str, stdout: str) -> bool:
+    """True when an stdout line ASSERTS file/resource access (passwd, shadow,
+    traversal, LFI, "accessible"/"readable") but the script output carries NO
+    actual file-content signature — i.e. a self-declared, unverified claim that
+    must not be recorded as a confirmed finding."""
+    if not _ACCESS_CLAIM_RE.search(line):
+        return False                       # not an access claim → unaffected
+    return not _FILE_PROOF_RE.search(stdout)
+
+
 def log(level: str, msg: str):
     colors = {"ok": G, "err": R, "warn": Y, "info": C, "brain": M, "phase": "\033[0;34m"}
     sym = {"ok": "+", "err": "-", "warn": "!", "info": "*", "brain": "🧠", "phase": "»"}
@@ -686,11 +726,29 @@ Then test the most promising attack vectors."""
                 # FOUND but RCE works") and would silently suppress a real finding.
                 NEG_MARKERS = ("NOT VULNERABLE", "NOT EXPLOITABLE", "NOT VULN", "NO CRITICAL",
                                "0 CRITICAL", "NO VULNERABILIT", "NOT INJECTABLE")
+                _unproven_access = False
                 for line in result["stdout"].split('\n'):
                     up = line.upper()
                     if any(kw in up for kw in ["VULNERABLE", "CONFIRMED", "CRITICAL", "EXPLOITABLE"]) \
                        and not any(neg in up for neg in NEG_MARKERS):
+                        # Reject a self-declared file-access/traversal claim that the
+                        # script output does not actually PROVE (no file content) — a
+                        # buggy PoC (`echo "...accessible" || echo`) prints it whether
+                        # or not the read succeeded. Don't record it as a finding.
+                        if _access_claim_unproven(line, result["stdout"]):
+                            _unproven_access = True
+                            log("warn", f"Rejected unproven access claim (no file "
+                                        f"content in output): {line.strip()[:80]}")
+                            continue
                         findings.append(line.strip())
+                if _unproven_access:
+                    all_results += (
+                        "\nNOTE: a file-access/traversal claim was printed WITHOUT the "
+                        "retrieved file content as proof, so it was NOT accepted as a "
+                        "finding. A real read must print the actual content (e.g. the "
+                        "`root:x:0:0:` line from /etc/passwd). Re-test and show the file "
+                        "content to confirm, or drop the claim. Note that `echo X || echo Y` "
+                        "does NOT make X conditional — echo always succeeds.\n")
 
         # Feed results back to brain
         had_syntax_error = any(b for b in code_blocks) and "SCRIPT DID NOT RUN" in all_results
