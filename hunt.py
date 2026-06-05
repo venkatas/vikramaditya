@@ -4336,7 +4336,6 @@ def run_cms_exploit(domain: str) -> bool:
                 if status == "200" and "drupal" in content.lower():
                     remember_host(drupal_hosts_map, host)
                     break
-                    break
 
     drupal_hosts = list(drupal_hosts_map.values())
 
