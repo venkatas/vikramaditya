@@ -55,11 +55,14 @@ Each role wants a different model. These are env-overridable with **no code chan
 |:--|:--|:--|:--|
 | **Narration / analysis** | `phi4:14b` | Lowest hallucination of any local model (Vectara 3.7 %) — won't fabricate findings | `BRAIN_MODEL=phi4:14b` |
 | **Triage** (submit/drop) | `bugtraceai-apex` | Security-DPO judgement; empirically beat phi4 + Foundation-Sec on a triage A/B | `TRIAGE_MODEL=bugtraceai-apex` |
-| **Exploit code-gen** | `qwen2.5-coder:14b` (or `devstral-small-2:24b`, 68 % SWE-bench) | A real coder — writes valid, runnable PoCs instead of malformed shell | `BRAIN_SCANNER_MODEL=qwen2.5-coder:14b` |
+| **Exploit code-gen** | **`devstral-small-2:24b`** (primary) / `qwen2.5-coder:14b` (fast fallback) | Both write valid, runnable PoCs (no malformed shell). A/B-validated: Devstral wins on correctness (68 % SWE-bench; emits the canonical sqlmap-GET structure), qwen2.5-coder is faster/lighter | `BRAIN_SCANNER_MODEL=devstral-small-2:24b` |
+
+`brain_scanner.pick_model()` prefers `devstral-small-2:24b` automatically when present, else falls back to `qwen2.5-coder:14b`.
 
 ```bash
 ollama pull phi4:14b            # faithful narrator (default since v9.23)
-ollama pull qwen2.5-coder:14b   # real coder for the active scanner
+ollama pull devstral-small-2:24b   # primary coder (A/B-validated)
+ollama pull qwen2.5-coder:14b      # fast fallback coder
 ```
 > ⚠️ A `claude-*` tag in your local Ollama is **not** Claude (Claude weights are not downloadable, so any such tag is a mislabeled local model). Always confirm with `ollama show <tag>`.
 
