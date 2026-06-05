@@ -1,5 +1,60 @@
 # Changelog
 
+## v9.24.0 — engagement-driven hardening (2026-06-05)
+
+Follow-up to the v9.23.0 false-positive purge, driven by the same live
+engagement. Closes the remaining cases where the intel/EOL/SSTI stages
+reported fabricated or stale signal, and finalizes the exploit code-gen
+model after live A/B testing.
+
+### Version-aware EOL & intel (`intel.py`, `eol_check.py`, `cve.py`)
+
+- **Version-aware EOL detection** — fingerprints now carry the detected
+  version (e.g. `php=7.4.33`, captured from `X-Powered-By` / generator
+  meta in `vikramaditya.py`). `intel.py` splits `name=version` before the
+  EOL lookup, so `php=7.4.33` correctly resolves to **expired** (EOL
+  2022-11-28, 🔴) instead of being reported "supported".
+- **Version-less junk-CVE filter** — added `NON_PRODUCT_TECHS` (hsts,
+  http/2, …) and `AMBIGUOUS_BARE_TECHS` (bootstrap, jquery, parsley.js,
+  vue, react, angular). Bare framework names no longer fan out into
+  unrelated NVD hits ("vue → HP-UX VUE 1994", WordPress-1.2-era CVEs);
+  an `NVD_MIN_YEAR = 2012` floor drops pre-modern noise. Mirrors the
+  same guard added to `cve.py` (`_is_searchable_tech`, 200-only
+  fingerprint).
+- **`intel.py` NameError fix** — `_split_tech` used `re` without
+  `import re`; added the missing import.
+
+### SSTI confirmation (`scanner.sh`, Check 4)
+
+- Replaced the `{{7*7}}` → `grep '\b49\b'` canary (which matched any
+  coincidental "49" on a page) with a distinctive `887*913=809831`
+  arithmetic probe. Static assets (`.css/.js/.map`, images, fonts) are
+  skipped, the baseline fetch must NOT already contain the result, and a
+  hit is confirmed only when `809831` is present **and** the literal
+  `887*913` is not reflected. Eliminates the 3 bogus
+  `[SSTI-CONFIRMED] engine=jinja2` hits on static WordPress assets.
+
+### Recon (`recon.sh`)
+
+- **Port-scan robustness** — guard the naabu→awk pipeline when naabu
+  writes no results file (was a stray error + empty `open_ports.txt`),
+  and add `nmap -Pn` so service fingerprinting still runs against
+  firewalled targets that drop ICMP/host-discovery probes.
+
+### Exploit code-gen model (`brain_scanner.py`)
+
+- Code-gen model A/B finalized against live targets: **`devstral-small-2:24b`**
+  validated as primary, `qwen2.5-coder:14b` fallback, `aya-expanse`
+  demoted to last resort. Still overridable via `BRAIN_SCANNER_MODEL`.
+
+### Docs
+
+- Full **README cleanup** — TOC moved to the top, a "What It Does"
+  elevator pitch, consistent header levels, release history collapsed to
+  a CHANGELOG pointer (1285 → ~770 lines). All operational sections
+  (Whitebox AWS, MFA/TOTP, HAR, engagement privacy, the per-role model
+  table) preserved.
+
 ## v9.23.0 — detector / report / brain false-positive purge (2026-06-04)
 
 A full-pipeline audit (triggered by a clean-target run against
