@@ -60,6 +60,23 @@ findings. All fixes were validated end-to-end on a fresh autonomous run
   iteration 2/15. Scan-plan placeholders are stripped and `bash -n`
   validated before the file is marked executable.
 
+### Models right-sized per role (live A/B-validated)
+
+Each role was head-to-head tested on real engagement output, not leaderboard
+claims:
+- **Narration / analysis → `phi4:14b`** (now `MODEL_PRIORITY[0]`). Beat
+  `xploiter` (which fabricated findings) on faithfulness; lowest local
+  hallucination rate (Vectara 3.7 %).
+- **Triage → `bugtraceai-apex`** (kept). Beat `phi4` (inconsistent verdicts)
+  and `Foundation-Sec-8B-Reasoning` (echoed the verdict menu) on a 2-fixture
+  triage A/B.
+- **Exploit code-gen → `devstral-small-2:24b`** (primary, A/B-validated) with
+  `qwen2.5-coder:14b` as the fast fallback. Both emit valid runnable PoCs
+  (vs the demoted `aya-expanse`, a multilingual chat model that produced
+  malformed shell); Devstral wins on correctness (68 % SWE-bench, canonical
+  sqlmap-GET structure). `pick_model()` prefers Devstral when installed.
+- All overridable via `BRAIN_MODEL` / `TRIAGE_MODEL` / `BRAIN_SCANNER_MODEL`.
+
 ## v9.22.0 — methodology + token-scanner wire-up (2026-05-11)
 
 Two skill modules and one CLI tool were imported earlier from the
