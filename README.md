@@ -9,38 +9,23 @@
    ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
 ```
 
+<h3 align="center">Autonomous VAPT platform — one target in, a submission-ready report out</h3>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![Shell](https://img.shields.io/badge/Shell-bash-4EAA25.svg?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![AI Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20MLX%20%7C%20Claude%20%7C%20GPT--4o%20%7C%20Grok-blueviolet.svg?style=flat-square)](#ai-brain--models)
 [![Version](https://img.shields.io/badge/version-10.0.0-success.svg?style=flat-square)](CHANGELOG.md)
 
-**One target → auto-fingerprint → smart engine selection → AI writes exploit code → professional report.**
+[![Tests](https://img.shields.io/badge/tests-~700%20passing-2ea44f.svg?style=flat-square)](#core-architecture)
+[![CVSS](https://img.shields.io/badge/CVSS-3.1%20%7C%204.0-blue.svg?style=flat-square)](#reports)
+[![AI Powered](https://img.shields.io/badge/AI-5%20providers-blueviolet.svg?style=flat-square)](#ai-brain--models)
 
-[Quick Start](#quick-start) · [Usage](#usage--capabilities) · [Architecture](#core-architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Whitebox AWS](#whitebox-aws-integration) · [HAR Testing](#har-based-authenticated-testing) · [Reports](#reports) · [Changelog](CHANGELOG.md)
+**Autonomous VAPT you can actually sign off on.** Point Vikramaditya at a domain, IP, or CIDR and it runs recon → scan → AI triage → a Burp-style HTML report — one command, no flags required. Every finding is verified before it reaches the report: nothing fabricated gets in, nothing real gets dropped.
+
+<sub>One target → auto-fingerprint → smart engine selection → AI writes exploit code → professional report.</sub>
+
+[Quick Start](#quick-start) · [Why Vikramaditya](#why-vikramaditya) · [Usage](#usage--capabilities) · [Architecture](#core-architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Whitebox AWS](#whitebox-aws-integration) · [HAR Testing](#har-based-authenticated-testing) · [Reports](#reports) · [Changelog](CHANGELOG.md)
 
 </div>
-
----
-
-## Table of Contents
-
-- [What It Does](#what-it-does)
-- [Quick Start](#quick-start)
-- [Usage & Capabilities](#usage--capabilities)
-- [AI Brain & Models](#ai-brain--models)
-- [Core Architecture](#core-architecture)
-- [Vulnerability Coverage](#vulnerability-coverage)
-- [Whitebox AWS Integration](#whitebox-aws-integration)
-- [HAR-Based Authenticated Testing](#har-based-authenticated-testing)
-- [Engagement Privacy](#engagement-privacy)
-- [Reports](#reports)
-- [Professional Usage & Workflow](#professional-usage--workflow)
-- [Ethical Use & Legal Compliance](#ethical-use--legal-compliance)
-- [Contributing](#contributing)
-- [Changelog](#changelog)
-- [The Legend](#the-legend)
-- [License & Support](#license--support)
 
 ---
 
@@ -54,13 +39,54 @@ Vikramaditya is an autonomous VAPT tool built for professional security consulta
 | 🔬 Fingerprint | Tech-stack detection (httpx), CVE risk scoring, priority host ranking |
 | 🔍 Scan | SQLi, XSS, SSTI, RCE, file upload, CORS, JWT, cloud misconfigs, framework exposure |
 | 💥 Exploit | CMS exploit chains (Drupal, WordPress), Spring actuators, exposed admin panels |
-| 🧠 Analyze | AI-powered triage — finds chains, ranks by impact, kills noise |
-| 📋 Report | Burp Suite-style HTML report: executive summary, CVSS scores, PoC evidence, remediation |
+| 🧠 Analyze | AI triage drops fabricated / low-confidence findings — verified PoCs only, ranked by impact |
+| 📋 Report | Burp Suite-style HTML report — every finding lands at its confirmed severity: nothing real dropped, nothing fabricated added |
 | 🔐 HAR Testing | Browser-session analysis, authenticated vulnerability testing, real-world attack simulation |
+
+<details>
+<summary><b>Full table of contents</b></summary>
+
+- [What It Does](#what-it-does)
+- [Why Vikramaditya](#why-vikramaditya)
+- [Quick Start](#quick-start)
+- [Usage & Capabilities](#usage--capabilities)
+- [AI Brain & Models](#ai-brain--models)
+- [Core Architecture](#core-architecture)
+- [Vulnerability Coverage](#vulnerability-coverage)
+- [Whitebox AWS Integration](#whitebox-aws-integration)
+- [HAR-Based Authenticated Testing](#har-based-authenticated-testing)
+- [Engagement Privacy](#engagement-privacy)
+- [Reports](#reports)
+- [Professional Usage & Workflow](#professional-usage--workflow)
+- [Ethical Use & Legal Compliance](#ethical-use--legal-compliance)
+- [Contributing](#contributing)
+- [Changelog](#changelog)
+- [License & Support](#license--support)
+
+</details>
+
+---
+
+## Why Vikramaditya
+
+Autonomous scanners are only useful if you can trust the report. The biggest objection a VAPT consultant has to autopilot tools is *"I'll spend more time disproving its false positives — and worrying about what it missed — than I saved."* Vikramaditya is built around two guarantees:
+
+- **Nothing fabricated reaches the report.** Detectors confirm before they claim — Drupalgeddon RCE needs a real `uid=` signature, time-based SQLi is anchored to a measured per-endpoint baseline, CORS detection is credential-aware, SSTI uses a distinctive arithmetic canary. A local-LLM triage gate (lowest-hallucination model, env-overridable) drops the rest.
+- **Nothing real gets dropped.** Every detector is wired to the report-ingestion contract — brain active-scanner output, confirmed RCE, and autopilot findings all land in `reporter.py` at their confirmed severity.
+
+The **v10.0.0 correctness audit** (60+ bugs across 12 files, independently reviewed by codex and grok) closed both failure classes.
+
+> **Evidence, not promises.** On the engagement that drove the audit, a clean-target run went from **25 findings (2 fabricated CVSS-10)** to **8 real ones** after the false-positive purge. The default triage model (`phi4:14b`) carries a measured **3.7 % hallucination rate** (Vectara leaderboard) — the lowest of any local model.
+
+This is a stated design contract backed by an audit — not a "100% accurate" claim. The operator still owns sign-off; Vikramaditya just makes the report worth signing.
 
 ---
 
 ## Quick Start
+
+### Prerequisites
+
+Tested on **macOS** (Apple Silicon / Intel). `setup.sh` provisions everything via **Homebrew** (auto-installed if missing), **Go**, and **pip** — it pulls ~30 external binaries onto your `PATH` (`subfinder`, `httpx`, `nuclei`, `ffuf`, `amass`, `sqlmap`, `naabu`, `katana`, `gau`, `dnsx`, `feroxbuster`, `gowitness`, `trufflehog`, `gitleaks`, … — see [`setup.sh`](setup.sh) for the full list). On Linux, install [Homebrew/Linuxbrew](https://docs.brew.sh/Homebrew-on-Linux) first, or install the listed tools manually.
 
 ### 1. Clone & install
 
@@ -73,21 +99,29 @@ chmod +x setup.sh && ./setup.sh
 source .venv/bin/activate
 ```
 
-### 2. First scan
+### 2. Verify the install
+
+Before pointing the tool at a real (authorized) target, confirm the install succeeded:
 
 ```bash
-python3 vikramaditya.py example.com          # auto-detect, interactive
+python3 vikramaditya.py --help                 # should print usage
+command -v subfinder httpx nuclei sqlmap        # core tools on PATH
 ```
 
-That's the whole 30-second path. **Ollama is optional** — without it you get
-interactive prompts; with it the AI brain runs the assessment fully
-autonomously (zero prompts unless a login is detected and `--creds` is missing).
+### 3. First scan
 
-### 3. (Optional) Install the AI brain
+```bash
+python3 vikramaditya.py example.com            # auto-detect, interactive
+```
 
-For autonomous operation, install [Ollama](https://ollama.com) and pull the
-per-role models the brain actually uses (see [AI Brain & Models](#ai-brain--models)
-for the rationale):
+**Two ways to run it:**
+
+- **Out of the box (no Ollama):** one command, then a few interactive prompts (proceed → credentials → enable brain → run active scanner). This is the ~30-second path.
+- **Fully autonomous (zero prompts):** install Ollama and pull the models in step 4 first (a multi-GB download — see sizing below). The brain then drives the whole assessment and only asks for credentials if a login is detected and `--creds` was not supplied.
+
+### 4. (Optional) Install the AI brain
+
+For autonomous operation, install [Ollama](https://ollama.com) and pull the per-role models the brain actually uses (see [AI Brain & Models](#ai-brain--models) for the rationale):
 
 ```bash
 ollama pull phi4:14b               # faithful narrator (default since v9.23)
@@ -95,7 +129,9 @@ ollama pull devstral-small-2:24b   # primary exploit coder (A/B-validated)
 ollama pull qwen2.5-coder:14b      # fast fallback coder
 ```
 
-Optionally create the security-tuned triage model:
+> **Minimum for autonomous mode:** `phi4:14b` (narrator) **plus one** coder — either `devstral-small-2:24b` *or* `qwen2.5-coder:14b` (the brain auto-prefers Devstral when both are present). These three are each multi-GB downloads.
+
+Optionally create the security-tuned triage model (fully optional — triage defaults to `phi4:14b` without it):
 
 ```bash
 wget -c 'https://huggingface.co/BugTraceAI/BugTraceAI-Apex-G4-26B-Q4/resolve/main/BugTraceAI-Apex-G4-26B-Q4.gguf' -O /tmp/BugTraceAI-Apex-G4-26B-Q4.gguf
@@ -131,9 +167,13 @@ only asks for credentials if a login is detected and `--creds` was not provided.
 Without Ollama it falls back to interactive mode.
 
 Useful flags (all confirmed in `vikramaditya.py`): `--creds` / `--creds-b`
-(primary + second account for IDOR/priv-esc), `--scope-lock` (restrict to the
-exact host), `--verify-fix`, `--passive-only` (generate the Phase-0 dork
-catalogue and exit), `--skip-passive`.
+(primary + second account for IDOR / priv-esc), `--verify-fix`, `--passive-only`
+(generate the Phase-0 dork catalogue and exit), `--skip-passive`.
+
+> **Scope-lock note:** on the main entry point, scope-lock is offered as an
+> interactive prompt on the infrastructure/hunt path only — it is **not** a
+> `vikramaditya.py` CLI flag. For a true CLI flag, use `hunt.py --scope-lock`
+> directly (see the [Whitebox](#whitebox-aws-integration) / hunt examples).
 
 Sample run:
 
@@ -184,7 +224,12 @@ python3 autopilot_api_hunt.py \
     --totp-secret-b "$VAPT_MFA_USER_TOTP_SECRET" \
     --frontend-url https://app.example.com \
     --output findings/example-vapt
+```
 
+<details>
+<summary><b>More auth modes</b> — extra login-body fields, token-only, IDOR second account, caller-supplied endpoint inventory</summary>
+
+```bash
 # Login endpoint expects extra body fields
 python3 autopilot_api_hunt.py \
     --base-url https://app.example.com/api --login-url auth/login \
@@ -218,6 +263,8 @@ python3 autopilot_api_hunt.py \
     --endpoints-file path/to/endpoints.json
 ```
 
+</details>
+
 If the server replies `requiresTotp: true` and no secret/code was supplied, the
 autopilot fails loudly rather than silently retrying with a non-MFA fallback.
 
@@ -232,12 +279,15 @@ role wants a different model — these are env-overridable with **no code change
 | Role | Model | Why | Env var |
 |:--|:--|:--|:--|
 | **Narration / analysis** | `phi4:14b` | Lowest hallucination of any local model (Vectara 3.7 %) — won't fabricate findings | `BRAIN_MODEL=phi4:14b` |
-| **Triage** (submit/drop) | `bugtraceai-apex` | Security-DPO judgement; empirically beat phi4 + Foundation-Sec on a triage A/B | `TRIAGE_MODEL=bugtraceai-apex` |
+| **Triage** (submit/drop) | `phi4:14b` *(default)* → `bugtraceai-apex` *(opt-in)* | Triage defaults to `phi4:14b` for speed and consistent JSON. Pull `bugtraceai-apex` and set `TRIAGE_MODEL` to switch to the security-DPO judge (empirically beat phi4 + Foundation-Sec on a triage A/B) | `TRIAGE_MODEL=bugtraceai-apex` |
 | **Exploit code-gen** | `devstral-small-2:24b` (primary) / `qwen2.5-coder:14b` (fast fallback) | Both write valid, runnable PoCs. A/B-validated: Devstral wins on correctness (68 % SWE-bench; emits the canonical sqlmap-GET structure), qwen2.5-coder is faster/lighter | `BRAIN_SCANNER_MODEL=devstral-small-2:24b` |
 
 `brain_scanner.pick_model()` prefers `devstral-small-2:24b` automatically when
 present, else falls back to `qwen2.5-coder:14b`. `brain.py` makes `phi4:14b` the
-default narrator (`MODEL_PRIORITY[0]`).
+default narrator **and** the default triage model (`MODEL_PRIORITY[0]` and
+`TRIAGE_MODEL_PRIORITY[0]`); `bugtraceai-apex` (which resolves to
+`bugtraceai-apex:latest`) sits second in both lists and is only selected when
+pulled or forced via the env var.
 
 > ⚠️ A `claude-*` tag in your local Ollama is **not** Claude (Claude weights are
 > not downloadable, so any such tag is a mislabeled local model). Always confirm
@@ -298,11 +348,13 @@ graph TB
     I --> M
     L --> M
 
-    style D fill:#ff9999
-    style J fill:#ff9999
-    style K fill:#ff9999
-    style L fill:#ff9999
+    classDef hub fill:#1f2937,stroke:#3b82f6,color:#fff,stroke-width:2px;
+    classDef har fill:#cce5ff,stroke:#3b82f6,color:#111;
+    class C hub;
+    class D,J,K,L har;
 ```
+
+<sub><i>Blue path = HAR-based authenticated testing flow; <code>vikramaditya.py</code> is the orchestrator hub.</i></sub>
 
 </div>
 
@@ -350,7 +402,8 @@ vikramaditya/
 │                                #   report-writer, email-auditor, autopilot, …
 ├── commands/                    # /recon /hunt /validate /report /triage /chain
 │                                #   /intel /token-scan /email-audit /anon, …
-└── tests/                       # ~700 test functions across 39 modules (pytest)
+└── tests/                       # ~700 test functions across 69 modules (pytest,
+                                 #   incl. the whitebox unit/integration/smoke suite)
 ```
 
 ---
@@ -365,16 +418,16 @@ vikramaditya/
 | **Scanning** | nuclei, sqlmap, naabu, feroxbuster | CVE detection, SQL injection, port scanning, directory bruteforce |
 | **Exploitation** | manual + brain-generated PoCs | CMS exploits, Spring Boot actuators, cloud misconfigs |
 
-### Authenticated testing
+### Authenticated testing (HAR-based)
 
-| Category | Vulnerability types | HAR-based |
-|:---------|:--------------------|:----------|
-| **Injection** | SQL, NoSQL, Command injection | ✅ Auth bypass, parameter injection |
-| **Broken Auth** | Session management, auth bypass | ✅ Admin-panel access, invalid-session acceptance |
-| **Sensitive Data** | IDOR, information disclosure | ✅ User enumeration, unauthorized data access |
-| **File Upload** | RCE, path traversal, filter bypass | ✅ Malicious uploads, bypass techniques |
-| **XSS** | Reflected, stored, DOM-based | ✅ Parameter-based testing |
-| **Session** | Token security, hijacking | ✅ Bearer-token analysis, cookie security |
+| Category | Vulnerability types | What it does |
+|:---------|:--------------------|:-------------|
+| **Injection** | SQL, NoSQL, Command injection | Auth bypass, parameter injection |
+| **Broken Auth** | Session management, auth bypass | Admin-panel access, invalid-session acceptance |
+| **Sensitive Data** | IDOR, information disclosure | User enumeration, unauthorized data access |
+| **File Upload** | RCE, path traversal, filter bypass | Malicious uploads, bypass techniques |
+| **XSS** | Reflected, stored, DOM-based | Parameter-based testing |
+| **Session** | Token security, hijacking | Bearer-token analysis, cookie security |
 
 ### Web3 — meme-coin / SPL / DEX LP
 
@@ -400,7 +453,7 @@ vikramaditya/
 
 - **Exploit generation** — brain writes custom PoC code for found vulnerabilities
 - **Chain discovery** — identifies multi-step attack paths
-- **False-positive reduction** — AI triage removes noise
+- **False-positive reduction** — AI triage drops fabricated / low-confidence findings before they reach the report
 - **Fix verification** — reads deployed code, finds logic-bypass opportunities
 - **Impact assessment** — business-risk scoring and prioritization
 
@@ -453,7 +506,12 @@ python3 vikramaditya.py example.com
 python3 -m whitebox.cloud_hunt --profile client-erp \
     --allowlist example.com \
     --session-dir recon/example.com
+```
 
+<details>
+<summary><b>More whitebox modes</b> — multi-account, timeout/region tuning, no-scope-lock</summary>
+
+```bash
 # Multi-account, timeouts widened for a large IAM estate
 PROWLER_TIMEOUT=7200 PMAPPER_TIMEOUT=3600 \
 WHITEBOX_REGIONS=us-east-1,ap-south-1,eu-west-1 \
@@ -466,6 +524,8 @@ python3 -m whitebox.cloud_hunt \
 python3 -m whitebox.cloud_hunt --profile client-erp --no-scope-lock \
     --session-dir recon/example.com
 ```
+
+</details>
 
 By default `cloud_hunt` filters `ec2 describe-regions` to enabled regions so
 boto3 never hangs in SYN_SENT against unenabled opt-in regions (`me-south-1`,
@@ -505,7 +565,7 @@ metadata-only.
 
 ```
 recon/<target>/cloud/<account_id>/
-├── inventory/                 # 26 services × N regions, raw boto3 JSON
+├── inventory/                 # ~25+ AWS service inventories × N regions, raw boto3 JSON
 ├── prowler/                   # OCSF JSON + compliance CSVs
 ├── pmapper/                   # Graph storage copy + stdout/stderr logs
 ├── secrets/                   # Per-finding redacted JSON (mode 0600 in 0700 dir)
@@ -668,7 +728,7 @@ Per-finding JSON is written under `findings/<target>/` for downstream tooling.
 
 - ✅ Only test systems you own or have explicit **written permission** to test
 - ✅ Obtain proper documentation before starting any assessment
-- ✅ Stay within defined scope — use `--scope-lock` for strict boundaries
+- ✅ Stay within defined scope — use `hunt.py --scope-lock` (or accept the interactive scope-lock prompt) to restrict to the exact host with no subdomain expansion
 - ✅ Follow responsible disclosure for any findings
 
 ### Methodology alignment
@@ -749,22 +809,6 @@ per role — `phi4:14b` narrator, `bugtraceai-apex` triage, `devstral-small-2:24
 
 ---
 
-## The Legend
-
-**Vikramaditya** — the legendary Indian emperor whose throne could only be
-ascended by one who sought truth fearlessly and judged without bias. His name
-means *"valour of the sun"*. This tool operates the same way: give it a target,
-walk away, and come back to a full VAPT report.
-
-It was inspired by and evolved from
-[**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) — the
-original AI-assisted bug-bounty automation platform that laid the recon pipeline,
-ReAct agent architecture, and AI analysis engine that power this tool today.
-
-> *"He who seeks the truth must be ready to face the fire."* — inspired by the legend of Vikramaditya
-
----
-
 ## License & Support
 
 **License:** MIT — see [LICENSE](LICENSE).
@@ -775,6 +819,8 @@ ReAct agent architecture, and AI analysis engine that power this tool today.
 This tool is designed for **authorized security testing only**. The developers
 assume no liability for misuse. Always ensure you have explicit written
 permission before testing any systems.
+
+> **The Legend.** *Vikramaditya* — the legendary Indian emperor whose throne could only be ascended by one who sought truth fearlessly and judged without bias. His name means *"valour of the sun"*. This tool operates the same way: give it a target, walk away, and come back to a full VAPT report. It was inspired by and evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) — the original AI-assisted bug-bounty automation platform that laid the recon pipeline, ReAct agent architecture, and AI analysis engine that power this tool today. *"He who seeks the truth must be ready to face the fire."*
 
 <div align="center">
 
