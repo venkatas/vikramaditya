@@ -26,6 +26,10 @@ permissions:
   security-events: write
   # Read commit contents
   contents: read
+  # OSV-Scanner v2 reusable workflow declares `actions: read`; a reusable
+  # workflow cannot request more than the caller grants, so this must be set
+  # here or the run fails at startup (GitHub Actions permission model).
+  actions: read
 
 jobs:
   scan-scheduled:
