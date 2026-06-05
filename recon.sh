@@ -290,8 +290,12 @@ run_phase5_port_scanning() {
             log_step "naabu top-1000 on $TARGET..."
             naabu -host "$TARGET" -top-ports 1000 -silent \
                 -o "$RECON_DIR/ports/naabu_results.txt" 2>/dev/null || true
-            awk -F: 'NF>1 {print $2"/open"}' "$RECON_DIR/ports/naabu_results.txt" \
-                | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
+            if [ -f "$RECON_DIR/ports/naabu_results.txt" ]; then
+                awk -F: 'NF>1 {print $2"/open"}' "$RECON_DIR/ports/naabu_results.txt" \
+                    | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
+            else
+                : > "$RECON_DIR/ports/open_ports.txt"
+            fi
 
             # v9.5.0 — fingerprintx adds structured per-port service banners
             # (auth-protocol detection: RDP/SSH/SMB/Postgres/MySQL/Mongo/etc).
@@ -306,18 +310,18 @@ run_phase5_port_scanning() {
             if [ -s "$RECON_DIR/ports/open_ports.txt" ]; then
                 PORT_CSV="$(cut -d/ -f1 "$RECON_DIR/ports/open_ports.txt" | paste -sd, -)"
                 log_step "nmap service fingerprinting on naabu-discovered ports: ${PORT_CSV:-none}"
-                nmap -sV -p "$PORT_CSV" -T4 --open "$TARGET" \
+                nmap -Pn -sV -p "$PORT_CSV" -T4 --open "$TARGET" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
                     -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
             else
                 log_warn "naabu found no open ports — falling back to nmap top-1000"
-                nmap -sV --top-ports 1000 -T4 --open "$TARGET" \
+                nmap -Pn -sV --top-ports 1000 -T4 --open "$TARGET" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
                     -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
             fi
         else
             log_step "nmap top-1000 on $TARGET..."
-            nmap -sV --top-ports 1000 -T4 --open "$TARGET" \
+            nmap -Pn -sV --top-ports 1000 -T4 --open "$TARGET" \
                 -oN "$RECON_DIR/ports/nmap_results.txt" \
                 -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
         fi
@@ -331,7 +335,7 @@ run_phase5_port_scanning() {
             log_step "nmap non-standard ports on CRITICAL hosts..."
             while IFS= read -r host; do
                 HOSTNAME=$(echo "$host" | sed 's|https\?://||;s|[/:].*||')
-                nmap -sV -p 8080,8443,8888,9090,9200,5601,6379,27017,3306,5432,2375,2376 \
+                nmap -Pn -sV -p 8080,8443,8888,9090,9200,5601,6379,27017,3306,5432,2375,2376 \
                     --open -T4 "$HOSTNAME" \
                     -oN "$RECON_DIR/ports/nmap_critical_${HOSTNAME}.txt" 2>/dev/null || true
             done < <(head -5 "$RECON_DIR/priority/critical_hosts.txt")
