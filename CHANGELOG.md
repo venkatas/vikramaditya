@@ -1,5 +1,36 @@
 # Changelog
 
+## v10.0.1 — sqlmap-confirmed SQLi ingestion + per-finding email_auth CVSS (2026-06-06)
+
+A follow-up to the v10.0.0 report-ingestion audit, surfaced by a live
+`python3 vikramaditya.py clientd.com` run whose reporter logged
+`WARNING: findings subdir 'sqlmap/' is not in SUBDIR_VTYPE`.
+
+- **sqlmap-confirmed SQLi now reaches the report.** `hunt.py` writes confirmed
+  injections to `sqlmap/sqlmap_results.txt` (and `results-*.csv` for OpenAPI/POST
+  runs), but `reporter.py` had no loader — a confirmed SQLi was silently dropped
+  despite the `sqli_sqlmap_confirmed` template existing. New `load_findings`
+  Method 1f parses both files (record-aware `DictReader`, `utf-8-sig` BOM-safe),
+  counts only rows with a non-empty `Technique(s)`, **skips rows sqlmap itself
+  tagged "false positive or unexploitable"** (whitespace-normalized, mirrors the
+  `brain.py` candidate filter) so a scanner-rejected row never becomes a CRITICAL,
+  and dedupes on the injected parameter's *value* while preserving query context
+  (`?op=users&id=1` and `?op=orders&id=1` stay distinct; `id=1` vs `id=999`
+  collapse). `sqlmap/` is suppressed from the unmapped-subdir warning via
+  `meta_dirs` (it also holds `candidates.txt`/`post_*.txt` the generic `.txt`
+  scan would mis-parse as findings).
+- **Email-auth findings now carry per-finding CVSS.** Every `email_auth` finding
+  previously rendered CVSS 5.3 regardless of its LOW/INFO label, because the
+  Method 1d loader set severity but not `cvss` and the renderer fell back to the
+  template. It now sets per-finding cvss: explicit item cvss → the template's
+  authored score when severity matches (MEDIUM stays 5.3) → `CVSS_DEFAULT`
+  otherwise (LOW→2.5, INFO→0.0, HIGH→7.5). `email_auth` was also moved from
+  `SUBDIR_VTYPE` to `meta_dirs` so the generic walk can't mis-score a future
+  `.txt` (the dedicated Method 1d loader is now the sole ingestion path).
+
+Regression-covered by `tests/test_reporter_sqlmap_ingestion.py` (19 tests).
+Independently reviewed by `codex` and `grok` (three rounds); all findings folded in.
+
 ## v10.0.0 — full-tool correctness audit (2026-06-05)
 
 A major correctness release. A multi-stage audit — an automated multi-agent
