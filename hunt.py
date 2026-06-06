@@ -946,6 +946,60 @@ def _dir_file_count(path: str) -> int:
     return total
 
 
+def _structured_finding_count(path: str) -> int:
+    """Count real findings under a findings directory, not raw file count.
+
+    v9.24 — ``_artifact_summary`` previously reported ``files=N`` for the
+    ``findings`` dir, conflating empty/placeholder/scaffolding files (e.g. an
+    empty ``candidates.txt`` or a tool's ``-o`` log) with actual findings. The
+    brain then announced "22 findings" when only 10 were real.
+
+    Parsing rule per file:
+      * ``.json`` — count list items, or dict entries, or JSON-object lines.
+      * other text — count non-empty, non-comment, non-banner lines.
+    Empty files contribute 0. Directories are walked recursively.
+    """
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            try:
+                if os.path.getsize(fpath) == 0:
+                    continue
+            except OSError:
+                continue
+            if fname.endswith(".json"):
+                try:
+                    with open(fpath, errors="ignore") as fh:
+                        data = json.load(fh)
+                    if isinstance(data, list):
+                        total += len(data)
+                    elif isinstance(data, dict):
+                        # Common shapes: {"findings": [...]} or a flat map.
+                        inner = data.get("findings") if "findings" in data else None
+                        total += len(inner) if isinstance(inner, list) else len(data)
+                    continue
+                except Exception:
+                    # Fall through to line-based count (JSONL / malformed).
+                    total += _count_json_findings(fpath)
+                    continue
+            # Plain-text findings: skip blanks, comments, and banner lines.
+            try:
+                with open(fpath, errors="ignore") as fh:
+                    for raw in fh:
+                        ln = raw.strip()
+                        if not ln:
+                            continue
+                        if ln.startswith(("#", "//", "=", "-", "*", "[")):
+                            continue
+                        total += 1
+            except OSError:
+                continue
+    return total
+
+
 def _artifact_summary(artifacts: dict[str, str] | None = None) -> str:
     if not artifacts:
         return "(no artifacts provided)"
@@ -962,6 +1016,14 @@ def _artifact_summary(artifacts: dict[str, str] | None = None) -> str:
                 continue
             if label == "upload":
                 lines.append(_upload_artifact_summary(path))
+                continue
+            if label == "findings":
+                # v9.24 — report a structured finding count (parsed), not the
+                # raw file count which over-reports placeholder/empty files.
+                lines.append(
+                    f"{label}: dir {path} | findings={_structured_finding_count(path)} "
+                    f"| files={_dir_file_count(path)}"
+                )
                 continue
             lines.append(f"{label}: dir {path} | files={_dir_file_count(path)}")
         else:
@@ -1454,6 +1516,95 @@ def check_tools() -> tuple[list, list]:
     return installed, missing
 
 
+def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, str]]:
+    """Lightweight readiness layer beyond binary presence (v9.24 audit-fix).
+
+    ``check_tools`` only proves a binary exists on PATH. Several tools are
+    present-but-broken: GitHound with no ``config.yml``, Kiterunner with no
+    route wordlist, jwt_tool with no secrets wordlist, etc. Reporting them as
+    "installed" then "0 results" masks the fact that they never really ran.
+
+    Returns a list of ``{tool, reason}`` for installed tools that lack a
+    required config / key / wordlist. Does NOT mutate the global accumulator —
+    callers decide whether to surface (the run-time path uses ``_mark_degraded``
+    when a tool actually executes degraded).
+    """
+    if installed is None:
+        installed, _ = check_tools()
+    installed_set = set(installed)
+    gaps: list[dict[str, str]] = []
+
+    # GitHound needs a config.yml carrying GitHub credentials. It searches
+    # CWD then $HOME/.githound/config.yml (and historically ./config.yml).
+    if "git-hound" in installed_set:
+        candidates = [
+            os.path.join(os.getcwd(), "config.yml"),
+            os.path.join(HOME, ".githound", "config.yml"),
+            os.path.join(HOME, "git-hound", "config.yml"),
+        ]
+        if not any(os.path.isfile(p) for p in candidates):
+            gaps.append({"tool": "git-hound",
+                         "reason": "no config.yml found (GitHub creds) — GitHub secret scan cannot authenticate"})
+
+    # Kiterunner needs an API-route wordlist; without one it bruteforces nothing.
+    if "kiterunner" in installed_set:
+        kr_wl = os.path.join(WORDLIST_DIR, "api-endpoints.txt")
+        kr_wl_alt = os.path.join(WORDLIST_DIR, "routes-large.kite")
+        if not (os.path.isfile(kr_wl) or os.path.isfile(kr_wl_alt)):
+            gaps.append({"tool": "kiterunner",
+                         "reason": "no API route wordlist (api-endpoints.txt / routes-large.kite) — run --setup-wordlists"})
+
+    # jwt_tool weak-secret cracking needs a secrets wordlist.
+    if "jwt_tool" in installed_set:
+        jwt_wl = os.path.join(WORDLIST_DIR, "jwt-secrets.txt")
+        if not os.path.isfile(jwt_wl):
+            gaps.append({"tool": "jwt_tool",
+                         "reason": "no jwt-secrets.txt wordlist — weak-secret cracking disabled (run --setup-wordlists)"})
+
+    return gaps
+
+
+# ── Phase status mapping (v9.24 audit-fix) ─────────────────────────────────────
+# The run_* helpers return ``True`` on skip/no-op paths (tool missing, no
+# candidates, all-errored) as well as on real success, so the HUNT summary
+# marked everything ✓. Phases now report a tri-state status string and the
+# dashboard renders distinct glyphs.
+PHASE_STATUS_RAN = "ran"        # executed and produced a result
+PHASE_STATUS_SKIPPED = "skipped"  # skipped / N/A (tool absent, no candidates)
+PHASE_STATUS_ERROR = "error"    # attempted but errored / produced nothing usable
+
+_PHASE_STATUS_GLYPH = {
+    PHASE_STATUS_RAN:     "✓",
+    PHASE_STATUS_SKIPPED: "∅",
+    PHASE_STATUS_ERROR:   "✗",
+}
+
+
+def phase_status_glyph(status: str) -> str:
+    """Map a tri-state phase status to its display glyph (✓ / ∅ / ✗)."""
+    return _PHASE_STATUS_GLYPH.get(status, "✓" if status else "∅")
+
+
+def derive_phase_status(requested: bool, ran_truthy: bool,
+                        degraded: bool = False) -> str:
+    """Derive a tri-state phase status from the signals hunt_target has.
+
+    * ``error``   — the phase ran degraded (tool present-but-broken, all
+                    candidates dead, dependency import error, etc.).
+    * ``skipped`` — the phase was not requested, or returned falsy (run_*
+                    helpers return False on tool-missing / no-candidate paths).
+    * ``ran``     — requested, returned truthy, and not degraded.
+
+    This is a strict improvement over the old "any truthy → ✓": a degraded
+    phase now reports ✗ and a not-requested/no-op phase reports ∅.
+    """
+    if not requested:
+        return PHASE_STATUS_SKIPPED
+    if degraded:
+        return PHASE_STATUS_ERROR
+    return PHASE_STATUS_RAN if ran_truthy else PHASE_STATUS_SKIPPED
+
+
 def _file_nonempty(path: str) -> bool:
     return os.path.isfile(path) and os.path.getsize(path) > 0
 
@@ -1551,6 +1702,275 @@ def _collect_urls_from_file(path: str, *, require_query: bool = False,
     except OSError:
         return urls
     return urls
+
+
+# ── Degraded-capability tracking (v9.24 audit-fix) ─────────────────────────────
+# Tools may be *present* on PATH yet *broken* at runtime (missing config.yml,
+# absent API key, missing wordlist, exited instantly with empty output, etc.).
+# Binary-presence preflight can't see this. We accumulate a per-run list of
+# {tool, reason} and persist it to ``<findings>/coverage.json`` so the reporter
+# can render a "Degraded capabilities" section instead of silently reporting a
+# clean/0-result scan for a tool that never actually ran.
+_DEGRADED_CAPABILITIES: list[dict[str, str]] = []
+
+
+def _mark_degraded(tool: str, reason: str) -> None:
+    """Record a present-but-broken tool. De-duplicated on (tool, reason)."""
+    entry = {"tool": tool, "reason": reason}
+    if entry not in _DEGRADED_CAPABILITIES:
+        _DEGRADED_CAPABILITIES.append(entry)
+        log("warn", f"Degraded capability: {tool} — {reason}")
+
+
+def _reset_degraded() -> None:
+    """Clear the accumulator (per-target reset for multi-target runs)."""
+    _DEGRADED_CAPABILITIES.clear()
+
+
+def write_coverage_json(findings_dir: str) -> str | None:
+    """Persist the degraded-capabilities list to ``<findings_dir>/coverage.json``.
+
+    Integration contract with the reporter agent: a JSON list of
+    ``{"tool": str, "reason": str}``. Always written (even when empty) so the
+    reporter can distinguish "no degradations" from "coverage not measured".
+    Returns the path written, or None on failure.
+    """
+    if not findings_dir:
+        return None
+    try:
+        os.makedirs(findings_dir, exist_ok=True)
+        out = os.path.join(findings_dir, "coverage.json")
+        with open(out, "w") as fh:
+            json.dump(list(_DEGRADED_CAPABILITIES), fh, indent=2)
+        return out
+    except OSError:
+        return None
+
+
+# Strings that mean GitHound (and similar GitHub-secret scanners) printed a
+# config/auth error instead of real results. The historical counter stripped
+# lines starting with ``[!]`` and then reported the empty remainder as
+# "0 results — clean", masking the fact that the scan never authenticated.
+_GITHOUND_ERROR_SIGNALS: tuple[str, ...] = (
+    "config.yml was not found",
+    "config.yaml was not found",
+    "no github",          # "no GitHub tokens", "no GitHub credentials"
+    "no api key",
+    "no token",
+    "authentication failed",
+    "unauthorized",
+    "rate limit",
+    "could not authenticate",
+)
+
+
+def _githound_output_is_error(text: str) -> bool:
+    """True if GitHound output is a config/auth error rather than real results."""
+    low = (text or "").lower()
+    return any(sig in low for sig in _GITHOUND_ERROR_SIGNALS)
+
+
+# ── sqlmap candidate hygiene (v9.24 audit-fix) ─────────────────────────────────
+# Placeholder tokens left in URLs by crawlers/paramspider that sqlmap can't use
+# as a real value (e.g. ``?d=FUZZ&t=FUZZ``). Substituted with a benign ``1`` so
+# sqlmap has a baseline value to mutate; if substitution can't help (the whole
+# value IS the placeholder and nothing else), the URL is dropped.
+_SQLMAP_PLACEHOLDER_TOKENS: tuple[str, ...] = ("FUZZ", "PLACEHOLDER", "XXXXX", "{{", "}}")
+
+# Candidate URL path segments that are useless for SQLi — ASP.NET resource
+# handlers serve static, signed, cached blobs; sqlmap burns minutes for nothing.
+_SQLMAP_PATH_DENYLIST: tuple[str, ...] = (
+    "webresource.axd", "scriptresource.axd",
+)
+
+
+def _substitute_fuzz_placeholders(url: str) -> str:
+    """Replace crawler placeholder tokens in a URL's query values with ``1``.
+
+    ``?d=FUZZ&t=FUZZ`` → ``?d=1&t=1``. Case-insensitive on the token. Leaves
+    URLs without placeholders untouched.
+    """
+    if not url:
+        return url
+    out = url
+    for tok in _SQLMAP_PLACEHOLDER_TOKENS:
+        if tok.lower() in out.lower():
+            out = _re_module.sub(_re_module.escape(tok), "1", out, flags=_re_module.IGNORECASE)
+    return out
+
+
+def _is_denylisted_sqlmap_candidate(url: str) -> bool:
+    """True if URL targets an ASP.NET resource handler (no SQLi surface)."""
+    low = (url or "").lower()
+    return any(seg in low for seg in _SQLMAP_PATH_DENYLIST)
+
+
+def _sanitize_sqlmap_candidates(candidates: list[str]) -> list[str]:
+    """Drop denylisted handlers and substitute FUZZ→1; preserve order, dedupe."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        if not c or _is_denylisted_sqlmap_candidate(c):
+            continue
+        fixed = _substitute_fuzz_placeholders(c)
+        # If a placeholder token remains after substitution attempts, skip it.
+        if any(tok.lower() in fixed.lower() for tok in _SQLMAP_PLACEHOLDER_TOKENS):
+            continue
+        if fixed in seen:
+            continue
+        seen.add(fixed)
+        cleaned.append(fixed)
+    return cleaned
+
+
+# v9.24 audit-fix (finding D): HTTP statuses that mean "host is up, keep the
+# candidate". An auth-gated parameterized endpoint answers 401/403 unauthenticated
+# and 405 to HEAD — those are exactly the high-value targets the later
+# cookie-aware sqlmap run should probe. Only a 404/410 (resource gone) is a true
+# "dead candidate"; every other server response proves the host is reachable.
+_DEAD_HTTP_CODES: frozenset[int] = frozenset({404, 410})
+
+
+def _url_reachable(url: str, timeout: int = 8, cookies: str = "") -> bool:
+    """Lightweight reachability preflight: True if the host responds at all.
+
+    A SQLi candidate is "reachable" whenever the server answers — including
+    auth-gated 401/403 and method-not-allowed 405 — because the later
+    cookie-aware sqlmap run can still probe it (and authentication may unlock it).
+    Only HARD failures drop the candidate:
+
+      * network-level errors (connection refused / timeout / DNS failure)
+      * an explicit ``404``/``410`` (the resource genuinely does not exist)
+
+    finding D: previously this returned False for 401/403/405 and every other
+    4xx/5xx, silently discarding authenticated parameterized endpoints before
+    sqlmap ever saw them. ``cookies`` is threaded into the probe so a session
+    that has already authenticated sees the real (200) response.
+    """
+    import urllib.request
+    import urllib.error
+
+    def _probe(method: str) -> bool | None:
+        try:
+            headers = {"User-Agent": "hunt.py/1.0"}
+            if cookies:
+                headers["Cookie"] = cookies
+            req = urllib.request.Request(url, method=method, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code = getattr(resp, "status", None) or resp.getcode()
+                # 2xx/3xx — host up and serving (3xx-to-login still means up).
+                return 200 <= int(code) < 400
+        except urllib.error.HTTPError as e:
+            # The server responded with an error status — the host is UP.
+            # Only 404/410 means the candidate itself is dead. 401/403/405 and
+            # every other 4xx/5xx keep the candidate (auth-gated / WAF / 5xx
+            # are all worth probing). 405/501 to HEAD → retry with GET first.
+            if e.code in (405, 501):
+                return None  # signal "retry with GET"
+            return e.code not in _DEAD_HTTP_CODES
+        except Exception:
+            # Network-level failure (connrefused / timeout / DNS) — host down.
+            return False
+
+    res = _probe("HEAD")
+    if res is None:
+        # HEAD returned 405/501 — retry with GET. If GET *also* returns
+        # 405/501 (some endpoints reject both), the host still responded, so
+        # treat it as reachable (finding D: method-not-allowed != dead).
+        res = _probe("GET")
+        if res is None:
+            return True
+    return bool(res)
+
+
+def _filter_reachable_candidates(candidates: list[str], *,
+                                 limit: int | None = None,
+                                 timeout: int = 8,
+                                 cookies: str = "") -> tuple[list[str], int]:
+    """Return (reachable_subset, dead_count). Probes at most ``limit`` URLs.
+
+    ``cookies`` is threaded into each preflight probe so auth-gated endpoints
+    are judged against the authenticated response (finding D).
+    """
+    reachable: list[str] = []
+    dead = 0
+    probe_set = candidates[:limit] if limit else candidates
+    for c in probe_set:
+        # Only forward ``cookies`` when set, so callers/tests that monkeypatch
+        # ``_url_reachable`` with the legacy ``(u, timeout=...)`` signature keep
+        # working on the no-cookie path (backward compatibility).
+        if cookies:
+            ok = _url_reachable(c, timeout=timeout, cookies=cookies)
+        else:
+            ok = _url_reachable(c, timeout=timeout)
+        if ok:
+            reachable.append(c)
+        else:
+            dead += 1
+    return reachable, dead
+
+
+# Hostname tokens that indicate a database tier — the highest-value SQLi
+# surface. db-named in-scope hosts are seeded as sqlmap candidates (v9.24).
+_DB_HOST_TOKENS: tuple[str, ...] = (
+    "mssql", "mysql", "postgres", "postgresql", "oracle", "mariadb",
+    "mongodb", "mongo", "redis", "db", "database", "sql", "rds", "dbserver",
+)
+
+
+def _is_db_named_host(url_or_host: str) -> bool:
+    """True if the URL/host's *hostname* contains a database-tier token.
+
+    Matches on dot/dash-delimited labels (``db.example.com``, ``mysql-prod``)
+    so ``feedback.example.com`` is NOT matched on the substring "db".
+    """
+    raw = (url_or_host or "").strip()
+    if not raw:
+        return False
+    host = raw
+    if "://" in raw:
+        host = urlsplit(raw).netloc or raw
+    host = host.split("@")[-1].split(":")[0].lower()  # strip creds + port
+    labels: list[str] = []
+    for label in host.split("."):
+        labels.extend(label.split("-"))
+        labels.extend(label.split("_"))
+
+    def _label_is_db(label: str) -> bool:
+        # Exact token match, or a token followed by a numeric suffix
+        # (``mssql01``, ``db1``, ``mysql02``) — but NOT a substring match, so
+        # ``feedback`` (contains "db") and ``www`` are excluded.
+        for tok in _DB_HOST_TOKENS:
+            if label == tok:
+                return True
+            if label.startswith(tok) and label[len(tok):].isdigit():
+                return True
+        return False
+
+    return any(_label_is_db(label) for label in labels)
+
+
+def _collect_db_named_candidates(recon_dir: str, *, limit: int = 10) -> list[str]:
+    """Seed db-named in-scope live hosts as sqlmap candidate URLs.
+
+    Reads ``live/urls.txt`` (falls back to ``urls/live_hosts.txt``) and returns
+    URLs whose hostname matches a database-tier token. These rarely carry a
+    query string, so the standard aggregator silently dropped them.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for fname in (os.path.join(recon_dir, "live", "urls.txt"),
+                  os.path.join(recon_dir, "urls", "live_hosts.txt")):
+        for url in _collect_urls_from_file(fname, limit=500):
+            if not _is_db_named_host(url):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+            if len(out) >= limit:
+                return out
+    return out
 
 
 def _glob_results_csvs(sqli_dir: str) -> list[str]:
@@ -3507,19 +3927,47 @@ def run_js_analysis(domain: str) -> bool:
     # unverified (most raw regex matches are noise: CSS, GUIDs, asset URLs).
     if os.path.isfile(secretfinder):
         sf_out = os.path.join(js_dir, "secretfinder.txt")
+        # v9.24 — do NOT blanket-suppress stderr. When SecretFinder's deps break
+        # (jsbeautifier/lxml import error, etc.) the old ``2>/dev/null`` hid the
+        # traceback, the tool exited ~0 in 0.1s with 0 bytes, and we reported a
+        # clean "0 matches". Merge stderr into the captured output (per-url so a
+        # single broken URL doesn't kill the loop) and assert plausibility.
         cmd = (
             f'cat "{js_urls_file}" | while read url; do '
-            f'  python3 "{secretfinder}" -i "$url" -o cli 2>/dev/null; '
+            f'  python3 "{secretfinder}" -i "$url" -o cli 2>&1; '
             f'done | tee "{sf_out}"'
         )
         run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         if os.path.exists(sf_out):
             count = 0
+            tb_signal = False
             with open(sf_out, errors="ignore") as fh:
                 for ln in fh:
                     if "\t->\t" in ln:
                         count += 1
-            log("ok", f"SecretFinder: {count} raw match(es) [unverified] → {sf_out}")
+                    low = ln.lower()
+                    # finding J: degrade ONLY on an explicit error signal — a
+                    # traceback, a missing-module / import error, a "command not
+                    # found" / "no such file" from the shell, or a SyntaxError.
+                    # The old fast+empty heuristic (js_count>0 && bytes==0 &&
+                    # dur<2.0) false-positived on a legit single-URL no-secrets
+                    # target that finishes <2s empty.
+                    if ("traceback (most recent call last)" in low
+                            or "modulenotfounderror" in low
+                            or "importerror" in low
+                            or "syntaxerror" in low
+                            or "command not found" in low
+                            or "no such file or directory" in low):
+                        tb_signal = True
+            # SecretFinder that printed an import/runtime error did not actually
+            # run — flag it instead of reporting "0 matches". An empty-but-clean
+            # file (no error markers) is a legitimate "no secrets found" result,
+            # even when the run finished quickly over a single JS URL.
+            if tb_signal:
+                _mark_degraded("secretfinder",
+                               "import/runtime error in output — dependency broken (see secretfinder.txt)")
+            else:
+                log("ok", f"SecretFinder: {count} raw match(es) [unverified] → {sf_out}")
     else:
         log("warn", "SecretFinder not found at ~/tools/SecretFinder/")
 
@@ -3592,18 +4040,28 @@ def run_secret_hunt(domain: str) -> bool:
     # GitHound: search GitHub for secrets related to domain
     if _which(git_hound):
         gh_out = os.path.join(secret_dir, "githound.txt")
+        # v9.24 — capture stderr too: GitHound prints "[!] config.yml was not
+        # found." to stdout, but other auth/rate-limit errors land on stderr.
         ok, out = run_cmd(
-            f'echo "{domain}" | {git_hound} --dig-files --dig-commits 2>/dev/null | tee "{gh_out}"',
+            f'echo "{domain}" | {git_hound} --dig-files --dig-commits 2>&1 | tee "{gh_out}"',
             timeout=SECRET_TIMEOUT,
             watch_file=secret_dir,
             watch_phase="SECRET HUNT"
         )
         if os.path.exists(gh_out):
-            # Filter out GitHound's own [!] warning/error lines (e.g. "config.yml not found")
-            # so only actual match lines are counted as findings
-            count = sum(1 for line in open(gh_out)
-                        if line.strip() and not line.lstrip().startswith("[!]"))
-            log("ok" if count == 0 else "crit", f"GitHound: {count} results → {gh_out}")
+            gh_text = _read_text(gh_out)
+            # If GitHound emitted a config/auth error (e.g. missing config.yml),
+            # the scan never authenticated — do NOT report "0 results clean".
+            # Surface a clear degradation instead.
+            if _githound_output_is_error(gh_text):
+                _mark_degraded("git-hound",
+                               "not configured (config.yml / GitHub creds missing) — GitHub secret scan SKIPPED")
+            else:
+                # Count only actual match lines; GitHound prefixes informational
+                # warnings with "[!]" which are not findings.
+                count = sum(1 for line in gh_text.splitlines()
+                            if line.strip() and not line.lstrip().startswith("[!]"))
+                log("ok" if count == 0 else "crit", f"GitHound: {count} results → {gh_out}")
     else:
         log("warn", "git-hound not in PATH — skipping GitHub scan")
 
@@ -5254,7 +5712,11 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         return False
 
     post_params_file = os.path.join(recon_dir, "params", "post_params.json")
-    if not os.path.isfile(post_params_file):
+    # v9.24 — short-circuit when POST discovery already ran this session. On a
+    # 0-form target ``post_params.json`` is never written, so also honour the
+    # done-marker; otherwise lightpanda re-renders every page a second time.
+    post_params_done = os.path.join(recon_dir, "params", "post_params_done.marker")
+    if not os.path.isfile(post_params_file) and not os.path.isfile(post_params_done):
         log("info", "sqlmap preflight: discovering POST parameters first (lightpanda + arjun)...")
         run_post_param_discovery(domain, cookies=cookies)
 
@@ -5302,8 +5764,44 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         except Exception:
             pass
 
+    # v9.24 — seed db-named in-scope live hosts (mssql/mysql/db/postgres/oracle…)
+    # as sqlmap candidates. These are the highest-value SQLi surface yet the
+    # historical aggregator never included them (no query string → filtered out).
+    candidates.extend(_collect_db_named_candidates(recon_dir))
+
     candidates = [c for c in dict.fromkeys(candidates) if not _looks_like_payload_url(c)]
+
+    # v9.24 — candidate hygiene: drop WebResource.axd/ScriptResource.axd handlers
+    # (static signed blobs, zero SQLi surface) and substitute crawler placeholder
+    # tokens (``?d=FUZZ&t=FUZZ`` → ``?d=1&t=1``) so sqlmap has a real baseline
+    # value to mutate instead of fuzzing the literal string "FUZZ".
+    candidates = _sanitize_sqlmap_candidates(candidates)
     candidates = candidates[:20]  # top 20 GET candidates
+
+    # v9.24 audit-fix (finding L): remember whether ANY candidate was discovered
+    # before reachability filtering, so the "nothing to test" message can tell
+    # "all discovered candidates were unreachable" apart from "never discovered".
+    discovered_candidate_count = len(candidates)
+    all_candidates_unreachable = False
+
+    # v9.24 — reachability preflight: both candidates in the clientd run
+    # were dead (404/connection-refused at connect) yet the phase logged
+    # "complete". Probe each candidate; if none survive, emit a degradation so
+    # the report shows the phase tested nothing rather than passing silently.
+    if candidates:
+        # finding D: thread the engagement's session cookies into the preflight
+        # so auth-gated parameterized endpoints aren't dropped before the
+        # cookie-aware sqlmap run that follows.
+        reachable, dead = _filter_reachable_candidates(
+            candidates, limit=20, cookies=cookies)
+        if dead:
+            log("info", f"sqlmap preflight: {dead} unreachable candidate(s) dropped")
+        if not reachable:
+            log("warn", "sqlmap: all GET candidates unreachable — nothing to test")
+            _mark_degraded("sqlmap",
+                           f"all {len(candidates)} GET candidate(s) unreachable (404/refused) — no SQLi surface probed")
+            all_candidates_unreachable = True
+        candidates = reachable
 
     # v7.1.4 — OpenAPI/Swagger POST endpoints from api_audit.py Phase 6.5.
     # These don't go through ``sqlmap -m`` (which treats one URL per line as GET);
@@ -5314,7 +5812,15 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         log("info", f"sqlmap: {len(openapi_posts)} POST candidate(s) from OpenAPI specs")
 
     if not candidates and not openapi_posts:
-        log("warn", "No SQLi candidates found — run recon + param discovery first")
+        # finding L: distinguish "all discovered candidates were unreachable"
+        # (host(s) down / 404 / refused) from "no candidates ever discovered"
+        # (recon/param-discovery never produced parameterized URLs).
+        if all_candidates_unreachable:
+            log("warn",
+                f"sqlmap: all {discovered_candidate_count} candidate(s) "
+                f"unreachable (404/refused) — no SQLi surface to test")
+        else:
+            log("warn", "No SQLi candidates found — run recon + param discovery first")
         return False
 
     # v7.1.4 — thread session cookies into sqlmap so authenticated endpoints
@@ -5357,6 +5863,15 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     #      is what actually finds app-layer SQLi through JSON APIs.
     #   --smart          — let sqlmap skip non-numeric params heuristically
     #      so /api/feedback/submit's "message" field doesn't burn 5 minutes.
+    #
+    # v9.24 audit-fix (finding B): track POST run failures + confirmed hits so
+    # the final return reflects reality. Previously the function returned True
+    # unconditionally even when sqlmap timed out / crashed with no injectable
+    # result, masking a dead phase as success.
+    post_ok = True            # AND of every POST run's ok flag
+    post_attempted = False    # at least one POST invocation happened
+    injectable_found = False  # any confirmed injectable parameter (GET or POST)
+    last_post_out = ""        # tail of the most recent POST run (for degrade msg)
     for op in openapi_posts:
         body = json.dumps(op["json_body"] or {"test": "1"}, separators=(",", ":"))
         safe_name = (op["url"].replace("https://", "").replace("http://", "")
@@ -5378,6 +5893,9 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
             f'--output-dir="{sqli_dir}"',
             timeout=600,
         )
+        post_attempted = True
+        post_ok = post_ok and bool(ok_p)
+        last_post_out = out_p or last_post_out
         # v7.1.10 — sqlmap writes its results-CSV to the output dir; re-read
         # the most recent one (the -o flag used before was a boolean, not a
         # path, and silently did nothing). A hit has a non-empty Technique(s)
@@ -5392,22 +5910,49 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         if ("injectable" in combined_out.lower()
                 or "parameter:" in combined_out.lower()):
             log("crit", f"API SQLi FOUND: {op['method']} {op['url']}")
+            injectable_found = True
 
+    injections = 0
     if os.path.exists(sqli_out):
-        injections = sum(1 for line in open(sqli_out) if "injectable" in line.lower() or "injection" in line.lower())
+        injections = sum(1 for line in open(sqli_out)
+                         if "injectable" in line.lower() or "injection" in line.lower())
         if injections:
             log("crit", f"sqlmap: {injections} injectable parameter(s) found → {sqli_dir}")
+            injectable_found = True
         else:
             log("ok", f"sqlmap complete → {sqli_dir}")
     else:
         log("ok" if ok else "warn", f"sqlmap complete → {sqli_dir}")
 
+    # v9.24 audit-fix (finding B): fold POST ok_p failures into the overall
+    # run status, and only declare success on a clean completion or a confirmed
+    # hit. Previously this returned True even when every sqlmap invocation
+    # timed out / crashed and nothing injectable was found — masking a dead
+    # phase as ✓.
+    #   * run_ok      — every sqlmap invocation that actually ran exited cleanly.
+    #   * ran_anything— at least one GET batch or POST op was invoked.
+    run_ok = bool(ok) and post_ok
+    ran_anything = bool(candidates) or post_attempted
+
+    overall_ok = injectable_found or run_ok
     _brain_phase_complete(
         "SQLMAP",
-        ok,
-        detail=f"target={domain} candidates={len(candidates)}",
+        overall_ok,
+        detail=(f"target={domain} candidates={len(candidates)} "
+                f"injectable={injectable_found} run_ok={run_ok}"),
         artifacts={"sqlmap": sqli_dir},
     )
+
+    # Failure path: sqlmap ran (something was attempted) but exited non-clean
+    # (timeout / crash) AND produced no confirmed injectable result. Mark the
+    # phase degraded and report failure so the dashboard shows ✗, not ✓.
+    if ran_anything and not run_ok and not injectable_found:
+        tail = ((out or "") + (last_post_out or ""))[-500:] \
+            or "sqlmap exited non-zero with no injectable result"
+        _mark_degraded("sqlmap", tail)
+        log("warn", "sqlmap: run did not complete cleanly and found no SQLi — reporting failure")
+        return False
+
     return True
 
 
@@ -5759,6 +6304,15 @@ def run_post_param_discovery(domain: str,
 
     if not post_params and not post_urls:
         log("info", "No POST parameters discovered")
+        # v9.24 — record that discovery completed (0 forms) so the sqlmap
+        # preflight does not re-render the same pages with lightpanda a second
+        # time. ``post_params.json`` is never written on the empty path, so use
+        # a sentinel marker as the "already ran this session" signal.
+        try:
+            with open(os.path.join(params_dir, "post_params_done.marker"), "w") as mk:
+                mk.write("0\n")
+        except OSError:
+            pass
         _brain_phase_complete("POST-PARAMS", True, detail=f"target={domain} found=0")
         return False
 
@@ -6006,6 +6560,25 @@ def run_browser_scan(
         )
         results = agent.run()
         total = sum(results.values()) if results else 0
+        # v9.24 audit-fix (finding A): distinguish a legit no-op skip (browser-use
+        # absent / no LLM → 0 tasks attempted) from total failure (every task
+        # errored). BrowserAgent exposes _tasks_completed / _tasks_errored; when
+        # results is empty AND tasks were attempted with completions==0, the phase
+        # is degraded, not skipped — surface it so the dashboard renders ✗ (ERROR)
+        # instead of hiding the phase behind a silent [OK].
+        tasks_errored = int(getattr(agent, "_tasks_errored", 0) or 0)
+        tasks_completed = int(getattr(agent, "_tasks_completed", 0) or 0)
+        if not results and tasks_errored > 0 and tasks_completed == 0:
+            reason = (f"all {tasks_errored} browser request(s) errored "
+                      f"(0 completed) — browser phase produced no result")
+            _mark_degraded("browser", reason)
+            log("err", f"Browser scan degraded: {reason}")
+            _brain_phase_complete(
+                phase_name, False,
+                detail=f"target={domain} headed={headed} degraded errors={tasks_errored}",
+                artifacts={"findings": findings_dir},
+            )
+            return False
         log("ok" if total else "info", f"Browser scan complete: {total} finding(s)")
         _brain_phase_complete(
             phase_name,
@@ -6016,6 +6589,9 @@ def run_browser_scan(
         return bool(results)
     except Exception as exc:
         log("err", f"Browser scan failed: {exc}")
+        # An exception escaping agent.run() is an unambiguous failure of a
+        # requested phase — mark degraded so it renders ✗ rather than ∅.
+        _mark_degraded("browser", f"browser phase raised: {exc}")
         _brain_phase_complete(phase_name, False, detail=f"target={domain} error={exc}")
         return False
 
@@ -6227,11 +6803,27 @@ def hunt_target(
         "sqlmap":            False,
         "jwt_audit":         False,
         "browser_scan":      False,
+        # v9.24 — tri-state phase status (ran / skipped / error) so the dashboard
+        # no longer marks skipped/no-op/errored phases with ✓. Keyed by phase.
+        "phase_status":      {},
         "session_id":        None,
         "recon_dir":         "",
         "findings_dir":      "",
         "report_dir":        "",
     }
+    _reset_degraded()  # per-target reset of the degraded-capability accumulator
+
+    # v9.24 audit-fix (finding K): install-time readiness gaps (tool present on
+    # PATH but missing its config / key / wordlist — e.g. git-hound with no
+    # config.yml) were only logged at startup and never reached coverage.json,
+    # so the reporter's coverage chapter missed "present but broken" gaps. Seed
+    # them into the degraded accumulator AFTER the per-target reset so they are
+    # persisted by write_coverage_json below alongside run-time degradations.
+    try:
+        for _gap in check_tool_readiness():
+            _mark_degraded(_gap["tool"], _gap["reason"])
+    except Exception:
+        pass  # readiness probing is best-effort; never block the hunt
 
     explicit_phase_selection = any((
         js_scan, param_discover, api_fuzz, secret_hunt, cors_check,
@@ -6447,6 +7039,50 @@ def hunt_target(
         log("info", "Brain: post-scan hook (triage + exploit + report)...")
         _brain.post_scan_hook(findings_dir, recon_dir)
 
+    # ── v9.24: tri-state phase status + coverage.json ───────────────────────
+    # Derive ran/skipped/error per phase so the dashboard stops marking
+    # skipped/no-op/errored phases with ✓. A phase is "error" when a degraded
+    # capability was recorded for one of its tools during this run.
+    _degraded_tools = {d["tool"] for d in _DEGRADED_CAPABILITIES}
+    _phase_tool_map = {
+        "js_analysis":     {"secretfinder", "jsluice", "trufflehog"},
+        "secret_hunt":     {"git-hound", "trufflehog"},
+        "sqlmap":          {"sqlmap"},
+        "jwt_audit":       {"jwt_tool"},
+        "api_fuzz":        {"kiterunner", "feroxbuster"},
+        # v9.24 audit-fix (finding A): a total browser failure records a
+        # "browser" degradation; map it so the phase renders ✗ (ERROR), not ✓/∅.
+        "browser_scan":    {"browser"},
+    }
+    _phase_requested = {
+        "recon":           should_run_recon,
+        "js_analysis":     js_scan,
+        "secret_hunt":     secret_hunt,
+        "param_discovery": param_discover,
+        "api_fuzz":        api_fuzz and not quick,
+        "cors":            cors_check,
+        "scan":            should_run_vuln_scan and not (skip_scan or skip_has(skip_items, "scan", "vuln_scan")),
+        "cms_exploit":     cms_exploit,
+        "rce_scan":        rce_scan,
+        "sqlmap":          sqlmap_scan,
+        "jwt_audit":       jwt_audit,
+        "browser_scan":    browser_scan,
+    }
+    # v9.24 audit-fix (finding A): persist per-phase "requested" flags so the
+    # dashboard can DISPLAY a requested phase that ended up skipped/errored
+    # (a requested browser phase that produced nothing must not be hidden).
+    result["phase_requested"] = {k: bool(v) for k, v in _phase_requested.items()}
+    for _phase, _requested in _phase_requested.items():
+        _degraded = bool(_phase_tool_map.get(_phase, set()) & _degraded_tools)
+        result["phase_status"][_phase] = derive_phase_status(
+            bool(_requested), bool(result.get(_phase)), degraded=_degraded
+        )
+
+    # Persist the degraded-capabilities list for the reporter (integration
+    # contract). Always written (even empty) so the reporter can tell
+    # "no degradations" from "coverage not measured".
+    write_coverage_json(findings_dir)
+
     # ── Phase 13: Reports ───────────────────────────────────────────────────
     if selected_only_mode:
         log("info", f"Skipping automatic report generation for {domain} (targeted phase mode)")
@@ -6470,18 +7106,42 @@ def print_dashboard(results: list) -> None:
         status = f"{GREEN}OK{NC}" if r["success"] else f"{RED}FAIL{NC}"
         print(f"  [{status}] {BOLD}{r['domain']}{NC}")
         phases = []
-        if r.get("recon"):           phases.append(f"{GREEN}Recon✓{NC}")
-        if r.get("js_analysis"):     phases.append(f"{CYAN}JS✓{NC}")
-        if r.get("secret_hunt"):     phases.append(f"{MAGENTA}Secrets✓{NC}")
-        if r.get("param_discovery"): phases.append(f"{BLUE}Params✓{NC}")
-        if r.get("api_fuzz"):        phases.append(f"{YELLOW}API✓{NC}")
-        if r.get("cors"):            phases.append(f"{CYAN}CORS✓{NC}")
-        if r.get("scan"):            phases.append(f"{GREEN}Scan✓{NC}")
-        if r.get("cms_exploit"):     phases.append(f"{RED}CMS✓{NC}")
-        if r.get("rce_scan"):        phases.append(f"{RED}RCE✓{NC}")
-        if r.get("sqlmap"):          phases.append(f"{RED}SQLi✓{NC}")
-        if r.get("jwt_audit"):       phases.append(f"{YELLOW}JWT✓{NC}")
-        if r.get("browser_scan"):    phases.append(f"{CYAN}Browser✓{NC}")
+        pstatus = r.get("phase_status") or {}
+        preq = r.get("phase_requested") or {}
+        # (result-key, label, color) — order preserved for display.
+        _phase_specs = [
+            ("recon",           "Recon",   GREEN),
+            ("js_analysis",     "JS",      CYAN),
+            ("secret_hunt",     "Secrets", MAGENTA),
+            ("param_discovery", "Params",  BLUE),
+            ("api_fuzz",        "API",     YELLOW),
+            ("cors",            "CORS",    CYAN),
+            ("scan",            "Scan",    GREEN),
+            ("cms_exploit",     "CMS",     RED),
+            ("rce_scan",        "RCE",     RED),
+            ("sqlmap",          "SQLi",    RED),
+            ("jwt_audit",       "JWT",     YELLOW),
+            ("browser_scan",    "Browser", CYAN),
+        ]
+        for key, label, color in _phase_specs:
+            if key in pstatus:
+                st = pstatus[key]
+                # v9.24 — show ∅ skipped / ✗ errored / ✓ ran-with-result.
+                # Hide phases that were never requested (∅ + not run) to keep
+                # the line readable; surface ✗ errors and ✓ successes.
+                # finding A: a *requested* phase that ended up skipped (returned
+                # falsy with no result) must STILL be shown — a total browser
+                # failure that fell through to SKIPPED was previously hidden,
+                # printing a silent [OK]. Only hide phases that were not requested.
+                if (st == PHASE_STATUS_SKIPPED and not r.get(key)
+                        and not preq.get(key)):
+                    continue
+                glyph = phase_status_glyph(st)
+                gcol = RED if st == PHASE_STATUS_ERROR else color
+                phases.append(f"{gcol}{label}{glyph}{NC}")
+            elif r.get(key):
+                # Legacy fallback (callers that don't populate phase_status).
+                phases.append(f"{color}{label}✓{NC}")
         if phases:
             print(f"       Phases : {' | '.join(phases)}")
         print(f"       Reports: {r.get('reports', 0)}")
@@ -6838,6 +7498,12 @@ Examples:
     log("info", f"Tools: {len(installed)}/{len(TOOL_REGISTRY)} installed")
     if missing:
         log("warn", f"Missing: {', '.join(missing)}")
+
+    # v9.24 — readiness layer: tools may be present on PATH yet broken (no
+    # config/key/wordlist). Surface those so a "34/34 installed" banner doesn't
+    # imply full capability when e.g. git-hound has no config.yml.
+    for _gap in check_tool_readiness(installed):
+        log("warn", f"Not ready: {_gap['tool']} — {_gap['reason']}")
 
     should_auto_repair = bool(missing) and (
         args.repair_tools or (args.autonomous and not args.no_auto_install_tools)

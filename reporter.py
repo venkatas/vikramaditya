@@ -889,18 +889,29 @@ def load_findings(findings_dir: str) -> list:
     # Collapse unconfirmed keyword matches into a single INFO context item.
     if unconfirmed_cves:
         sample = ", ".join(f"{c} ({p})" if p else c for c, p, _ in unconfirmed_cves[:8])
+        _collapsed_detail = (
+            "These CVEs were matched by technology NAME only (NVD keyword search) "
+            "with no version correlation and no active confirmation, so they are NOT "
+            "verified findings and must not be reported as-is. Validate each against "
+            "the actually-deployed version before including it. "
+            f"Examples: {sample}.")
+        # v10.0.2 — set an explicit per-severity CVSS so this INFO context row does NOT
+        # inherit the misconfig template's hardcoded MEDIUM-band 5.3 (the renderer falls
+        # back to tmpl.cvss when the finding carries none). Same per-severity approach as
+        # the email_auth loader: INFO → "0.0". Also fold the rich detail (matched CVE
+        # examples + "validate before reporting" warning) INTO the poc text, because the
+        # renderers surface poc-before-detail (`poc or raw or detail`); without this the
+        # CVE list and warning never reach the report.
         results.append({
             "severity": "info",
+            "cvss": CVSS_DEFAULT.get("info", "0.0"),
             "vtype": "misconfig",
             "title": (f"Unconfirmed tech-stack CVE keyword matches ({len(unconfirmed_cves)}) "
                       "— version verification required"),
-            "detail": ("These CVEs were matched by technology NAME only (NVD keyword search) "
-                       "with no version correlation and no active confirmation, so they are NOT "
-                       "verified findings and must not be reported as-is. Validate each against "
-                       "the actually-deployed version before including it. "
-                       f"Examples: {sample}."),
+            "detail": _collapsed_detail,
             "url": "N/A",
-            "poc": "Source: cves/cve_database_matches.json (keyword matches; not version-verified).",
+            "poc": (f"{_collapsed_detail}\n\n"
+                    "Source: cves/cve_database_matches.json (keyword matches; not version-verified)."),
         })
 
     # Method 1c: cves_custom/ — output of scanner.sh Check 1.5 (nuclei custom templates)
@@ -1527,6 +1538,33 @@ def _badge(sev: str) -> str:
             f'font-size:0.85em;font-weight:bold">{sev.upper()}</span>')
 
 
+def _finding_remediation(f: dict, tmpl: dict) -> str:
+    """Resolve the remediation text to render for a finding.
+
+    v10.0.2 — area-specific posture findings (e.g. email_auth's
+    DNSSEC/MTA-STS/TLS-RPT/BIMI/DKIM rows) carry their precise fix in the
+    finding's ``notes``/``detail``/``poc`` as a ``Fix:`` clause, but every
+    one of them shares one template whose remediation is the generic DMARC
+    advice. Prefer, in order: an explicit per-finding ``remediation`` →
+    the per-finding ``Fix:`` clause parsed out of notes/detail/poc → the
+    template remediation. This keeps generic templates working while
+    surfacing the authored, area-correct fix when one exists.
+    """
+    explicit = (f.get("remediation") or "").strip()
+    if explicit:
+        return explicit
+    # Look for an authored "Fix:" clause in the finding's own text. Search the
+    # richest fields first; take everything after the first "Fix:" marker.
+    for field in ("notes", "detail", "poc"):
+        text = f.get(field)
+        if not isinstance(text, str) or "Fix:" not in text:
+            continue
+        fix = text.split("Fix:", 1)[1].strip()
+        if fix:
+            return fix
+    return tmpl.get("remediation", "")
+
+
 def _render_upload_evasion_matrix(findings: list) -> str:
     """Render an HTML table summarizing file type evasion test results.
 
@@ -1597,6 +1635,197 @@ def _render_upload_evasion_matrix(findings: list) -> str:
   {rows}
 </table>
 """
+
+
+def _resolve_recon_findings_dirs(report_dir: str) -> tuple[str, str]:
+    """Map a report dir to its sibling recon/ and findings/ session dirs.
+
+    Operators pass either the ``findings/<t>/sessions/<id>/`` or the
+    ``recon/<t>/sessions/<id>/`` path; both layouts share a session id so we
+    can derive the peer dir by swapping the top-level segment. Mirrors the
+    inline logic in ``_collect_scan_diagnostics`` (kept in sync, factored out
+    so the recon-inventory + coverage chapters resolve paths identically).
+
+    v10.0.3 — in production this is called with the *generated report* dir
+    (``reports/<t>/sessions/<id>/``, the value ``resolve_target_and_report_dir``
+    returns and ``process_findings_dir`` threads through ``render_*_report``).
+    That third layout matched neither the ``findings/`` nor the ``recon/``
+    segment, so the recon-inventory + coverage chapters looked under
+    ``reports/.../live`` / ``reports/.../ports`` / ``reports/.../coverage.json``
+    — all non-existent — and rendered empty in every real report. We now also
+    recognise the ``reports/`` segment and map it to BOTH sibling layouts
+    (recon for host/port artefacts, findings for coverage.json)."""
+    report_dir = (report_dir or "").rstrip("/")
+    # Match the top-level "findings/", "recon/", or "reports/" segment whether
+    # the caller passed an absolute ("/.../findings/...") or a relative
+    # ("findings/...") path — the inline /findings/-only check in
+    # _collect_scan_diagnostics silently no-ops on a relative findings dir,
+    # which would leave the recon inventory empty. Swap only the FIRST segment
+    # so a literal "findings"/"recon"/"reports" deeper in the path is preserved.
+    findings_seg = re.compile(r"(^|/)findings/")
+    recon_seg = re.compile(r"(^|/)recon/")
+    reports_seg = re.compile(r"(^|/)reports/")
+    if reports_seg.search(report_dir):
+        # The generated-report layout: map the SAME session dir onto both the
+        # recon/ tree (live/, ports/) and the findings/ tree (coverage.json).
+        recon_dir = reports_seg.sub(lambda m: m.group(1) + "recon/", report_dir, count=1)
+        findings_dir = reports_seg.sub(lambda m: m.group(1) + "findings/", report_dir, count=1)
+        return recon_dir, findings_dir
+    if findings_seg.search(report_dir):
+        recon_dir = findings_seg.sub(lambda m: m.group(1) + "recon/", report_dir, count=1)
+        return recon_dir, report_dir
+    findings_dir = recon_seg.sub(lambda m: m.group(1) + "findings/", report_dir, count=1)
+    return report_dir, findings_dir
+
+
+def _render_recon_inventory_html(report_dir: str, target: str) -> str:
+    """Render a "Recon / Host & Port Inventory" chapter from the session's
+    live/httpx, ports/nmap, and priority artefacts.
+
+    v10.0.2 — discovered hosts (e.g. ``mssql.*``), open ports (FTP 21/990,
+    8443), and the live-host surface previously never appeared in the report:
+    the only recon-derived block was the all-zeros "Recon Surface" metrics
+    table whose paths often miss the real layout. This chapter lists every
+    live host + status/tech and every open port even when no finding maps to
+    them, so the inventory is visible. Degrades to a friendly note when the
+    artefacts are absent."""
+    recon_dir, _ = _resolve_recon_findings_dirs(report_dir)
+
+    def _read_lines(*parts: str) -> list[str]:
+        try:
+            with open(os.path.join(recon_dir, *parts), errors="replace") as fh:
+                return [ln.rstrip("\n") for ln in fh if ln.strip()]
+        except OSError:
+            return []
+
+    # --- Live hosts (httpx_full.txt: "URL [status] [len] [title] [ip] [tech]") ---
+    host_rows = ""
+    httpx_re = re.compile(
+        r"^(\S+)"                      # url
+        r"(?:\s+\[([^\]]*)\])?"        # status
+        r"(?:\s+\[([^\]]*)\])?"        # content length
+        r"(?:\s+\[([^\]]*)\])?"        # title
+        r"(?:\s+\[([^\]]*)\])?"        # ip
+        r"(?:\s+\[([^\]]*)\])?")       # tech
+    for line in _read_lines("live", "httpx_full.txt"):
+        m = httpx_re.match(line.strip())
+        if not m:
+            continue
+        url, status, _clen, ptitle, ip, tech = m.groups()
+        host_rows += (
+            f"<tr><td><code style=\"word-break:break-all\">{url}</code></td>"
+            f"<td>{status or '—'}</td>"
+            f"<td>{ip or '—'}</td>"
+            f"<td>{ptitle or '—'}</td>"
+            f"<td>{tech or '—'}</td></tr>\n")
+    if not host_rows:
+        # Fallback: plain URL list (live/urls.txt) when httpx detail is absent.
+        for url in _read_lines("live", "urls.txt"):
+            host_rows += (
+                f"<tr><td><code style=\"word-break:break-all\">{url}</code></td>"
+                "<td>—</td><td>—</td><td>—</td><td>—</td></tr>\n")
+
+    # --- Open ports (open_ports.txt: "21/open"; nmap_greppable for service detail) ---
+    port_service = {}
+    for line in _read_lines("ports", "nmap_greppable.txt"):
+        if "Ports:" not in line:
+            continue
+        for chunk in line.split("Ports:", 1)[1].split(","):
+            # e.g. "21/open/tcp//ftp//Microsoft ftpd/"
+            fields = chunk.strip().split("/")
+            if len(fields) >= 5 and fields[0].isdigit():
+                svc = fields[4] or ""
+                ver = fields[6] if len(fields) > 6 else ""
+                port_service[fields[0]] = " ".join(x for x in (svc, ver) if x).strip()
+    port_rows = ""
+    for line in _read_lines("ports", "open_ports.txt"):
+        port = line.split("/", 1)[0].strip()
+        if not port:
+            continue
+        port_rows += (f"<tr><td><code>{line}</code></td>"
+                      f"<td>{port_service.get(port, '—') or '—'}</td></tr>\n")
+
+    ips = _read_lines("live", "ips.txt")
+    ips_str = ", ".join(ips) if ips else "—"
+
+    if not host_rows and not port_rows:
+        # v10.0.3 — render NOTHING (matches the coverage chapter's silent ''),
+        # rather than an empty H2 + "inventory unavailable" block that leaked
+        # raw filesystem paths into a client-facing report. A scan with no
+        # recon artefacts (authenticated-API-only, scope-locked, etc.) should
+        # simply omit the chapter, not advertise a missing directory.
+        return ""
+
+    host_body = host_rows or ('<tr><td colspan="5" style="color:#6c757d">'
+                              'No live hosts recorded.</td></tr>')
+    port_body = port_rows or ('<tr><td colspan="2" style="color:#6c757d">'
+                              'No open ports recorded.</td></tr>')
+    host_tbl = (
+        '<h3 style="margin-top:20px">Live Hosts</h3>'
+        '<table class="tbl">'
+        '<tr><th>Host / URL</th><th style="width:80px">Status</th>'
+        '<th style="width:120px">IP</th><th>Title</th><th>Tech</th></tr>'
+        f'{host_body}'
+        '</table>')
+    port_tbl = (
+        '<h3 style="margin-top:20px">Open Ports</h3>'
+        '<table class="tbl" style="width:auto">'
+        '<tr><th>Port</th><th>Service / Version</th></tr>'
+        f'{port_body}'
+        '</table>')
+
+    return f'''
+<h2 id="recon-inventory" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">
+Recon / Host &amp; Port Inventory</h2>
+<p style="color:#495057">Hosts and ports discovered during reconnaissance, listed even where no
+finding maps to them. Resolved IP(s): <code>{ips_str}</code>.</p>
+{host_tbl}
+{port_tbl}
+'''
+
+
+def _render_coverage_limitations_html(report_dir: str) -> str:
+    """Render a "Tooling & Coverage Limitations" chapter.
+
+    INTEGRATION CONTRACT (v10.0.2): reads ``coverage.json`` under the findings
+    session dir — a JSON list of ``{"tool": ..., "reason": ...}`` entries
+    written by the hunt.py agent describing degraded/skipped capabilities.
+    Degrades gracefully (renders nothing) when the file is absent, empty, or
+    malformed so a normal full-coverage run adds no noise."""
+    import json as _json
+    _, findings_dir = _resolve_recon_findings_dirs(report_dir)
+    cov_path = os.path.join(findings_dir, "coverage.json")
+    if not os.path.isfile(cov_path):
+        return ""
+    try:
+        with open(cov_path, errors="replace") as fh:
+            data = _json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, list):
+        return ""
+
+    rows = ""
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        tool = str(item.get("tool", "")).strip() or "—"
+        reason = str(item.get("reason", "")).strip() or "—"
+        rows += f"<tr><td><code>{tool}</code></td><td>{reason}</td></tr>\n"
+    if not rows:
+        return ""
+
+    return f'''
+<h2 id="coverage-limitations" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">
+Tooling &amp; Coverage Limitations</h2>
+<p style="color:#495057">The following capabilities were degraded or skipped during this
+engagement. Findings should be read in light of these gaps — an absent result for a class
+below is <b>inconclusive</b>, not a clean bill of health.</p>
+<table class="tbl">
+  <tr><th style="width:220px">Tool / Capability</th><th>Reason</th></tr>
+  {rows}
+</table>
+'''
 
 
 def _collect_scan_diagnostics(report_dir: str, target: str) -> dict:
@@ -1858,7 +2087,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
     <h4 style="color:#343a40;margin:10px 0 6px">Evidence / Proof of Concept</h4>
     <pre style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;padding:12px;overflow-x:auto;font-size:0.85em;white-space:pre-wrap">{f.get("poc", f.get("raw", f.get("detail", "—")))}</pre>
     <h4 style="color:#343a40;margin:10px 0 6px">Remediation</h4>
-    <p style="margin:0 0 10px">{tmpl["remediation"]}</p>
+    <p style="margin:0 0 10px">{_finding_remediation(f, tmpl)}</p>
     <h4 style="color:#343a40;margin:4px 0 6px">References</h4>
     <ul style="margin:0;padding-left:18px">{refs}</ul>
   </div>
@@ -1910,6 +2139,8 @@ a{{color:#0d6efd}}code{{background:#f8f9fa;padding:1px 5px;border-radius:3px;fon
   <li><a href="#scope">Scope &amp; Methodology</a></li>
   <li><a href="#vtable">Vulnerability Summary</a></li>
   <li><a href="#details">Detailed Findings</a></li>
+  <li><a href="#recon-inventory">Recon / Host &amp; Port Inventory</a></li>
+  <li><a href="#scan-diagnostics">Scan Diagnostics</a></li>
   <li><a href="#appendix-a">Appendix A: Tools</a></li>
   <li><a href="#appendix-b">Appendix B: Methodology</a></li>
 </ol>
@@ -1960,6 +2191,10 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 {details or '<p style="color:#6c757d">No findings.</p>'}
 
 {_render_upload_evasion_matrix(findings)}
+
+{_render_recon_inventory_html(report_dir, target)}
+
+{_render_coverage_limitations_html(report_dir)}
 
 {_render_scan_diagnostics_html(diagnostics)}
 
@@ -2092,7 +2327,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
             "**Evidence / Proof of Concept:**", "```",
             f.get("poc", f.get("raw", f.get("detail", "—"))),
             "```", "",
-            f"**Remediation:** {tmpl['remediation']}", "",
+            f"**Remediation:** {_finding_remediation(f, tmpl)}", "",
             "**References:**", refs, "", "---", "",
         ]
     lines.append(f"*Generated by [Vikramaditya](https://github.com/venkatas/vikramaditya) — Autonomous VAPT Platform | {date_str}*")

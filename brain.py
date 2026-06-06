@@ -866,6 +866,13 @@ Keep it under 80 words total."""
                 candidate_files = []
                 for pattern in ("RCE_CONFIRMED*.txt", "JBOSS_EXPOSED*.txt", "JBOSS_DEFAULTCREDS*.txt", "nuclei_rce.txt", "nuclei_tomcat_cve.txt"):
                     candidate_files.extend(sorted(cat_dir.glob(pattern)))
+            elif cat_dir.name == "sqlmap":
+                # Mirror interpret_scan: the sqlmap dir holds INPUT artifacts
+                # (candidates.txt = FUZZ targets to feed sqlmap, target.txt =
+                # sqlmap's own run config) alongside the real output. Globbing
+                # *.txt harvested those candidates as bogus '[sqlmap]' findings.
+                # Only confirmed-result artifacts are real findings.
+                candidate_files = sorted(cat_dir.glob("sqlmap_results.txt")) + sorted(cat_dir.glob("results-*.csv"))
             else:
                 candidate_files = sorted(cat_dir.glob("*.txt"))
             for fpath in candidate_files:
@@ -901,6 +908,44 @@ Keep it under 80 words total."""
         add_section("IDOR Candidates", findings_path / "idor" / "idor_candidates.txt", 1400)
         for rce_file in sorted((findings_path / "rce").glob("RCE_CONFIRMED*.txt"))[:3]:
             add_section(f"Confirmed RCE Artifact: {rce_file.name}", rce_file, 1600)
+
+        # Email authentication posture (email_auth/findings.json). The reporter
+        # ingests this JSON list (Method 1d) and emits SPF/DKIM/DMARC/DNSSEC/
+        # MTA-STS findings, but the brain's evidence set previously omitted it —
+        # so the brain emitted NO_REPORTS while the reporter shipped findings.
+        # Render the confirmed items as text so the brain sees the same evidence.
+        email_auth_path = findings_path / "email_auth" / "findings.json"
+        if email_auth_path.exists():
+            try:
+                ea_data = json.loads(email_auth_path.read_text(errors="ignore"))
+            except (ValueError, OSError):
+                ea_data = None
+            if isinstance(ea_data, list):
+                ea_lines: list[str] = []
+                for item in ea_data:
+                    if not isinstance(item, dict):
+                        continue
+                    sev = str(item.get("severity", "")).strip()
+                    title = str(item.get("title", "")).strip()
+                    endpoint = str(item.get("endpoint", "")).strip()
+                    notes = str(item.get("notes", "")).strip()
+                    parts = []
+                    if sev:
+                        parts.append(f"[{sev.upper()}]")
+                    if title:
+                        parts.append(title)
+                    header = " ".join(parts)
+                    line = header
+                    if endpoint:
+                        line += f"\n  endpoint: {endpoint}"
+                    if notes:
+                        line += f"\n  {notes}"
+                    if line.strip():
+                        ea_lines.append(line)
+                if ea_lines:
+                    evidence_sections.append(
+                        "## Email Authentication Posture\n" + "\n\n".join(ea_lines)[:2000]
+                    )
 
         if evidence_sections:
             add_section("Scan Summary", findings_path / "summary.txt", 1800)
@@ -966,6 +1011,173 @@ Keep it under 80 words total."""
             return "NO_REPORTS"
 
         return "\n\n---\n\n".join(kept_sections)
+
+    @staticmethod
+    def _append_live_host_grounding(analysis_text: str, live_hosts: list[str]) -> str:
+        """Reconcile recon prose with on-disk live-host evidence.
+
+        httpx-confirmed live hosts are ground truth. When the model claims "No
+        subdomains / None identified" (or similar) but live hosts exist, append a
+        deterministic correction listing the confirmed hosts so the saved
+        analysis can never assert "none" against real evidence. No-op when there
+        are no live hosts (preserving the model's output verbatim).
+        """
+        text = analysis_text or ""
+        if not live_hosts:
+            return text
+        lower = text.lower()
+        # The model claimed nothing was found anywhere near the host/subdomain
+        # discussion. Detect the common "none" assertions case-insensitively.
+        denial_markers = (
+            "no subdomain", "none identified", "no live host",
+            "no live subdomain", "none found", "no hosts identified",
+        )
+        host_block = "\n".join(f"- {h}" for h in live_hosts)
+        footer = (
+            "\n\n## Confirmed Live Hosts (httpx — ground truth)\n"
+            f"{len(live_hosts)} live host(s) were confirmed by httpx and MUST be "
+            "treated as in-scope attack surface regardless of any 'none "
+            "identified' statement above:\n"
+            f"{host_block}\n"
+        )
+        if any(marker in lower for marker in denial_markers):
+            footer = (
+                "\n\n## Correction — Live Hosts DO Exist\n"
+                "The analysis above states no subdomains/live hosts were found, "
+                "but that contradicts the httpx recon data. The following live "
+                "host(s) are confirmed and in-scope:\n"
+                f"{host_block}\n"
+            )
+        return text.rstrip() + footer
+
+    @staticmethod
+    def _q6_consistency_note(gate_text: str) -> str:
+        """Deterministic reasoning->answer consistency check for gate Q6.
+
+        Q6 ('Is this finding ABSENT from the always-rejected list?') is a
+        positive question, but local models routinely flip its polarity: they
+        answer 'NO' while their own one-line reasoning says the finding is *not*
+        on the list (which means the answer should be 'YES'). This is pure-text,
+        side-effect-free: it returns a human-readable note when the stated YES/NO
+        answer contradicts the reasoning, else "" when consistent or unparseable.
+        """
+        text = gate_text or ""
+        # Capture the Q6 answer token and its inline reasoning. Tolerate bold/
+        # whitespace and an optional dash-led reasoning continuation on the next
+        # line (the format the model actually emits).
+        m = re.search(
+            r"(?im)^\s*\**\s*q6\s*\**\s*[:.\-]?\s*\**\s*(YES|NO)\b(.*?)"
+            r"(?=^\s*\**\s*q7\b|\Z)",
+            text,
+            re.DOTALL,
+        )
+        if not m:
+            return ""
+        answer = m.group(1).upper()
+        reasoning = (m.group(2) or "").lower()
+        # Phrases asserting the finding is NOT on the rejected list -> expect YES.
+        not_on_list = any(
+            phrase in reasoning
+            for phrase in (
+                "not listed", "not on the", "not in the", "not part of",
+                "does not match", "doesn't match", "not match", "not a member",
+                "is absent", "absent from", "not among", "not present",
+                "not one of", "no match",
+            )
+        )
+        # Phrases asserting the finding IS on the rejected list -> expect NO.
+        on_list = any(
+            phrase in reasoning
+            for phrase in (
+                "is listed", "is on the", "is in the", "appears on",
+                "matches the", "matches one", "found on the list",
+                "part of the always-rejected", "on the always-rejected",
+            )
+        )
+        if not_on_list and not on_list and answer == "NO":
+            return ("[Q6 consistency] Reasoning says the finding is NOT on the "
+                    "always-rejected list, so Q6 should be YES (not NO). "
+                    "Treating Q6 as YES.")
+        if on_list and not not_on_list and answer == "YES":
+            return ("[Q6 consistency] Reasoning says the finding IS on the "
+                    "always-rejected list, so Q6 should be NO (not YES). "
+                    "Treating Q6 as NO.")
+        return ""
+
+    @staticmethod
+    def _parse_gate_answer(gate_text: str, q: int) -> str | None:
+        """Return 'YES'/'NO' for gate question ``q`` (Q1..Q7), else None.
+
+        Mirrors the bold/whitespace/dash tolerance of _q6_consistency_note so the
+        deterministic verdict re-derivation reads the same tokens the operator
+        sees in gate_workings.md.
+        """
+        m = re.search(
+            rf"(?im)^\s*\**\s*q{q}\s*\**\s*[:.\-]?\s*\**\s*(YES|NO)\b",
+            gate_text or "",
+        )
+        return m.group(1).upper() if m else None
+
+    @staticmethod
+    def _apply_q6_correction(verdict: str, gate_text: str, q6_note: str) -> str:
+        """Re-derive the returned verdict when the Q6 polarity post-check fired.
+
+        Before v9.23.1 the Q6 contradiction only appended a 'Treating Q6 as …'
+        note to gate_workings.md; the returned verdict still reflected the
+        model's *flipped* Q6, so triage acted on the uncorrected reading while
+        the audit log claimed a correction. This makes the correction real:
+
+          - Corrected Q6 = NO  (finding IS on the always-rejected list): Q6 is a
+            hard gate, so any SUBMIT/CHAIN is downgraded to DROP.
+          - Corrected Q6 = YES (finding is NOT on the list): a DROP that was
+            driven by the spurious Q6=NO is lifted. We do not blindly upgrade to
+            SUBMIT — Q6=YES is necessary, not sufficient — so we re-read the
+            other gate answers: all of Q1-Q5 & Q7 = YES -> SUBMIT, otherwise
+            CHAIN (viable, no longer auto-rejected, but not a clean pass).
+
+        Returns the (possibly unchanged) verdict. Unknown/unparseable verdicts
+        and empty notes are passed through untouched.
+        """
+        if not q6_note or verdict not in ("SUBMIT", "CHAIN", "DROP"):
+            return verdict
+        # Corrected Q6 = NO -> finding is on the always-rejected list -> DROP.
+        if "should be NO" in q6_note:
+            return "DROP" if verdict in ("SUBMIT", "CHAIN") else verdict
+        # Corrected Q6 = YES -> not auto-rejected; only relevant if Q6 had
+        # forced a DROP. Re-derive from the remaining answers.
+        if "should be YES" in q6_note and verdict == "DROP":
+            others = [Brain._parse_gate_answer(gate_text, q)
+                      for q in (1, 2, 3, 4, 5, 7)]
+            if others and all(a == "YES" for a in others):
+                return "SUBMIT"
+            return "CHAIN"
+        return verdict
+
+    @staticmethod
+    def _extract_shell_from_markdown(text: str) -> str:
+        """Pull a runnable bash body out of an LLM response.
+
+        When the model wraps the script in a ```bash fenced block (and then,
+        despite instructions, appends trailing prose AFTER the closing fence),
+        the old "strip leading fence + strip trailing fence at end-of-string"
+        approach left that trailing prose in the body — bash then tried to run
+        it as commands ("command not found"). Extract ONLY the content of the
+        first fenced code block when a fence is present; otherwise return the
+        text unchanged (no fence to key on).
+        """
+        raw = (text or "").strip()
+        # First complete ```[lang] ... ``` block. DOTALL so the body may span
+        # lines; non-greedy so we stop at the first closing fence.
+        m = re.search(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n(.*?)\r?\n?```",
+                      raw, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        # No paired fence — fall back to the legacy line-anchored strip so an
+        # unterminated opening fence (or a stray closing fence) is still removed.
+        body = re.sub(r"^```(?:[A-Za-z0-9_+-]*)?[ \t]*\r?\n?", "", raw,
+                      flags=re.MULTILINE)
+        body = re.sub(r"\r?\n?```[ \t]*$", "", body.strip(), flags=re.MULTILINE)
+        return body.strip()
 
     @staticmethod
     def _sanitize_exploit_command(cmd: str) -> tuple[str | None, str]:
@@ -1131,6 +1343,24 @@ endpoints, URLs, APIs, credentials, or findings. If the data shows "(none)" or
   otherwise label it an UNVERIFIED hypothesis and name the missing evidence."""
 
         result = self._stream(prompt, f"Recon Analysis → {target}", MAX_RESP, temperature=0.15)
+
+        # Grounding correction: httpx confirmed live hosts (e.g. mssql.*), yet the
+        # model's prose sometimes asserts "No subdomains / None identified". Never
+        # let a "none" claim override on-disk live-host evidence — append the
+        # confirmed list (deterministic, from live/urls.txt) so the saved analysis
+        # is self-consistent with the recon data.
+        live_hosts: list[str] = []
+        live_urls_path = recon_path / "live" / "urls.txt"
+        if live_urls_path.exists():
+            try:
+                for raw in live_urls_path.read_text(errors="ignore").splitlines():
+                    host = urlsplit(raw.strip()).netloc or raw.strip()
+                    if host and host not in live_hosts:
+                        live_hosts.append(host)
+            except OSError:
+                live_hosts = []
+        result = self._append_live_host_grounding(result, live_hosts)
+
         self._save_analysis(recon_dir, "01_recon_analysis.md", result)
         return result
 
@@ -1445,7 +1675,11 @@ Q2: Does it affect a real user who took NO unusual actions?
 Q3: Is the impact concrete — money, PII, ATO, or RCE?
 Q4: Is this in scope per the engagement agreement?
 Q5: Is this NOT a known/duplicate finding (common on this tech stack)?
-Q6: Is this NOT on the always-rejected list?
+Q6: Is this finding ABSENT from the always-rejected list below?
+    POLARITY (read carefully — this is a positive question, not a trap):
+      - Answer YES  = the finding is NOT on the rejected list (good, keep going).
+      - Answer NO   = the finding IS on the rejected list (it is rejected).
+    So if you cannot find the finding on the list, the answer is YES.
 Q7: Would a triager say "yes, that's a real bug"?
 
 ALWAYS-REJECTED LIST: Missing CSP/HSTS/security headers, missing SPF/DKIM, GraphQL introspection alone,
@@ -1501,6 +1735,21 @@ IF DROP: What would need to change for this to become viable?"""
                                        system=NARRATION_SYSTEM, temperature=0.1)
             verdict = _parse_verdict(result)
 
+        # Deterministic Q6 polarity post-check. Q6 is a double-negative-prone
+        # question; local models flip its answer vs. their own reasoning between
+        # near-identical findings. Flag the contradiction so the persisted
+        # worksheet records the corrected reading instead of silent nondeterminism.
+        q6_note = self._q6_consistency_note(result)
+
+        # v9.23.1 — the note above used to be cosmetic: it landed in
+        # gate_workings.md while the returned verdict still reflected the model's
+        # *flipped* Q6 answer, so triage acted on the uncorrected reading. Now
+        # actually re-derive the verdict so the caller's decision matches the
+        # corrected Q6 (not just the audit log).
+        corrected = self._apply_q6_correction(verdict, result, q6_note)
+        verdict_changed = corrected != verdict
+        verdict = corrected
+
         # v9.2.0 (P2-10) — append every gate cycle to brain/gate_workings.md
         # so the operator can audit phi4:14b's intermediate Q1-Q7 reasoning
         # without scrolling through 100KB of streamed model output in the
@@ -1512,7 +1761,12 @@ IF DROP: What would need to change for this to become viable?"""
                 with open(wf, "a") as fh:
                     fh.write(f"\n## {datetime.now().isoformat(timespec='seconds')} — VERDICT={verdict}\n")
                     fh.write(f"FINDING: {finding_description[:400]}\n\n")
-                    fh.write(result.strip() + "\n\n---\n")
+                    fh.write(result.strip() + "\n")
+                    if q6_note:
+                        fh.write(f"\n{q6_note}\n")
+                        if verdict_changed:
+                            fh.write(f"[Q6 correction applied] verdict re-derived to {verdict}.\n")
+                    fh.write("\n---\n")
         except Exception:
             pass
 
@@ -2215,10 +2469,10 @@ Rules:
         # Save as executable script
         plan_path = recon_path / "brain" / "scan_plan.sh"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
-        # Strip markdown fences if LLM wrapped it
-        import re
-        code = re.sub(r"^```(?:bash|sh)?\s*\n?", "", result.strip(), flags=re.MULTILINE)
-        code = re.sub(r"\n?```\s*$", "", code.strip(), flags=re.MULTILINE)
+        # Strip markdown fences if LLM wrapped it. Extract ONLY the fenced code
+        # block so trailing post-fence prose can't leak into the bash body and
+        # blow up at runtime with "command not found".
+        code = self._extract_shell_from_markdown(result)
         # v9.23 — drop any leftover placeholder lines so the saved script never ships
         # /path/to/ junk, then syntax-check (bash -n) before marking it executable.
         # NOTE: bash -n only catches gross syntax errors — it does NOT validate tool

@@ -272,6 +272,29 @@ def version_tuple(version: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def detect_product_version(text: str, product_keys) -> str | None:
+    """
+    Extract the version that immediately follows a product keyword, handling the
+    ways httpx / whatweb emit it (``IIS:10.0``, ``Microsoft-IIS/10.0``,
+    ``iis 10.0``). ``product_keys`` is a keyword or iterable of keywords tried in
+    order. Returns the first matched version string, or None when no version is
+    attached to the product (e.g. a bare banner with no version).
+    """
+    if isinstance(product_keys, str):
+        product_keys = (product_keys,)
+    lowered = (text or "").lower()
+    for key in product_keys:
+        # Allow ":", "/", "-", or whitespace between the product name and the
+        # version number, mirroring real fingerprint output.
+        match = re.search(
+            re.escape(key.lower()) + r"\s*[:/\-]?\s*(\d+(?:\.\d+)*)",
+            lowered,
+        )
+        if match:
+            return match.group(1)
+    return None
+
+
 def is_vulnerable_drupal_version(version: str) -> bool:
     parts = version_tuple(version)
     if not parts:
@@ -491,11 +514,23 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
     version_hints = []
     evidence_hints = [hint for hint in extra_hints if hint.startswith("evidence:")]
 
-    # Scan the entire line for tech keywords
+    # max_score_floor tracks the highest score justified by something OTHER than
+    # the IIS keyword loop contribution: non-IIS tech matches plus every gate
+    # that raises a floor via ``max(max_score, X)`` below. The IIS-6 version gate
+    # uses it to recompute max_score after dropping the IIS-6-only CVE, so it
+    # only neutralizes that one CVE without canning the whole host's score.
+    max_score_floor = 0
+
+    # Scan the entire line for tech keywords. Accumulate each non-IIS match into
+    # max_score_floor so the IIS-6 version gate can drop the IIS-6-only CVE and
+    # recompute max_score from the remaining matches WITHOUT canning the whole
+    # host's score.
     for tech_key, (score, cve_info) in TECH_CVE_MAP.items():
         if tech_key in line_lower:
             if score > max_score:
                 max_score = score
+            if tech_key not in ("iis", "microsoft iis") and score > max_score_floor:
+                max_score_floor = score
             matched_cves.append(f"{tech_key.title()}: {cve_info}")
 
     for tech_key, checks in TECH_ATTACK_MAP.items():
@@ -525,11 +560,13 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
         drupal_parts = version_tuple(drupal_version)
         if drupal_parts and drupal_parts[0] == 7 and drupal_parts < (7, 58):
             max_score = max(max_score, 10)
+            max_score_floor = max(max_score_floor, 10)
             matched_cves.append(
                 f"Drupal {drupal_version}: legacy Drupal 7 build (pre-7.58) — prioritize Drupalgeddon-era RCE validation"
             )
         elif drupal_parts and drupal_parts[0] == 7:
             max_score = max(max_score, 8)
+            max_score_floor = max(max_score_floor, 8)
             matched_cves.append(
                 f"Drupal {drupal_version}: legacy Drupal 7 branch — review Drupal-specific CVEs and exposed admin paths"
             )
@@ -542,6 +579,7 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
         php_parts = version_tuple(php_version)
         if php_parts and php_parts < (7, 0):
             max_score = max(max_score, 7)
+            max_score_floor = max(max_score_floor, 7)
             matched_cves.append(
                 f"PHP {php_version}: end-of-life PHP branch — prioritize legacy PHP exploit-surface review"
             )
@@ -555,8 +593,10 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
         ]
         if any(is_vulnerable_drupal_version(version) for version in drupal_versions):
             max_score = max(max_score, 10)
+            max_score_floor = max(max_score_floor, 10)
         else:
             max_score = min(max_score, 7)
+            max_score_floor = min(max_score_floor, 7)
             matched_cves = _replace_cve_message(
                 matched_cves,
                 ("Drupal",),
@@ -566,8 +606,10 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
     if any(marker in line_lower for marker in ("f5", "bigip", "big-ip")):
         if "evidence:f5-mgmt" in evidence_hints:
             max_score = max(max_score, 9)
+            max_score_floor = max(max_score_floor, 9)
         else:
             max_score = min(max_score, 6)
+            max_score_floor = min(max_score_floor, 6)
             matched_cves = _replace_cve_message(
                 matched_cves,
                 ("F5",),
@@ -577,8 +619,10 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
     if "laravel" in line_lower:
         if "evidence:laravel-debug" in evidence_hints:
             max_score = max(max_score, 9)
+            max_score_floor = max(max_score_floor, 9)
         else:
             max_score = min(max_score, 6)
+            max_score_floor = min(max_score_floor, 6)
             matched_cves = _replace_cve_message(
                 matched_cves,
                 ("Laravel",),
@@ -588,8 +632,10 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
     if "wordpress" in line_lower:
         if "evidence:wordpress-surface" in evidence_hints:
             max_score = max(max_score, 6)
+            max_score_floor = max(max_score_floor, 6)
         else:
             max_score = min(max_score, 5)
+            max_score_floor = min(max_score_floor, 5)
             matched_cves = _replace_cve_message(
                 matched_cves,
                 ("Wordpress",),
@@ -599,8 +645,10 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
     if "tomcat" in line_lower:
         if any(marker in evidence_hints for marker in ("evidence:tomcat-ajp", "evidence:tomcat-manager")):
             max_score = max(max_score, 8)
+            max_score_floor = max(max_score_floor, 8)
         else:
             max_score = min(max_score, 6)
+            max_score_floor = min(max_score_floor, 6)
             matched_cves = _replace_cve_message(
                 matched_cves,
                 ("Tomcat", "Apache Tomcat"),
@@ -610,8 +658,10 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
     if any(marker in line_lower for marker in ("jboss", "wildfly")):
         if "evidence:jboss-surface" in evidence_hints:
             max_score = max(max_score, 8)
+            max_score_floor = max(max_score_floor, 8)
         else:
             max_score = min(max_score, 6)
+            max_score_floor = min(max_score_floor, 6)
             matched_cves = _replace_cve_message(
                 matched_cves,
                 ("Jboss", "Wildfly"),
@@ -621,8 +671,10 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
     if "exchange" in line_lower:
         if "evidence:exchange-surface" in evidence_hints:
             max_score = max(max_score, 8)
+            max_score_floor = max(max_score_floor, 8)
         else:
             max_score = min(max_score, 6)
+            max_score_floor = min(max_score_floor, 6)
             matched_cves = _replace_cve_message(
                 matched_cves,
                 ("Exchange",),
@@ -631,6 +683,7 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
 
     if "spring" in line_lower:
         max_score = min(max_score, 6)
+        max_score_floor = min(max_score_floor, 6)
         matched_cves = _replace_cve_message(
             matched_cves,
             ("Spring", "Spring Framework"),
@@ -639,6 +692,7 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
 
     if any(marker in line_lower for marker in ("fortigate", "fortios")):
         max_score = min(max_score, 6)
+        max_score_floor = min(max_score_floor, 6)
         matched_cves = _replace_cve_message(
             matched_cves,
             ("Fortigate", "Fortios"),
@@ -647,11 +701,44 @@ def score_host(host_line: str, extra_hints: list[str] | None = None) -> dict:
 
     if "openssl" in line_lower:
         max_score = min(max_score, 5)
+        max_score_floor = min(max_score_floor, 5)
         matched_cves = _replace_cve_message(
             matched_cves,
             ("Openssl",),
             "OpenSSL detected — Heartbleed / CVE-2022-0778 require exact version evidence before spending validation time",
         )
+
+    # IIS CVE-2017-7269 (ScStoragePathFromUrl WebDAV RCE) only affects IIS 6.0.
+    # httpx writes the version as e.g. "IIS:10.0" / "Microsoft-IIS/10.0", so a
+    # bare "iis" substring match wrongly tags modern IIS 10 hosts with an
+    # IIS-6-only critical RCE. When the detected major version is NOT 6 (or is
+    # unknown), drop ONLY the IIS-6-only CVE's score contribution and surface a
+    # softer note — NEVER cap the score contributed by other technologies/CVEs
+    # (e.g. a co-located Log4Shell match must remain CRITICAL).
+    if "iis" in line_lower:
+        iis_version = detect_product_version(line_lower, ("iis", "microsoft-iis"))
+        iis_parts = version_tuple(iis_version) if iis_version else ()
+        if not (iis_parts and iis_parts[0] == 6):
+            # Drop the IIS keyword's score contribution and recompute max_score
+            # from the score justified by every OTHER tech/CVE (max_score_floor,
+            # which mirrors all the non-IIS raise/cap gates above). This
+            # neutralizes only the IIS-6-only CVE — co-located findings such as
+            # Log4Shell keep their score and stay CRITICAL.
+            max_score = max_score_floor
+            if iis_parts:
+                matched_cves = _replace_cve_message(
+                    matched_cves,
+                    ("Iis", "Microsoft Iis"),
+                    f"IIS {iis_version} detected — the ScStoragePathFromUrl WebDAV RCE "
+                    "only affects IIS 6.0; review version-appropriate IIS / ASP.NET CVEs instead",
+                )
+            else:
+                matched_cves = _replace_cve_message(
+                    matched_cves,
+                    ("Iis", "Microsoft Iis"),
+                    "IIS detected — the ScStoragePathFromUrl WebDAV RCE only affects "
+                    "IIS 6.0; confirm the major version before treating it as exploitable",
+                )
 
     matched_techs = dedupe_keep_order(matched_techs)[:6]
     recommended_checks = dedupe_keep_order(recommended_checks)[:6]
