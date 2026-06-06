@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -336,8 +337,56 @@ def search_cves(tech_name, max_results=10):
     return cves
 
 
-def run_nuclei_cve_scan(domain, recon_dir=None):
-    """Run nuclei with CVE templates against the target."""
+def _write_nuclei_status(out_file, status, error=None, findings=0):
+    """Persist a degraded/ok status sidecar next to ``out_file``.
+
+    The sidecar lets the caller distinguish "nuclei ran clean, 0 findings"
+    from "nuclei failed/missing (result unknown)" — a clean 0-finding run is a
+    real negative, a failed run is NOT and must not be reported as such.
+
+    Returns the sidecar path on success, or ``None`` if it could not be written
+    (best-effort; never raises). The path is ``<out_file>.status.json``.
+    """
+    if not out_file:
+        return None
+    status_file = out_file + ".status.json"
+    payload = {
+        "status": status,            # "ok" | "degraded" | "failed"
+        "tool": "nuclei",
+        "error": error,
+        "findings": findings,
+        "timestamp": datetime.now().isoformat(),
+    }
+    try:
+        with open(status_file, "w") as f:
+            json.dump(payload, f, indent=2)
+        return status_file
+    except OSError:
+        return None
+
+
+def run_nuclei_cve_scan(domain, recon_dir=None, out_file=None):
+    """Run nuclei with CVE templates against the target.
+
+    nuclei streams findings to ``out_file`` via ``-o`` instead of buffering them
+    in the subprocess stdout pipe. That makes results land on disk incrementally
+    and — critically — survive the 300s timeout cap: ``run_cmd`` kills the
+    process and discards its buffered stdout on timeout, so any CVE found in the
+    last seconds before the cap used to be lost. Reading the ``-o`` file recovers
+    those partial results. Coverage is unchanged (same tags/severity/rate-limit/
+    timeout); only the result-capture path is hardened.
+
+    Failure handling: a non-timeout, non-zero exit (nuclei missing, template
+    download failure, panic before writing ``-o`` …) is a *degraded/failed*
+    run, NOT a clean "no CVEs detected" result. Such failures are surfaced as a
+    WARN with captured stderr and recorded in a ``<out_file>.status.json``
+    sidecar so the caller can mark the engagement's CVE coverage as incomplete
+    rather than silently treating a tool failure as a vulnerability-free target.
+
+    Returns the (de-duplicated) list of nuclei finding lines. The list is empty
+    both on a clean 0-finding run and on a tool failure — read the status
+    sidecar (or ``nuclei_scan_status`` on this function) to tell them apart.
+    """
     print(f"\n[*] Running nuclei CVE scan on {domain}...")
 
     targets_file = None
@@ -346,24 +395,143 @@ def run_nuclei_cve_scan(domain, recon_dir=None):
         if os.path.exists(live_file):
             targets_file = live_file
 
+    # Stream findings to a file so partial results survive the timeout cap.
+    cleanup_out = False
+    if not out_file:
+        out_file = os.path.join(
+            tempfile.gettempdir(), f"nuclei_cve_{domain}_{os.getpid()}.txt"
+        )
+        cleanup_out = True
+    try:
+        out_dir = os.path.dirname(out_file)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        # Start clean so we never read a previous run's findings.
+        open(out_file, "w").close()
+    except OSError:
+        pass
+
+    # Capture nuclei's stderr to a file so a tool failure (missing binary,
+    # template error, panic) is no longer silently swallowed by 2>/dev/null.
+    err_file = out_file + ".stderr" if out_file else None
+    if err_file:
+        try:
+            open(err_file, "w").close()
+        except OSError:
+            err_file = None
+    stderr_redirect = f'2>"{err_file}"' if err_file else "2>/dev/null"
+
+    nuclei_opts = (
+        f'nuclei -tags cve -severity medium,high,critical -silent '
+        f'-rate-limit 30 -o "{out_file}"'
+    )
     if targets_file:
-        cmd = f'cat "{targets_file}" | nuclei -tags cve -severity medium,high,critical -silent -rate-limit 30 2>/dev/null'
+        cmd = f'cat "{targets_file}" | {nuclei_opts} {stderr_redirect}'
     else:
-        cmd = f'echo "https://{domain}" | nuclei -tags cve -severity medium,high,critical -silent -rate-limit 30 2>/dev/null'
+        cmd = f'echo "https://{domain}" | {nuclei_opts} {stderr_redirect}'
 
     success, output = run_cmd(cmd, timeout=300)
+    timed_out = (
+        not success and isinstance(output, str) and output.startswith("timeout after")
+    )
+    if timed_out:
+        print(f"    [!] nuclei hit the {output.split()[-1]} cap — reading partial results")
 
+    # Read whatever nuclei wrote to stderr (if anything) for diagnostics.
+    stderr_text = ""
+    if err_file:
+        try:
+            with open(err_file) as f:
+                stderr_text = f.read().strip()
+        except OSError:
+            stderr_text = ""
+
+    # Prefer the -o file (complete on clean exit, partial on timeout); fall back
+    # to whatever made it into stdout if the file is unreadable.
     findings = []
-    if success and output:
-        for line in output.strip().split("\n"):
-            if line.strip():
-                findings.append(line.strip())
-                print(f"    [VULN] {line.strip()}")
+    seen = set()
+    raw_lines = []
+    try:
+        with open(out_file) as f:
+            raw_lines = f.read().splitlines()
+    except OSError:
+        if isinstance(output, str):
+            raw_lines = output.splitlines()
+    for line in raw_lines:
+        line = line.strip()
+        if line and line not in seen:
+            seen.add(line)
+            findings.append(line)
+            print(f"    [VULN] {line}")
 
-    if not findings:
+    # Classify the run BEFORE cleaning up temp artifacts.
+    #   - timeout (partial recovery): degraded, but findings recovered are real.
+    #   - non-timeout non-zero exit:  tool failed/missing — result UNKNOWN, do
+    #     NOT report "no CVEs"; emit a WARN with stderr and a degraded signal.
+    #   - clean exit:                 ok (0 findings is a real negative).
+    error_detail = None
+    if timed_out:
+        status = "degraded"
+        error_detail = output  # "timeout after 300s"
+    elif not success:
+        status = "failed"
+        # run_cmd surfaces an exception string (not a returncode) in `output`
+        # when Popen itself blew up; nuclei's own diagnostics go to stderr.
+        detail = stderr_text or (output if isinstance(output, str) else "")
+        error_detail = detail.strip() or "nuclei exited non-zero (no stderr captured)"
+        # First stderr line is the most useful (e.g. "nuclei: command not found").
+        first_line = error_detail.splitlines()[0] if error_detail else error_detail
+        print(
+            f"    [WARN] nuclei CVE scan FAILED (tool missing or errored before "
+            f"writing results) — CVE coverage is INCOMPLETE, not clean. "
+            f"Detail: {first_line}"
+        )
+    else:
+        status = "ok"
+
+    # Record the status sidecar before cleaning up so the caller can read it.
+    # (On the default-temp path the sidecar is cleaned up with the rest; the
+    # caller-supplied `out_file` path keeps the sidecar for inspection.)
+    status_file = _write_nuclei_status(
+        out_file, status, error=error_detail, findings=len(findings)
+    )
+    # Expose the last run's outcome for callers that prefer not to read a file.
+    run_nuclei_cve_scan.last_status = {
+        "status": status,
+        "error": error_detail,
+        "findings": len(findings),
+        "status_file": status_file,
+    }
+
+    if cleanup_out:
+        for path in (out_file, err_file, status_file):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    elif err_file:
+        # Keep the caller's out_file + status sidecar; drop the raw stderr scratch.
+        try:
+            os.remove(err_file)
+        except OSError:
+            pass
+
+    if findings:
+        pass
+    elif status == "ok":
         print("    [+] No CVEs detected by nuclei")
+    # On a failed/degraded-with-no-findings run we deliberately do NOT print
+    # "No CVEs detected" — the WARN/timeout message above already explained the
+    # incomplete coverage.
 
     return findings
+
+
+# Initialise the introspectable status attribute so callers can rely on it
+# existing even before the first invocation.
+run_nuclei_cve_scan.last_status = None
 
 
 def check_exposed_configs(domain, recon_dir=None):
@@ -465,13 +633,25 @@ def hunt_cves(domain, recon_dir=None, findings_root=None):
                 }, f, indent=2)
             print(f"\n    [+] Saved {len(all_cves)} CVE matches to {cve_file}")
 
-    # Step 3: Run nuclei CVE detection
-    nuclei_findings = run_nuclei_cve_scan(domain, recon_dir)
+    # Step 3: Run nuclei CVE detection. Stream straight into the findings dir so
+    # results persist incrementally and survive the timeout cap (partial findings
+    # used to be discarded when run_cmd killed nuclei at 300s).
+    nuclei_file = os.path.join(findings_dir, "nuclei_cve_confirmed.txt")
+    nuclei_findings = run_nuclei_cve_scan(domain, recon_dir, out_file=nuclei_file)
+    nuclei_status = (getattr(run_nuclei_cve_scan, "last_status", None) or {})
+    nuclei_ok = nuclei_status.get("status", "ok") == "ok"
     if nuclei_findings:
-        nuclei_file = os.path.join(findings_dir, "nuclei_cve_confirmed.txt")
         with open(nuclei_file, "w") as f:
             f.write("\n".join(nuclei_findings))
         print(f"    [+] Saved {len(nuclei_findings)} nuclei CVE findings")
+    if not nuclei_ok:
+        # Do not let a tool failure masquerade as "no CVEs": flag the run so
+        # the report/operator knows nuclei coverage is incomplete.
+        print(
+            f"    [WARN] nuclei CVE coverage is {nuclei_status.get('status', 'degraded').upper()}"
+            f" — results are NOT a confirmed-clean signal"
+            f"{' (' + str(nuclei_status.get('error')) + ')' if nuclei_status.get('error') else ''}"
+        )
 
     # Summary
     print(f"\n{'=' * 50}")
@@ -479,7 +659,13 @@ def hunt_cves(domain, recon_dir=None, findings_root=None):
     print(f"{'=' * 50}")
     print(f"  Technologies detected: {len(techs)}")
     print(f"  CVEs from databases: {len(all_cves)}")
-    print(f"  Confirmed by nuclei: {len(nuclei_findings)}")
+    if nuclei_ok:
+        print(f"  Confirmed by nuclei: {len(nuclei_findings)}")
+    else:
+        print(
+            f"  Confirmed by nuclei: {len(nuclei_findings)} "
+            f"(nuclei {nuclei_status.get('status', 'degraded').upper()} — coverage INCOMPLETE)"
+        )
 
     high_cves = [c for c in all_cves if c.get("cvss_score", 0) >= 7.0]
     if high_cves:

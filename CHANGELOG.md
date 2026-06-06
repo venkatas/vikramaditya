@@ -1,5 +1,65 @@
 # Changelog
 
+## v10.1.0 — engagement-reliability release: stop masking failures, close FP/FN gaps, add coverage reporting (2026-06-06)
+
+Driven by a full multi-agent audit of a live `python3 vikramaditya.py clientd.com`
+end-to-end run: 8 facet auditors → adversarial per-issue verification → 43 confirmed
+issues, fixed across two passes (29 + 13) and independently re-reviewed by `codex` and
+`grok` (both clean). The dominant theme: **the tool was silently masking phase failures
+as success**, so a run could finish green while whole capabilities did nothing. A minor
+(not patch) release because it adds new functionality alongside the fixes.
+
+### New functionality
+- **Recon / Host & Port Inventory** report chapter — discovered hosts, ports, and the
+  recon surface now reach the client report even for hosts with no finding (the `mssql.*`
+  host + FTP/8443 ports were previously discovered but invisible).
+- **Tooling & Coverage Limitations** report chapter + `coverage.json` artifact — degraded
+  or skipped capabilities are surfaced instead of hidden.
+- **Tri-state phase status** (✓ ran / ∅ skipped-N/A / ✗ errored) replacing the single
+  green ✓ that was shown even for skipped/errored/no-op phases.
+- **Adaptive recon scaling** — ffuf gets a per-host `-maxtime`, a 301-catchall filter, and
+  a wordlist trimmed for tiny surfaces; real `dnsx` resolution replaces blind candidate
+  copying; passive enum (crt.sh/OTX) gains retry + a "0 from N sources" warning.
+- **Vision-capability detection** in the browser agent (`use_vision=False` fallback when
+  the Ollama model is text-only — no more all-errored vision requests reported as success).
+
+### Reliability — failures no longer masked as success
+- git-hound (missing config), SecretFinder (broken deps), asnmap (interactive key prompt),
+  cdncheck (`-json`→`-jsonl`) and a dead browser phase were all reporting clean/`✓` while
+  doing nothing — each now detects the failure and degrades loudly.
+- `scanner.sh` CSP/security-header check read a non-existent `live/live_hosts.txt` (now
+  `live/urls.txt` with a fallback chain) — it was dropping a real "no CSP/HSTS/XFO/XCTO"
+  finding on every run.
+- sqlmap candidate handling: reachability pre-flight, `FUZZ` placeholder substitution, and
+  `WebResource.axd`/`ScriptResource.axd` exclusion (sqlmap was "completing" having tested
+  nothing); `run_sqlmap_targeted` now returns False/degraded on real failure.
+
+### False positives / false negatives
+- **CVE-2017-7269 (IIS 6 WebDAV RCE)** no longer matched against IIS 10 hosts — version-gated
+  in `prioritize.py`; the gate fixed to neutralize only that CVE, **never the host's other
+  CVEs** (a first-pass regression that would have suppressed Log4Shell was caught by the
+  review and corrected).
+- `_url_reachable` now treats 401/403/405/5xx as reachable (host up) so auth-gated SQLi
+  endpoints aren't dropped; only 404/410 and network errors are "dead".
+- Brain: email_auth findings included in the evidence set (no more NO_REPORTS vs 10-findings
+  contradiction); sqlmap **input candidates** no longer harvested as `[sqlmap]` findings;
+  scan-plan prose no longer leaks into the generated bash; 7-Question-Gate Q6 contradiction
+  now corrects the returned verdict, not just the audit log; live hosts grounded into recon prose.
+- `cve.py` nuclei: a tool failure is reported as degraded/failed, not "No CVEs detected".
+
+### Report quality
+- Collapsed unconfirmed-CVE INFO item now carries a per-severity CVSS (was inheriting the
+  misconfig template's 5.3) and surfaces its matched CVE IDs; email-auth remediation uses
+  the per-finding fix text instead of a single generic DMARC line.
+
+### Environment
+- Fixed the venv `setuptools`/`_distutils_hack` breakage that produced `ModuleNotFoundError`
+  noise on every invocation (and broke SecretFinder's dependencies).
+
+Regression-covered by `tests/test_auditfix_*.py` + `tests/test_auditfix2_*.py`
+(150+ new tests). Full suite green (only the pre-existing, unrelated `test_pmapper_runner`
+env test fails).
+
 ## v10.0.1 — sqlmap-confirmed SQLi ingestion + per-finding email_auth CVSS (2026-06-06)
 
 A follow-up to the v10.0.0 report-ingestion audit, surfaced by a live

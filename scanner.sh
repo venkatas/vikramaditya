@@ -389,13 +389,13 @@ if ! skip_has upload; then
     rm -f "$SOFT404_FILE"
 fi
 
-# ── Check 1.5: Custom nuclei templates (vikramaditya-tagged) ────────────
+# ── Check 1: Custom nuclei templates (vikramaditya-tagged) ──────────────
 # Runs the repo-local nuclei-templates/ directory so engagement-specific custom
 # templates (e.g. CVE-2025-68645 Zimbra) execute alongside the official set.
 # Must run BEFORE the per-tag SQLi pass so operator sees custom-template
 # coverage even when --skip sqli is set.
 if tool_ok nuclei && [ -d "$CUSTOM_NUCLEI_TEMPLATES" ] && [ -n "$(ls -A "$CUSTOM_NUCLEI_TEMPLATES" 2>/dev/null)" ]; then
-    log_info "Check 1.5: Custom nuclei templates (${CUSTOM_NUCLEI_TEMPLATES})"
+    log_info "Check 1: Custom nuclei templates (${CUSTOM_NUCLEI_TEMPLATES})"
     nuclei -l "$ORDERED_SCAN" -t "$CUSTOM_NUCLEI_TEMPLATES" \
         -severity low,medium,high,critical -silent \
         -o "$FINDINGS_DIR/cves_custom/nuclei_custom.txt" 2>/dev/null || true
@@ -497,6 +497,25 @@ PYEOF
     log_step "Analysing Content-Security-Policy headers..."
     CSP_WEAK="$FINDINGS_DIR/xss/csp_weak.txt"
     CSP_MISSING="$FINDINGS_DIR/xss/csp_missing.txt"
+    # Resolve the live-hosts input. recon writes `live/urls.txt` (one URL per
+    # line) — the old `live/live_hosts.txt` path never existed, so this check
+    # iterated 0 hosts and silently reported 0 missing headers. Mirror the
+    # canonical fallback chain from the "Resolve scan targets" block above, and
+    # fall back to httpx_full.txt's first column when only that is present.
+    CSP_INPUT=""
+    for f in "$RECON_DIR/live/urls.txt" "$ORDERED_SCAN" "$PRIORITY_DIR/prioritized_hosts.txt"; do
+        [ -s "$f" ] && CSP_INPUT="$f" && break
+    done
+    if [ -z "$CSP_INPUT" ] && [ -s "$RECON_DIR/live/httpx_full.txt" ]; then
+        CSP_INPUT=$(mktemp -t scanner_csp.XXXXXX 2>/dev/null \
+            || mktemp /tmp/scanner_csp_XXXXXX 2>/dev/null \
+            || echo "/tmp/scanner_csp_$$_$RANDOM.txt")
+        awk '{print $1}' "$RECON_DIR/live/httpx_full.txt" > "$CSP_INPUT"
+        CSP_INPUT_TMP="$CSP_INPUT"
+    fi
+    if [ -z "$CSP_INPUT" ] || [ ! -s "$CSP_INPUT" ]; then
+        log_warn "[CSP] No live-hosts input found (looked for live/urls.txt) — skipping security-header check"
+    else
     while IFS= read -r host; do
         [ -z "$host" ] && continue
         HDR=$(curl -sk --max-time 8 -I "$host" 2>/dev/null | tr -d '\r')
@@ -516,7 +535,9 @@ PYEOF
                 echo "[CSP-WEAK]$WEAK | $host" >> "$CSP_WEAK"
             fi
         fi
-    done < <(cat "$RECON_DIR/live/live_hosts.txt" 2>/dev/null | head -50)
+    done < <(head -50 "$CSP_INPUT")
+    [ -n "${CSP_INPUT_TMP:-}" ] && rm -f "$CSP_INPUT_TMP"
+    fi
 
     # 3c — XSStrike WAF-bypass scan (full mode only, requires tools/XSStrike)
     XSSSTRIKE_SCRIPT="$SCRIPT_DIR/tools/XSStrike/xsstrike.py"
@@ -592,9 +613,9 @@ if ! skip_has ssti; then
     fi
 fi
 
-# ── Check 7: CMS Detection & MSF Generation ──────────────────────────────
+# ── Check 5: CMS Detection & MSF Generation ──────────────────────────────
 if ! skip_has cms; then
-    log_info "Check 7: CMS Detection & MSF Generation"
+    log_info "Check 5: CMS Detection & MSF Generation"
     head -50 "$ORDERED_SCAN" | while read -r url; do
         [ -z "$url" ] && continue
         RES=$(curl -sk --max-time 10 "$url" 2>/dev/null || true)
@@ -618,9 +639,9 @@ if ! skip_has cms; then
     done
 fi
 
-# ── Check 8: MFA / 2FA Bypass ─────────────────────────────────────────────────
+# ── Check 6: MFA / 2FA Bypass ─────────────────────────────────────────────────
 if ! skip_has mfa; then
-    log_info "Check 8: MFA / 2FA Bypass"
+    log_info "Check 6: MFA / 2FA Bypass"
     mkdir -p "$FINDINGS_DIR/mfa"
 
     # Detect MFA/OTP endpoints from URL list
@@ -682,9 +703,9 @@ if ! skip_has mfa; then
     fi
 fi
 
-# ── Check 9: SAML / SSO Attacks ───────────────────────────────────────────────
+# ── Check 7: SAML / SSO Attacks ───────────────────────────────────────────────
 if ! skip_has saml; then
-    log_info "Check 9: SAML / SSO Attack Surface"
+    log_info "Check 7: SAML / SSO Attack Surface"
     mkdir -p "$FINDINGS_DIR/saml"
 
     # Detect SAML/SSO endpoints
@@ -739,9 +760,9 @@ if ! skip_has saml; then
     [ "$SAML_FINDINGS" -gt 0 ] && log_ok "[SAML] $SAML_FINDINGS finding(s) — review $FINDINGS_DIR/saml/"
 fi
 
-# ── Check 10: Import/Export Abuse (TOP100 #1 RCE surface) ────────────────────
+# ── Check 8: Import/Export Abuse (TOP100 #1 RCE surface) ─────────────────────
 if ! skip_has import; then
-    log_info "Check 10: Import/Export Feature Abuse"
+    log_info "Check 8: Import/Export Feature Abuse"
     mkdir -p "$FINDINGS_DIR/import_export"
 
     LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -30 || true)
@@ -801,9 +822,9 @@ if ! skip_has import; then
     [ "$IMPORT_COUNT" -gt 0 ] && log_ok "[IMPORT] $IMPORT_COUNT import/export endpoint(s) found — high-priority manual test surface"
 fi
 
-# ── Check 11: Deserialization Probes ─────────────────────────────────────────
+# ── Check 9: Deserialization Probes ──────────────────────────────────────────
 if ! skip_has deserialize; then
-    log_info "Check 11: Deserialization Probes"
+    log_info "Check 9: Deserialization Probes"
     mkdir -p "$FINDINGS_DIR/deserialize"
 
     LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -20 || true)
@@ -873,9 +894,9 @@ if ! skip_has deserialize; then
     [ "$DESER_COUNT" -gt 0 ] && log_ok "[DESERIALIZE] $DESER_COUNT deserialization surface(s) — requires manual ysoserial/PHPGGC follow-up"
 fi
 
-# ── Check 12: Supply Chain Exposure ──────────────────────────────────────────
+# ── Check 10: Supply Chain Exposure ──────────────────────────────────────────
 if ! skip_has supplychain; then
-    log_info "Check 12: Supply Chain Exposure"
+    log_info "Check 10: Supply Chain Exposure"
     mkdir -p "$FINDINGS_DIR/supply_chain"
 
     LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -30 || true)
