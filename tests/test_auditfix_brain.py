@@ -111,8 +111,8 @@ def test_sqlmap_confirmed_results_still_harvested(tmp_path):
         for m in [re.search(r"https?://([^/\s,'\"]+)", line)]
         if m
     }
-    assert "confirmed.example.com" in sqlmap_hosts
-    assert "x.example.com" not in sqlmap_hosts
+    assert any(h == "confirmed.example.com" for h in sqlmap_hosts)
+    assert all(h != "x.example.com" for h in sqlmap_hosts)
 
 
 # ---------------------------------------------------------------------------
