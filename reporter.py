@@ -678,11 +678,11 @@ SUBDIR_VTYPE = {
     "jwt": "jwt",                    # hunt.py JWT audit
     "graphql": "graphql",            # upstream graphql findings dir
     "smuggling": "smuggling",        # HTTP request smuggling
-    # v9.23 — email_auth/findings.json (subspace_sentinel) was silently dropped
-    # from every report because the dir was unmapped. Mapped here; the JSON itself
-    # is parsed by the dedicated "Method 1d" loader below (Method 1's .txt scan
-    # finds nothing in this dir, which is harmless).
-    "email_auth": "email_auth",      # SPF/DKIM/DMARC/DNSSEC/MTA-STS posture
+    # NOTE: email_auth/ is intentionally NOT mapped here. Its findings.json is parsed by
+    # the dedicated Method 1d loader (which sets per-finding cvss); routing it through the
+    # generic Method-1 .txt scan would mis-score any .txt that appears (parse_custom_line
+    # sets no cvss → template's fixed 5.3 for every severity). It is suppressed from the
+    # unmapped-subdir warning via meta_dirs instead — same pattern as sqlmap/cves_custom.
 }
 
 
@@ -760,7 +760,9 @@ def load_findings(findings_dir: str) -> list:
         meta_dirs = {"summary", "manual_review", "ordered_scan_targets", "brain",
                       "exploits", "screenshots", ".async", ".tmp",
                       "cves_custom",   # cves_custom/ is handled by Method 1c below
-                      "brain_active"}  # brain_active/ is handled by Method 1e below
+                      "brain_active",  # brain_active/ is handled by Method 1e below
+                      "sqlmap",        # sqlmap/ is handled by Method 1f below
+                      "email_auth"}    # email_auth/findings.json handled by Method 1d below
         for entry in sorted(os.listdir(findings_dir)):
             full = os.path.join(findings_dir, entry)
             if not os.path.isdir(full):
@@ -958,8 +960,23 @@ def load_findings(findings_dir: str) -> list:
                     sev = "info"
                 if sev not in SEVERITY_ORDER:
                     sev = "low"
+                # v10.0.1 — per-finding CVSS so a LOW/INFO posture item no longer inherits
+                # the email_auth template's fixed MEDIUM 5.3 (previously EVERY email_auth
+                # finding rendered 5.3 because the loader set severity but not cvss and the
+                # renderer fell back to the template). Precedence: explicit per-item cvss →
+                # if the finding's severity MATCHES the template's, keep the template's
+                # authored score (so MEDIUM stays 5.3 — no needless drift, no split with peer
+                # MEDIUM templates) → otherwise the canonical severity→score map.
+                _ea_tmpl = VULN_TEMPLATES.get("email_auth", {})
+                if item.get("cvss") is not None:
+                    _ea_cvss = str(item["cvss"])
+                elif sev == _ea_tmpl.get("severity"):
+                    _ea_cvss = _ea_tmpl.get("cvss", CVSS_DEFAULT.get(sev, "N/A"))
+                else:
+                    _ea_cvss = CVSS_DEFAULT.get(sev, "N/A")
                 results.append({
                     "severity": sev,
+                    "cvss": _ea_cvss,
                     "vtype": "email_auth",
                     "title": item.get("title", "Email authentication weakness"),
                     "detail": item.get("notes", ""),
@@ -971,6 +988,108 @@ def load_findings(findings_dir: str) -> list:
                 })
         except Exception:
             pass
+
+    # Method 1f: sqlmap-confirmed SQL injection (sqlmap/sqlmap_results.txt + results-*.csv)
+    # v10.0.1 — hunt.py runs sqlmap with --results-file → sqlmap/sqlmap_results.txt, and
+    # OpenAPI/POST runs leave sqlmap's default results-<ts>.csv in the same dir (both share
+    # the header: Target URL,Place,Parameter,Technique(s),Note(s)). A row with a NON-EMPTY
+    # Technique(s) column is a CONFIRMED injection. These files had no ingestion path, so
+    # sqlmap-confirmed SQLi was silently dropped even though `sqli_sqlmap_confirmed` exists.
+    # The dir is deliberately NOT in SUBDIR_VTYPE: it also holds candidates.txt / post_*.txt
+    # console dumps the generic Method-1 .txt scan would mis-parse as findings, so it is
+    # suppressed from the unmapped-subdir warning via meta_dirs and parsed only here.
+    # Safety contract: a header-only file (sqlmap found nothing) yields zero findings, and a
+    # row sqlmap itself tagged "false positive or unexploitable" is skipped (mirrors the
+    # brain.py candidate filter) so a scanner-rejected row never becomes a CRITICAL finding.
+    sqlmap_dir = os.path.join(findings_dir, "sqlmap")
+    if os.path.isdir(sqlmap_dir):
+        import csv as _csv
+        import glob as _glob
+        from urllib.parse import urlparse as _urlparse, parse_qsl as _parse_qsl
+        sqlmap_tmpl = VULN_TEMPLATES.get("sqli_sqlmap_confirmed", {})
+        seen_sqlmap = set()
+        sqlmap_csvs = []
+        primary = os.path.join(sqlmap_dir, "sqlmap_results.txt")
+        if os.path.isfile(primary):
+            sqlmap_csvs.append(primary)
+        sqlmap_csvs.extend(sorted(_glob.glob(os.path.join(sqlmap_dir, "results-*.csv"))))
+        for csv_path in sqlmap_csvs:
+            try:
+                # utf-8-sig strips a BOM if present (sqlmap-on-Windows / concatenated CSVs)
+                # so the header isn't read as a BOM-prefixed "Target URL". newline="" +
+                # DictReader keep a quoted multi-line Note(s) in ONE record so the
+                # false-positive filter below can't be defeated by an embedded newline.
+                f = open(csv_path, encoding="utf-8-sig", newline="", errors="replace")
+            except OSError:
+                continue
+            with f:
+                reader = _csv.DictReader(f)
+                if not reader.fieldnames or "Target URL" not in reader.fieldnames \
+                        or "Technique(s)" not in reader.fieldnames:
+                    continue
+                rows = iter(reader)
+                _seen_rows = 0
+                while _seen_rows < 100_000:   # sanity cap (sqlmap result files are small)
+                    _seen_rows += 1
+                    try:
+                        row = next(rows)
+                    except StopIteration:
+                        break
+                    except _csv.Error:
+                        # A recoverable malformed record (e.g. oversized field) must not
+                        # abort the file: skip it and keep parsing later rows so one bad
+                        # record can't drop a later confirmed injection. (A truly
+                        # unterminated quote is unrecoverable by any correct CSV parser —
+                        # sqlmap never emits one — but rows parsed before it are kept.)
+                        continue
+                    try:
+                        technique = (row.get("Technique(s)") or "").strip()
+                        url = (row.get("Target URL") or "").strip()
+                        if not technique or not url:
+                            continue  # no Technique(s) => sqlmap did not confirm injection
+                        # Collapse all whitespace (incl. embedded newlines) before matching
+                        # sqlmap's own false-positive tag so a multi-line Note can't slip past.
+                        note_norm = " ".join((row.get("Note(s)") or "").lower().split())
+                        if "false positive or unexploitable" in note_norm:
+                            continue  # sqlmap itself rejected this candidate
+                        place = (row.get("Place") or "").strip()
+                        param = (row.get("Parameter") or "").strip()
+                        note = (row.get("Note(s)") or "").strip()
+                        parsed = _urlparse(url)
+                        # Dedup: blank ONLY the injected parameter's value (id=1 vs id=999 on
+                        # the same endpoint is one vuln) while PRESERVING the rest of the query
+                        # context (op=users vs op=orders are distinct contexts → both reported).
+                        try:
+                            qctx = tuple(sorted(
+                                (k, "" if k == param else v)
+                                for k, v in _parse_qsl(parsed.query, keep_blank_values=True)
+                            ))
+                        except Exception:
+                            qctx = (("_raw", parsed.query),)
+                        dedup_key = (parsed.scheme, parsed.netloc, parsed.path,
+                                     place, param, qctx)
+                        if dedup_key in seen_sqlmap:
+                            continue
+                        seen_sqlmap.add(dedup_key)
+                        host = parsed.netloc or url
+                        results.append({
+                            "severity": sqlmap_tmpl.get("severity", "critical"),
+                            "cvss": sqlmap_tmpl.get("cvss", "9.8"),
+                            "vtype": "sqli_sqlmap_confirmed",
+                            "title": f"SQL Injection (sqlmap Confirmed) on {host}",
+                            "detail": (f"sqlmap confirmed SQL injection in the '{param}' "
+                                       f"{place} parameter via technique(s) {technique}."),
+                            "url": url,
+                            "poc": (f"Target URL : {url}\n"
+                                    f"Place      : {place}\n"
+                                    f"Parameter  : {param}\n"
+                                    f"Technique  : {technique}\n"
+                                    + (f"Note(s)    : {note}\n" if note else "")
+                                    + "\nConfirmed by sqlmap. Reproduce:\n"
+                                    f"  sqlmap -u \"{url}\" --batch --dbs"),
+                        })
+                    except Exception:
+                        continue  # one bad row must not drop the rest of the file
 
     # Method 1e: Brain active scanner output (brain_active/iteration_*.json)
     # brain_scanner.run_brain_scanner writes iteration_NN.json files whose
