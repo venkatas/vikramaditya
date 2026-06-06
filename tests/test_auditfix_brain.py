@@ -14,6 +14,7 @@ Covers the pure-Python helpers — no LLM/Ollama dependency:
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -102,8 +103,16 @@ def test_sqlmap_confirmed_results_still_harvested(tmp_path):
     )
     cands = _bare_brain()._collect_candidate_findings(str(findings))
     sqlmap_lines = [line for cat, line in cands if cat == "sqlmap"]
-    assert any("confirmed.example.com" in line for line in sqlmap_lines)
-    assert not any("x.example.com" in line for line in sqlmap_lines)
+    # Extract exact hostnames (avoids imprecise URL-substring matching — CodeQL
+    # py/incomplete-url-substring-sanitization — and tightens the assertion).
+    sqlmap_hosts = {
+        m.group(1)
+        for line in sqlmap_lines
+        for m in [re.search(r"https?://([^/\s,'\"]+)", line)]
+        if m
+    }
+    assert "confirmed.example.com" in sqlmap_hosts
+    assert "x.example.com" not in sqlmap_hosts
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +166,14 @@ def test_live_host_grounding_corrects_denial():
     out = Brain._append_live_host_grounding(
         analysis, ["mssql.example.com", "www.example.com"]
     )
-    assert "mssql.example.com" in out
+    assert re.search(r"\bmssql\.example\.com\b", out)
     assert "Correction" in out
 
 
 def test_live_host_grounding_appends_when_no_denial():
     analysis = "Three live hosts were enumerated and look promising."
     out = Brain._append_live_host_grounding(analysis, ["mssql.example.com"])
-    assert "mssql.example.com" in out
+    assert re.search(r"\bmssql\.example\.com\b", out)
     assert "Confirmed Live Hosts" in out
 
 

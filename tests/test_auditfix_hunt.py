@@ -118,10 +118,12 @@ def test_collect_db_named_candidates(tmp_path):
         "https://feedback.example.com/\n"
     )
     out = hunt._collect_db_named_candidates(str(tmp_path))
-    assert "https://db.example.com/" in out
-    assert "https://mysql-prod.example.com/login" in out
-    assert "https://www.example.com/" not in out
-    assert "https://feedback.example.com/" not in out
+    # Exact-equality membership (out is a list of full URLs) — avoids the
+    # imprecise URL-substring check CodeQL flags (py/incomplete-url-substring-sanitization).
+    assert any(u == "https://db.example.com/" for u in out)
+    assert any(u == "https://mysql-prod.example.com/login" for u in out)
+    assert all(u != "https://www.example.com/" for u in out)
+    assert all(u != "https://feedback.example.com/" for u in out)
 
 
 # ── Issue 4: tri-state phase status mapping ───────────────────────────────────
