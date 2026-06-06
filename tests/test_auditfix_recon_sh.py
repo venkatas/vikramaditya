@@ -131,7 +131,12 @@ def test_fix3_asnmap_skips_without_pdcp_key():
 # ── Fix 4: ffuf -maxtime, wordlist scaling, 301-catchall filter ──────────────
 def test_fix4_ffuf_maxtime_and_scaling_present():
     s = _src()
-    assert "-maxtime-job" in s
+    # v10.1.1 — the ffuf invocation must use -maxtime (entire-process, per-host
+    # invocation cap), NOT -maxtime-job (recursion-only; a no-op on the flat
+    # single-job run, which let each host grind the full wordlist for 8-22 min).
+    # Check the actual flag USAGE (the explanatory comment may still name the bad flag).
+    assert '-maxtime "$FFUF_MAXTIME"' in s
+    assert '-maxtime-job "$FFUF_MAXTIME"' not in s
     assert 'FFUF_MAXTIME="${FFUF_MAXTIME:-300}"' in s
     assert "FFUF_SMALL_WL" in s
     assert "tiny surface" in s

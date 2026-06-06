@@ -1,5 +1,17 @@
 # Changelog
 
+## v10.1.1 — fix ineffective ffuf time-cap (recon perf regression) (2026-06-06)
+
+The v10.1.0 "adaptive ffuf" change used `-maxtime-job`, which only bounds ffuf
+*recursion* sub-jobs and is a no-op on the flat single-job directory scan — so the
+intended 300s per-host cap never applied and each host ground the full 31k wordlist
+(8–22 min/host). Caught by the v10.1.0 validation re-run (recon hit 48 min vs the
+prior ~24). Switched to `-maxtime` (entire-process cap; each host is its own ffuf
+invocation, so it caps per host). Regression-guarded in `tests/test_auditfix_recon_sh.py`
+(asserts the `-maxtime` flag usage and rejects `-maxtime-job`). The v10.1.0 dnsx
+resolution + 301-catchall fixes were validated working in the same run
+(`dnsx: 3 resolved (dropped 688)`, `301 catchall — excluding 301`).
+
 ## v10.1.0 — engagement-reliability release: stop masking failures, close FP/FN gaps, add coverage reporting (2026-06-06)
 
 Driven by a full multi-agent audit of a live `python3 vikramaditya.py clientd.com`

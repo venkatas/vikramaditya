@@ -1530,9 +1530,12 @@ if tool_ok ffuf && { [ -n "$WORDLIST" ] || [ -n "$RAFT_WORDLIST" ] || [ -f "$SUP
         log_step "ffuf: tiny surface ($FUZZ_TARGET_COUNT host) — wordlist trimmed $WL_FULL → $(file_lines "$COMBINED_WORDLIST")"
     fi
 
-    # v9.23 (perf) — per-host wall-clock cap so no single host can stall the
-    # whole phase. -maxtime-job applies per ffuf job; default 300s, override
-    # with FFUF_MAXTIME.
+    # v10.1.1 (perf fix) — per-host wall-clock cap so no single host can stall
+    # the whole phase. MUST be -maxtime (entire-process cap): -maxtime-job only
+    # bounds ffuf *recursion* sub-jobs and does NOTHING on a flat single-job run,
+    # so the v10.1.0 attempt let each host grind the full wordlist (8-22 min).
+    # Each host is its own ffuf invocation, so -maxtime caps it per host. Default
+    # 300s, override with FFUF_MAXTIME.
     FFUF_MAXTIME="${FFUF_MAXTIME:-300}"
 
     while IFS= read -r url && [ "$FUZZ_COUNT" -lt "$MAX_FUZZ" ]; do
@@ -1563,7 +1566,7 @@ if tool_ok ffuf && { [ -n "$WORDLIST" ] || [ -n "$RAFT_WORDLIST" ] || [ -f "$SUP
             -rate "$RATE_LIMIT" \
             -sf \
             -timeout "$CURL_TIMEOUT" \
-            -maxtime-job "$FFUF_MAXTIME" \
+            -maxtime "$FFUF_MAXTIME" \
             -o "$RECON_DIR/dirs/ffuf_${domain}.json" \
             -of json 2>/dev/null || true
         FUZZ_COUNT=$((FUZZ_COUNT + 1))
