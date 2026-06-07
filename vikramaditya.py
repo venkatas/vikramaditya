@@ -45,7 +45,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
 # See CHANGELOG.md for the version-by-version delta.
-__version__ = "10.1.2"
+__version__ = "10.2.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -845,7 +845,20 @@ def make_output_dir(target: str) -> str:
     try:
         sys.path.insert(0, SCRIPT_DIR)
         from whitebox.config_lock import write_session_lock
-        write_session_lock(out_dir, args={"target": target, "argv": sys.argv})
+        # v10.2.0 — NEVER persist secret CLI values to config.lock.json. Redact the
+        # value that follows a secret flag (Burp API key, credentials).
+        _secret_flags = {"--burp-key", "--api-key", "--creds", "--creds-b",
+                         "--restler-token", "--ad-pass"}
+        _safe_argv, _redact_next = [], False
+        for _a in sys.argv:
+            if _redact_next:
+                _safe_argv.append("***"); _redact_next = False; continue
+            _safe_argv.append(_a)
+            if _a in _secret_flags:
+                _redact_next = True
+            elif "=" in _a and _a.split("=", 1)[0] in _secret_flags:
+                _safe_argv[-1] = _a.split("=", 1)[0] + "=***"
+        write_session_lock(out_dir, args={"target": target, "argv": _safe_argv})
     except Exception:
         pass
     return out_dir
@@ -866,6 +879,12 @@ Options:
   --verify-fix PATH       Verify a deployed fix or source path
   --code-url URL          Source repository or code URL for audit context
   --legacy                Route through the legacy hunt.py flow
+  --burp                  v10.2.0 — run a Burp Suite active scan (REST API) of the
+  --burp-only             target and fold its issues into the report. Needs Burp's
+                          REST API running + BURP_API_KEY (or --burp-key). Uses
+                          --creds for an authenticated scan; scope-locked to host.
+  --burp-url URL          Burp REST base (default $BURP_API_URL or 127.0.0.1:1337)
+  --burp-key KEY          Burp REST API key (default $BURP_API_KEY; it is secret)
   --passive-only          v9.3.0 — generate Google dork catalogue and exit
                           (no active scanning; emits HTML+JSON to
                           recon/<target>/sessions/<id>/passive/).
@@ -979,6 +998,11 @@ def parse_cli_args() -> dict:
         "code_url": "",
         "legacy": False,
         "help": False,
+        # v10.2.0 — Burp Suite REST API integration
+        "burp": False,
+        "burp_only": False,
+        "burp_url": "",
+        "burp_key": "",
         # v9.3.0 — passive recon controls
         "passive_only": False,
         "skip_passive": False,
@@ -1063,6 +1087,14 @@ def parse_cli_args() -> dict:
             args["code_url"] = argv[i + 1]; i += 2
         elif argv[i] == "--legacy":
             args["legacy"] = True; i += 1
+        elif argv[i] == "--burp":
+            args["burp"] = True; i += 1
+        elif argv[i] == "--burp-only":
+            args["burp_only"] = True; args["burp"] = True; i += 1
+        elif argv[i] == "--burp-url" and i + 1 < len(argv):
+            args["burp_url"] = argv[i + 1]; i += 2
+        elif argv[i] == "--burp-key" and i + 1 < len(argv):
+            args["burp_key"] = argv[i + 1]; i += 2
         elif argv[i] == "--passive-only":
             args["passive_only"] = True; i += 1
         elif argv[i] == "--skip-passive":
@@ -1477,6 +1509,37 @@ def main():
     if cli["oauth_audit"]:
         log("info", f"--oauth-audit: probing {cli['oauth_audit']}")
         run_oauth_audit(cli["oauth_audit"])
+        print(f"\n  {D}Done.{N}\n"); return
+    # v10.2.0 — Burp Suite active scan (standalone). Both --burp and --burp-only
+    # run a Burp crawl-and-audit and fold its issues into the report via reporter
+    # Method 1g. Requires Burp's REST API enabled + BURP_API_KEY (or --burp-key).
+    if cli["burp"]:
+        burp_target = cli["target"]
+        if not burp_target:
+            log("err", "--burp needs a target, e.g. python3 vikramaditya.py example.com --burp")
+            return
+        try:
+            from burp_scanner import run_burp_scan, burp_reachable
+        except Exception as e:
+            log("err", f"burp_scanner import failed: {e}")
+            return
+        burp_url = cli["burp_url"] or None
+        burp_key = cli["burp_key"] or None
+        if not burp_reachable(burp_url, burp_key):
+            log("warn", "Burp scan skipped — REST API not reachable. Enable Burp → "
+                        "Settings → Suite → REST API → 'Service running' and set BURP_API_KEY.")
+            print(f"\n  {D}Done.{N}\n"); return
+        host = urlparse(burp_target if "://" in burp_target else f"//{burp_target}").netloc or burp_target
+        out_dir = make_output_dir(host)
+        log("info", f"--burp: Burp scan of {burp_target} → {out_dir}")
+        run_burp_scan(
+            target=burp_target,
+            output_dir=os.path.join(out_dir, "burp"),
+            api_url=burp_url, api_key=burp_key,
+            creds=cli["creds"] or None, creds_b=cli["creds_b"] or None,
+            scope_lock=True,
+        )
+        run_report(out_dir)
         print(f"\n  {D}Done.{N}\n"); return
     if cli["race_test"]:
         log("info", f"--race-test: {cli['race_threads']} parallel reqs → {cli['race_test']}")

@@ -1,5 +1,34 @@
 # Changelog
 
+## v10.2.0 — Burp Suite Professional integration (REST API) (2026-06-07)
+
+Wires Burp's crawl-and-audit engine into the suite so a target can be actively
+scanned by Burp and its issues folded into the same report as every other engine.
+
+- **`burp_scanner.py`** — `BurpClient` (reachable / start / poll-to-terminal),
+  `normalize_issue()` → reporter finding shape, `run_burp_scan()` writes
+  `<output_dir>/findings.json`. The API key lives in the URL path (a secret) and
+  is read from `$BURP_API_KEY`, never hardcoded, and redacted in all output.
+  Validated against **live desktop Burp Suite Professional**, which surfaced and
+  fixed three desktop-vs-Enterprise REST quirks: the top-level `name` field is
+  Enterprise-only (400 "Names are not supported in the desktop product"); an
+  unknown NamedConfiguration 400s ("Unknown configuration") so no config is sent
+  unless explicitly requested; and a scope `rule` is a **literal URL prefix, not a
+  regex** (a regex rule 400s "Not all seed URLs are in scope").
+- **`reporter.py` Method 1g** — ingests `burp/findings.json` (a JSON list),
+  mapping Burp's `type` key to the renderer's `vtype`, clamping severity (Burp has
+  no Critical), defaulting unknown types to misconfig; `burp/` is in `meta_dirs`.
+- **`vikramaditya.py`** — `--burp` / `--burp-only` run a Burp scan of the target
+  (scope-locked, `--creds` for authenticated scans) and render a report that
+  includes the Burp issues; `--burp-url` / `--burp-key` override the REST endpoint.
+- **Security hardening** (from the codex+grok review): the Burp scope rule carries a
+  trailing `/` so a prefix like `https://example.com/` cannot match
+  `https://example.com.evil/` (and the seed is normalized + the port preserved); and
+  secret CLI values (`--burp-key`, `--creds`, …) are redacted before being persisted
+  to `config.lock.json`.
+- Tests: `tests/test_auditfix_burp.py` (Method 1g ingestion, scope bounding, no
+  Enterprise-only fields, secret-safe).
+
 ## v10.1.2 — hard-kill hang-prone recon tools (amass/dnsx ignore SIGTERM) (2026-06-07)
 
 A validation re-run stalled in Phase 1 for ~hours: `amass enum -passive` hung and

@@ -762,7 +762,8 @@ def load_findings(findings_dir: str) -> list:
                       "cves_custom",   # cves_custom/ is handled by Method 1c below
                       "brain_active",  # brain_active/ is handled by Method 1e below
                       "sqlmap",        # sqlmap/ is handled by Method 1f below
-                      "email_auth"}    # email_auth/findings.json handled by Method 1d below
+                      "email_auth",    # email_auth/findings.json handled by Method 1d below
+                      "burp"}          # burp/findings.json handled by Method 1g below
         for entry in sorted(os.listdir(findings_dir)):
             full = os.path.join(findings_dir, entry)
             if not os.path.isdir(full):
@@ -1101,6 +1102,45 @@ def load_findings(findings_dir: str) -> list:
                         })
                     except Exception:
                         continue  # one bad row must not drop the rest of the file
+
+    # Method 1g: Burp Suite active-scan issues (burp/findings.json)
+    # v10.2.0 — burp_scanner.run_burp_scan writes a JSON LIST of normalized issues
+    # {severity, type, title, url, detail, poc, confidence, source:"burp"}. The dir
+    # is in meta_dirs (not SUBDIR_VTYPE) so the generic .txt walk ignores it; this
+    # dedicated loader is the sole ingestion path. NB: burp uses the key "type" for
+    # the vuln class, but the renderer keys off "vtype" — map it here. Burp has no
+    # CRITICAL severity (its top is High); rich Burp prose already lives in `poc`.
+    burp_path = os.path.join(findings_dir, "burp", "findings.json")
+    if os.path.isfile(burp_path):
+        try:
+            with open(burp_path, errors="replace") as f:
+                burp_data = _json.load(f)
+            for item in (burp_data if isinstance(burp_data, list) else []):
+                sev = str(item.get("severity", "info")).lower()
+                if sev in ("informational", "information"):
+                    sev = "info"
+                if sev == "critical":
+                    sev = "high"   # Burp has no Critical severity — clamp per contract
+                if sev not in SEVERITY_ORDER:
+                    sev = "info"
+                vtype = (item.get("type") or item.get("vtype") or "misconfig")
+                if vtype not in VULN_TEMPLATES:
+                    vtype = "misconfig"
+                finding = {
+                    "severity": sev,
+                    "vtype": vtype,
+                    "title": item.get("title", "Burp Suite issue"),
+                    "detail": item.get("detail", ""),
+                    "url": item.get("url", "N/A"),
+                    "poc": item.get("poc", ""),
+                }
+                # Honor an explicit per-finding cvss if Burp/normalizer provided one;
+                # otherwise the renderer falls back to the vtype template / severity band.
+                if item.get("cvss"):
+                    finding["cvss"] = str(item["cvss"])
+                results.append(finding)
+        except Exception:
+            pass
 
     # Method 1e: Brain active scanner output (brain_active/iteration_*.json)
     # brain_scanner.run_brain_scanner writes iteration_NN.json files whose
