@@ -26,6 +26,7 @@ the AI brain if Ollama is installed, and routes to the right scan engine.
 | `recon.sh` | Subdomain enum, live host discovery, URL crawling |
 | `scanner.sh` | Vulnerability scanner (SQLi, XSS, SSTI, RCE, cloud, frameworks) |
 | `reporter.py` | Burp Suite-style HTML + Markdown report generator |
+| `burp_scanner.py` | **Burp Suite Pro integration** — drives Burp's REST API crawl-and-audit; issues fold into the report (`vikramaditya.py --burp`) |
 | `auth_utils.py` | JWT helper, rate limiter, authenticated session management |
 | `prioritize.py` | CVE risk scoring and host prioritization |
 | `whitebox/cloud_hunt.py` | **Whitebox VAPT** — AWS audit (Prowler + PMapper + secrets), feeds blackbox |
