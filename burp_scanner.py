@@ -318,9 +318,12 @@ def run_burp_scan(target: str, output_dir: str, api_url: str = None,
     if not parsed.path:
         target_url = target_url.rstrip("/") + "/"
 
+    # Derive a yes/no flag from creds' PRESENCE only — never reference the creds
+    # value (user:pass) inside a logged string (clear-text-credential logging).
+    auth_flag = "yes" if creds else "no"
     log("burp", f"Starting Burp scan of {target_url} "
                 f"(config='{config_name or DEFAULT_CONFIG or 'Burp default'}', "
-                f"auth={'yes' if creds else 'no'}, scope_lock={scope_lock})")
+                f"auth={auth_flag}, scope_lock={scope_lock})")
     try:
         task_id = client.start_scan(
             [target_url], creds=creds, creds_b=creds_b,
