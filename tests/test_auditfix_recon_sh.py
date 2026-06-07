@@ -55,6 +55,17 @@ def test_fix1_dnsx_resolution_present():
     assert "UNRESOLVED" in s
 
 
+def test_hangprone_tools_use_timeout_hardkill():
+    # v10.1.2 — amass (and dnsx) ignore SIGTERM; a plain `timeout N` only TERMs
+    # once and then waits forever (amass observed running 58 min under `timeout 600`).
+    # They MUST use `timeout -k <grace>` so the deadline escalates to SIGKILL.
+    s = _src()
+    assert "timeout -k 30 \"$AMASS_TIMEOUT\" amass enum -passive" in s
+    assert "timeout 600 amass" not in s          # the old un-killable form is gone
+    assert "timeout -k 30 300 dnsx -silent -a -l" in s
+    assert "timeout 600 dnsx" not in s
+
+
 def test_fix1_wildcard_filter_not_dead_gated():
     s = _src()
     # The old extra gate `WILDCARD_DNS=1` must no longer guard the dig filter;
