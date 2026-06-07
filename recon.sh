@@ -157,7 +157,7 @@ TARGET_TYPE="${TARGET_TYPE:-$(_detect_target_type "$TARGET")}"
 if [ "$TARGET_TYPE" = "ip" ] || [ "$TARGET_TYPE" = "cidr" ]; then
     SCOPE_LOCK=1
 fi
-AMASS_TIMEOUT=600      # 10 minutes (was 5 min)
+AMASS_TIMEOUT="${AMASS_TIMEOUT:-180}"  # v10.1.2: 3 min (passive amass is low-yield + hang-prone; was 600)
 CURL_TIMEOUT=10        # per request
 HTTP_PROBE_TIMEOUT=5   # reduced: 5s per-host timeout (was 10) — avoids macOS TCP hang
 
@@ -476,10 +476,12 @@ else
     log_warn "assetfinder not installed"
 fi
 
-# amass — deeper passive (10 min timeout)
+# amass — deeper passive. v10.1.2: MUST use 'timeout -k' — amass ignores SIGTERM
+# (observed running 58 min under a plain `timeout 600`, which only TERMs once and
+# then waits forever), so escalate to SIGKILL 30s after the deadline.
 if tool_ok amass && [ "$QUICK_MODE" != "--quick" ]; then
-    log_step "amass passive (timeout: ${AMASS_TIMEOUT}s = 10 min)..."
-    timeout "$AMASS_TIMEOUT" amass enum -passive -d "$TARGET" \
+    log_step "amass passive (timeout: ${AMASS_TIMEOUT}s, hard-kill +30s)..."
+    timeout -k 30 "$AMASS_TIMEOUT" amass enum -passive -d "$TARGET" \
         -o "$RECON_DIR/subdomains/amass.txt" 2>/dev/null || true
     [ ! -f "$RECON_DIR/subdomains/amass.txt" ] && touch "$RECON_DIR/subdomains/amass.txt"
     # v9.0.1 fix — amass writes graph format
@@ -700,7 +702,7 @@ if phase_done "$RECON_DIR/subdomains/resolved.txt"; then true; else
     if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] \
        && [ -s "$RECON_DIR/subdomains/all.txt" ] && [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
         log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
-        timeout 600 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
+        timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
             > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
         if [ -s "$RECON_DIR/subdomains/resolved.txt" ]; then
             DNS_VALIDATED=1

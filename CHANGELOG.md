@@ -1,5 +1,24 @@
 # Changelog
 
+## v10.1.2 — hard-kill hang-prone recon tools (amass/dnsx ignore SIGTERM) (2026-06-07)
+
+A validation re-run stalled in Phase 1 for ~hours: `amass enum -passive` hung and
+the `timeout 600` wrapper never killed it — plain `timeout` sends a single SIGTERM
+and then waits indefinitely, and amass ignores SIGTERM (observed running 58 min
+under a 600s cap). Fixed by `timeout -k 30` (escalate to SIGKILL 30s past the
+deadline) for both amass and dnsx (also flagged hang-prone on macOS), and lowered
+the amass passive cap to 180s (it is low-yield — 2 subdomains here — and the prior
+600s was both too long and not enforced). Regression-guarded in
+`tests/test_auditfix_recon_sh.py`.
+
+Note: v10.1.1's ffuf `-maxtime` was independently verified to work correctly
+(`-maxtime 5` → process exits at 5.06s); the ffuf-phase wall-clock in the stalled
+run was environmental (Ollama/brain degradation), not a flag bug. The substantive
+v10.1.0 report-layer fixes were validated in a real rendered report: per-severity
+email_auth CVSS (INFO→0.0, LOW→2.5, MED→5.3), the `[CSP-MISSING]` finding now
+reaching the report, `mssql.*` host present, and the Recon/Host&Port Inventory
+chapter rendering.
+
 ## v10.1.1 — fix ineffective ffuf time-cap (recon perf regression) (2026-06-06)
 
 The v10.1.0 "adaptive ffuf" change used `-maxtime-job`, which only bounds ffuf
