@@ -140,4 +140,4 @@ def test_scope_host_preserves_port_and_seed_gets_path(monkeypatch):
     body = captured["b"]
     assert body["urls"] == ["https://essl.example.com:8443/"]      # seed normalized w/ path
     rules = [r["rule"] for r in body["scope"]["include"]]
-    assert "https://essl.example.com:8443/" in rules               # port preserved in scope
+    assert any(r == "https://essl.example.com:8443/" for r in rules)  # port preserved in scope

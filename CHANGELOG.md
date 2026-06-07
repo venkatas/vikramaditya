@@ -1,5 +1,19 @@
 # Changelog
 
+## v10.2.1 — CSP-header finding is a misconfig, not XSS (+ CodeQL hardening) (2026-06-07)
+
+- **Missing/weak CSP header no longer reported as XSS.** `scanner.sh` wrote its
+  `[CSP-MISSING]`/`[CSP-WEAK]` results into `findings/<t>/xss/`, and the reporter maps
+  `xss/` → vtype `xss`, so every CSP-missing host rendered as a CVSS-6.1 "Cross-Site
+  Scripting" finding — a false positive (a missing CSP header mitigates XSS but is not
+  itself an XSS vuln). This surfaced on the clientd.com test as 5 bogus "MEDIUM
+  XSS" findings. Now written to `misconfig/` as explicit **LOW** security-misconfiguration
+  findings. Regression-guarded in `tests/test_auditfix_csp.py`.
+- **CodeQL hardening (PR alerts):** `burp_scanner.py` no longer references the `creds`
+  value inside a logged f-string (derive a yes/no flag from presence only —
+  clear-text-credential logging); a burp test assertion switched from URL-substring `in`
+  to exact `==` (incomplete-url-substring-sanitization).
+
 ## v10.2.0 — Burp Suite Professional integration (REST API) (2026-06-07)
 
 Wires Burp's crawl-and-audit engine into the suite so a target can be actively

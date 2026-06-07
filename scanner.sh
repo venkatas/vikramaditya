@@ -495,8 +495,13 @@ PYEOF
 
     # 3b — CSP header analysis on live hosts
     log_step "Analysing Content-Security-Policy headers..."
-    CSP_WEAK="$FINDINGS_DIR/xss/csp_weak.txt"
-    CSP_MISSING="$FINDINGS_DIR/xss/csp_missing.txt"
+    # v10.2.1 — a missing/weak CSP header is a defense-in-depth HARDENING gap, NOT
+    # an XSS vulnerability. Writing it under xss/ made the reporter render each line
+    # as a CVSS-6.1 "Cross-Site Scripting" finding (a false positive). Classify it as
+    # a LOW security-misconfiguration instead.
+    mkdir -p "$FINDINGS_DIR/misconfig"
+    CSP_WEAK="$FINDINGS_DIR/misconfig/csp_weak.txt"
+    CSP_MISSING="$FINDINGS_DIR/misconfig/csp_missing.txt"
     # Resolve the live-hosts input. recon writes `live/urls.txt` (one URL per
     # line) — the old `live/live_hosts.txt` path never existed, so this check
     # iterated 0 hosts and silently reported 0 missing headers. Mirror the
@@ -522,7 +527,7 @@ PYEOF
         CSP=$(echo "$HDR" | grep -i "^content-security-policy:" | cut -d: -f2-)
         if [ -z "$CSP" ]; then
             log_warn "[CSP-MISSING] No CSP header: $host"
-            echo "[CSP-MISSING] $host" >> "$CSP_MISSING"
+            echo "[LOW] Missing Content-Security-Policy (CSP) response header — $host" >> "$CSP_MISSING"
         else
             # Flag dangerous directives
             WEAK=""
@@ -532,7 +537,7 @@ PYEOF
             echo "$CSP" | grep -qi "data:"          && WEAK="$WEAK data-uri"
             if [ -n "$WEAK" ]; then
                 log_vuln "[CSP-WEAK]$WEAK — $host"
-                echo "[CSP-WEAK]$WEAK | $host" >> "$CSP_WEAK"
+                echo "[LOW] Weak Content-Security-Policy directives ($WEAK ) — $host" >> "$CSP_WEAK"
             fi
         fi
     done < <(head -50 "$CSP_INPUT")
@@ -960,8 +965,8 @@ log_info "Scan Complete. Consolidating..."
     echo "Verified Upload Only : $(count_vuln "$FINDINGS_DIR/upload/verified_upload_pocs.txt")"
     echo "XSS (dalfox)         : $(count_vuln "$FINDINGS_DIR/xss/dalfox_results.txt")"
     echo "XSS (XSStrike WAF)   : $(count_vuln "$FINDINGS_DIR/xss/xsstrike_results.txt")"
-    echo "CSP Missing          : $(count_vuln "$FINDINGS_DIR/xss/csp_missing.txt")"
-    echo "CSP Weak             : $(count_vuln "$FINDINGS_DIR/xss/csp_weak.txt")"
+    echo "CSP Missing          : $(count_vuln "$FINDINGS_DIR/misconfig/csp_missing.txt")"
+    echo "CSP Weak             : $(count_vuln "$FINDINGS_DIR/misconfig/csp_weak.txt")"
     echo "SSTI Confirmed       : $(count_vuln "$FINDINGS_DIR/ssti/ssti_candidates.txt")"
     echo "MFA Bypass Findings  : $(count_vuln "$FINDINGS_DIR/mfa/findings.txt")"
     echo "SAML/SSO Findings    : $(count_vuln "$FINDINGS_DIR/saml/findings.txt")"
