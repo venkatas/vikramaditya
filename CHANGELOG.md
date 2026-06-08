@@ -1,5 +1,26 @@
 # Changelog
 
+## v10.3.1 — hard wall-clock deadline on web-app fingerprinting (anti-tarpit) (2026-06-08)
+
+Fixes a hang where a slow/tarpitting target wedges the whole tool at startup.
+
+- **`fingerprint_webapp` could hang forever.** It fires ~20 sequential HTTP
+  probes that each carry only a *per-request* `timeout=`. A trickle/tarpit
+  endpoint sends bytes slower than the read-timeout window, so requests' timeout
+  keeps resetting and never fires — a single probe wedges the whole scan
+  (observed live on `mins.clienta.com`: fingerprinting froze 9+ minutes with
+  zero progress). Per-request timeouts cannot stop that; only a total wall-clock
+  cap can.
+- **Fix — `fingerprint_webapp_bounded(url, deadline=FINGERPRINT_DEADLINE=45)`:**
+  runs `fingerprint_webapp` in a daemon thread sharing the result dict, joins with
+  the deadline, and on timeout returns a `copy.deepcopy` snapshot of whatever was
+  gathered (main-page tech/status are collected first, so they survive) with
+  `timed_out=True` — the scan always proceeds instead of hanging. Both call sites
+  now use it; `FINGERPRINT_DEADLINE` is env-overridable. A global
+  `socket.setdefaulttimeout()` was rejected as the fix because it would cut the
+  brain's long local-LLM reads.
+- **Tests:** `tests/test_fingerprint_deadline.py` (6, network-free). Codex-reviewed.
+
 ## v10.3.0 — Google Gemini brain provider (analysis + active exploit loop) (2026-06-08)
 
 Wires Google Gemini into the multi-provider brain and routes the active
