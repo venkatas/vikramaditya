@@ -54,7 +54,7 @@ def run_cmd(cmd, timeout=30):
     try:
         proc = subprocess.Popen(
             cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, preexec_fn=os.setsid,
+            text=True, start_new_session=True,
         )
         stdout, stderr = proc.communicate(timeout=timeout)
         return proc.returncode == 0, stdout.strip()

@@ -1,5 +1,26 @@
 # Changelog
 
+## v10.3.2 — fix macOS subprocess SIGSEGV (preexec_fn → start_new_session) (2026-06-08)
+
+External scan tools launched late in a run could die instantly with `rc=-11`
+(SIGSEGV) — observed live: `sqlmap` and `cve.py` both crashed at 0.0s during a
+16-host scan, though both run fine standalone.
+
+- **Root cause:** the subprocess launchers used `subprocess.Popen(...,
+  preexec_fn=os.setsid)`. `preexec_fn` runs Python in the child **after `fork()`
+  but before `exec()`** — which Python's docs warn is unsafe with threads. hunt.py
+  is heavily threaded (brain watchers, watchdogs, `ThreadPoolExecutor`), and on
+  macOS a forked child that touches the CoreFoundation/Objective-C runtime
+  SIGSEGVs; it's timing-dependent, so early launches survived but late ones
+  (sqlmap/cve hunt) crashed.
+- **Fix:** `preexec_fn=os.setsid` → **`start_new_session=True`** in `hunt.py`
+  (5×), `cve.py`, `fuzzer.py`, `oauth_tester.py`. It does the `setsid` inside the
+  C fork/exec path (no Python after fork) and still makes the child its own
+  session/process-group leader, so the watchdog's
+  `os.killpg(os.getpgid(pid), SIGKILL)` keeps working unchanged.
+- Regression guard: `tests/test_subprocess_fork_safety.py` (no `preexec_fn=
+  os.setsid` anywhere; launchers use `start_new_session`; killpg still works).
+
 ## v10.3.1 — hard wall-clock deadline on web-app fingerprinting (anti-tarpit) (2026-06-08)
 
 Fixes a hang where a slow/tarpitting target wedges the whole tool at startup.

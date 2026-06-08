@@ -325,7 +325,7 @@ class ProcessWatchdog:
     process group with SIGKILL and asks Brain for a verdict.
 
     Usage:
-        proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid)
+        proc = subprocess.Popen(cmd, shell=True, start_new_session=True)
         wd = ProcessWatchdog(proc, watch_file, phase="RECON")
         proc.wait()
         wd.stop()
@@ -906,7 +906,7 @@ def auto_repair_tools(tool_names: list[str], include_system: bool = False) -> di
                 stdin=subprocess.DEVNULL,
                 cwd=SCRIPT_DIR,
                 env=_tool_env(),
-                preexec_fn=os.setsid,
+                start_new_session=True,
             )
             stdout, _ = proc.communicate(timeout=900)
             result = type("R", (), {"returncode": proc.returncode, "stdout": stdout or "", "stderr": ""})()
@@ -1201,7 +1201,7 @@ def run_cmd(
                 cwd=cwd,
                 env=env,
                 text=True,
-                preexec_fn=os.setsid,
+                start_new_session=True,
             )
             log("info", f"START {label}: PID {proc.pid} @ {started_label}")
             log("info", f"Command: {cmd}")
@@ -1259,7 +1259,7 @@ def run_cmd(
             cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             cwd=cwd, env=_tool_env(), text=True,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
         try:
             stdout, _ = proc.communicate(timeout=timeout)
@@ -1313,7 +1313,7 @@ def run_live(cmd: str, timeout: int = 3600,
         env = _tool_env()
 
         # Use os.setsid so watchdog can kill the whole process group
-        proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid, env=env)
+        proc = subprocess.Popen(cmd, shell=True, start_new_session=True, env=env)
         log("info", f"START {label}: PID {proc.pid} @ {started_label}")
         log("info", f"Command: {cmd}")
 
