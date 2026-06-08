@@ -36,6 +36,11 @@ jobs:
     if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
     uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2" # v2.3.8
     with:
+      # The dependency scan still runs (results in the job log + fail-on-vuln);
+      # only the SARIF upload to Security > Code-Scanning is disabled, because this
+      # repo is PRIVATE and code scanning there requires GitHub Advanced Security.
+      # Run `osv-scanner -r .` locally for the same scan.
+      upload-sarif: false
       scan-args: |-
         -r
         --skip-git
