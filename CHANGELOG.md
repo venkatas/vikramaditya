@@ -1,5 +1,35 @@
 # Changelog
 
+## v10.3.0 — Google Gemini brain provider (analysis + active exploit loop) (2026-06-08)
+
+Wires Google Gemini into the multi-provider brain and routes the active
+LLM-driven exploit loop through it too, so an engagement can run on a cloud
+brain instead of (or alongside) local Ollama.
+
+- **`brain.py`** — new `gemini` provider via Gemini's OpenAI-compatible endpoint
+  (`https://generativelanguage.googleapis.com/v1beta/openai`, `Authorization:
+  Bearer $GEMINI_API_KEY`), reusing the existing OpenAI-compat chat path.
+  Registered in `PROVIDER_PRIORITY`, `DEFAULT_MODELS` (default **gemini-3.5-flash**,
+  the GA flash model), `list_models`, and key auto-detection (`GEMINI_API_KEY`).
+  New `chat_messages()` preserves full multi-turn history (openai/grok/gemini
+  native, ollama native, claude system-split, mlx flattened) — the exploit loop
+  keeps a running conversation that single-shot `chat()` would drop. New
+  `_redact_secret()` scrubs `Bearer …` / `x-api-key` from exception logs.
+- **`brain_scanner.py`** — `pick_model()` and `ask_brain()` are provider-aware:
+  cloud providers route through `LLMClient` (Ollama remains the default with its
+  repetition guards). A fail-fast availability gate plus a `MAX_EMPTY_STREAK=3`
+  abort stop a bad / over-quota key or invalid model from burning all 15
+  iterations on empty responses. The cached `LLMClient` is keyed to
+  `(provider, sha256(key)[:12])` so it rebuilds when the provider/key changes.
+- **Model codes** verified against
+  [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models):
+  GA = `gemini-3.5-flash`, `gemini-3.1-flash-lite`; Pro / base-flash are
+  **preview-suffixed** (`gemini-3.1-pro-preview`, `gemini-3-flash-preview`) — the
+  bare names 404. Set `BRAIN_PROVIDER=gemini` + `GEMINI_API_KEY`; optionally
+  `BRAIN_SCANNER_MODEL=gemini-3.1-pro-preview` for stronger exploit code-gen.
+- **Tests:** `tests/test_brain_gemini_provider.py` (17 tests, network-free).
+  Independently reviewed by Codex (3 rounds, converged).
+
 ## v10.2.1 — CSP-header finding is a misconfig, not XSS (+ CodeQL hardening) (2026-06-07)
 
 - **Missing/weak CSP header no longer reported as XSS.** `scanner.sh` wrote its

@@ -53,6 +53,7 @@ N = "\033[0m"
 
 MAX_ITERATIONS = 15
 MAX_SCRIPT_RUNTIME = 60  # seconds
+MAX_EMPTY_STREAK = 3     # abort if the provider returns N empty responses in a row
 
 
 # ── Stdout-claim corroboration ────────────────────────────────────────────────
@@ -115,6 +116,21 @@ def pick_model() -> str:
     """
     import os as _os
     env = _os.environ.get("BRAIN_SCANNER_MODEL", "").strip()
+    prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
+    # Cloud / non-ollama provider (gemini/openai/claude/grok/mlx): the model name
+    # is the BRAIN_SCANNER_MODEL override or the provider's default — no local
+    # pull. MLX has no DEFAULT_MODELS entry (the model is loaded internally and
+    # the name arg is ignored), so resolve a truthy id from MLX_MODEL/default
+    # rather than refusing to start. Provider availability is enforced in
+    # run_brain_scanner so a missing key/server fails fast (not an empty loop).
+    if prov and prov != "ollama":
+        try:
+            from brain import LLMClient, MLX_DEFAULT_MODEL
+            if prov == "mlx":
+                return env or _os.environ.get("MLX_MODEL") or MLX_DEFAULT_MODEL
+            return env or LLMClient.DEFAULT_MODELS.get(prov) or ""
+        except Exception:
+            return env or ""
     try:
         import ollama
         candidates = ([env] if env else []) + [
@@ -138,20 +154,57 @@ def pick_model() -> str:
     return ""
 
 
+_SCANNER_LLM = None      # cached cloud LLMClient (lazy; honors BRAIN_PROVIDER)
+_SCANNER_LLM_SIG = None   # (provider, key-hash) the cached client was built for
+
+
+def _get_scanner_llm():
+    """Lazily build + cache the multi-provider LLM client for cloud providers.
+
+    The cache is keyed to (BRAIN_PROVIDER, hashed API key) so that if either
+    changes in a long-lived process we rebuild instead of reusing a client
+    bound to the old provider / stale credentials. The key is hashed, never
+    stored raw.
+    """
+    global _SCANNER_LLM, _SCANNER_LLM_SIG
+    import os as _os, hashlib as _hashlib
+    prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
+    key_env = {"gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
+               "claude": "ANTHROPIC_API_KEY", "grok": "XAI_API_KEY"}.get(prov, "")
+    key_val = _os.environ.get(key_env, "") if key_env else ""
+    sig = (prov, _hashlib.sha256(key_val.encode()).hexdigest()[:12] if key_val else "")
+    if _SCANNER_LLM is None or _SCANNER_LLM_SIG != sig:
+        from brain import LLMClient
+        _SCANNER_LLM = LLMClient()  # reads BRAIN_PROVIDER + the matching API key
+        _SCANNER_LLM_SIG = sig
+    return _SCANNER_LLM
+
+
 def ask_brain(model: str, messages: list[dict], max_tokens: int = 4000) -> str:
-    """Send messages to Ollama and get response."""
-    import ollama
-    resp = ollama.chat(
-        model=model,
-        messages=messages,
-        options={
-            "num_predict": max_tokens,
-            "temperature": 0.1,
-            "repeat_penalty": 1.3,   # Prevent S_S_S_S degeneration
-            "top_p": 0.9,
-        },
-    )
-    content = resp["message"].get("content", "")
+    """Send messages to the active LLM provider and get the response.
+
+    Honors BRAIN_PROVIDER: cloud providers (gemini/openai/claude/grok) route
+    through brain.LLMClient.chat_messages (full multi-turn history preserved);
+    the default is local Ollama with the repetition guards a small local coder
+    needs. The S_S_S degeneration guard below is harmless on cloud output.
+    """
+    import os as _os
+    prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
+    if prov and prov != "ollama":
+        content = _get_scanner_llm().chat_messages(model, messages, max_tokens=max_tokens)
+    else:
+        import ollama
+        resp = ollama.chat(
+            model=model,
+            messages=messages,
+            options={
+                "num_predict": max_tokens,
+                "temperature": 0.1,
+                "repeat_penalty": 1.3,   # Prevent S_S_S_S degeneration
+                "top_p": 0.9,
+            },
+        )
+        content = resp["message"].get("content", "")
     # Detect and truncate repetition loops (model degeneration)
     if "_S_S_S" in content or len(set(content[-200:])) < 10:
         # Find where repetition starts and truncate
@@ -416,8 +469,23 @@ def run_brain_scanner(target: str, briefing: str = "", cookies: str = "",
     """
     model = pick_model()
     if not model:
-        log("err", "No Ollama model available")
+        _prov = os.environ.get("BRAIN_PROVIDER", "").strip().lower() or "ollama"
+        if _prov == "ollama":
+            log("err", "No Ollama model available (pull a coder, e.g. ollama pull qwen2.5-coder:14b)")
+        else:
+            log("err", f"No model available for provider '{_prov}' "
+                       f"(set BRAIN_SCANNER_MODEL or check the API key)")
         return
+
+    # Fail fast: a non-ollama provider with no API key / unloadable backend would
+    # otherwise log a model name and then loop on empty responses for every
+    # iteration. Verify the client is actually usable before doing any work.
+    _prov = os.environ.get("BRAIN_PROVIDER", "").strip().lower()
+    if _prov and _prov != "ollama":
+        if not _get_scanner_llm().available:
+            log("err", f"Provider '{_prov}' selected but not available — "
+                       f"check the API key (e.g. GEMINI_API_KEY) or backend")
+            return
 
     log("brain", f"Model: {model}")
     log("info", f"Target: {target}")
@@ -568,6 +636,7 @@ Then test the most promising attack vectors."""
     findings = []
     iteration = 0
     successful_runs = 0   # scripts that actually executed (no syntax/tooling error)
+    empty_streak = 0      # consecutive empty provider responses (see MAX_EMPTY_STREAK)
 
     mode_labels = {
         "scan": "Active LLM-Driven Vulnerability Testing",
@@ -587,6 +656,21 @@ Then test the most promising attack vectors."""
         # Ask brain for next test
         log("brain", "Thinking...")
         response = ask_brain(model, messages)
+
+        # Guard: a usable-looking but non-functional provider (revoked / over-quota
+        # key, invalid model name, network failure) makes ask_brain return "" every
+        # time. Abort after a short streak instead of burning all iterations on
+        # empty output. The startup availability gate only checks local config, not
+        # a live call, so this catches what the gate cannot.
+        if not (response or "").strip():
+            empty_streak += 1
+            log("warn", f"Brain returned an empty response [{empty_streak}/{MAX_EMPTY_STREAK}]")
+            if empty_streak >= MAX_EMPTY_STREAK:
+                log("err", "Provider returned empty responses repeatedly — aborting. "
+                           "Check the API key validity, quota/billing, and model name.")
+                break
+            continue
+        empty_streak = 0
 
         # Display brain's reasoning
         # Print non-code parts

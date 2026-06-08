@@ -3,16 +3,17 @@ from __future__ import annotations
 
 """
 Brain — Multi-Provider LLM Reasoning Layer for VAPT
-Supports: Ollama (local), MLX (Apple Silicon), Claude API, OpenAI, Grok (xAI)
+Supports: Ollama (local), MLX (Apple Silicon), Claude API, OpenAI, Grok (xAI), Gemini (Google)
 
 Provider selection (in order of precedence):
-  1. BRAIN_PROVIDER env var  (ollama | mlx | claude | openai | grok)
+  1. BRAIN_PROVIDER env var  (ollama | mlx | claude | openai | grok | gemini)
   2. Auto-detect: uses first provider whose API key / server is available
 
 API keys (env vars):
   ANTHROPIC_API_KEY   — Claude (claude-opus-4-6, claude-sonnet-4-6, etc.)
   OPENAI_API_KEY      — OpenAI (gpt-4o, o1, etc.)
   XAI_API_KEY         — Grok (grok-2-latest, grok-3-mini, etc.)
+  GEMINI_API_KEY      — Gemini (Google AI Studio; gemini-3.5-flash, gemini-3.1-pro, etc.)
   OLLAMA_HOST         — Ollama base URL (default: http://localhost:11434)
   MLX_MODEL           — MLX model path (default: mlx-community/Qwen2.5-14B-Instruct-4bit)
 
@@ -78,6 +79,19 @@ except ImportError:
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MLX_DEFAULT_MODEL = os.environ.get("MLX_MODEL", "mlx-community/Qwen2.5-14B-Instruct-4bit")
 
+
+def _redact_secret(text) -> str:
+    """Scrub bearer tokens / API keys from a string before logging.
+
+    ``requests`` header-validation errors can echo the Authorization header
+    verbatim (``Bearer <key>``); never let a key reach stdout/logs.
+    """
+    s = str(text)
+    s = re.sub(r'(?i)(bearer\s+)\S+', r'\1***', s)
+    s = re.sub(r'(?i)(x-api-key["\']?\s*[:=]?\s*["\']?)\S+', r'\1***', s)
+    return s
+
+
 # ── Multi-provider LLM client ──────────────────────────────────────────────────
 # Wraps Ollama, Claude, OpenAI, Grok behind a single .chat() interface.
 
@@ -91,13 +105,14 @@ class LLMClient:
         reply  = client.chat(model, system_prompt, user_prompt, max_tokens=2000)
     """
 
-    PROVIDER_PRIORITY = ["ollama", "mlx", "claude", "openai", "grok"]
+    PROVIDER_PRIORITY = ["ollama", "mlx", "claude", "openai", "grok", "gemini"]
 
     # Default models per provider
     DEFAULT_MODELS = {
         "claude":  "claude-sonnet-4-6",
         "openai":  "gpt-4o",
         "grok":    "grok-2-latest",
+        "gemini":  "gemini-3.5-flash",
         "ollama":  None,   # resolved dynamically
         "mlx":     None,   # resolved from MLX_MODEL env var or default
     }
@@ -124,6 +139,8 @@ class LLMClient:
             key_providers.append("openai")
         if os.environ.get("XAI_API_KEY"):
             key_providers.append("grok")
+        if os.environ.get("GEMINI_API_KEY"):
+            key_providers.append("gemini")
         local_providers = [p for p in self.PROVIDER_PRIORITY if p not in key_providers]
         ordered = key_providers + local_providers
 
@@ -204,6 +221,21 @@ class LLMClient:
             self.available   = True
             self.description = "Grok API (xAI)"
 
+        elif provider == "gemini":
+            # Google Gemini via its OpenAI-compatible endpoint — reuses the
+            # OpenAI chat path. Base URL has NO trailing slash so the shared
+            # f"{base}/chat/completions" join matches OpenAI/Grok exactly.
+            key = os.environ.get("GEMINI_API_KEY", "")
+            if not key:
+                return
+            import requests
+            self._http = requests.Session()
+            self._http.headers.update({"Authorization": f"Bearer {key}",
+                                       "Content-Type": "application/json"})
+            self._gemini_base = "https://generativelanguage.googleapis.com/v1beta/openai"
+            self.available    = True
+            self.description  = "Gemini API (Google AI Studio)"
+
     def chat(self, model: str | None, system: str, user: str,
              max_tokens: int = 4000, temperature: float = 0.1) -> str:
         """Send a chat request; return the assistant reply as a string."""
@@ -216,10 +248,10 @@ class LLMClient:
                 return self._chat_mlx(model, system, user, max_tokens, temperature)
             elif self.provider == "claude":
                 return self._chat_claude(model, system, user, max_tokens, temperature)
-            elif self.provider in ("openai", "grok"):
+            elif self.provider in ("openai", "grok", "gemini"):
                 return self._chat_openai_compat(model, system, user, max_tokens, temperature)
         except Exception as e:
-            print(f"{YELLOW}[Brain/{self.provider}] chat error: {e}{NC}", flush=True)
+            print(f"{YELLOW}[Brain/{self.provider}] chat error: {_redact_secret(e)}{NC}", flush=True)
             return ""
         return ""
 
@@ -267,9 +299,17 @@ class LLMClient:
         r.raise_for_status()
         return r.json()["content"][0]["text"].strip()
 
+    def _openai_compat_base(self) -> str:
+        """Resolve the OpenAI-compatible base URL for the active provider."""
+        if self.provider == "grok":
+            return self._grok_base
+        if self.provider == "gemini":
+            return self._gemini_base
+        return self._openai_base
+
     def _chat_openai_compat(self, model, system, user, max_tokens, temperature) -> str:
         import json as _json
-        base = self._grok_base if self.provider == "grok" else self._openai_base
+        base = self._openai_compat_base()
         m    = model or self.DEFAULT_MODELS[self.provider]
         body = {"model": m, "max_tokens": max_tokens, "temperature": temperature,
                 "messages": [{"role": "system", "content": system},
@@ -278,6 +318,62 @@ class LLMClient:
                             data=_json.dumps(body), timeout=120)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
+
+    def chat_messages(self, model: str | None, messages: list[dict],
+                      max_tokens: int = 4000, temperature: float = 0.1) -> str:
+        """Multi-turn chat using a full messages list (system/user/assistant).
+
+        The single-shot ``chat()`` only carries one system + one user turn; the
+        active exploit loop (brain_scanner.py) maintains a running conversation
+        and needs the whole history preserved. OpenAI-compatible providers
+        (openai/grok/gemini) and Ollama take a messages array natively; Claude
+        needs the system message split out; MLX is flattened to a prompt.
+        """
+        if not self.available:
+            return ""
+        try:
+            if self.provider == "ollama":
+                resp = self._ollama.chat(
+                    model=model, messages=messages,
+                    options={"num_predict": max_tokens, "temperature": temperature,
+                             "num_ctx": MAX_CTX})
+                return (resp.get("message", {}).get("content") or "").strip()
+
+            if self.provider == "mlx":
+                sys_txt = "\n".join(x["content"] for x in messages if x.get("role") == "system")
+                convo   = "\n".join(f'{x["role"]}: {x["content"]}'
+                                    for x in messages if x.get("role") != "system")
+                return self._chat_mlx(model, sys_txt, convo, max_tokens, temperature)
+
+            if self.provider == "claude":
+                import json as _json
+                m       = model or self.DEFAULT_MODELS["claude"]
+                sys_txt = "\n".join(x["content"] for x in messages if x.get("role") == "system")
+                convo   = [x for x in messages if x.get("role") != "system"]
+                if hasattr(self, "_anthropic_client"):
+                    resp = self._anthropic_client.messages.create(
+                        model=m, max_tokens=max_tokens, system=sys_txt, messages=convo)
+                    return resp.content[0].text.strip()
+                body = {"model": m, "max_tokens": max_tokens, "system": sys_txt,
+                        "messages": convo}
+                r = self._http.post("https://api.anthropic.com/v1/messages",
+                                    data=_json.dumps(body), timeout=120)
+                r.raise_for_status()
+                return r.json()["content"][0]["text"].strip()
+
+            # openai / grok / gemini — native messages array
+            import json as _json
+            base = self._openai_compat_base()
+            m    = model or self.DEFAULT_MODELS[self.provider]
+            body = {"model": m, "max_tokens": max_tokens, "temperature": temperature,
+                    "messages": messages}
+            r = self._http.post(f"{base}/chat/completions",
+                                data=_json.dumps(body), timeout=120)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"{YELLOW}[Brain/{self.provider}] chat_messages error: {_redact_secret(e)}{NC}", flush=True)
+            return ""
 
     def list_models(self) -> list[str]:
         """List available models for the current provider."""
@@ -300,6 +396,12 @@ class LLMClient:
             return ["gpt-4o", "gpt-4o-mini", "o1", "o3-mini"]
         elif self.provider == "grok":
             return ["grok-2-latest", "grok-3-mini", "grok-3"]
+        elif self.provider == "gemini":
+            # GA/stable first, then -preview codes (verified against
+            # https://ai.google.dev/gemini-api/docs/models). Pro/base-flash are
+            # preview-suffixed; using the bare name would 404 → empty responses.
+            return ["gemini-3.5-flash", "gemini-3.1-flash-lite",
+                    "gemini-3.1-pro-preview", "gemini-3-flash-preview"]
         return []
 
 # Model preference order — first available wins
