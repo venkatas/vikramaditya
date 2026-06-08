@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from urllib.parse import urlparse
@@ -45,7 +46,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
 # See CHANGELOG.md for the version-by-version delta.
-__version__ = "10.3.0"
+__version__ = "10.3.1"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -292,13 +293,12 @@ def classify_target(target: str) -> dict:
 
 # ── Web App Fingerprinting ────────────────────────────────────────────────────
 
-def fingerprint_webapp(url: str) -> dict:
-    """Quick fingerprint: tech stack, login detection, API detection, JS analysis."""
-    import requests
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Hard wall-clock cap (seconds) on the whole fingerprint stage. Override via env.
+FINGERPRINT_DEADLINE = int(os.environ.get("FINGERPRINT_DEADLINE", "45"))
 
-    result = {
+
+def _new_fingerprint_result(url: str) -> dict:
+    return {
         "url": url,
         "tech": [],
         "login_detected": False,
@@ -312,6 +312,61 @@ def fingerprint_webapp(url: str) -> dict:
         "status": 0,
         "error": None,
     }
+
+
+def fingerprint_webapp_bounded(url: str, deadline: int | None = None) -> dict:
+    """Run fingerprint_webapp under a hard wall-clock deadline.
+
+    fingerprint_webapp fires ~20 sequential HTTP probes that each carry only a
+    per-request timeout. A trickle / tarpit endpoint sends bytes slower than the
+    read-timeout window, so requests' timeout keeps resetting and never fires —
+    wedging the whole tool (observed on a live target: fingerprinting froze for
+    9+ minutes with zero progress). Per-request timeouts cannot stop that; only
+    a total wall-clock cap can. We run the worker in a daemon thread sharing the
+    result dict (main-page tech/status are gathered first, so they survive) and
+    cap total time, guaranteeing the scan always proceeds with whatever was
+    collected rather than hanging.
+    """
+    deadline = deadline if deadline is not None else FINGERPRINT_DEADLINE
+    result = _new_fingerprint_result(url)
+
+    def _run():
+        try:
+            fingerprint_webapp(url, _result=result)
+        except Exception as e:  # degrade, never propagate from the worker thread
+            if not result.get("error"):
+                result["error"] = str(e)
+
+    t = threading.Thread(target=_run, name="fingerprint", daemon=True)
+    t.start()
+    t.join(deadline)
+    if t.is_alive():
+        # The abandoned daemon may still be mutating `result`; snapshot it so the
+        # caller's decisions can't shift under a late-unblocking probe. Best-effort
+        # — fall back to the live dict if a copy races with a concurrent write.
+        import copy
+        try:
+            result = copy.deepcopy(result)
+        except Exception:
+            pass
+        result["timed_out"] = True
+        log("warn", f"Fingerprint exceeded {deadline}s (slow/tarpitting target) — "
+                    f"proceeding with partial fingerprint")
+    return result
+
+
+def fingerprint_webapp(url: str, _result: dict | None = None) -> dict:
+    """Quick fingerprint: tech stack, login detection, API detection, JS analysis.
+
+    Accepts an optional shared ``_result`` dict so a wrapper (see
+    fingerprint_webapp_bounded) can read partial results if this is abandoned
+    mid-flight on a tarpitting target.
+    """
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    result = _result if _result is not None else _new_fingerprint_result(url)
 
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -1850,7 +1905,7 @@ def main():
     if target_info["type"] == "domain":
         url_to_check = f"https://{target_info['value']}"
         log("info", f"Checking {url_to_check} ...")
-        fp = fingerprint_webapp(url_to_check)
+        fp = fingerprint_webapp_bounded(url_to_check)
 
         if fp["error"] or fp["status"] == 0:
             show_summary(target_info)
@@ -1884,7 +1939,7 @@ def main():
         fp = already_fp
     else:
         log("info", "Fingerprinting target...")
-        fp = fingerprint_webapp(url)
+        fp = fingerprint_webapp_bounded(url)
 
     if fp["error"]:
         print(f"  {R}Error reaching target: {fp['error']}{N}")
