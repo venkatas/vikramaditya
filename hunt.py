@@ -3495,6 +3495,57 @@ def select_targets(top_n: int = 10) -> list:
 
 
 # ── Core pipeline steps ────────────────────────────────────────────────────────
+def _is_safe_target(s: str) -> bool:
+    """True if `s` is a plain FQDN / IP / CIDR / label with no shell metacharacters.
+
+    The target is interpolated into shell command strings (run_recon builds a
+    `bash "<script>" "<domain>"` line with shell=True), so a value containing
+    $(), backticks, ;, |, &, quotes or spaces could inject or break paths.
+    A real target never needs those. (Codex HIGH — applies to any --target.)
+    """
+    return bool(re.fullmatch(r"[A-Za-z0-9._:/\-]+", s or ""))
+
+
+def _read_targets_file(path: str) -> list[str]:
+    """Read a host-list file → normalized, deduped hostnames.
+
+    Strips scheme (http/https), any path/query, surrounding whitespace; drops
+    blank lines and #-comments; lower-cases; preserves first-seen order. Backs
+    --targets-file (multi-host scope-lock) so an explicit authorized host list
+    can be scanned without subdomain enumeration.
+    """
+    hosts: list[str] = []
+    seen: set[str] = set()
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            s = re.sub(r"^https?://", "", s, flags=re.IGNORECASE)   # strip scheme
+            s = s.split("/")[0].split("?")[0].strip().rstrip(".").lower()  # strip path/query
+            # Accept ONLY a plain hostname[:port] — a crafted host like
+            # `x.$(cmd).com` must never reach a shell command / filename. (Codex HIGH)
+            if not re.fullmatch(r"[a-z0-9]([a-z0-9.-]{0,253}[a-z0-9])?(:\d{1,5})?", s):
+                continue
+            if s and s not in seen:
+                seen.add(s)
+                hosts.append(s)
+    return hosts
+
+
+def _derive_targets_label(hosts: list[str]) -> str:
+    """Most-common registrable apex (last two labels) across hosts — used for
+    session naming when --targets-file is given without an explicit --target."""
+    from collections import Counter
+    apexes: "Counter[str]" = Counter()
+    for h in hosts:
+        parts = h.split(":")[0].split(".")   # drop any :port before taking the apex
+        apexes[".".join(parts[-2:]) if len(parts) >= 2 else parts[0]] += 1
+    label = apexes.most_common(1)[0][0] if apexes else "targets"
+    # The label becomes a filename that is later shelled — keep it to safe chars.
+    return re.sub(r"[^a-z0-9.-]", "", label) or "targets"
+
+
 def run_recon(
     domain: str,
     quick: bool = False,
@@ -3503,6 +3554,7 @@ def run_recon(
     session_id: str | None = None,
     scope_lock: bool = False,
     max_urls: int = 100,
+    targets_file: str | None = None,
 ) -> bool:
     if resume:
         active_session_id, recon_dir = _activate_recon_session(
@@ -3551,6 +3603,21 @@ def run_recon(
             _hosts = expand_cidr(domain)
             log("info", f"CIDR {domain} → {len(_hosts)} host(s) to scan")
 
+    # Always PIN TARGETS_FILE for the child process: empty when unused, so an
+    # INHERITED TARGETS_FILE env var can't hijack the normal --target / IP / CIDR
+    # scope-lock paths (recon.sh checks it before CIDR). (Codex MEDIUM)
+    _targets_env = "TARGETS_FILE= "
+    if targets_file:
+        scope_lock = True  # an explicit host list is, by definition, scope-locked
+        try:
+            _n_hosts = sum(1 for _l in open(targets_file)
+                           if _l.strip() and not _l.lstrip().startswith("#"))
+        except OSError:
+            _n_hosts = 0
+        # Quote the path so a crafted value can't inject shell. (Codex HIGH)
+        _targets_env = f"TARGETS_FILE={shlex.quote(targets_file)} "
+        log("info", f"Host-list scope-lock: {_n_hosts} host(s) from "
+                    f"{os.path.basename(targets_file)} — subdomain enum skipped")
     _scope_env  = "SCOPE_LOCK=1 " if scope_lock else ""
     _type_env   = f'TARGET_TYPE="{_target_type}" '
     _maxurl_env = f"MAX_URLS={max_urls} " if max_urls > 0 else "MAX_URLS=0 "
@@ -3559,7 +3626,7 @@ def run_recon(
     if max_urls > 0:
         log("info", f"URL cap: {max_urls} URLs max (priority-ordered)")
     ok = run_live(
-        f'{adaptive_env}{_scope_env}{_type_env}{_maxurl_env}'
+        f'{adaptive_env}{_scope_env}{_type_env}{_maxurl_env}{_targets_env}'
         f'RECON_OUT_DIR="{recon_dir}" RECON_SESSION_ID="{active_session_id or ""}" '
         f'BATCH_SIZE={batch_size} bash "{script}" "{domain}" {quick_flag} {resume_flag}',
         timeout=_dynamic_timeout,
@@ -6780,6 +6847,7 @@ def hunt_target(
     skip_scan: bool = False,
     scope_lock: bool = False,
     max_urls: int = 100,
+    targets_file: str | None = None,
     browser_scan: bool = False,
     browser_headed: bool = False,
     browser_model: str | None = None,
@@ -6892,6 +6960,7 @@ def hunt_target(
             session_id=resume_session_id,
             scope_lock=scope_lock,
             max_urls=max_urls,
+            targets_file=targets_file,
         )
         if not result["recon"]:
             log("warn", f"Recon had issues for {domain}, continuing...")
@@ -7267,6 +7336,8 @@ Examples:
     )
     # Core
     parser.add_argument("--target",           type=str,  help="Target: FQDN, IP, or CIDR (e.g. example.com, 192.168.1.1, 10.0.0.0/24)")
+    parser.add_argument("--targets-file",     type=str,  metavar="PATH",
+                        help="Scan an explicit list of authorized hosts (one per line; URLs/#comments OK), NO subdomain enumeration. Implies --scope-lock. Use for a curated multi-host scope.")
     parser.add_argument("--quick",            action="store_true", help="Quick focused scan mode")
     parser.add_argument("--resume",           nargs="?", const="latest", metavar="SESSION_ID",
                         help="Resume an existing recon session. Omit SESSION_ID to reuse the latest session, or pass a specific session ID to continue that exact recon folder")
@@ -7363,6 +7434,38 @@ Examples:
     resume_requested = args.resume is not None
     resume_session_id = None if args.resume in (None, "", "latest") else args.resume
     skip_items = parse_skip_items(args.skip)
+
+    # ── --targets-file: explicit multi-host scope-lock (no subdomain enum) ────
+    targets_file = None
+    if getattr(args, "targets_file", None):
+        if not os.path.isfile(args.targets_file):
+            log("err", f"--targets-file not found: {args.targets_file}")
+            sys.exit(1)
+        if args.autonomous or getattr(args, "agent", False):
+            log("err", "--targets-file is not yet supported with --autonomous/--agent; use --full")
+            sys.exit(1)
+        _hosts = _read_targets_file(args.targets_file)
+        if not _hosts:
+            log("err", f"--targets-file {args.targets_file} has no valid hosts")
+            sys.exit(1)
+        _label = _derive_targets_label(_hosts)
+        _hostlist_dir = os.path.join(TARGETS_DIR, "_hostlists")
+        os.makedirs(_hostlist_dir, exist_ok=True)
+        targets_file = os.path.join(_hostlist_dir, f"{_label}.txt")
+        with open(targets_file, "w", encoding="utf-8") as _fh:
+            _fh.write("\n".join(_hosts) + "\n")
+        if not args.target:
+            args.target = _label
+        args.scope_lock = True
+        log("info", f"Host-list scope: {len(_hosts)} hosts → label '{args.target}' "
+                    f"(subdomain enum OFF, scope-locked)")
+
+    # Reject a target carrying shell metacharacters before it ever reaches a
+    # shell command string (run_recon / recon dirs). Covers user-supplied AND
+    # derived targets. (Codex HIGH)
+    if args.target and not _is_safe_target(args.target):
+        log("err", f"Unsafe --target {args.target!r}: only FQDN / IP / CIDR characters are allowed")
+        sys.exit(1)
 
     if resume_session_id and not args.target:
         log("err", "--resume SESSION_ID requires --target")
@@ -7623,6 +7726,7 @@ Examples:
                 full=args.full,
                 scope_lock=args.scope_lock,
                 max_urls=args.max_urls,
+                targets_file=targets_file,
                 browser_scan=args.browser_scan,
                 browser_headed=args.browser_headed,
                 browser_model=args.browser_model,
