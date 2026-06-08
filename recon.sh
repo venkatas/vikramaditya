@@ -419,7 +419,13 @@ if phase_done "$RECON_DIR/subdomains/all.txt"; then true; else
 
 # ── Scope-lock: skip all enum tools, test only the exact given target ─────────
 if [ "$SCOPE_LOCK" = "1" ]; then
-    if [ "$TARGET_TYPE" = "cidr" ]; then
+    if [ -n "${TARGETS_FILE:-}" ] && [ -s "${TARGETS_FILE:-}" ]; then
+        # Multi-host scope-lock (--targets-file): hunt.py already normalized this
+        # list — use it verbatim as the host set, no subdomain enumeration.
+        sort -u "$TARGETS_FILE" > "$RECON_DIR/subdomains/all.txt"
+        log_warn "SCOPE_LOCK active — explicit host list, subdomain enumeration skipped"
+        log_ok "Scope-locked: $(file_lines "$RECON_DIR/subdomains/all.txt") target(s) from host list"
+    elif [ "$TARGET_TYPE" = "cidr" ]; then
         log_info "CIDR target — running ping sweep to discover live hosts"
         if tool_ok nmap; then
             nmap -sn "$TARGET" -oG - 2>/dev/null \
