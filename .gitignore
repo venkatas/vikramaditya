@@ -113,3 +113,7 @@ schemathesis-report/
 
 # ── Operator-only drafts (never publish) ──────────────────────────────────────
 .github-support-request.md
+
+# Client-specific config & logs — never commit (contains real targets/accounts)
+whitebox_config.yaml
+logs/
