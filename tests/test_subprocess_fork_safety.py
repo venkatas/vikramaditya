@@ -1,13 +1,15 @@
-"""Regression guard: never launch subprocesses with preexec_fn=os.setsid.
+"""Regression guard: never launch subprocesses with preexec_fn=os.setsid, and keep
+the legacy launchers' killpg-able process group.
 
-`preexec_fn` runs arbitrary Python in the child AFTER fork() but BEFORE exec().
-Python's docs warn it is unsafe in the presence of threads, and on macOS a
-forked child that touches the (CoreFoundation/Objective-C-initialized) runtime
-SIGSEGVs. hunt.py is heavily threaded (brain watchers, watchdogs, thread pools),
-so late-run subprocess launches segfaulted (observed: sqlmap + cve.py both
-ended rc=-11 / SIGSEGV at 0.0s during a live scan). The fix is the documented,
-fork-safe equivalent `start_new_session=True` (setsid done inside the C
-fork/exec path), which preserves the os.killpg(getpgid(pid)) kill behaviour.
+`preexec_fn` runs arbitrary Python in the child AFTER fork() but BEFORE exec() and is
+unsafe with threads, so it must never be reintroduced. NOTE, however, that switching
+preexec_fn -> start_new_session was NOT what cured the observed `rc=-11 / SIGSEGV at
+0.0s` crashes (sqlmap, cve.py, AND reporter.py): both flags force CPython's fork()+exec
+path, and the real culprit is Apple's Network.framework registering a non-fork-safe
+pthread_atfork CHILD handler that SIGSEGVs in the forked child before exec. The actual
+fix is to launch via os.posix_spawn (which does not run atfork handlers) — guarded by
+tests/test_posix_spawn_fork_safety.py. These checks remain valid: preexec_fn=os.setsid
+must stay gone, and the fallback launchers still create their own session for killpg.
 """
 import os
 import signal

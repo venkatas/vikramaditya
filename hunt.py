@@ -1176,6 +1176,167 @@ def _brain_phase_complete(phase: str, success: bool, detail: str = "", artifacts
     _brain.phase_complete(phase, success, "\n\n".join(summary_parts))
 
 
+_POSIX_SPAWN_OK = hasattr(os, "posix_spawn") and hasattr(os, "POSIX_SPAWN_DUP2")
+
+
+class _PosixSpawnProc:
+    """A small ``subprocess.Popen`` work-alike that launches via ``os.posix_spawn``
+    instead of ``fork()+exec``.
+
+    WHY THIS EXISTS — macOS fork() is not safe here. hunt.py's parent loads Apple's
+    Network.framework (in-process HTTP/TLS; on hosts with a VPN/endpoint-filter
+    NetworkExtension it also pulls in NEFlowDirector). That framework registers a
+    NON-fork-safe ``pthread_atfork`` *child* handler
+    (``nw_settings_child_has_forked`` -> ``os_log`` -> ``_os_log_preferences_refresh``).
+    Any ``subprocess.Popen`` that takes the fork()+exec path runs that handler in the
+    forked child *before* exec and SIGSEGVs at 0.0s — observed killing the SQLMAP,
+    CVE HUNT and REPORTS phases (``rc=-11 duration=0.0s``; 0 reports produced).
+
+    Both ``preexec_fn`` (set to ``os.setsid``) AND ``start_new_session=True`` force the
+    fork() path, so neither "fixes" it. ``posix_spawn`` does not run ``pthread_atfork``
+    handlers, and
+    ``setsid=True`` keeps the child a session/group leader so the watchdog's
+    ``os.killpg(os.getpgid(pid))`` still tears down the whole tree.
+
+    Implements only the Popen surface hunt.py + ProcessWatchdog use: ``.pid``,
+    ``.stdout``, ``.poll()``, ``.returncode``, ``.wait()``, ``.communicate()``, ``.kill()``.
+    """
+
+    def __init__(self, spec, env=None, cwd=None, capture=True, shell=True):
+        self._lock = threading.Lock()
+        self.returncode = None
+        self.stdout = None
+
+        # Normalise (argv, cwd) into a fork-safe posix_spawn invocation. We have no
+        # POSIX_SPAWN_CHDIR on every build, so cwd is applied via a `cd ... &&` shell
+        # wrapper (which also covers argv-mode commands that need a cwd).
+        if shell:
+            cmd = spec
+            if cwd:
+                cmd = f"cd {shlex.quote(cwd)} && ({cmd})"
+            program, argv, use_path = "/bin/sh", ["/bin/sh", "-c", cmd], False
+        else:
+            argv = list(spec)
+            if cwd:
+                inner = " ".join(shlex.quote(a) for a in argv)
+                program, argv, use_path = "/bin/sh", [
+                    "/bin/sh", "-c", f"cd {shlex.quote(cwd)} && exec {inner}"], False
+            else:
+                program, use_path = argv[0], True
+
+        file_actions = [(os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0)]
+        r = w = None
+        if capture:
+            r, w = os.pipe()
+            file_actions += [
+                (os.POSIX_SPAWN_DUP2, w, 1),
+                (os.POSIX_SPAWN_DUP2, w, 2),
+                (os.POSIX_SPAWN_CLOSE, r),
+                (os.POSIX_SPAWN_CLOSE, w),
+            ]
+
+        spawn = os.posix_spawnp if use_path else os.posix_spawn
+        try:
+            self.pid = spawn(program, argv, env if env is not None else os.environ,
+                             file_actions=file_actions, setsid=True)
+        except Exception:
+            if capture:
+                os.close(r); os.close(w)
+            raise
+        if capture:
+            os.close(w)
+            self.stdout = os.fdopen(r, "r", errors="replace")
+
+    def poll(self):
+        with self._lock:
+            if self.returncode is not None:
+                return self.returncode
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self.returncode = 0  # already reaped elsewhere; status unknowable
+                return self.returncode
+            if pid == 0:
+                return None
+            self.returncode = -os.WTERMSIG(status) if os.WIFSIGNALED(status) \
+                else os.WEXITSTATUS(status)
+            return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            rc = self.poll()
+            if rc is not None:
+                return rc
+            if deadline is not None and time.time() > deadline:
+                raise subprocess.TimeoutExpired("posix_spawn", timeout)
+            time.sleep(0.02)
+
+    def communicate(self, timeout=None):
+        # Single absolute deadline shared by the read and the reap, so total runtime
+        # cannot exceed `timeout` (a separate timeout on each step would allow ~2x).
+        deadline = None if timeout is None else time.time() + timeout
+        out = ""
+        if self.stdout is not None:
+            buf = []
+            reader = threading.Thread(target=lambda: buf.append(self.stdout.read()),
+                                      daemon=True)
+            reader.start()
+            reader.join(None if deadline is None else max(0.0, deadline - time.time()))
+            if reader.is_alive():
+                raise subprocess.TimeoutExpired("posix_spawn", timeout)
+            out = buf[0] if buf else ""
+        # stdout EOF does NOT imply the process exited — it may have closed/redirected its
+        # own stdout and kept running. poll() first so a genuinely-finished process is
+        # never a spurious timeout; otherwise reap within the REMAINING deadline only, so
+        # communicate() never outlives the caller's timeout.
+        if self.poll() is None:
+            self.wait(None if deadline is None else max(0.0, deadline - time.time()))
+        return out, ""
+
+    def kill(self):
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    def __del__(self):
+        # Backstop: reap if a caller path never waited, so we don't leak a zombie.
+        # Non-blocking (WNOHANG) — __del__ must never hang.
+        try:
+            if getattr(self, "returncode", 0) is None:
+                os.waitpid(self.pid, os.WNOHANG)
+        except Exception:
+            pass
+
+
+def _fork_safe_spawn(spec, env=None, cwd=None, capture=True, shell=True):
+    """Launch a subprocess WITHOUT fork() when possible (macOS Network.framework
+    atfork handlers SIGSEGV the forked child — see ``_PosixSpawnProc``).
+
+    Uses ``os.posix_spawn`` (no atfork handlers) on interpreters that support it;
+    otherwise falls back to the original fork-based ``subprocess.Popen`` so Linux/CI
+    and old interpreters are unchanged. Returns a Popen-or-Popen-like object."""
+    if _POSIX_SPAWN_OK:
+        return _PosixSpawnProc(spec, env=env, cwd=cwd, capture=capture, shell=shell)
+    # Fallback (no posix_spawn): original behaviour.
+    if shell:
+        return subprocess.Popen(
+            spec, shell=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None,
+            stdin=subprocess.DEVNULL, cwd=cwd, env=env, text=True,
+            start_new_session=True,
+        )
+    return subprocess.Popen(
+        spec,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        stdin=subprocess.DEVNULL, cwd=cwd, env=env, text=True,
+        start_new_session=True,
+    )
+
+
 def run_cmd(
     cmd: str,
     cwd: str = None,
@@ -1192,17 +1353,9 @@ def run_cmd(
             started_label = started_at.strftime("%Y-%m-%d %H:%M:%S")
             env = _tool_env()
 
-            proc = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                cwd=cwd,
-                env=env,
-                text=True,
-                start_new_session=True,
-            )
+            # Fork-safe launch: posix_spawn avoids macOS Network.framework atfork
+            # SIGSEGV that killed SQLMAP/CVE HUNT/REPORTS at 0.0s (see _PosixSpawnProc).
+            proc = _fork_safe_spawn(cmd, env=env, cwd=cwd, capture=True, shell=True)
             log("info", f"START {label}: PID {proc.pid} @ {started_label}")
             log("info", f"Command: {cmd}")
 
@@ -1215,27 +1368,47 @@ def run_cmd(
             timed_out = False
             stdout = ""
             stderr = ""
+            chunks: list[bytes] = []
             try:
                 import select as _select
                 deadline = time.time() + timeout
-                chunks: list[str] = []
+                fd = proc.stdout.fileno() if proc.stdout else None
                 while True:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(cmd, timeout)
-                    if proc.stdout:
-                        ready, _, _ = _select.select([proc.stdout], [], [], min(0.5, remaining))
+                    if fd is not None:
+                        ready, _, _ = _select.select([fd], [], [], min(0.5, remaining))
                         if ready:
-                            chunk = proc.stdout.read(4096)
-                            if chunk:
-                                chunks.append(chunk)
+                            # os.read returns whatever is available (<=65536) the moment
+                            # the fd is ready — unlike TextIOWrapper.read(n), which can
+                            # block until n chars or EOF and so overrun the deadline.
+                            data = os.read(fd, 65536)
+                            if data:
+                                chunks.append(data)
+                                continue  # keep draining before re-checking exit
+                            # EOF: the write end is closed. A closed fd stays
+                            # select-ready forever, so stop watching it (otherwise the
+                            # loop busy-spins when the child closed stdout but kept
+                            # running). The process itself may still be alive.
+                            fd = None
+                    else:
+                        # Nothing left to read but process still running — poll its exit
+                        # on a short sleep instead of busy-spinning.
+                        time.sleep(min(0.1, max(0.0, remaining)))
                     if proc.poll() is not None:
+                        # Process exited; drain any buffered tail still in the pipe, but
+                        # never block past the deadline.
+                        while fd is not None and time.time() < deadline:
+                            ready, _, _ = _select.select([fd], [], [], 0.1)
+                            if not ready:
+                                break
+                            data = os.read(fd, 65536)
+                            if not data:
+                                break
+                            chunks.append(data)
                         break
-                if proc.stdout:
-                    tail = proc.stdout.read()
-                    if tail:
-                        chunks.append(tail)
-                stdout = "".join(chunks)
+                stdout = b"".join(chunks).decode("utf-8", "replace")
             except subprocess.TimeoutExpired:
                 timed_out = True
                 log("warn", f"{label}: timeout after {timeout}s — killing PID {proc.pid}")
@@ -1243,7 +1416,11 @@ def run_cmd(
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
                     proc.kill()
-                stdout, _ = proc.communicate()
+                try:
+                    proc.wait(timeout=10)  # reap the killed tree; don't hang
+                except Exception:
+                    pass
+                stdout = b"".join(chunks).decode("utf-8", "replace")
             finally:
                 watchdog.stop()
 
@@ -1255,12 +1432,7 @@ def run_cmd(
             log(end_level, f"END {label}: PID {proc.pid} rc={rc} duration={duration:.1f}s{timeout_note}")
             return rc == 0, (stdout or "") + (stderr or "")
 
-        proc = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            cwd=cwd, env=_tool_env(), text=True,
-            start_new_session=True,
-        )
+        proc = _fork_safe_spawn(cmd, env=_tool_env(), cwd=cwd, capture=True, shell=True)
         try:
             stdout, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1280,20 +1452,29 @@ def run_cmd_args(
     cwd: str = None,
     timeout: int = 600,
 ) -> tuple[bool, str]:
+    # Fork-safe launch (posix_spawn): avoids the macOS Network.framework atfork
+    # SIGSEGV that fork()+exec triggers late in a run (see _PosixSpawnProc). stdout
+    # and stderr are merged into one stream, matching the previous concatenation.
+    proc = None
     try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            cwd=cwd,
-            timeout=timeout,
-            env=_tool_env(),
-        )
-        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
-    except subprocess.TimeoutExpired:
-        return False, "Command timed out"
+        proc = _fork_safe_spawn(list(args), env=_tool_env(), cwd=cwd,
+                                capture=True, shell=False)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.wait()
+            return False, "Command timed out"
+        return proc.returncode == 0, out or ""
     except Exception as exc:
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return False, str(exc)
 
 
@@ -1312,8 +1493,9 @@ def run_live(cmd: str, timeout: int = 3600,
         started_label = started_at.strftime("%Y-%m-%d %H:%M:%S")
         env = _tool_env()
 
-        # Use os.setsid so watchdog can kill the whole process group
-        proc = subprocess.Popen(cmd, shell=True, start_new_session=True, env=env)
+        # Fork-safe launch (posix_spawn + setsid); see _PosixSpawnProc. setsid keeps
+        # the child a group leader so the watchdog can killpg the whole tree.
+        proc = _fork_safe_spawn(cmd, env=env, capture=False, shell=True)
         log("info", f"START {label}: PID {proc.pid} @ {started_label}")
         log("info", f"Command: {cmd}")
 
@@ -1336,6 +1518,10 @@ def run_live(cmd: str, timeout: int = 3600,
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
                 proc.kill()
+            try:
+                proc.wait(timeout=10)  # reap the killed child (no Popen GC to do it)
+            except Exception:
+                pass
         finally:
             if watchdog:
                 watchdog.stop()
