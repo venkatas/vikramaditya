@@ -1,6 +1,42 @@
 # Changelog
 
+## v10.3.3 — ACTUALLY fix macOS subprocess SIGSEGV (fork → posix_spawn) (2026-06-09)
+
+The v10.3.2 fix below was a **misdiagnosis** — the `rc=-11` (SIGSEGV at 0.0s)
+crashes persisted. A re-run crashed **three** phases identically: `SQLMAP`,
+`CVE HUNT`, **and the final `REPORTS` phase** (so the run produced **0 reports**).
+
+- **Real root cause (from the macOS crash report):** the faulting stack is
+  `subprocess.Popen → _posixsubprocess.do_fork_exec → fork() →
+  _pthread_atfork_child_handlers → Network.nw_settings_child_has_forked() →
+  os_log → _os_log_preferences_refresh` = `EXC_BAD_ACCESS`. hunt.py's parent
+  loads Apple's **Network.framework** (in-process HTTP/TLS; on hosts with a
+  VPN/endpoint-filter NetworkExtension it also pulls in `NEFlowDirector`), which
+  registers a **non-fork-safe `pthread_atfork` child handler**. `fork()` runs that
+  handler in the child *before* `exec()`, and it SIGSEGVs.
+- **Why v10.3.2 didn't help:** both `preexec_fn=os.setsid` **and**
+  `start_new_session=True` force CPython onto the **`fork()+exec`** path. The crash
+  is in the C-library atfork handler that `fork()` runs — nothing Python does after
+  fork matters. (It was *not* the CoreFoundation/ObjC issue v10.3.2 guessed.)
+- **Fix:** new `_PosixSpawnProc` (a small `Popen` work-alike) + `_fork_safe_spawn()`
+  launch via **`os.posix_spawn(..., setsid=True)`**, which **does not run
+  `pthread_atfork` handlers** and so cannot hit the crash, while `setsid=True` keeps
+  the child a session/group leader so the watchdog's
+  `os.killpg(os.getpgid(pid), SIGKILL)` still tears down the whole tree. Routed into
+  `run_cmd` (watch + non-watch branches), `run_live`, and `run_cmd_args`. Falls back
+  to the original fork-based `Popen` when `os.posix_spawn` is unavailable
+  (Linux/CI/old interpreters unchanged).
+- **Deterministic regression test:** `tests/test_posix_spawn_fork_safety.py`
+  registers a hostile `abort()` `pthread_atfork` child handler (standing in for
+  Apple's crashing handler) in an isolated subprocess and asserts each launcher
+  survives — proving the launch no longer runs atfork handlers. Fails on the fork
+  path, passes on posix_spawn.
+
 ## v10.3.2 — fix macOS subprocess SIGSEGV (preexec_fn → start_new_session) (2026-06-08)
+
+> **Superseded by v10.3.3 — this diagnosis was wrong.** `start_new_session=True`
+> still uses `fork()`, so the SIGSEGV persisted. See v10.3.3 for the real cause
+> (Apple Network.framework `pthread_atfork` handler) and fix (`posix_spawn`).
 
 External scan tools launched late in a run could die instantly with `rc=-11`
 (SIGSEGV) — observed live: `sqlmap` and `cve.py` both crashed at 0.0s during a
