@@ -447,11 +447,41 @@ class HARVAPTEngine:
                                 
                                 # Ask the brain to try harder to find it and get RCE by writing a script
                                 try:
+                                    import os
                                     from brain_scanner import run_brain_scanner
                                     print(f"\n   🧠 [BRAIN] Asking AI to write a script to find the uploaded shell '{fname}' on '{url}'")
                                     cookies_str = "; ".join([f"{c.name}={c.value}" for c in self.session.cookies])
                                     briefing = f"File upload accepted at {url}. File: {fname}. Parameter: {param}. I cannot find the uploaded file at standard paths like /upload/{fname}. Write a script to fuzz directories and find the uploaded shell, and try to get RCE. You must write a complete Python script that searches for the uploaded file and executes a command."
-                                    run_brain_scanner(target=url, briefing=briefing, cookies=cookies_str, mode='scan', max_iterations=2)
+                                    # Persist brain output to disk when a session dir exists, and
+                                    # capture the returned findings so a confirmed RCE is recorded.
+                                    brain_out = None
+                                    if self.output_dir:
+                                        # param is a HAR form-field name → sanitize before using it
+                                        # as a path component (a '/' or '..' would escape the dir).
+                                        safe_param = re.sub(r'[^A-Za-z0-9_.-]', '_', param) or 'field'
+                                        brain_out = os.path.join(self.output_dir, 'brain', f'upload_{safe_param}')
+                                        os.makedirs(brain_out, exist_ok=True)
+                                    brain_findings = run_brain_scanner(target=url, briefing=briefing, cookies=cookies_str, mode='scan', max_iterations=2, output_dir=brain_out)
+                                    bf_lines = [bf.strip() for bf in (brain_findings or []) if bf and bf.strip()]
+                                    if bf_lines:
+                                        # run_brain_scanner returns two kinds of line: script-grounded
+                                        # findings (from actual tool stdout) and unverified model prose
+                                        # tagged "[MODEL CLAIM — verify PoC]". Severity must derive ONLY
+                                        # from script-grounded evidence — a model claim containing
+                                        # "EXPLOITABLE" must not escalate this to critical.
+                                        script_lines = [l for l in bf_lines if not l.upper().startswith('[MODEL CLAIM')]
+                                        joined = '\n'.join(bf_lines)  # keep all lines in the detail for context
+                                        grounded = ' '.join(script_lines).upper()
+                                        if any(k in grounded for k in ('RCE', 'EXPLOITABLE')):
+                                            sev = 'critical'
+                                        elif script_lines:
+                                            sev = 'high'
+                                        else:
+                                            sev = 'medium'  # model claims only — investigated, unconfirmed
+                                        # One _log call: multiple distinct confirmed lines (e.g. path
+                                        # discovery + RCE command output) share the same (type, endpoint,
+                                        # param) dedup key, so per-line calls would collapse to the first.
+                                        self._log(sev, 'File Upload RCE (Brain-Investigated)', url, joined, param=param)
                                 except ImportError:
                                     pass
                     except Exception:

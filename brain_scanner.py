@@ -53,6 +53,47 @@ N = "\033[0m"
 
 MAX_ITERATIONS = 15
 MAX_SCRIPT_RUNTIME = 60  # seconds
+MAX_EMPTY_STREAK = 3     # abort if the provider returns N empty responses in a row
+
+
+# ── Stdout-claim corroboration ────────────────────────────────────────────────
+# A generated PoC can DECLARE success without it being true. Real example caught
+# in the field: a shell PoC ended with
+#     echo "[CRITICAL] Shadow file also accessible!" || echo "[-] Only passwd"
+# `echo` always exits 0, so the `||` fallback never runs and the CRITICAL line
+# prints UNCONDITIONALLY — even though the server returned `404 Not Found`. The
+# grounding layer trusts script stdout over model prose (the anti-hallucination
+# rule), so that buggy echo became a "confirmed" CRITICAL finding.
+#
+# Defence: a self-declared file-access / path-traversal / LFI claim is only
+# accepted as a finding when the script output actually CONTAINS the file's
+# content (proof). A genuine read prints the file (e.g. `root:x:0:0:` from
+# /etc/passwd); an unconditional echo prints nothing of the sort. This does NOT
+# touch other finding classes (SQLi/XSS/RCE confirmed by real tools), so it
+# cannot suppress those.
+_ACCESS_CLAIM_RE = re.compile(
+    r'accessib|readable|path[\s_-]*traversal|directory traversal|\blfi\b|'
+    r'arbitrary[\s_-]*file|file (?:read|disclos|retriev|leak)|local file|'
+    r'/etc/passwd|/etc/shadow|win\.ini|boot\.ini|web\.config', re.I)
+_FILE_PROOF_RE = re.compile(
+    # A real /etc/passwd or /etc/shadow read prints account LINES at line-start —
+    # user:x:UID:GID:... (passwd) or user:$hash:lastchg:min:... (shadow). Anchored
+    # to line-start (MULTILINE) so a passwd-shaped string embedded in a shell ERROR
+    # ("bash: line 3: root:x:0:0:...: No such file") is NOT miscounted as proof.
+    r'^[a-z_][a-z0-9_-]*:[^:\n]*:\d+:\d+:'
+    r'|\[boot loader\]|\[fonts\]|\[mci extensions\]'              # win.ini / boot.ini
+    r'|<\?xml\b|<configuration\b|<connectionStrings|<appSettings',  # web.config
+    re.I | re.M)
+
+
+def _access_claim_unproven(line: str, stdout: str) -> bool:
+    """True when an stdout line ASSERTS file/resource access (passwd, shadow,
+    traversal, LFI, "accessible"/"readable") but the script output carries NO
+    actual file-content signature — i.e. a self-declared, unverified claim that
+    must not be recorded as a confirmed finding."""
+    if not _ACCESS_CLAIM_RE.search(line):
+        return False                       # not an access claim → unaffected
+    return not _FILE_PROOF_RE.search(stdout)
 
 
 def log(level: str, msg: str):
@@ -64,14 +105,45 @@ def log(level: str, msg: str):
 
 
 def pick_model() -> str:
-    """Pick the best available Ollama model for security tasks.
+    """Pick the best available Ollama model for active exploit CODE GENERATION.
 
-    Priority: bugtraceai-apex (security-tuned, <thinking> blocks, 0% refusal)
-    Fallback: gemma4:26b (fast all-rounder)
+    v9.23 — this role WRITES and EXECUTES bash/python PoCs, so it needs a CODER.
+    The old default aya-expanse:latest is Cohere's MULTILINGUAL chat model (8B,
+    8K ctx) — it produced malformed bash that never ran and the loop then
+    concluded "NOT VULNERABLE" from its own crash. Demoted to last resort.
+    Order: env override -> Devstral (agentic SWE, if pulled) -> installed qwen
+    coders. Override with BRAIN_SCANNER_MODEL=<name>.
     """
+    import os as _os
+    env = _os.environ.get("BRAIN_SCANNER_MODEL", "").strip()
+    prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
+    # Cloud / non-ollama provider (gemini/openai/claude/grok/mlx): the model name
+    # is the BRAIN_SCANNER_MODEL override or the provider's default — no local
+    # pull. MLX has no DEFAULT_MODELS entry (the model is loaded internally and
+    # the name arg is ignored), so resolve a truthy id from MLX_MODEL/default
+    # rather than refusing to start. Provider availability is enforced in
+    # run_brain_scanner so a missing key/server fails fast (not an empty loop).
+    if prov and prov != "ollama":
+        try:
+            from brain import LLMClient, MLX_DEFAULT_MODEL
+            if prov == "mlx":
+                return env or _os.environ.get("MLX_MODEL") or MLX_DEFAULT_MODEL
+            return env or LLMClient.DEFAULT_MODELS.get(prov) or ""
+        except Exception:
+            return env or ""
     try:
         import ollama
-        for m in ["bugtraceai-apex", "gemma4:26b", "qwen3:14b", "qwen3:8b", "gemma4:e4b"]:
+        candidates = ([env] if env else []) + [
+            "devstral-small-2:24b",        # agentic SWE coder (68% SWE-bench) if pulled
+            "qwen2.5-coder:14b",           # installed, fast, purpose-built coder
+            "qwen3-coder:30b",             # installed, stronger MoE coder
+            "qwen2.5-coder:14b-instruct",
+            "bugtraceai-apex",             # security-tuned fallback
+            "aya-expanse:latest",          # LAST resort — not a coder
+        ]
+        for m in candidates:
+            if not m:
+                continue
             try:
                 ollama.show(m)
                 return m
@@ -82,20 +154,57 @@ def pick_model() -> str:
     return ""
 
 
+_SCANNER_LLM = None      # cached cloud LLMClient (lazy; honors BRAIN_PROVIDER)
+_SCANNER_LLM_SIG = None   # (provider, key-hash) the cached client was built for
+
+
+def _get_scanner_llm():
+    """Lazily build + cache the multi-provider LLM client for cloud providers.
+
+    The cache is keyed to (BRAIN_PROVIDER, hashed API key) so that if either
+    changes in a long-lived process we rebuild instead of reusing a client
+    bound to the old provider / stale credentials. The key is hashed, never
+    stored raw.
+    """
+    global _SCANNER_LLM, _SCANNER_LLM_SIG
+    import os as _os, hashlib as _hashlib
+    prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
+    key_env = {"gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
+               "claude": "ANTHROPIC_API_KEY", "grok": "XAI_API_KEY"}.get(prov, "")
+    key_val = _os.environ.get(key_env, "") if key_env else ""
+    sig = (prov, _hashlib.sha256(key_val.encode()).hexdigest()[:12] if key_val else "")
+    if _SCANNER_LLM is None or _SCANNER_LLM_SIG != sig:
+        from brain import LLMClient
+        _SCANNER_LLM = LLMClient()  # reads BRAIN_PROVIDER + the matching API key
+        _SCANNER_LLM_SIG = sig
+    return _SCANNER_LLM
+
+
 def ask_brain(model: str, messages: list[dict], max_tokens: int = 4000) -> str:
-    """Send messages to Ollama and get response."""
-    import ollama
-    resp = ollama.chat(
-        model=model,
-        messages=messages,
-        options={
-            "num_predict": max_tokens,
-            "temperature": 0.1,
-            "repeat_penalty": 1.3,   # Prevent S_S_S_S degeneration
-            "top_p": 0.9,
-        },
-    )
-    content = resp["message"].get("content", "")
+    """Send messages to the active LLM provider and get the response.
+
+    Honors BRAIN_PROVIDER: cloud providers (gemini/openai/claude/grok) route
+    through brain.LLMClient.chat_messages (full multi-turn history preserved);
+    the default is local Ollama with the repetition guards a small local coder
+    needs. The S_S_S degeneration guard below is harmless on cloud output.
+    """
+    import os as _os
+    prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
+    if prov and prov != "ollama":
+        content = _get_scanner_llm().chat_messages(model, messages, max_tokens=max_tokens)
+    else:
+        import ollama
+        resp = ollama.chat(
+            model=model,
+            messages=messages,
+            options={
+                "num_predict": max_tokens,
+                "temperature": 0.1,
+                "repeat_penalty": 1.3,   # Prevent S_S_S_S degeneration
+                "top_p": 0.9,
+            },
+        )
+        content = resp["message"].get("content", "")
     # Detect and truncate repetition loops (model degeneration)
     if "_S_S_S" in content or len(set(content[-200:])) < 10:
         # Find where repetition starts and truncate
@@ -124,11 +233,35 @@ def extract_code_blocks(text: str) -> list[dict]:
 
 
 def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> dict:
-    """Execute a code block and capture output."""
+    """Execute a code block and capture output.
+
+    v9.23 — validate syntax BEFORE running. The LLM frequently emits malformed
+    shell (e.g. an unterminated quote: --data="username=admin'--) which bash
+    aborts with "unexpected EOF" having run nothing. Previously that crash was fed
+    back as if it were a target result and the model concluded "NOT VULNERABLE"
+    from a script that never executed. We now flag syntax errors distinctly
+    (``syntax_error: True``) so the caller can force a rewrite instead of treating
+    it as evidence — and never partially execute a broken script.
+    """
     if lang in ("bash", "sh", "curl"):
         cmd = ["bash", "-c", code]
+        # `bash -n` parses without executing — catches unbalanced quotes / EOF.
+        try:
+            chk = subprocess.run(["bash", "-n", "-c", code],
+                                 capture_output=True, text=True, timeout=15)
+            if chk.returncode != 0:
+                return {"stdout": "", "stderr": f"SCRIPT SYNTAX ERROR (not executed): "
+                                                f"{chk.stderr.strip()[:500]}",
+                        "returncode": 2, "syntax_error": True}
+        except Exception:
+            pass
     elif lang == "python":
         cmd = [sys.executable, "-c", code]
+        try:
+            compile(code, "<brain_script>", "exec")
+        except SyntaxError as e:
+            return {"stdout": "", "stderr": f"SCRIPT SYNTAX ERROR (not executed): {e}",
+                    "returncode": 2, "syntax_error": True}
     else:
         return {"stdout": "", "stderr": f"Unsupported language: {lang}", "returncode": -1}
 
@@ -144,7 +277,8 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
             "returncode": result.returncode,
         }
     except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": f"TIMEOUT after {timeout}s", "returncode": -9}
+        return {"stdout": "", "stderr": f"TIMEOUT after {timeout}s", "returncode": -9,
+                "timed_out": True, "timeout": timeout}
     except Exception as e:
         return {"stdout": "", "stderr": str(e), "returncode": -1}
 
@@ -335,8 +469,23 @@ def run_brain_scanner(target: str, briefing: str = "", cookies: str = "",
     """
     model = pick_model()
     if not model:
-        log("err", "No Ollama model available")
+        _prov = os.environ.get("BRAIN_PROVIDER", "").strip().lower() or "ollama"
+        if _prov == "ollama":
+            log("err", "No Ollama model available (pull a coder, e.g. ollama pull qwen2.5-coder:14b)")
+        else:
+            log("err", f"No model available for provider '{_prov}' "
+                       f"(set BRAIN_SCANNER_MODEL or check the API key)")
         return
+
+    # Fail fast: a non-ollama provider with no API key / unloadable backend would
+    # otherwise log a model name and then loop on empty responses for every
+    # iteration. Verify the client is actually usable before doing any work.
+    _prov = os.environ.get("BRAIN_PROVIDER", "").strip().lower()
+    if _prov and _prov != "ollama":
+        if not _get_scanner_llm().available:
+            log("err", f"Provider '{_prov}' selected but not available — "
+                       f"check the API key (e.g. GEMINI_API_KEY) or backend")
+            return
 
     log("brain", f"Model: {model}")
     log("info", f"Target: {target}")
@@ -486,6 +635,8 @@ Then test the most promising attack vectors."""
 
     findings = []
     iteration = 0
+    successful_runs = 0   # scripts that actually executed (no syntax/tooling error)
+    empty_streak = 0      # consecutive empty provider responses (see MAX_EMPTY_STREAK)
 
     mode_labels = {
         "scan": "Active LLM-Driven Vulnerability Testing",
@@ -506,6 +657,21 @@ Then test the most promising attack vectors."""
         log("brain", "Thinking...")
         response = ask_brain(model, messages)
 
+        # Guard: a usable-looking but non-functional provider (revoked / over-quota
+        # key, invalid model name, network failure) makes ask_brain return "" every
+        # time. Abort after a short streak instead of burning all iterations on
+        # empty output. The startup availability gate only checks local config, not
+        # a live call, so this catches what the gate cannot.
+        if not (response or "").strip():
+            empty_streak += 1
+            log("warn", f"Brain returned an empty response [{empty_streak}/{MAX_EMPTY_STREAK}]")
+            if empty_streak >= MAX_EMPTY_STREAK:
+                log("err", "Provider returned empty responses repeatedly — aborting. "
+                           "Check the API key validity, quota/billing, and model name.")
+                break
+            continue
+        empty_streak = 0
+
         # Display brain's reasoning
         # Print non-code parts
         parts = re.split(r'```(?:python|bash|sh|curl)?\n.*?```', response, flags=re.DOTALL)
@@ -521,11 +687,37 @@ Then test the most promising attack vectors."""
         if not code_blocks:
             # Brain didn't write code — check if it's giving a final verdict
             if any(kw in response.upper() for kw in ["CONFIRMED", "VERDICT:", "FINAL ASSESSMENT", "SUMMARY OF FINDINGS"]):
+                # v9.23 — refuse a final verdict that rests on ZERO successful tests.
+                # The model used to declare "NOT VULNERABLE" right after its only
+                # script died with a syntax error — concluding from a run that never
+                # happened. Require at least one script to have actually executed.
+                if successful_runs == 0:
+                    log("warn", "Verdict rejected — no script has executed successfully yet "
+                                "(a script/syntax error is NOT evidence about the target)")
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content":
+                        "You have not run a single SUCCESSFUL test yet — every script so far "
+                        "failed to execute (syntax/tooling error), which tells us NOTHING about "
+                        "the target's security. Do NOT issue a verdict. Write a corrected, "
+                        "self-contained script (mind your quotes) in a ```bash or ```python "
+                        "block so it actually runs."})
+                    continue
                 log("ok", "Brain issued final verdict")
-                # Extract findings
+                # Only accept verdict-prose lines as findings if they are explicitly
+                # CONFIRMED/EXPLOITABLE; tag them as model claims pending PoC review so
+                # they are never mistaken for tool-verified findings. Substring matching
+                # alone records negative verdicts ("NOT VULNERABLE (LOW)", "No CRITICAL
+                # ... CONFIRMED") as findings — skip any line carrying a negation marker.
+                NEG_MARKERS = ("NOT VULNERABLE", "NOT EXPLOITABLE", "NO CRITICAL", "NO HIGH",
+                               "NOT CONFIRMED", "UNABLE TO CONFIRM", "NOTHING CONFIRMED",
+                               "NO VULNERABILIT", "NOT CONFIRM")
                 for line in response.split('\n'):
-                    if any(sev in line.upper() for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]):
-                        findings.append(line.strip())
+                    up = line.upper()
+                    if any(neg in up for neg in NEG_MARKERS):
+                        continue
+                    if any(sev in up for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]) \
+                       and any(k in up for k in ["CONFIRMED", "EXPLOITABLE", "VULNERABLE"]):
+                        findings.append(f"[MODEL CLAIM — verify PoC] {line.strip()}")
                 break
             else:
                 # Ask brain to write code
@@ -549,7 +741,13 @@ Then test the most promising attack vectors."""
                 print(f"  {C}│{N} ... ({code.count(chr(10)) - 30} more lines)")
             print(f"  {C}└─────────────────────────────────────────────────{N}\n")
 
-            result = execute_script(lang, code)
+            # The SYSTEM_PROMPT mandates sqlmap --level/--risk, full-severity nuclei,
+            # and ffuf fuzzing — all of which routinely run for minutes. The 60s
+            # default kills them mid-run, so scale the budget when a long tool is
+            # invoked. Recon curls self-cap (--max-time 15) and stay on the default.
+            long_tools = ("sqlmap", "nuclei", "ffuf", "feroxbuster", "gobuster", "dalfox")
+            tmo = 600 if any(t in code for t in long_tools) else MAX_SCRIPT_RUNTIME
+            result = execute_script(lang, code, timeout=tmo)
 
             # Show results
             if result["stdout"]:
@@ -565,19 +763,88 @@ Then test the most promising attack vectors."""
                 print(f"  {R}└──────────────────────────────────────────────{N}")
 
             all_results += f"\n=== Script {i+1} ({lang}) — exit code {result['returncode']} ===\n"
-            all_results += f"STDOUT:\n{result['stdout']}\n"
-            if result["stderr"]:
+            if result.get("syntax_error"):
+                # Make it unmistakable that this is a SCRIPT defect, not a target result.
+                all_results += ("SCRIPT DID NOT RUN — shell/python SYNTAX ERROR in YOUR script "
+                                "(e.g. an unterminated quote). This is NOT evidence about the "
+                                "target. Rewrite the script correctly and try again.\n")
                 all_results += f"STDERR:\n{result['stderr']}\n"
-
-            # Check for findings in output
-            for line in result["stdout"].split('\n'):
-                if any(kw in line.upper() for kw in ["VULNERABLE", "CONFIRMED", "CRITICAL", "EXPLOITABLE"]):
-                    findings.append(line.strip())
+            elif result.get("timed_out"):
+                # A timeout TRUNCATED the test — it is NOT a negative result about the
+                # target. Tell the model so it never reads an empty/partial stdout as
+                # "not vulnerable", and steer it to a narrower scope.
+                all_results += (f"SCRIPT TIMED OUT after {result.get('timeout', tmo)}s — the test "
+                                "was TRUNCATED, NOT a negative result. Narrow the scope (single "
+                                "param / fewer templates / one URL) or it ran out of budget.\n")
+                all_results += f"STDERR:\n{result['stderr']}\n"
+            else:
+                all_results += f"STDOUT:\n{result['stdout']}\n"
+                if result["stderr"]:
+                    all_results += f"STDERR:\n{result['stderr']}\n"
+                # A script that ran (rc 0, or non-zero but not a syntax error) counts
+                # as a real test the model may reason from. Exclude TIMEOUT (-9) and
+                # internal/tooling errors (-1), which did NOT produce target evidence.
+                # Also exclude RUNTIME tooling failures (Python traceback / missing
+                # module / command-not-found): these "ran" but produced zero target
+                # evidence, so they must not satisfy the gate that lets the model
+                # issue a final verdict after no real testing.
+                # (sys.exit(1) PoCs, grep/curl --fail pipelines, sqlmap/dalfox/ffuf all
+                #  exit non-zero on a genuine run, so rc != 0 must still count.)
+                _stderr_up = (result.get("stderr") or "").upper()
+                _tooling_error = (
+                    result["returncode"] == 127
+                    or "TRACEBACK (MOST RECENT CALL LAST)" in _stderr_up
+                    or "MODULENOTFOUNDERROR" in _stderr_up
+                    or "NAMEERROR" in _stderr_up
+                    or "IMPORTERROR" in _stderr_up
+                    or "COMMAND NOT FOUND" in _stderr_up
+                )
+                if result["returncode"] not in (-9, -1) and not _tooling_error:
+                    successful_runs += 1
+                # Grounded findings: only from ACTUAL script stdout. Plain substring
+                # matching records negative lines ("NOT VULNERABLE", "No critical ...")
+                # as findings — skip any line carrying a negation marker. Markers are
+                # kept narrow and unambiguous: broad phrases like "NOT FOUND" / "NO
+                # ISSUES" / "NOT AFFECTED" were dropped because they can appear inside
+                # a genuinely-confirming stdout line (e.g. "EXPLOITABLE: creds NOT
+                # FOUND but RCE works") and would silently suppress a real finding.
+                NEG_MARKERS = ("NOT VULNERABLE", "NOT EXPLOITABLE", "NOT VULN", "NO CRITICAL",
+                               "0 CRITICAL", "NO VULNERABILIT", "NOT INJECTABLE")
+                _unproven_access = False
+                for line in result["stdout"].split('\n'):
+                    up = line.upper()
+                    if any(kw in up for kw in ["VULNERABLE", "CONFIRMED", "CRITICAL", "EXPLOITABLE"]) \
+                       and not any(neg in up for neg in NEG_MARKERS):
+                        # Reject a self-declared file-access/traversal claim that the
+                        # script output does not actually PROVE (no file content) — a
+                        # buggy PoC (`echo "...accessible" || echo`) prints it whether
+                        # or not the read succeeded. Don't record it as a finding.
+                        if _access_claim_unproven(line, result["stdout"]):
+                            _unproven_access = True
+                            log("warn", f"Rejected unproven access claim (no file "
+                                        f"content in output): {line.strip()[:80]}")
+                            continue
+                        findings.append(line.strip())
+                if _unproven_access:
+                    all_results += (
+                        "\nNOTE: a file-access/traversal claim was printed WITHOUT the "
+                        "retrieved file content as proof, so it was NOT accepted as a "
+                        "finding. A real read must print the actual content (e.g. the "
+                        "`root:x:0:0:` line from /etc/passwd). Re-test and show the file "
+                        "content to confirm, or drop the claim. Note that `echo X || echo Y` "
+                        "does NOT make X conditional — echo always succeeds.\n")
 
         # Feed results back to brain
+        had_syntax_error = any(b for b in code_blocks) and "SCRIPT DID NOT RUN" in all_results
+        guidance = ("Analyze these results. If a script DID NOT RUN due to a syntax error, that is "
+                    "NOT a finding — fix the script and re-run it. " if had_syntax_error else
+                    "Analyze these results. ")
         messages.append({
             "role": "user",
-            "content": f"Here are the execution results:\n\n{all_results}\n\nAnalyze these results. If you found a vulnerability, document it clearly with CONFIRMED status. If you need more testing, write the next test script. If you've tested enough, give your FINAL ASSESSMENT with all findings."
+            "content": f"Here are the execution results:\n\n{all_results}\n\n{guidance}"
+                       "If you genuinely confirmed a vulnerability via script OUTPUT, document it "
+                       "with CONFIRMED status. If you need more testing, write the next test script. "
+                       "Only give a FINAL ASSESSMENT once at least one script has actually executed."
         })
 
         # Trim context if getting long (keep system + last 10 messages)

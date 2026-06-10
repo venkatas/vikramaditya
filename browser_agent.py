@@ -65,6 +65,16 @@ MODEL_PRIORITY = [
 ]
 TASK_TIMEOUT = int(os.environ.get("BROWSER_TASK_TIMEOUT", "120"))
 
+# Substrings of known multimodal / vision-capable model names. Used as a
+# fallback when `ollama show` capabilities cannot be queried (older Ollama,
+# offline registry). NOT exhaustive — the authoritative check is the
+# `vision` capability reported by `ollama show`.
+VISION_MODEL_HINTS = (
+    "llava", "bakllava", "llama3.2-vision", "llama-3.2-vision", "llama4",
+    "minicpm-v", "moondream", "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "qwen-vl",
+    "gemma3", "mistral-small3", "pixtral", "granite3.2-vision", "vision",
+)
+
 
 def _log(level: str, msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -151,6 +161,44 @@ def _try_claude(model_override: str | None):
         return None
 
 
+def _ollama_model_supports_vision(model: str) -> bool:
+    """
+    Return True only when the given Ollama model can accept image input.
+
+    browser-use sends screenshots (multimodal requests) by default; a text-only
+    model (e.g. qwen3-coder:30b) returns HTTP 400 "model does not support
+    multimodal requests" on *every* request, silently killing the phase.
+
+    Detection order:
+      1. `ollama show <model>` — authoritative `capabilities` list (Ollama >=0.1.x).
+         A vision-capable model reports the "vision" capability.
+      2. Known-multimodal-name allowlist fallback (VISION_MODEL_HINTS) when the
+         capabilities API is unavailable or returns nothing.
+
+    Conservative by design: when the answer is unknown we return False so the
+    browser agent degrades to text/DOM analysis rather than 400-ing on every
+    request.
+    """
+    name = (model or "").lower()
+    try:
+        import ollama as _ollama_lib
+        client = _ollama_lib.Client(host=OLLAMA_HOST)
+        info = client.show(model)
+        caps = None
+        # ShowResponse (attr) or plain dict, depending on ollama-python version.
+        if hasattr(info, "capabilities"):
+            caps = info.capabilities
+        elif isinstance(info, dict):
+            caps = info.get("capabilities")
+        if caps:
+            return any(str(c).lower() == "vision" for c in caps)
+        # capabilities key absent/empty → fall through to name heuristic
+    except Exception as exc:
+        _log("warn", f"Could not query vision capability for {model}: {exc}; using name heuristic")
+
+    return any(hint in name for hint in VISION_MODEL_HINTS)
+
+
 class BrowserAgent:
     """
     Orchestrates browser-based validation tasks against a single target.
@@ -177,11 +225,54 @@ class BrowserAgent:
         self.allow_unsafe = allow_unsafe or env_allow_unsafe in {"1", "true", "yes", "on"}
         self.method_policy = SafeMethodPolicy()
         self.llm = None
+        # Default to vision ON; downgraded to False below when the resolved
+        # backend is a text-only Ollama model that cannot accept screenshots.
+        self.use_vision = True
+        # Phase-health counters: distinguish "ran but found nothing" (success)
+        # from "every browser request errored" (degraded/failure).
+        self._tasks_completed = 0
+        self._tasks_errored = 0
         (self.findings_dir / "browser" / "screenshots").mkdir(parents=True, exist_ok=True)
 
     def _init_llm(self) -> bool:
         self.llm = init_browser_llm(model_override=self.model_override)
+        if self.llm is not None:
+            self._resolve_use_vision()
         return self.llm is not None
+
+    def _resolve_use_vision(self) -> None:
+        """
+        Decide whether to send screenshots (vision) to the active LLM.
+
+        For Ollama backends we probe the model's capabilities: a text-only
+        model returns HTTP 400 on every multimodal request, which previously
+        killed the whole phase. Non-Ollama backends (e.g. Claude) keep vision
+        enabled. BROWSER_USE_VISION=0/1 forces the choice explicitly.
+        """
+        forced = os.environ.get("BROWSER_USE_VISION", "").strip().lower()
+        if forced in {"0", "false", "no", "off"}:
+            self.use_vision = False
+            _log("info", "Vision disabled by BROWSER_USE_VISION")
+            return
+        if forced in {"1", "true", "yes", "on"}:
+            self.use_vision = True
+            _log("info", "Vision forced on by BROWSER_USE_VISION")
+            return
+
+        if self.llm is not None and self.llm.__class__.__name__ == "ChatOllama":
+            model = getattr(self.llm, "model", "") or self.model_override or ""
+            if _ollama_model_supports_vision(model):
+                self.use_vision = True
+            else:
+                self.use_vision = False
+                _log(
+                    "warn",
+                    f"Ollama model '{model}' has no vision capability — disabling "
+                    "screenshots; browser agent will use DOM/text analysis only "
+                    "(install a multimodal model for full vision validation)",
+                )
+        else:
+            self.use_vision = True
 
     def is_ready(self) -> bool:
         """Return True only when browser-use is installed and an LLM is available."""
@@ -275,18 +366,23 @@ class BrowserAgent:
                 task=task.prompt,
                 llm=self.llm,
                 browser=browser,
+                use_vision=self.use_vision,
                 **self._browser_use_kwargs(task),
             )
             result = await asyncio.wait_for(agent.run(), timeout=TASK_TIMEOUT)
             count = self._write_finding(task, str(result))
+            # Task executed end-to-end (no error) — phase is not "fully dead".
+            self._tasks_completed += 1
             if count:
                 _log("ok", f"{task.__class__.__name__}: {count} finding(s)")
             return count
         except asyncio.TimeoutError:
             _log("warn", f"{task.__class__.__name__} timed out after {TASK_TIMEOUT}s")
+            self._tasks_errored += 1
             return 0
         except Exception as exc:
             _log("err", f"{task.__class__.__name__} failed: {exc}")
+            self._tasks_errored += 1
             return 0
         finally:
             try:
@@ -308,6 +404,7 @@ class BrowserAgent:
                 results[name] = await self._run_task(task)
             except Exception as exc:
                 _log("err", f"Task {name} crashed: {exc}")
+                self._tasks_errored += 1
                 results[name] = 0
         return results
 
@@ -348,6 +445,19 @@ class BrowserAgent:
 
         results = asyncio.run(self._run_all_tasks(tasks))
         total = sum(results.values())
+
+        # Phase is "fully dead" when every task that actually ran errored
+        # (e.g. text-only model 400-ing on multimodal requests) and none
+        # completed. Return an empty dict so the orchestrator reports the
+        # phase as degraded/failed (∅/✗) rather than success.
+        if self._tasks_completed == 0 and self._tasks_errored > 0:
+            _log(
+                "err",
+                f"Browser phase degraded — all {self._tasks_errored} browser "
+                "request(s) errored (0 completed); reporting failure",
+            )
+            return {}
+
         _log("ok" if total else "info", f"Browser phase complete — {total} finding(s)")
         return results
 

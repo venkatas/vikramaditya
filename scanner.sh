@@ -189,6 +189,10 @@ if ! skip_has upload; then
         || mktemp /tmp/scanner_soft404_XXXXXX 2>/dev/null \
         || echo "/tmp/scanner_soft404_$$_$RANDOM.txt")
     : > "$SOFT404_FILE"
+    # Cap shared by the baseline/catchall loop AND the upload probe loop below —
+    # they MUST cover the same host set, else hosts 11-30 get probed with no
+    # soft-404 baseline and fire spurious [UPLOAD-CANDIDATE]s.
+    UPLOAD_MAX_HOSTS=30
     log_step "Detecting catchall behavior..."
     # Process substitution (not pipe) so loop body runs in the parent shell —
     # otherwise CATCHALL_HOSTS mutations evaporate.
@@ -235,7 +239,7 @@ if ! skip_has upload; then
                 fi
             fi
         done
-    done < <(head -10 "$ORDERED_SCAN")
+    done < <(head -"$UPLOAD_MAX_HOSTS" "$ORDERED_SCAN")
 
     # ── Path list ────────────────────────────────────────────────────────
     # Static seed list (~85 entries) covers generic, framework-specific,
@@ -318,7 +322,10 @@ if ! skip_has upload; then
         [ -z "$host" ] && continue
         # Hard skip: confirmed catchall (both random probes agreed on
         # status+hash) — the baseline body would mask any real upload sink.
-        [[ "$CATCHALL_HOSTS" == *"$host"* ]] && continue
+        # Whole-token match (same ,token, convention as _has_skip) — an
+        # unanchored substring test wrongly skips hosts that merely contain a
+        # catchall host as a prefix/substring.
+        case ",$CATCHALL_HOSTS," in *",$host,"*) continue ;; esac
         # Look up ALL per-host baseline (code, hash) pairs — there can be one
         # per URL shape (e.g. apex returns 404, /api/* returns 401, /admin/*
         # returns 403 with three distinct signatures, all worth filtering).
@@ -378,17 +385,17 @@ if ! skip_has upload; then
                 fi
             fi
         done
-    done < <(head -30 "$ORDERED_SCAN")
+    done < <(head -"$UPLOAD_MAX_HOSTS" "$ORDERED_SCAN")
     rm -f "$SOFT404_FILE"
 fi
 
-# ── Check 1.5: Custom nuclei templates (vikramaditya-tagged) ────────────
+# ── Check 1: Custom nuclei templates (vikramaditya-tagged) ──────────────
 # Runs the repo-local nuclei-templates/ directory so engagement-specific custom
 # templates (e.g. CVE-2025-68645 Zimbra) execute alongside the official set.
 # Must run BEFORE the per-tag SQLi pass so operator sees custom-template
 # coverage even when --skip sqli is set.
 if tool_ok nuclei && [ -d "$CUSTOM_NUCLEI_TEMPLATES" ] && [ -n "$(ls -A "$CUSTOM_NUCLEI_TEMPLATES" 2>/dev/null)" ]; then
-    log_info "Check 1.5: Custom nuclei templates (${CUSTOM_NUCLEI_TEMPLATES})"
+    log_info "Check 1: Custom nuclei templates (${CUSTOM_NUCLEI_TEMPLATES})"
     nuclei -l "$ORDERED_SCAN" -t "$CUSTOM_NUCLEI_TEMPLATES" \
         -severity low,medium,high,critical -silent \
         -o "$FINDINGS_DIR/cves_custom/nuclei_custom.txt" 2>/dev/null || true
@@ -474,9 +481,13 @@ with open(sys.argv[1]) as fin, open(sys.argv[2], 'w') as fout:
 PYEOF
         DEDUP_COUNT=$(wc -l < "$DAL_DEDUP_FILE" 2>/dev/null || echo 0)
         log_step "Running dalfox on up to $DAL_LIMIT URLs (deduped from $(wc -l < "$PARAMS_FILE") → ${DEDUP_COUNT}, timeout: ${DAL_MAX_TIME}s)..."
-        head -"$DAL_LIMIT" "$DAL_DEDUP_FILE" | \
-            gtimeout "$DAL_MAX_TIME" dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null \
-            || timeout "$DAL_MAX_TIME" dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null \
+        # Single `timeout` (portable shim defined above delegates to gtimeout
+        # when present). The old `head | gtimeout dalfox || timeout dalfox`
+        # form fed head's stdin ONLY to the first command, so the fallback ran
+        # with empty stdin and dalfox scanned zero URLs whenever gtimeout was
+        # absent (the normal Linux case).
+        head -"$DAL_LIMIT" "$DAL_DEDUP_FILE" \
+            | timeout "$DAL_MAX_TIME" dalfox pipe --silence --no-spinner --skip-bav --timeout 15 -o "$DAL_OUT" 2>/dev/null \
             || true
         rm -f "$DAL_DEDUP_FILE"
         log_done "dalfox check done"
@@ -484,15 +495,39 @@ PYEOF
 
     # 3b — CSP header analysis on live hosts
     log_step "Analysing Content-Security-Policy headers..."
-    CSP_WEAK="$FINDINGS_DIR/xss/csp_weak.txt"
-    CSP_MISSING="$FINDINGS_DIR/xss/csp_missing.txt"
+    # v10.2.1 — a missing/weak CSP header is a defense-in-depth HARDENING gap, NOT
+    # an XSS vulnerability. Writing it under xss/ made the reporter render each line
+    # as a CVSS-6.1 "Cross-Site Scripting" finding (a false positive). Classify it as
+    # a LOW security-misconfiguration instead.
+    mkdir -p "$FINDINGS_DIR/misconfig"
+    CSP_WEAK="$FINDINGS_DIR/misconfig/csp_weak.txt"
+    CSP_MISSING="$FINDINGS_DIR/misconfig/csp_missing.txt"
+    # Resolve the live-hosts input. recon writes `live/urls.txt` (one URL per
+    # line) — the old `live/live_hosts.txt` path never existed, so this check
+    # iterated 0 hosts and silently reported 0 missing headers. Mirror the
+    # canonical fallback chain from the "Resolve scan targets" block above, and
+    # fall back to httpx_full.txt's first column when only that is present.
+    CSP_INPUT=""
+    for f in "$RECON_DIR/live/urls.txt" "$ORDERED_SCAN" "$PRIORITY_DIR/prioritized_hosts.txt"; do
+        [ -s "$f" ] && CSP_INPUT="$f" && break
+    done
+    if [ -z "$CSP_INPUT" ] && [ -s "$RECON_DIR/live/httpx_full.txt" ]; then
+        CSP_INPUT=$(mktemp -t scanner_csp.XXXXXX 2>/dev/null \
+            || mktemp /tmp/scanner_csp_XXXXXX 2>/dev/null \
+            || echo "/tmp/scanner_csp_$$_$RANDOM.txt")
+        awk '{print $1}' "$RECON_DIR/live/httpx_full.txt" > "$CSP_INPUT"
+        CSP_INPUT_TMP="$CSP_INPUT"
+    fi
+    if [ -z "$CSP_INPUT" ] || [ ! -s "$CSP_INPUT" ]; then
+        log_warn "[CSP] No live-hosts input found (looked for live/urls.txt) — skipping security-header check"
+    else
     while IFS= read -r host; do
         [ -z "$host" ] && continue
         HDR=$(curl -sk --max-time 8 -I "$host" 2>/dev/null | tr -d '\r')
         CSP=$(echo "$HDR" | grep -i "^content-security-policy:" | cut -d: -f2-)
         if [ -z "$CSP" ]; then
             log_warn "[CSP-MISSING] No CSP header: $host"
-            echo "[CSP-MISSING] $host" >> "$CSP_MISSING"
+            echo "[LOW] Missing Content-Security-Policy (CSP) response header — $host" >> "$CSP_MISSING"
         else
             # Flag dangerous directives
             WEAK=""
@@ -502,10 +537,12 @@ PYEOF
             echo "$CSP" | grep -qi "data:"          && WEAK="$WEAK data-uri"
             if [ -n "$WEAK" ]; then
                 log_vuln "[CSP-WEAK]$WEAK — $host"
-                echo "[CSP-WEAK]$WEAK | $host" >> "$CSP_WEAK"
+                echo "[LOW] Weak Content-Security-Policy directives ($WEAK ) — $host" >> "$CSP_WEAK"
             fi
         fi
-    done < <(cat "$RECON_DIR/live/live_hosts.txt" 2>/dev/null | head -50)
+    done < <(head -50 "$CSP_INPUT")
+    [ -n "${CSP_INPUT_TMP:-}" ] && rm -f "$CSP_INPUT_TMP"
+    fi
 
     # 3c — XSStrike WAF-bypass scan (full mode only, requires tools/XSStrike)
     XSSSTRIKE_SCRIPT="$SCRIPT_DIR/tools/XSStrike/xsstrike.py"
@@ -532,23 +569,46 @@ if ! skip_has ssti; then
     if [ -s "$PARAMS_FILE" ]; then
         # Removed associative array for Bash 3.2 compatibility
         # engines: jinja2, freemarker, thymeleaf, erb
+        # v9.23 — robust SSTI confirmation. The old check grepped the injected
+        # response for "\b49\b" (7*7), which matched coincidental "49" in minified
+        # CSS/JS and any HTML — producing fake "SSTI CONFIRMED jinja2" on WordPress
+        # STATIC assets (e.g. elementor-icons.min.css?ver={{7*7}}). Now we:
+        #   (1) skip static-asset URLs (.css/.js/...) and pure cache-bust ?ver= params,
+        #   (2) use a DISTINCTIVE canary (887*913=809831) unlikely to appear by chance,
+        #   (3) confirm only when the RESULT appears in the injected response AND is
+        #       ABSENT from a clean baseline fetch AND the literal expression is NOT
+        #       reflected (reflected != evaluated).
         SSTI_ENGINES=("jinja2" "freemarker" "thymeleaf" "erb")
-        SSTI_PAYLOADS=("{{7*7}}" "\${7*7}" "*{7*7}" "<%= 7*7 %>")
-        
+        SSTI_PAYLOADS=("{{887*913}}" "\${887*913}" "*{887*913}" "<%= 887*913 %>")
+        SSTI_EXPR="887*913"        # literal expression — if reflected verbatim, NOT evaluated
+        SSTI_RESULT="809831"       # 887*913 — distinctive evaluated result
+
         SSTI_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 20 || echo 50)
         log_step "Testing SSTI payloads on up to $SSTI_LIMIT URLs..."
         hit=0
         while IFS= read -r url; do
             [ -z "$url" ] && continue
+            # Skip static assets — a ?ver= cache-buster on a .css/.js file is not a
+            # template sink; injecting there and matching content is a false positive.
+            base_path="${url%%\?*}"
+            case "$base_path" in
+                *.css|*.js|*.mjs|*.map|*.png|*.jpg|*.jpeg|*.gif|*.svg|*.ico|*.webp|*.woff|*.woff2|*.ttf|*.eot|*.pdf) continue ;;
+            esac
+            # Baseline (clean) response — if it already contains the canary result,
+            # the match would be coincidental, so skip this URL.
+            baseline=$(curl -sk --max-time 10 "$url" 2>/dev/null || true)
+            echo "$baseline" | grep -qF "$SSTI_RESULT" && continue
             for idx in "${!SSTI_ENGINES[@]}"; do
                 engine="${SSTI_ENGINES[$idx]}"
                 payload="${SSTI_PAYLOADS[$idx]}"
                 enc_payload=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$payload'''))" 2>/dev/null || echo "$payload")
                 injected=$(echo "$url" | sed "s/=\([^&]*\)/=${enc_payload}/g")
                 body=$(curl -sk --max-time 10 "$injected" 2>/dev/null || true)
-                if echo "$body" | grep -qE '(\b49\b|7777777)'; then
+                # CONFIRM only if the engine EVALUATED the canary: result present, and
+                # the literal expression NOT reflected verbatim (reflection != execution).
+                if echo "$body" | grep -qF "$SSTI_RESULT" && ! echo "$body" | grep -qF "$SSTI_EXPR"; then
                     log_crit "SSTI confirmed [$engine]: $injected"
-                    echo "[SSTI-CONFIRMED] engine=$engine url=$injected" >> "$SSTI_OUT"
+                    echo "[SSTI-CONFIRMED] engine=$engine url=$injected result=$SSTI_RESULT" >> "$SSTI_OUT"
                     hit=$(( hit + 1 ))
                     break
                 fi
@@ -558,9 +618,9 @@ if ! skip_has ssti; then
     fi
 fi
 
-# ── Check 7: CMS Detection & MSF Generation ──────────────────────────────
+# ── Check 5: CMS Detection & MSF Generation ──────────────────────────────
 if ! skip_has cms; then
-    log_info "Check 7: CMS Detection & MSF Generation"
+    log_info "Check 5: CMS Detection & MSF Generation"
     head -50 "$ORDERED_SCAN" | while read -r url; do
         [ -z "$url" ] && continue
         RES=$(curl -sk --max-time 10 "$url" 2>/dev/null || true)
@@ -584,9 +644,9 @@ if ! skip_has cms; then
     done
 fi
 
-# ── Check 8: MFA / 2FA Bypass ─────────────────────────────────────────────────
+# ── Check 6: MFA / 2FA Bypass ─────────────────────────────────────────────────
 if ! skip_has mfa; then
-    log_info "Check 8: MFA / 2FA Bypass"
+    log_info "Check 6: MFA / 2FA Bypass"
     mkdir -p "$FINDINGS_DIR/mfa"
 
     # Detect MFA/OTP endpoints from URL list
@@ -606,7 +666,15 @@ if ! skip_has mfa; then
                     -H "Content-Type: application/json" \
                     -d '{"otp":"000000"}' 2>/dev/null || echo "ERR"
             done | sort | uniq -c | sort -rn | head -5)
-            if echo "$STATUS_CODES" | grep -qv "429\|ERR"; then
+            # Fire only when the endpoint actually responded with real HTTP
+            # codes AND none of them is 429. The old `grep -qv "429\|ERR"`
+            # matched if ANY single line was not 429, which is almost always
+            # true (an initial 200 before throttling) → guaranteed false
+            # positive even when rate limiting works. Requiring a 3-digit code
+            # also suppresses a dead/unreachable endpoint whose histogram is
+            # all-ERR/all-000 (curl failures), which carries no rate-limit signal.
+            if echo "$STATUS_CODES" | grep -qE '[1-5][0-9]{2}' \
+                && ! echo "$STATUS_CODES" | grep -q "429"; then
                 log_vuln "[MFA] No rate limit detected on OTP endpoint: $BASE"
                 echo "[MFA-NO-RATE-LIMIT] $BASE | codes: $STATUS_CODES" >> "$FINDINGS_DIR/mfa/findings.txt"
             fi
@@ -640,9 +708,9 @@ if ! skip_has mfa; then
     fi
 fi
 
-# ── Check 9: SAML / SSO Attacks ───────────────────────────────────────────────
+# ── Check 7: SAML / SSO Attacks ───────────────────────────────────────────────
 if ! skip_has saml; then
-    log_info "Check 9: SAML / SSO Attack Surface"
+    log_info "Check 7: SAML / SSO Attack Surface"
     mkdir -p "$FINDINGS_DIR/saml"
 
     # Detect SAML/SSO endpoints
@@ -697,9 +765,9 @@ if ! skip_has saml; then
     [ "$SAML_FINDINGS" -gt 0 ] && log_ok "[SAML] $SAML_FINDINGS finding(s) — review $FINDINGS_DIR/saml/"
 fi
 
-# ── Check 10: Import/Export Abuse (TOP100 #1 RCE surface) ────────────────────
+# ── Check 8: Import/Export Abuse (TOP100 #1 RCE surface) ─────────────────────
 if ! skip_has import; then
-    log_info "Check 10: Import/Export Feature Abuse"
+    log_info "Check 8: Import/Export Feature Abuse"
     mkdir -p "$FINDINGS_DIR/import_export"
 
     LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -30 || true)
@@ -708,7 +776,10 @@ if ! skip_has import; then
         [ -z "$host" ] && continue
 
         # ── Discover import/export endpoints ──
-        for PATH in \
+        # NOTE: loop var is ep_path, NOT PATH — overwriting $PATH here would
+        # break the in-loop curl (and every external command afterwards, since
+        # this while-read runs in the parent shell via a here-string).
+        for ep_path in \
             "/import" "/export" "/api/import" "/api/export" \
             "/admin/import" "/admin/export" "/bulk/import" \
             "/api/v1/import" "/api/v2/import" \
@@ -716,11 +787,11 @@ if ! skip_has import; then
             "/upload/import" "/data/import" "/migrate" \
             "/api/migrate" "/template/import" "/backup/restore"; do
             CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
-                "${host}${PATH}" 2>/dev/null || echo "0")
+                "${host}${ep_path}" 2>/dev/null || echo "0")
             case "$CODE" in
                 200|201|301|302|400|403|405|422)
-                    log_vuln "[IMPORT] Endpoint exists (HTTP $CODE): ${host}${PATH}"
-                    echo "[IMPORT-ENDPOINT] ${host}${PATH} | HTTP $CODE" >> "$FINDINGS_DIR/import_export/endpoints.txt"
+                    log_vuln "[IMPORT] Endpoint exists (HTTP $CODE): ${host}${ep_path}"
+                    echo "[IMPORT-ENDPOINT] ${host}${ep_path} | HTTP $CODE" >> "$FINDINGS_DIR/import_export/endpoints.txt"
                     ;;
             esac
         done
@@ -756,9 +827,9 @@ if ! skip_has import; then
     [ "$IMPORT_COUNT" -gt 0 ] && log_ok "[IMPORT] $IMPORT_COUNT import/export endpoint(s) found — high-priority manual test surface"
 fi
 
-# ── Check 11: Deserialization Probes ─────────────────────────────────────────
+# ── Check 9: Deserialization Probes ──────────────────────────────────────────
 if ! skip_has deserialize; then
-    log_info "Check 11: Deserialization Probes"
+    log_info "Check 9: Deserialization Probes"
     mkdir -p "$FINDINGS_DIR/deserialize"
 
     LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -20 || true)
@@ -779,13 +850,31 @@ if ! skip_has deserialize; then
                 log_vuln "[DESERIALIZE] Java serialized object endpoint: ${host}${JAVA_PATH} — ysoserial candidate"
                 echo "[JAVA-DESER] ${host}${JAVA_PATH} | $CT" >> "$FINDINGS_DIR/deserialize/findings.txt"
             fi
-            # JMX/JBoss/WebLogic common deser paths
-            case "$CODE" in 200|500|400)
-                if echo "$JAVA_PATH" | grep -qi "invoker\|jmx\|remoting"; then
-                    log_vuln "[DESERIALIZE] Java RMI/JMX endpoint (HTTP $CODE): ${host}${JAVA_PATH}"
-                    echo "[JAVA-RMI] ${host}${JAVA_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/deserialize/findings.txt"
-                fi ;;
-            esac
+            # JMX/JBoss/WebLogic common deser paths. Only fires for explicitly
+            # Java-specific paths (invoker/jmx/remoting) — generic paths returning
+            # 400/500 produce nothing, which is what was causing false positives.
+            # A live-handler code (200/401/403) plus a corroborating signal
+            # (java-serialized CT or an RMI/JMX body marker) is a confirmed finding;
+            # everything else on a Java-specific path is a manual-followup candidate.
+            if echo "$JAVA_PATH" | grep -qi "invoker\|jmx\|remoting"; then
+                case "$CODE" in
+                200|401|403)
+                    BODY=$(curl -sk --max-time 5 "${host}${JAVA_PATH}" 2>/dev/null | head -c 4096 || true)
+                    if echo "$CT" | grep -qi "java\|x-java-serialized\|application/octet-stream" \
+                       || echo "$BODY" | grep -qi "jmx\|JBoss\|RMI\|InvokerServlet\|MBean"; then
+                        log_vuln "[DESERIALIZE] Java RMI/JMX endpoint (HTTP $CODE): ${host}${JAVA_PATH}"
+                        echo "[JAVA-RMI] ${host}${JAVA_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/deserialize/findings.txt"
+                    else
+                        echo "[JAVA-RMI-CANDIDATE] ${host}${JAVA_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/deserialize/findings.txt"
+                    fi ;;
+                400|500)
+                    # A JBoss /invoker/JMXInvokerServlet typically returns 500 to a
+                    # bare GET (the servlet tries to deserialize the empty body and
+                    # throws) — the classic ysoserial target. Keep it as a candidate
+                    # for manual follow-up rather than dropping the signal entirely.
+                    echo "[JAVA-RMI-CANDIDATE] ${host}${JAVA_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/deserialize/findings.txt" ;;
+                esac
+            fi
         done
 
         # ── PHP object injection: detect unserialize() call surfaces ──
@@ -810,9 +899,9 @@ if ! skip_has deserialize; then
     [ "$DESER_COUNT" -gt 0 ] && log_ok "[DESERIALIZE] $DESER_COUNT deserialization surface(s) — requires manual ysoserial/PHPGGC follow-up"
 fi
 
-# ── Check 12: Supply Chain Exposure ──────────────────────────────────────────
+# ── Check 10: Supply Chain Exposure ──────────────────────────────────────────
 if ! skip_has supplychain; then
-    log_info "Check 12: Supply Chain Exposure"
+    log_info "Check 10: Supply Chain Exposure"
     mkdir -p "$FINDINGS_DIR/supply_chain"
 
     LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -30 || true)
@@ -876,8 +965,8 @@ log_info "Scan Complete. Consolidating..."
     echo "Verified Upload Only : $(count_vuln "$FINDINGS_DIR/upload/verified_upload_pocs.txt")"
     echo "XSS (dalfox)         : $(count_vuln "$FINDINGS_DIR/xss/dalfox_results.txt")"
     echo "XSS (XSStrike WAF)   : $(count_vuln "$FINDINGS_DIR/xss/xsstrike_results.txt")"
-    echo "CSP Missing          : $(count_vuln "$FINDINGS_DIR/xss/csp_missing.txt")"
-    echo "CSP Weak             : $(count_vuln "$FINDINGS_DIR/xss/csp_weak.txt")"
+    echo "CSP Missing          : $(count_vuln "$FINDINGS_DIR/misconfig/csp_missing.txt")"
+    echo "CSP Weak             : $(count_vuln "$FINDINGS_DIR/misconfig/csp_weak.txt")"
     echo "SSTI Confirmed       : $(count_vuln "$FINDINGS_DIR/ssti/ssti_candidates.txt")"
     echo "MFA Bypass Findings  : $(count_vuln "$FINDINGS_DIR/mfa/findings.txt")"
     echo "SAML/SSO Findings    : $(count_vuln "$FINDINGS_DIR/saml/findings.txt")"

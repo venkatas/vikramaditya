@@ -86,6 +86,7 @@ BREW_TOOLS=(
     "trufflehog"
     "gitleaks"
     "whatweb"
+    "feroxbuster"
 )
 
 echo ""
@@ -392,7 +393,7 @@ echo "============================================="
 echo "[*] Installation Verification"
 echo "============================================="
 
-ALL_TOOLS=(subfinder httpx nuclei ffuf nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss)
+ALL_TOOLS=(subfinder httpx nuclei ffuf feroxbuster nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss)
 INSTALLED=0
 MISSING=0
 

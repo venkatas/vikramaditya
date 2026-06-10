@@ -3,16 +3,17 @@ from __future__ import annotations
 
 """
 Brain — Multi-Provider LLM Reasoning Layer for VAPT
-Supports: Ollama (local), MLX (Apple Silicon), Claude API, OpenAI, Grok (xAI)
+Supports: Ollama (local), MLX (Apple Silicon), Claude API, OpenAI, Grok (xAI), Gemini (Google)
 
 Provider selection (in order of precedence):
-  1. BRAIN_PROVIDER env var  (ollama | mlx | claude | openai | grok)
+  1. BRAIN_PROVIDER env var  (ollama | mlx | claude | openai | grok | gemini)
   2. Auto-detect: uses first provider whose API key / server is available
 
 API keys (env vars):
   ANTHROPIC_API_KEY   — Claude (claude-opus-4-6, claude-sonnet-4-6, etc.)
   OPENAI_API_KEY      — OpenAI (gpt-4o, o1, etc.)
   XAI_API_KEY         — Grok (grok-2-latest, grok-3-mini, etc.)
+  GEMINI_API_KEY      — Gemini (Google AI Studio; gemini-3.5-flash, gemini-3.1-pro, etc.)
   OLLAMA_HOST         — Ollama base URL (default: http://localhost:11434)
   MLX_MODEL           — MLX model path (default: mlx-community/Qwen2.5-14B-Instruct-4bit)
 
@@ -78,6 +79,19 @@ except ImportError:
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MLX_DEFAULT_MODEL = os.environ.get("MLX_MODEL", "mlx-community/Qwen2.5-14B-Instruct-4bit")
 
+
+def _redact_secret(text) -> str:
+    """Scrub bearer tokens / API keys from a string before logging.
+
+    ``requests`` header-validation errors can echo the Authorization header
+    verbatim (``Bearer <key>``); never let a key reach stdout/logs.
+    """
+    s = str(text)
+    s = re.sub(r'(?i)(bearer\s+)\S+', r'\1***', s)
+    s = re.sub(r'(?i)(x-api-key["\']?\s*[:=]?\s*["\']?)\S+', r'\1***', s)
+    return s
+
+
 # ── Multi-provider LLM client ──────────────────────────────────────────────────
 # Wraps Ollama, Claude, OpenAI, Grok behind a single .chat() interface.
 
@@ -91,13 +105,14 @@ class LLMClient:
         reply  = client.chat(model, system_prompt, user_prompt, max_tokens=2000)
     """
 
-    PROVIDER_PRIORITY = ["ollama", "mlx", "claude", "openai", "grok"]
+    PROVIDER_PRIORITY = ["ollama", "mlx", "claude", "openai", "grok", "gemini"]
 
     # Default models per provider
     DEFAULT_MODELS = {
         "claude":  "claude-sonnet-4-6",
         "openai":  "gpt-4o",
         "grok":    "grok-2-latest",
+        "gemini":  "gemini-3.5-flash",
         "ollama":  None,   # resolved dynamically
         "mlx":     None,   # resolved from MLX_MODEL env var or default
     }
@@ -124,6 +139,8 @@ class LLMClient:
             key_providers.append("openai")
         if os.environ.get("XAI_API_KEY"):
             key_providers.append("grok")
+        if os.environ.get("GEMINI_API_KEY"):
+            key_providers.append("gemini")
         local_providers = [p for p in self.PROVIDER_PRIORITY if p not in key_providers]
         ordered = key_providers + local_providers
 
@@ -204,6 +221,21 @@ class LLMClient:
             self.available   = True
             self.description = "Grok API (xAI)"
 
+        elif provider == "gemini":
+            # Google Gemini via its OpenAI-compatible endpoint — reuses the
+            # OpenAI chat path. Base URL has NO trailing slash so the shared
+            # f"{base}/chat/completions" join matches OpenAI/Grok exactly.
+            key = os.environ.get("GEMINI_API_KEY", "")
+            if not key:
+                return
+            import requests
+            self._http = requests.Session()
+            self._http.headers.update({"Authorization": f"Bearer {key}",
+                                       "Content-Type": "application/json"})
+            self._gemini_base = "https://generativelanguage.googleapis.com/v1beta/openai"
+            self.available    = True
+            self.description  = "Gemini API (Google AI Studio)"
+
     def chat(self, model: str | None, system: str, user: str,
              max_tokens: int = 4000, temperature: float = 0.1) -> str:
         """Send a chat request; return the assistant reply as a string."""
@@ -216,10 +248,10 @@ class LLMClient:
                 return self._chat_mlx(model, system, user, max_tokens, temperature)
             elif self.provider == "claude":
                 return self._chat_claude(model, system, user, max_tokens, temperature)
-            elif self.provider in ("openai", "grok"):
+            elif self.provider in ("openai", "grok", "gemini"):
                 return self._chat_openai_compat(model, system, user, max_tokens, temperature)
         except Exception as e:
-            print(f"{YELLOW}[Brain/{self.provider}] chat error: {e}{NC}", flush=True)
+            print(f"{YELLOW}[Brain/{self.provider}] chat error: {_redact_secret(e)}{NC}", flush=True)
             return ""
         return ""
 
@@ -267,9 +299,17 @@ class LLMClient:
         r.raise_for_status()
         return r.json()["content"][0]["text"].strip()
 
+    def _openai_compat_base(self) -> str:
+        """Resolve the OpenAI-compatible base URL for the active provider."""
+        if self.provider == "grok":
+            return self._grok_base
+        if self.provider == "gemini":
+            return self._gemini_base
+        return self._openai_base
+
     def _chat_openai_compat(self, model, system, user, max_tokens, temperature) -> str:
         import json as _json
-        base = self._grok_base if self.provider == "grok" else self._openai_base
+        base = self._openai_compat_base()
         m    = model or self.DEFAULT_MODELS[self.provider]
         body = {"model": m, "max_tokens": max_tokens, "temperature": temperature,
                 "messages": [{"role": "system", "content": system},
@@ -278,6 +318,62 @@ class LLMClient:
                             data=_json.dumps(body), timeout=120)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
+
+    def chat_messages(self, model: str | None, messages: list[dict],
+                      max_tokens: int = 4000, temperature: float = 0.1) -> str:
+        """Multi-turn chat using a full messages list (system/user/assistant).
+
+        The single-shot ``chat()`` only carries one system + one user turn; the
+        active exploit loop (brain_scanner.py) maintains a running conversation
+        and needs the whole history preserved. OpenAI-compatible providers
+        (openai/grok/gemini) and Ollama take a messages array natively; Claude
+        needs the system message split out; MLX is flattened to a prompt.
+        """
+        if not self.available:
+            return ""
+        try:
+            if self.provider == "ollama":
+                resp = self._ollama.chat(
+                    model=model, messages=messages,
+                    options={"num_predict": max_tokens, "temperature": temperature,
+                             "num_ctx": MAX_CTX})
+                return (resp.get("message", {}).get("content") or "").strip()
+
+            if self.provider == "mlx":
+                sys_txt = "\n".join(x["content"] for x in messages if x.get("role") == "system")
+                convo   = "\n".join(f'{x["role"]}: {x["content"]}'
+                                    for x in messages if x.get("role") != "system")
+                return self._chat_mlx(model, sys_txt, convo, max_tokens, temperature)
+
+            if self.provider == "claude":
+                import json as _json
+                m       = model or self.DEFAULT_MODELS["claude"]
+                sys_txt = "\n".join(x["content"] for x in messages if x.get("role") == "system")
+                convo   = [x for x in messages if x.get("role") != "system"]
+                if hasattr(self, "_anthropic_client"):
+                    resp = self._anthropic_client.messages.create(
+                        model=m, max_tokens=max_tokens, system=sys_txt, messages=convo)
+                    return resp.content[0].text.strip()
+                body = {"model": m, "max_tokens": max_tokens, "system": sys_txt,
+                        "messages": convo}
+                r = self._http.post("https://api.anthropic.com/v1/messages",
+                                    data=_json.dumps(body), timeout=120)
+                r.raise_for_status()
+                return r.json()["content"][0]["text"].strip()
+
+            # openai / grok / gemini — native messages array
+            import json as _json
+            base = self._openai_compat_base()
+            m    = model or self.DEFAULT_MODELS[self.provider]
+            body = {"model": m, "max_tokens": max_tokens, "temperature": temperature,
+                    "messages": messages}
+            r = self._http.post(f"{base}/chat/completions",
+                                data=_json.dumps(body), timeout=120)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"{YELLOW}[Brain/{self.provider}] chat_messages error: {_redact_secret(e)}{NC}", flush=True)
+            return ""
 
     def list_models(self) -> list[str]:
         """List available models for the current provider."""
@@ -300,6 +396,12 @@ class LLMClient:
             return ["gpt-4o", "gpt-4o-mini", "o1", "o3-mini"]
         elif self.provider == "grok":
             return ["grok-2-latest", "grok-3-mini", "grok-3"]
+        elif self.provider == "gemini":
+            # GA/stable first, then -preview codes (verified against
+            # https://ai.google.dev/gemini-api/docs/models). Pro/base-flash are
+            # preview-suffixed; using the bare name would 404 → empty responses.
+            return ["gemini-3.5-flash", "gemini-3.1-flash-lite",
+                    "gemini-3.1-pro-preview", "gemini-3-flash-preview"]
         return []
 
 # Model preference order — first available wins
@@ -308,14 +410,23 @@ class LLMClient:
 #     deepseek-r1:14b    T1=17.0s T2=31.5s  3.18 tok/s  Strong reasoning, slow, <think> blocks
 #     gemma4:26b         T1=16.1s T2=22.0s  0 tok/s     SILENT FAIL: eats num_predict on internal reasoning
 #                                                       (use only with num_predict>=2048)
-#   bugtraceai-apex / qwen3-coder-64k retained as deep-analysis tier when needed.
+# v9.23 — phi4:14b is now FIRST (the default narrator/analyst). It was benchmarked
+# #0 above yet the list still led with xploiter, an "uncensored exploit" finetune
+# that is WEIGHT-biased to assert vulns and fabricated findings on real runs
+# ("permissive CORS" on a 0-finding scan, "a real estate company in San Francisco").
+# phi4 also tops the Vectara hallucination leaderboard for local models (3.7%).
+# Validated on clientc-cat3.com (honest "no findings", zero fabrication). xploiter is
+# retained ONLY as an exploit-IDEATION fallback, never the default narrator.
 MODEL_PRIORITY = [
-    "phi4:14b",                  # ★ #0 v9.1.3 — fastest + most consistent JSON, no hidden thinking
-    "bugtraceai-apex",           # #1 — security-tuned, DPO on bug bounty reports, 0% refusal
-    "qwen3-coder-64k:latest",    # #2 — 64K context, best for code/JS analysis
-    "deepseek-r1:14b",           # #3 — strong chain-of-thought, use for deep reasoning
-    "vapt-qwen25:latest",        # #4 — custom 32B VAPT-tuned
-    "gemma4:26b",                # #5 — kept as fallback; needs num_predict>=2048 to avoid silent truncation
+    "phi4:14b",                      # ★ v9.23 DEFAULT — faithful narration/analysis, no hidden thinking
+    "qwen3:14b",                     # faithful long-context fallback (40K native ctx; run /no_think)
+    "bugtraceai-apex:latest",        # security DPO reasoning — deep-analysis tier
+    "xploiter/the-xploiter:latest",  # exploit-IDEATION only — hallucinates on faithful narration
+    "vapt-qwen25:latest",            # Custom 32B VAPT-tuned model
+    "aya-expanse:latest",            # Cohere Aya Expanse 8B (multilingual — weak for analysis)
+    "qwen3-coder-64k:latest",        # 64K context, best for code/JS analysis
+    "deepseek-r1:14b",               # strong chain-of-thought, use for deep reasoning
+    "gemma4:26b",                    # needs num_predict>=2048 to avoid silent truncation
     "vikramaditya-custom:latest",
     "vapt-model:latest",
     "qwen3-coder:30b",
@@ -324,7 +435,6 @@ MODEL_PRIORITY = [
     "qwen2.5-coder:32b",
     "qwen2.5:32b",
     "gemma4:e4b",
-    "qwen3:14b",
     "baron-llm:latest",
     "qwen3:8b",
     "mistral:7b-instruct-v0.3-q8_0",
@@ -345,12 +455,17 @@ MLX_MODEL_PRIORITY = [
 # 03 May 2026 bench: phi4:14b T1=4.3s vs baron-llm 17s — 4× faster, 100% valid JSON
 TRIAGE_MODEL_PRIORITY = [
     "phi4:14b",                  # ★ v9.1.3 — fastest triage, consistent JSON, no hidden thinking
+    "bugtraceai-apex:latest",       # Zero-refusal security DPO reasoning model
     "baron-llm:latest",          # BaronLLM — RLHF on offensive security data
+    "aya-expanse:latest",           # Cohere Aya Expanse 8B Multilingual flagship model
     "gemma4:e4b",                # Gemma 4 4B — fast triage with tool calling
     "vapt-qwen25:latest",        # custom VAPT-tuned fallback
     "vapt-model:latest",
     "qwen3:8b",
     "qwen3-coder-64k:latest",    # last resort — big model for triage if nothing else
+    # xploiter/the-xploiter is intentionally NOT in this list — it is WEIGHT-biased
+    # to assert/fabricate vulns (see MODEL_PRIORITY comment) and the 7-Question Gate
+    # is a faithful-evaluation task. It remains an exploit-IDEATION-only fallback.
 ]
 
 # Token limits — qwen3-coder-64k supports 64K context
@@ -415,6 +530,22 @@ When asked to analyze data:
 - Be decisive about cutting dead ends — wasted time means missed critical findings
 - Think about what a tired developer at 2am might have broken
 - Output the analysis and nothing else — no preamble, no disclaimers, no closing remarks"""
+
+
+# v9.23 — narration/description system prompt. BRAIN_SYSTEM above forbids caveats
+# and pushes the model to ASSERT findings, which is wrong for neutral phase
+# narration: with it, the model reported "permissive CORS" on a 0-finding scan and
+# invented "a real estate company in San Francisco". Used for descriptive narration
+# only — it permits (and requires) honest "no findings / unknown" answers.
+NARRATION_SYSTEM = """You are a penetration-testing assistant summarising tool output for an authorized VAPT engagement.
+You are DESCRIBING what the provided artifacts show — you are not hunting, guessing, or selling impact.
+
+ABSOLUTE RULES:
+- Describe ONLY what the provided Summary/Artifacts text actually states.
+- If the data shows no findings, empty files, or files=0, you MUST say the phase produced no signal. "No findings" is a correct, expected answer — never invent one to seem useful.
+- NEVER claim a vulnerability (CORS, SQLi, IDOR, SSRF, upload, etc.) unless a specific line in the provided text supports it. With only weak/ambiguous data, label it an UNVERIFIED hypothesis and name the missing evidence. A result file existing (files>0) does NOT mean a finding exists — these files are written even when empty.
+- NEVER state the target's industry, location, company type, or business purpose unless that exact fact appears in the artifact text. If unknown, say "business context unknown from recon data".
+- Do not add authorization disclaimers. Be concise and factual. Output only the requested summary — no preamble."""
 
 
 def _get_available_models() -> list[str]:
@@ -576,27 +707,45 @@ Summary:
 {summary or "(no summary provided)"}
 {phase_rules}
 
+Ground every statement in the Summary text above. If the Summary shows no
+findings, empty output, or only file counts (not actual findings), say the phase
+produced no signal — do NOT infer a vulnerability from a file existing. Do not
+guess the target's industry or location.
+
 Respond in 2 short bullets only:
-- whether the phase produced useful signal
+- whether the phase produced useful signal (say "no signal" if the summary shows none)
 - the immediate next best action
 
 Keep it under 80 words total."""
 
-        return self._stream(prompt, f"Phase Complete → {phase}", max_tokens=140)
+        # v9.23 — narration uses NARRATION_SYSTEM (honest "no findings" allowed) and
+        # low temperature, instead of the exploit-tuned BRAIN_SYSTEM that pushed the
+        # model to fabricate findings (e.g. "permissive CORS" on a 0-finding scan).
+        return self._stream(prompt, f"Phase Complete → {phase}",
+                            max_tokens=140, system=NARRATION_SYSTEM, temperature=0.1)
 
     # ── Internal streaming helper ──────────────────────────────────────────────
-    def _stream_fast(self, user_prompt: str, label: str, max_tokens: int = 1500) -> str:
+    def _stream_fast(self, user_prompt: str, label: str, max_tokens: int = 1500,
+                     system: str = None, temperature: float = 0.3) -> str:
         """Stream using the fast triage model (BaronLLM if installed)."""
         orig = self.model
         self.model = self.triage_model
-        result = self._stream(user_prompt, label, max_tokens)
+        result = self._stream(user_prompt, label, max_tokens, system=system,
+                              temperature=temperature)
         self.model = orig
         return result
 
-    def _stream(self, user_prompt: str, label: str, max_tokens: int = MAX_RESP) -> str:
-        """Call the active LLM provider, print response live (Ollama streams; cloud APIs print after)."""
+    def _stream(self, user_prompt: str, label: str, max_tokens: int = MAX_RESP,
+                system: str = None, temperature: float = 0.3) -> str:
+        """Call the active LLM provider, print response live (Ollama streams; cloud APIs print after).
+
+        v9.23 — ``system`` defaults to the exploit-tuned BRAIN_SYSTEM, but
+        descriptive narration passes NARRATION_SYSTEM so the model is allowed to
+        say "no findings" instead of being pushed to assert one.
+        """
         if not self.enabled:
             return ""
+        system = system or BRAIN_SYSTEM
 
         print(f"\n{MAGENTA}{BOLD}[BRAIN/{self._llm.provider.upper()}/{self.model}] {label}{NC}")
         print(f"{DIM}{'─'*60}{NC}")
@@ -608,13 +757,13 @@ Keep it under 80 words total."""
                 stream = self.client.chat(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": BRAIN_SYSTEM},
+                        {"role": "system", "content": system},
                         {"role": "user",   "content": user_prompt},
                     ],
                     stream=True,
                     options={
                         "num_predict": max_tokens,
-                        "temperature": 0.3,
+                        "temperature": temperature,
                         "top_p": 0.9,
                         "num_ctx": MAX_CTX,
                     },
@@ -626,8 +775,8 @@ Keep it under 80 words total."""
             else:
                 # Non-streaming path for cloud providers
                 full_text = self._llm.chat(
-                    self.model, BRAIN_SYSTEM, user_prompt,
-                    max_tokens=max_tokens, temperature=0.3,
+                    self.model, system, user_prompt,
+                    max_tokens=max_tokens, temperature=temperature,
                 )
                 print(full_text, flush=True)
 
@@ -819,6 +968,13 @@ Keep it under 80 words total."""
                 candidate_files = []
                 for pattern in ("RCE_CONFIRMED*.txt", "JBOSS_EXPOSED*.txt", "JBOSS_DEFAULTCREDS*.txt", "nuclei_rce.txt", "nuclei_tomcat_cve.txt"):
                     candidate_files.extend(sorted(cat_dir.glob(pattern)))
+            elif cat_dir.name == "sqlmap":
+                # Mirror interpret_scan: the sqlmap dir holds INPUT artifacts
+                # (candidates.txt = FUZZ targets to feed sqlmap, target.txt =
+                # sqlmap's own run config) alongside the real output. Globbing
+                # *.txt harvested those candidates as bogus '[sqlmap]' findings.
+                # Only confirmed-result artifacts are real findings.
+                candidate_files = sorted(cat_dir.glob("sqlmap_results.txt")) + sorted(cat_dir.glob("results-*.csv"))
             else:
                 candidate_files = sorted(cat_dir.glob("*.txt"))
             for fpath in candidate_files:
@@ -854,6 +1010,44 @@ Keep it under 80 words total."""
         add_section("IDOR Candidates", findings_path / "idor" / "idor_candidates.txt", 1400)
         for rce_file in sorted((findings_path / "rce").glob("RCE_CONFIRMED*.txt"))[:3]:
             add_section(f"Confirmed RCE Artifact: {rce_file.name}", rce_file, 1600)
+
+        # Email authentication posture (email_auth/findings.json). The reporter
+        # ingests this JSON list (Method 1d) and emits SPF/DKIM/DMARC/DNSSEC/
+        # MTA-STS findings, but the brain's evidence set previously omitted it —
+        # so the brain emitted NO_REPORTS while the reporter shipped findings.
+        # Render the confirmed items as text so the brain sees the same evidence.
+        email_auth_path = findings_path / "email_auth" / "findings.json"
+        if email_auth_path.exists():
+            try:
+                ea_data = json.loads(email_auth_path.read_text(errors="ignore"))
+            except (ValueError, OSError):
+                ea_data = None
+            if isinstance(ea_data, list):
+                ea_lines: list[str] = []
+                for item in ea_data:
+                    if not isinstance(item, dict):
+                        continue
+                    sev = str(item.get("severity", "")).strip()
+                    title = str(item.get("title", "")).strip()
+                    endpoint = str(item.get("endpoint", "")).strip()
+                    notes = str(item.get("notes", "")).strip()
+                    parts = []
+                    if sev:
+                        parts.append(f"[{sev.upper()}]")
+                    if title:
+                        parts.append(title)
+                    header = " ".join(parts)
+                    line = header
+                    if endpoint:
+                        line += f"\n  endpoint: {endpoint}"
+                    if notes:
+                        line += f"\n  {notes}"
+                    if line.strip():
+                        ea_lines.append(line)
+                if ea_lines:
+                    evidence_sections.append(
+                        "## Email Authentication Posture\n" + "\n\n".join(ea_lines)[:2000]
+                    )
 
         if evidence_sections:
             add_section("Scan Summary", findings_path / "summary.txt", 1800)
@@ -919,6 +1113,173 @@ Keep it under 80 words total."""
             return "NO_REPORTS"
 
         return "\n\n---\n\n".join(kept_sections)
+
+    @staticmethod
+    def _append_live_host_grounding(analysis_text: str, live_hosts: list[str]) -> str:
+        """Reconcile recon prose with on-disk live-host evidence.
+
+        httpx-confirmed live hosts are ground truth. When the model claims "No
+        subdomains / None identified" (or similar) but live hosts exist, append a
+        deterministic correction listing the confirmed hosts so the saved
+        analysis can never assert "none" against real evidence. No-op when there
+        are no live hosts (preserving the model's output verbatim).
+        """
+        text = analysis_text or ""
+        if not live_hosts:
+            return text
+        lower = text.lower()
+        # The model claimed nothing was found anywhere near the host/subdomain
+        # discussion. Detect the common "none" assertions case-insensitively.
+        denial_markers = (
+            "no subdomain", "none identified", "no live host",
+            "no live subdomain", "none found", "no hosts identified",
+        )
+        host_block = "\n".join(f"- {h}" for h in live_hosts)
+        footer = (
+            "\n\n## Confirmed Live Hosts (httpx — ground truth)\n"
+            f"{len(live_hosts)} live host(s) were confirmed by httpx and MUST be "
+            "treated as in-scope attack surface regardless of any 'none "
+            "identified' statement above:\n"
+            f"{host_block}\n"
+        )
+        if any(marker in lower for marker in denial_markers):
+            footer = (
+                "\n\n## Correction — Live Hosts DO Exist\n"
+                "The analysis above states no subdomains/live hosts were found, "
+                "but that contradicts the httpx recon data. The following live "
+                "host(s) are confirmed and in-scope:\n"
+                f"{host_block}\n"
+            )
+        return text.rstrip() + footer
+
+    @staticmethod
+    def _q6_consistency_note(gate_text: str) -> str:
+        """Deterministic reasoning->answer consistency check for gate Q6.
+
+        Q6 ('Is this finding ABSENT from the always-rejected list?') is a
+        positive question, but local models routinely flip its polarity: they
+        answer 'NO' while their own one-line reasoning says the finding is *not*
+        on the list (which means the answer should be 'YES'). This is pure-text,
+        side-effect-free: it returns a human-readable note when the stated YES/NO
+        answer contradicts the reasoning, else "" when consistent or unparseable.
+        """
+        text = gate_text or ""
+        # Capture the Q6 answer token and its inline reasoning. Tolerate bold/
+        # whitespace and an optional dash-led reasoning continuation on the next
+        # line (the format the model actually emits).
+        m = re.search(
+            r"(?im)^\s*\**\s*q6\s*\**\s*[:.\-]?\s*\**\s*(YES|NO)\b(.*?)"
+            r"(?=^\s*\**\s*q7\b|\Z)",
+            text,
+            re.DOTALL,
+        )
+        if not m:
+            return ""
+        answer = m.group(1).upper()
+        reasoning = (m.group(2) or "").lower()
+        # Phrases asserting the finding is NOT on the rejected list -> expect YES.
+        not_on_list = any(
+            phrase in reasoning
+            for phrase in (
+                "not listed", "not on the", "not in the", "not part of",
+                "does not match", "doesn't match", "not match", "not a member",
+                "is absent", "absent from", "not among", "not present",
+                "not one of", "no match",
+            )
+        )
+        # Phrases asserting the finding IS on the rejected list -> expect NO.
+        on_list = any(
+            phrase in reasoning
+            for phrase in (
+                "is listed", "is on the", "is in the", "appears on",
+                "matches the", "matches one", "found on the list",
+                "part of the always-rejected", "on the always-rejected",
+            )
+        )
+        if not_on_list and not on_list and answer == "NO":
+            return ("[Q6 consistency] Reasoning says the finding is NOT on the "
+                    "always-rejected list, so Q6 should be YES (not NO). "
+                    "Treating Q6 as YES.")
+        if on_list and not not_on_list and answer == "YES":
+            return ("[Q6 consistency] Reasoning says the finding IS on the "
+                    "always-rejected list, so Q6 should be NO (not YES). "
+                    "Treating Q6 as NO.")
+        return ""
+
+    @staticmethod
+    def _parse_gate_answer(gate_text: str, q: int) -> str | None:
+        """Return 'YES'/'NO' for gate question ``q`` (Q1..Q7), else None.
+
+        Mirrors the bold/whitespace/dash tolerance of _q6_consistency_note so the
+        deterministic verdict re-derivation reads the same tokens the operator
+        sees in gate_workings.md.
+        """
+        m = re.search(
+            rf"(?im)^\s*\**\s*q{q}\s*\**\s*[:.\-]?\s*\**\s*(YES|NO)\b",
+            gate_text or "",
+        )
+        return m.group(1).upper() if m else None
+
+    @staticmethod
+    def _apply_q6_correction(verdict: str, gate_text: str, q6_note: str) -> str:
+        """Re-derive the returned verdict when the Q6 polarity post-check fired.
+
+        Before v9.23.1 the Q6 contradiction only appended a 'Treating Q6 as …'
+        note to gate_workings.md; the returned verdict still reflected the
+        model's *flipped* Q6, so triage acted on the uncorrected reading while
+        the audit log claimed a correction. This makes the correction real:
+
+          - Corrected Q6 = NO  (finding IS on the always-rejected list): Q6 is a
+            hard gate, so any SUBMIT/CHAIN is downgraded to DROP.
+          - Corrected Q6 = YES (finding is NOT on the list): a DROP that was
+            driven by the spurious Q6=NO is lifted. We do not blindly upgrade to
+            SUBMIT — Q6=YES is necessary, not sufficient — so we re-read the
+            other gate answers: all of Q1-Q5 & Q7 = YES -> SUBMIT, otherwise
+            CHAIN (viable, no longer auto-rejected, but not a clean pass).
+
+        Returns the (possibly unchanged) verdict. Unknown/unparseable verdicts
+        and empty notes are passed through untouched.
+        """
+        if not q6_note or verdict not in ("SUBMIT", "CHAIN", "DROP"):
+            return verdict
+        # Corrected Q6 = NO -> finding is on the always-rejected list -> DROP.
+        if "should be NO" in q6_note:
+            return "DROP" if verdict in ("SUBMIT", "CHAIN") else verdict
+        # Corrected Q6 = YES -> not auto-rejected; only relevant if Q6 had
+        # forced a DROP. Re-derive from the remaining answers.
+        if "should be YES" in q6_note and verdict == "DROP":
+            others = [Brain._parse_gate_answer(gate_text, q)
+                      for q in (1, 2, 3, 4, 5, 7)]
+            if others and all(a == "YES" for a in others):
+                return "SUBMIT"
+            return "CHAIN"
+        return verdict
+
+    @staticmethod
+    def _extract_shell_from_markdown(text: str) -> str:
+        """Pull a runnable bash body out of an LLM response.
+
+        When the model wraps the script in a ```bash fenced block (and then,
+        despite instructions, appends trailing prose AFTER the closing fence),
+        the old "strip leading fence + strip trailing fence at end-of-string"
+        approach left that trailing prose in the body — bash then tried to run
+        it as commands ("command not found"). Extract ONLY the content of the
+        first fenced code block when a fence is present; otherwise return the
+        text unchanged (no fence to key on).
+        """
+        raw = (text or "").strip()
+        # First complete ```[lang] ... ``` block. DOTALL so the body may span
+        # lines; non-greedy so we stop at the first closing fence.
+        m = re.search(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n(.*?)\r?\n?```",
+                      raw, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        # No paired fence — fall back to the legacy line-anchored strip so an
+        # unterminated opening fence (or a stray closing fence) is still removed.
+        body = re.sub(r"^```(?:[A-Za-z0-9_+-]*)?[ \t]*\r?\n?", "", raw,
+                      flags=re.MULTILINE)
+        body = re.sub(r"\r?\n?```[ \t]*$", "", body.strip(), flags=re.MULTILINE)
+        return body.strip()
 
     @staticmethod
     def _sanitize_exploit_command(cmd: str) -> tuple[str | None, str]:
@@ -1077,9 +1438,31 @@ Be specific. Reference actual hostnames/endpoints/params from the data above.
 CRITICAL GROUNDING RULE: You MUST only reference hosts, paths, and parameters that
 appear verbatim in the data sections above. Do NOT invent, guess, or fabricate
 endpoints, URLs, APIs, credentials, or findings. If the data shows "(none)" or
-"(empty)", state that explicitly and do not substitute hypothetical examples."""
+"(empty)", state that explicitly and do not substitute hypothetical examples.
+- Do NOT state the target's industry, location, company type, or business purpose
+  unless that exact fact appears in the data above. If unknown, say so.
+- Only list a vulnerability class as a priority if a specific data line supports it;
+  otherwise label it an UNVERIFIED hypothesis and name the missing evidence."""
 
-        result = self._stream(prompt, f"Recon Analysis → {target}", MAX_RESP)
+        result = self._stream(prompt, f"Recon Analysis → {target}", MAX_RESP, temperature=0.15)
+
+        # Grounding correction: httpx confirmed live hosts (e.g. mssql.*), yet the
+        # model's prose sometimes asserts "No subdomains / None identified". Never
+        # let a "none" claim override on-disk live-host evidence — append the
+        # confirmed list (deterministic, from live/urls.txt) so the saved analysis
+        # is self-consistent with the recon data.
+        live_hosts: list[str] = []
+        live_urls_path = recon_path / "live" / "urls.txt"
+        if live_urls_path.exists():
+            try:
+                for raw in live_urls_path.read_text(errors="ignore").splitlines():
+                    host = urlsplit(raw.strip()).netloc or raw.strip()
+                    if host and host not in live_hosts:
+                        live_hosts.append(host)
+            except OSError:
+                live_hosts = []
+        result = self._append_live_host_grounding(result, live_hosts)
+
         self._save_analysis(recon_dir, "01_recon_analysis.md", result)
         return result
 
@@ -1094,17 +1477,33 @@ endpoints, URLs, APIs, credentials, or findings. If the data shows "(none)" or
         target        = self._target_from_artifact_dir(findings_dir)
 
         sections = {}
+        # Mirror _collect_candidate_findings's allowed set — rce/sqlmap/cms have
+        # their own engines that write to findings/<cat>/ (not the top-level
+        # summary.txt), so omitting them here made confirmed RCE/SQLi invisible.
         categories = [
             "xss", "sqli", "lfi", "ssti", "ssrf", "cves", "cors",
             "graphql", "jwt", "smuggling", "takeover", "misconfig",
             "exposure", "redirects", "idor", "auth_bypass", "cloud",
+            "cms", "rce", "sqlmap",
         ]
         for cat in categories:
             cat_dir = findings_path / cat
             if not cat_dir.exists():
                 continue
+            # rce/ holds a noisy summary.txt and not-confirmed candidate files;
+            # only surface the confirmed-evidence artifacts like the collectors do.
+            if cat == "rce":
+                cat_files = []
+                for pattern in ("RCE_CONFIRMED*.txt", "JBOSS_EXPOSED*.txt",
+                                "JBOSS_DEFAULTCREDS*.txt", "nuclei_rce.txt",
+                                "nuclei_tomcat_cve.txt"):
+                    cat_files.extend(sorted(cat_dir.glob(pattern)))
+            elif cat == "sqlmap":
+                cat_files = sorted(cat_dir.glob("sqlmap_results.txt")) + sorted(cat_dir.glob("results-*.csv"))
+            else:
+                cat_files = sorted(cat_dir.glob("*.txt"))
             cat_content = []
-            for f in cat_dir.glob("*.txt"):
+            for f in cat_files:
                 content = f.read_text(errors="ignore").strip()
                 if content:
                     cat_content.append(f"=== {f.name} ===\n{content[:1500]}")
@@ -1378,7 +1777,11 @@ Q2: Does it affect a real user who took NO unusual actions?
 Q3: Is the impact concrete — money, PII, ATO, or RCE?
 Q4: Is this in scope per the engagement agreement?
 Q5: Is this NOT a known/duplicate finding (common on this tech stack)?
-Q6: Is this NOT on the always-rejected list?
+Q6: Is this finding ABSENT from the always-rejected list below?
+    POLARITY (read carefully — this is a positive question, not a trap):
+      - Answer YES  = the finding is NOT on the rejected list (good, keep going).
+      - Answer NO   = the finding IS on the rejected list (it is rejected).
+    So if you cannot find the finding on the list, the answer is YES.
 Q7: Would a triager say "yes, that's a real bug"?
 
 ALWAYS-REJECTED LIST: Missing CSP/HSTS/security headers, missing SPF/DKIM, GraphQL introspection alone,
@@ -1399,28 +1802,55 @@ VERDICT REASONING: Why this verdict in 2-3 sentences
 IF CHAIN: What other finding would elevate this to SUBMIT?
 IF DROP: What would need to change for this to become viable?"""
 
-        result = self._stream_fast(prompt, "Finding Triage", 1000)
+        # Markdown/whitespace-tolerant verdict parse. Local models frequently bold
+        # the verdict ('**VERDICT:** SUBMIT', 'VERDICT: **SUBMIT**'), indent it, or
+        # prefix it ('Final VERDICT: DROP'). Stay line-scoped so we don't match the
+        # VERDICT REASONING / IF DROP prose further down the response.
+        def _parse_verdict(text: str) -> str:
+            for line in (text or "").splitlines():
+                m = re.match(r"\s*\**\s*(?:final\s+)?verdict\s*\**\s*:\s*\**\s*(SUBMIT|CHAIN|DROP)\b",
+                             line, re.IGNORECASE)
+                if m:
+                    return m.group(1).upper()
+            return "UNKNOWN"
+
+        # v9.23 — the 7-Question Gate is a faithful-evaluation task, not an
+        # exploit-assertion one: pin NARRATION_SYSTEM + low temperature so a
+        # hallucination-biased triage model cannot tilt the gate toward SUBMIT.
+        result = self._stream_fast(prompt, "Finding Triage", 1000,
+                                   system=NARRATION_SYSTEM, temperature=0.1)
+        verdict = _parse_verdict(result)
 
         # v7.1.4 — baron-llm cold-start cosmetic bug: first invocation
         # sometimes returns a generic task description ("You have been tasked
         # with validating the quality of a penetration test report…") instead
-        # of running the gate. Detect the miss (no VERDICT: token anywhere)
-        # and retry once with a stricter prompt that forbids meta-narration.
-        if "VERDICT:" not in (result or ""):
+        # of running the gate. Retry once when no parseable verdict line exists
+        # (keying on the parse result, not the bare 'VERDICT:' substring — a
+        # bolded '**VERDICT:**' contains the substring yet yields no verdict).
+        if verdict == "UNKNOWN":
             strict_prompt = (
                 "DO NOT describe the task. DO NOT summarise the finding in prose.\n"
                 "Start your response with the literal token 'VERDICT:'.\n\n"
                 + prompt
             )
-            result = self._stream_fast(strict_prompt, "Finding Triage (retry)", 1000)
+            result = self._stream_fast(strict_prompt, "Finding Triage (retry)", 1000,
+                                       system=NARRATION_SYSTEM, temperature=0.1)
+            verdict = _parse_verdict(result)
 
-        verdict = "UNKNOWN"
-        for line in result.splitlines():
-            if line.startswith("VERDICT:"):
-                v = line.split(":", 1)[1].strip().split()[0]
-                if v in ("SUBMIT", "CHAIN", "DROP"):
-                    verdict = v
-                break
+        # Deterministic Q6 polarity post-check. Q6 is a double-negative-prone
+        # question; local models flip its answer vs. their own reasoning between
+        # near-identical findings. Flag the contradiction so the persisted
+        # worksheet records the corrected reading instead of silent nondeterminism.
+        q6_note = self._q6_consistency_note(result)
+
+        # v9.23.1 — the note above used to be cosmetic: it landed in
+        # gate_workings.md while the returned verdict still reflected the model's
+        # *flipped* Q6 answer, so triage acted on the uncorrected reading. Now
+        # actually re-derive the verdict so the caller's decision matches the
+        # corrected Q6 (not just the audit log).
+        corrected = self._apply_q6_correction(verdict, result, q6_note)
+        verdict_changed = corrected != verdict
+        verdict = corrected
 
         # v9.2.0 (P2-10) — append every gate cycle to brain/gate_workings.md
         # so the operator can audit phi4:14b's intermediate Q1-Q7 reasoning
@@ -1433,7 +1863,12 @@ IF DROP: What would need to change for this to become viable?"""
                 with open(wf, "a") as fh:
                     fh.write(f"\n## {datetime.now().isoformat(timespec='seconds')} — VERDICT={verdict}\n")
                     fh.write(f"FINDING: {finding_description[:400]}\n\n")
-                    fh.write(result.strip() + "\n\n---\n")
+                    fh.write(result.strip() + "\n")
+                    if q6_note:
+                        fh.write(f"\n{q6_note}\n")
+                        if verdict_changed:
+                            fh.write(f"[Q6 correction applied] verdict re-derived to {verdict}.\n")
+                    fh.write("\n---\n")
         except Exception:
             pass
 
@@ -2096,6 +2531,14 @@ Based on this:
         httpx_sample     = self._read_file_sample(str(httpx_file), 3000)
         priority_sample  = self._read_file_sample(str(priority_file), 2000)
 
+        # v9.23 — give the model the REAL installed tool paths so it stops emitting
+        # /path/to/ placeholders and fake flags.
+        import shutil as _sh
+        _tools = {t: _sh.which(t) for t in
+                  ("nuclei", "dalfox", "sqlmap", "ffuf", "gau", "katana", "curl", "httpx")}
+        tool_lines = "\n".join(f"- {t}  (installed)" for t, p in _tools.items() if p) \
+                     or "- use bare binary names on $PATH"
+
         prompt = f"""Based on recon of {target}, generate a targeted scan plan.
 
 ## Recon Analysis
@@ -2107,31 +2550,55 @@ Based on this:
 ## Priority hosts
 {priority_sample or "(none)"}
 
+## Installed tools (call these by bare name — they are on $PATH)
+{tool_lines}
+
 ---
 
 Output a bash script (#!/bin/bash) with 8–15 targeted commands.
 Rules:
-- Use real tool names: nuclei, dalfox, sqlmap, ffuf, gau, katana, curl
-- Each command must be targeted at a specific host or endpoint from the data above
-- Include flags/payloads appropriate for the tech stack detected
-- Comment each command with what it is testing
-- Wrap commands in reasonable timeouts (timeout 120 cmd)
-- Output ONLY the bash script, nothing else."""
+- Use the bare tool names above (e.g. `nuclei`, `sqlmap`). NEVER use /path/to/ or any
+  placeholder path. If a path is unknown, use the bare binary name.
+- Use ONLY hosts/URLs that appear verbatim in the data above — never invent targets.
+- Each command targets a specific host or endpoint from the data above.
+- Include flags/payloads appropriate for the detected tech stack.
+- Comment each command with what it is testing.
+- Wrap commands in reasonable timeouts (timeout 120 cmd).
+- Output ONLY the bash script — no prose, no explanations, no ethics disclaimers."""
 
-        result = self._stream(prompt, f"Scan Plan → {target}", MAX_RESP)
+        result = self._stream(prompt, f"Scan Plan → {target}", MAX_RESP, temperature=0.15)
 
         # Save as executable script
         plan_path = recon_path / "brain" / "scan_plan.sh"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
-        # Strip markdown fences if LLM wrapped it
-        import re
-        code = re.sub(r"^```(?:bash|sh)?\s*\n?", "", result.strip(), flags=re.MULTILINE)
-        code = re.sub(r"\n?```\s*$", "", code.strip(), flags=re.MULTILINE)
+        # Strip markdown fences if LLM wrapped it. Extract ONLY the fenced code
+        # block so trailing post-fence prose can't leak into the bash body and
+        # blow up at runtime with "command not found".
+        code = self._extract_shell_from_markdown(result)
+        # v9.23 — drop any leftover placeholder lines so the saved script never ships
+        # /path/to/ junk, then syntax-check (bash -n) before marking it executable.
+        # NOTE: bash -n only catches gross syntax errors — it does NOT validate tool
+        # flags, hosts, or stray prose, all of which parse as valid commands.
+        code = "\n".join(ln for ln in code.splitlines() if "/path/to/" not in ln).strip()
         if not code.startswith("#!"):
             code = "#!/bin/bash\n" + code
+        import subprocess as _sp
+        try:
+            _chk = _sp.run(["bash", "-n", "-c", code], capture_output=True, text=True, timeout=15)
+            valid = (_chk.returncode == 0)
+        except Exception:
+            valid = False
+        if not valid:
+            code = ("#!/bin/bash\n# ⚠ SCAN PLAN FAILED bash -n SYNTAX CHECK — the model "
+                    "produced unparseable shell. Review manually before running.\n\n"
+                    + code)
         plan_path.write_text(code)
-        plan_path.chmod(0o755)
-        print(f"{GREEN}[Brain] Scan plan saved only → {plan_path}  (not executed automatically){NC}")
+        if valid:
+            plan_path.chmod(0o755)
+        status_note = ("syntax-checked only (bash -n) — review before running"
+                       if valid else "FAILED bash -n syntax check — not marked executable")
+        print(f"{GREEN}[Brain] Scan plan saved only → {plan_path} "
+              f"({status_note}; not executed automatically){NC}")
         return result
 
     def post_scan_hook(self, findings_dir: str, recon_dir: str = "") -> None:
@@ -2144,9 +2611,16 @@ Rules:
         if not self.enabled:
             return
         interp = self.interpret_scan(findings_dir)
-        # interpret_scan returns "" when findings dirs are empty — skip
-        # downstream phases entirely to avoid fabricated chains and reports.
-        if not interp or "no findings" in interp.lower()[:80]:
+        # Gate the downstream pipeline on deterministic on-disk evidence — the same
+        # collectors the chain/triage/report phases consume — not on a substring of
+        # free-form model prose. The old `'no findings' in interp.lower()[:80]` check
+        # could (a) fail to short-circuit a truly empty scan when the model prepended
+        # narration, and (b) wrongly drop a real RCE when the model opened with
+        # "No findings of XSS, but a critical RCE exists…". Only skip when BOTH the
+        # text verdict AND the structured collectors are empty.
+        has_candidates = bool(self._collect_candidate_findings(findings_dir))
+        has_report_evidence = bool(self._build_report_evidence(findings_dir, recon_dir).strip())
+        if (not interp or "no findings" in interp.lower()[:80]) and not has_candidates and not has_report_evidence:
             print(f"{YELLOW}[Brain] No scan findings — skipping chain/report phases{NC}")
             return
         self.build_chains(findings_dir)

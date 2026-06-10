@@ -1,5 +1,483 @@
 # Changelog
 
+## v10.3.3 — ACTUALLY fix macOS subprocess SIGSEGV (fork → posix_spawn) (2026-06-09)
+
+The v10.3.2 fix below was a **misdiagnosis** — the `rc=-11` (SIGSEGV at 0.0s)
+crashes persisted. A re-run crashed **three** phases identically: `SQLMAP`,
+`CVE HUNT`, **and the final `REPORTS` phase** (so the run produced **0 reports**).
+
+- **Real root cause (from the macOS crash report):** the faulting stack is
+  `subprocess.Popen → _posixsubprocess.do_fork_exec → fork() →
+  _pthread_atfork_child_handlers → Network.nw_settings_child_has_forked() →
+  os_log → _os_log_preferences_refresh` = `EXC_BAD_ACCESS`. hunt.py's parent
+  loads Apple's **Network.framework** (in-process HTTP/TLS; on hosts with a
+  VPN/endpoint-filter NetworkExtension it also pulls in `NEFlowDirector`), which
+  registers a **non-fork-safe `pthread_atfork` child handler**. `fork()` runs that
+  handler in the child *before* `exec()`, and it SIGSEGVs.
+- **Why v10.3.2 didn't help:** both `preexec_fn=os.setsid` **and**
+  `start_new_session=True` force CPython onto the **`fork()+exec`** path. The crash
+  is in the C-library atfork handler that `fork()` runs — nothing Python does after
+  fork matters. (It was *not* the CoreFoundation/ObjC issue v10.3.2 guessed.)
+- **Fix:** new `_PosixSpawnProc` (a small `Popen` work-alike) + `_fork_safe_spawn()`
+  launch via **`os.posix_spawn(..., setsid=True)`**, which **does not run
+  `pthread_atfork` handlers** and so cannot hit the crash, while `setsid=True` keeps
+  the child a session/group leader so the watchdog's
+  `os.killpg(os.getpgid(pid), SIGKILL)` still tears down the whole tree. Routed into
+  `run_cmd` (watch + non-watch branches), `run_live`, and `run_cmd_args`. Falls back
+  to the original fork-based `Popen` when `os.posix_spawn` is unavailable
+  (Linux/CI/old interpreters unchanged).
+- **Deterministic regression test:** `tests/test_posix_spawn_fork_safety.py`
+  registers a hostile `abort()` `pthread_atfork` child handler (standing in for
+  Apple's crashing handler) in an isolated subprocess and asserts each launcher
+  survives — proving the launch no longer runs atfork handlers. Fails on the fork
+  path, passes on posix_spawn.
+
+## v10.3.2 — fix macOS subprocess SIGSEGV (preexec_fn → start_new_session) (2026-06-08)
+
+> **Superseded by v10.3.3 — this diagnosis was wrong.** `start_new_session=True`
+> still uses `fork()`, so the SIGSEGV persisted. See v10.3.3 for the real cause
+> (Apple Network.framework `pthread_atfork` handler) and fix (`posix_spawn`).
+
+External scan tools launched late in a run could die instantly with `rc=-11`
+(SIGSEGV) — observed live: `sqlmap` and `cve.py` both crashed at 0.0s during a
+16-host scan, though both run fine standalone.
+
+- **Root cause:** the subprocess launchers used `subprocess.Popen(...,
+  preexec_fn=os.setsid)`. `preexec_fn` runs Python in the child **after `fork()`
+  but before `exec()`** — which Python's docs warn is unsafe with threads. hunt.py
+  is heavily threaded (brain watchers, watchdogs, `ThreadPoolExecutor`), and on
+  macOS a forked child that touches the CoreFoundation/Objective-C runtime
+  SIGSEGVs; it's timing-dependent, so early launches survived but late ones
+  (sqlmap/cve hunt) crashed.
+- **Fix:** `preexec_fn=os.setsid` → **`start_new_session=True`** in `hunt.py`
+  (5×), `cve.py`, `fuzzer.py`, `oauth_tester.py`. It does the `setsid` inside the
+  C fork/exec path (no Python after fork) and still makes the child its own
+  session/process-group leader, so the watchdog's
+  `os.killpg(os.getpgid(pid), SIGKILL)` keeps working unchanged.
+- Regression guard: `tests/test_subprocess_fork_safety.py` (no `preexec_fn=
+  os.setsid` anywhere; launchers use `start_new_session`; killpg still works).
+
+## v10.3.1 — hard wall-clock deadline on web-app fingerprinting (anti-tarpit) (2026-06-08)
+
+Fixes a hang where a slow/tarpitting target wedges the whole tool at startup.
+
+- **`fingerprint_webapp` could hang forever.** It fires ~20 sequential HTTP
+  probes that each carry only a *per-request* `timeout=`. A trickle/tarpit
+  endpoint sends bytes slower than the read-timeout window, so requests' timeout
+  keeps resetting and never fires — a single probe wedges the whole scan
+  (observed live on `mins.clienta.com`: fingerprinting froze 9+ minutes with
+  zero progress). Per-request timeouts cannot stop that; only a total wall-clock
+  cap can.
+- **Fix — `fingerprint_webapp_bounded(url, deadline=FINGERPRINT_DEADLINE=45)`:**
+  runs `fingerprint_webapp` in a daemon thread sharing the result dict, joins with
+  the deadline, and on timeout returns a `copy.deepcopy` snapshot of whatever was
+  gathered (main-page tech/status are collected first, so they survive) with
+  `timed_out=True` — the scan always proceeds instead of hanging. Both call sites
+  now use it; `FINGERPRINT_DEADLINE` is env-overridable. A global
+  `socket.setdefaulttimeout()` was rejected as the fix because it would cut the
+  brain's long local-LLM reads.
+- **Tests:** `tests/test_fingerprint_deadline.py` (6, network-free). Codex-reviewed.
+
+## v10.3.0 — Google Gemini brain provider (analysis + active exploit loop) (2026-06-08)
+
+Wires Google Gemini into the multi-provider brain and routes the active
+LLM-driven exploit loop through it too, so an engagement can run on a cloud
+brain instead of (or alongside) local Ollama.
+
+- **`brain.py`** — new `gemini` provider via Gemini's OpenAI-compatible endpoint
+  (`https://generativelanguage.googleapis.com/v1beta/openai`, `Authorization:
+  Bearer $GEMINI_API_KEY`), reusing the existing OpenAI-compat chat path.
+  Registered in `PROVIDER_PRIORITY`, `DEFAULT_MODELS` (default **gemini-3.5-flash**,
+  the GA flash model), `list_models`, and key auto-detection (`GEMINI_API_KEY`).
+  New `chat_messages()` preserves full multi-turn history (openai/grok/gemini
+  native, ollama native, claude system-split, mlx flattened) — the exploit loop
+  keeps a running conversation that single-shot `chat()` would drop. New
+  `_redact_secret()` scrubs `Bearer …` / `x-api-key` from exception logs.
+- **`brain_scanner.py`** — `pick_model()` and `ask_brain()` are provider-aware:
+  cloud providers route through `LLMClient` (Ollama remains the default with its
+  repetition guards). A fail-fast availability gate plus a `MAX_EMPTY_STREAK=3`
+  abort stop a bad / over-quota key or invalid model from burning all 15
+  iterations on empty responses. The cached `LLMClient` is keyed to
+  `(provider, sha256(key)[:12])` so it rebuilds when the provider/key changes.
+- **Model codes** verified against
+  [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models):
+  GA = `gemini-3.5-flash`, `gemini-3.1-flash-lite`; Pro / base-flash are
+  **preview-suffixed** (`gemini-3.1-pro-preview`, `gemini-3-flash-preview`) — the
+  bare names 404. Set `BRAIN_PROVIDER=gemini` + `GEMINI_API_KEY`; optionally
+  `BRAIN_SCANNER_MODEL=gemini-3.1-pro-preview` for stronger exploit code-gen.
+- **Tests:** `tests/test_brain_gemini_provider.py` (17 tests, network-free).
+  Independently reviewed by Codex (3 rounds, converged).
+
+## v10.2.1 — CSP-header finding is a misconfig, not XSS (+ CodeQL hardening) (2026-06-07)
+
+- **Missing/weak CSP header no longer reported as XSS.** `scanner.sh` wrote its
+  `[CSP-MISSING]`/`[CSP-WEAK]` results into `findings/<t>/xss/`, and the reporter maps
+  `xss/` → vtype `xss`, so every CSP-missing host rendered as a CVSS-6.1 "Cross-Site
+  Scripting" finding — a false positive (a missing CSP header mitigates XSS but is not
+  itself an XSS vuln). This surfaced on the clientd.com test as 5 bogus "MEDIUM
+  XSS" findings. Now written to `misconfig/` as explicit **LOW** security-misconfiguration
+  findings. Regression-guarded in `tests/test_auditfix_csp.py`.
+- **CodeQL hardening (PR alerts):** `burp_scanner.py` no longer references the `creds`
+  value inside a logged f-string (derive a yes/no flag from presence only —
+  clear-text-credential logging); a burp test assertion switched from URL-substring `in`
+  to exact `==` (incomplete-url-substring-sanitization).
+
+## v10.2.0 — Burp Suite Professional integration (REST API) (2026-06-07)
+
+Wires Burp's crawl-and-audit engine into the suite so a target can be actively
+scanned by Burp and its issues folded into the same report as every other engine.
+
+- **`burp_scanner.py`** — `BurpClient` (reachable / start / poll-to-terminal),
+  `normalize_issue()` → reporter finding shape, `run_burp_scan()` writes
+  `<output_dir>/findings.json`. The API key lives in the URL path (a secret) and
+  is read from `$BURP_API_KEY`, never hardcoded, and redacted in all output.
+  Validated against **live desktop Burp Suite Professional**, which surfaced and
+  fixed three desktop-vs-Enterprise REST quirks: the top-level `name` field is
+  Enterprise-only (400 "Names are not supported in the desktop product"); an
+  unknown NamedConfiguration 400s ("Unknown configuration") so no config is sent
+  unless explicitly requested; and a scope `rule` is a **literal URL prefix, not a
+  regex** (a regex rule 400s "Not all seed URLs are in scope").
+- **`reporter.py` Method 1g** — ingests `burp/findings.json` (a JSON list),
+  mapping Burp's `type` key to the renderer's `vtype`, clamping severity (Burp has
+  no Critical), defaulting unknown types to misconfig; `burp/` is in `meta_dirs`.
+- **`vikramaditya.py`** — `--burp` / `--burp-only` run a Burp scan of the target
+  (scope-locked, `--creds` for authenticated scans) and render a report that
+  includes the Burp issues; `--burp-url` / `--burp-key` override the REST endpoint.
+- **Security hardening** (from the codex+grok review): the Burp scope rule carries a
+  trailing `/` so a prefix like `https://example.com/` cannot match
+  `https://example.com.evil/` (and the seed is normalized + the port preserved); and
+  secret CLI values (`--burp-key`, `--creds`, …) are redacted before being persisted
+  to `config.lock.json`.
+- Tests: `tests/test_auditfix_burp.py` (Method 1g ingestion, scope bounding, no
+  Enterprise-only fields, secret-safe).
+
+## v10.1.2 — hard-kill hang-prone recon tools (amass/dnsx ignore SIGTERM) (2026-06-07)
+
+A validation re-run stalled in Phase 1 for ~hours: `amass enum -passive` hung and
+the `timeout 600` wrapper never killed it — plain `timeout` sends a single SIGTERM
+and then waits indefinitely, and amass ignores SIGTERM (observed running 58 min
+under a 600s cap). Fixed by `timeout -k 30` (escalate to SIGKILL 30s past the
+deadline) for both amass and dnsx (also flagged hang-prone on macOS), and lowered
+the amass passive cap to 180s (it is low-yield — 2 subdomains here — and the prior
+600s was both too long and not enforced). Regression-guarded in
+`tests/test_auditfix_recon_sh.py`.
+
+Note: v10.1.1's ffuf `-maxtime` was independently verified to work correctly
+(`-maxtime 5` → process exits at 5.06s); the ffuf-phase wall-clock in the stalled
+run was environmental (Ollama/brain degradation), not a flag bug. The substantive
+v10.1.0 report-layer fixes were validated in a real rendered report: per-severity
+email_auth CVSS (INFO→0.0, LOW→2.5, MED→5.3), the `[CSP-MISSING]` finding now
+reaching the report, `mssql.*` host present, and the Recon/Host&Port Inventory
+chapter rendering.
+
+## v10.1.1 — fix ineffective ffuf time-cap (recon perf regression) (2026-06-06)
+
+The v10.1.0 "adaptive ffuf" change used `-maxtime-job`, which only bounds ffuf
+*recursion* sub-jobs and is a no-op on the flat single-job directory scan — so the
+intended 300s per-host cap never applied and each host ground the full 31k wordlist
+(8–22 min/host). Caught by the v10.1.0 validation re-run (recon hit 48 min vs the
+prior ~24). Switched to `-maxtime` (entire-process cap; each host is its own ffuf
+invocation, so it caps per host). Regression-guarded in `tests/test_auditfix_recon_sh.py`
+(asserts the `-maxtime` flag usage and rejects `-maxtime-job`). The v10.1.0 dnsx
+resolution + 301-catchall fixes were validated working in the same run
+(`dnsx: 3 resolved (dropped 688)`, `301 catchall — excluding 301`).
+
+## v10.1.0 — engagement-reliability release: stop masking failures, close FP/FN gaps, add coverage reporting (2026-06-06)
+
+Driven by a full multi-agent audit of a live `python3 vikramaditya.py clientd.com`
+end-to-end run: 8 facet auditors → adversarial per-issue verification → 43 confirmed
+issues, fixed across two passes (29 + 13) and independently re-reviewed by `codex` and
+`grok` (both clean). The dominant theme: **the tool was silently masking phase failures
+as success**, so a run could finish green while whole capabilities did nothing. A minor
+(not patch) release because it adds new functionality alongside the fixes.
+
+### New functionality
+- **Recon / Host & Port Inventory** report chapter — discovered hosts, ports, and the
+  recon surface now reach the client report even for hosts with no finding (the `mssql.*`
+  host + FTP/8443 ports were previously discovered but invisible).
+- **Tooling & Coverage Limitations** report chapter + `coverage.json` artifact — degraded
+  or skipped capabilities are surfaced instead of hidden.
+- **Tri-state phase status** (✓ ran / ∅ skipped-N/A / ✗ errored) replacing the single
+  green ✓ that was shown even for skipped/errored/no-op phases.
+- **Adaptive recon scaling** — ffuf gets a per-host `-maxtime`, a 301-catchall filter, and
+  a wordlist trimmed for tiny surfaces; real `dnsx` resolution replaces blind candidate
+  copying; passive enum (crt.sh/OTX) gains retry + a "0 from N sources" warning.
+- **Vision-capability detection** in the browser agent (`use_vision=False` fallback when
+  the Ollama model is text-only — no more all-errored vision requests reported as success).
+
+### Reliability — failures no longer masked as success
+- git-hound (missing config), SecretFinder (broken deps), asnmap (interactive key prompt),
+  cdncheck (`-json`→`-jsonl`) and a dead browser phase were all reporting clean/`✓` while
+  doing nothing — each now detects the failure and degrades loudly.
+- `scanner.sh` CSP/security-header check read a non-existent `live/live_hosts.txt` (now
+  `live/urls.txt` with a fallback chain) — it was dropping a real "no CSP/HSTS/XFO/XCTO"
+  finding on every run.
+- sqlmap candidate handling: reachability pre-flight, `FUZZ` placeholder substitution, and
+  `WebResource.axd`/`ScriptResource.axd` exclusion (sqlmap was "completing" having tested
+  nothing); `run_sqlmap_targeted` now returns False/degraded on real failure.
+
+### False positives / false negatives
+- **CVE-2017-7269 (IIS 6 WebDAV RCE)** no longer matched against IIS 10 hosts — version-gated
+  in `prioritize.py`; the gate fixed to neutralize only that CVE, **never the host's other
+  CVEs** (a first-pass regression that would have suppressed Log4Shell was caught by the
+  review and corrected).
+- `_url_reachable` now treats 401/403/405/5xx as reachable (host up) so auth-gated SQLi
+  endpoints aren't dropped; only 404/410 and network errors are "dead".
+- Brain: email_auth findings included in the evidence set (no more NO_REPORTS vs 10-findings
+  contradiction); sqlmap **input candidates** no longer harvested as `[sqlmap]` findings;
+  scan-plan prose no longer leaks into the generated bash; 7-Question-Gate Q6 contradiction
+  now corrects the returned verdict, not just the audit log; live hosts grounded into recon prose.
+- `cve.py` nuclei: a tool failure is reported as degraded/failed, not "No CVEs detected".
+
+### Report quality
+- Collapsed unconfirmed-CVE INFO item now carries a per-severity CVSS (was inheriting the
+  misconfig template's 5.3) and surfaces its matched CVE IDs; email-auth remediation uses
+  the per-finding fix text instead of a single generic DMARC line.
+
+### Environment
+- Fixed the venv `setuptools`/`_distutils_hack` breakage that produced `ModuleNotFoundError`
+  noise on every invocation (and broke SecretFinder's dependencies).
+
+Regression-covered by `tests/test_auditfix_*.py` + `tests/test_auditfix2_*.py`
+(150+ new tests). Full suite green (only the pre-existing, unrelated `test_pmapper_runner`
+env test fails).
+
+## v10.0.1 — sqlmap-confirmed SQLi ingestion + per-finding email_auth CVSS (2026-06-06)
+
+A follow-up to the v10.0.0 report-ingestion audit, surfaced by a live
+`python3 vikramaditya.py clientd.com` run whose reporter logged
+`WARNING: findings subdir 'sqlmap/' is not in SUBDIR_VTYPE`.
+
+- **sqlmap-confirmed SQLi now reaches the report.** `hunt.py` writes confirmed
+  injections to `sqlmap/sqlmap_results.txt` (and `results-*.csv` for OpenAPI/POST
+  runs), but `reporter.py` had no loader — a confirmed SQLi was silently dropped
+  despite the `sqli_sqlmap_confirmed` template existing. New `load_findings`
+  Method 1f parses both files (record-aware `DictReader`, `utf-8-sig` BOM-safe),
+  counts only rows with a non-empty `Technique(s)`, **skips rows sqlmap itself
+  tagged "false positive or unexploitable"** (whitespace-normalized, mirrors the
+  `brain.py` candidate filter) so a scanner-rejected row never becomes a CRITICAL,
+  and dedupes on the injected parameter's *value* while preserving query context
+  (`?op=users&id=1` and `?op=orders&id=1` stay distinct; `id=1` vs `id=999`
+  collapse). `sqlmap/` is suppressed from the unmapped-subdir warning via
+  `meta_dirs` (it also holds `candidates.txt`/`post_*.txt` the generic `.txt`
+  scan would mis-parse as findings).
+- **Email-auth findings now carry per-finding CVSS.** Every `email_auth` finding
+  previously rendered CVSS 5.3 regardless of its LOW/INFO label, because the
+  Method 1d loader set severity but not `cvss` and the renderer fell back to the
+  template. It now sets per-finding cvss: explicit item cvss → the template's
+  authored score when severity matches (MEDIUM stays 5.3) → `CVSS_DEFAULT`
+  otherwise (LOW→2.5, INFO→0.0, HIGH→7.5). `email_auth` was also moved from
+  `SUBDIR_VTYPE` to `meta_dirs` so the generic walk can't mis-score a future
+  `.txt` (the dedicated Method 1d loader is now the sole ingestion path).
+
+Regression-covered by `tests/test_reporter_sqlmap_ingestion.py` (19 tests).
+Independently reviewed by `codex` and `grok` (three rounds); all findings folded in.
+
+## v10.0.0 — full-tool correctness audit (2026-06-05)
+
+A major correctness release. A multi-stage audit — an automated multi-agent
+fan-out across every engine, an adversarial self-review of the resulting fixes,
+then **independent reviews by `codex` and `grok`** tracing every code path end to
+end — found and fixed **60+ real bugs across 12 files**. Every fix was verified
+against live code and the patched `reporter.py` was smoke-tested on a real
+findings directory. Two failure classes were closed: detectors fabricating
+findings, and real findings never reaching the report.
+
+### The report-ingestion contract (the headline theme)
+
+Several detectors produced correct findings that never reached `reporter.py`, and
+a few candidate/INFO lines that *did* reach it were inflated to HIGH/CRITICAL.
+
+- **Brain active-scanner output now ingested** — `reporter.py` Method 1e parses
+  `brain_active/iteration_*.json`; `vikramaditya.py` reordered so the report runs
+  AFTER the active scanner and points at a dir that includes its output (was the
+  original report-before-testing bug).
+- **Confirmed Drupalgeddon RCE now reported** — a verified `uid=` RCE was written
+  only to the meta `exploits/` dir (ignored by the reporter); it now also writes
+  `rce/RCE_CONFIRMED_drupalgeddon2_*.txt`.
+- **Autopilot `finding_*.json` no longer silently dropped** — the Method 2 loader
+  was gated behind `if not results:` and skipped whenever any earlier loader (a
+  `brain_active` INFO row, CORS, …) had already added a row; now always ingested
+  with `(vtype,url,detail)` dedup.
+- **`CORS-INFO` (benign wildcard ACAO without credentials)** no longer rendered as
+  a LOW vuln — `parse_custom_line` maps explicit `INFO` to `info`, not `low`.
+- **`cvemap` global "worth testing" CVE IDs** no longer promoted to CRITICAL
+  findings (`cvemap_results.txt` added to the reporter's non-finding files).
+- **`[JAVA-RMI-CANDIDATE]` lead** no longer rendered as a HIGH deserialization
+  finding (added to the reporter's non-finding prefixes).
+
+### False positives eliminated (detectors)
+
+- Drupalgeddon2 "RCE CONFIRMED" required a real `uid=N(` signature, not any
+  non-empty stdout; Java RMI/JMX deser confirmed only with a corroborating
+  CT/body marker (400/500 on Java paths kept as a manual candidate, fixing both
+  an FP and the JBoss-500 FN); time-based SQLi anchored to a measured per-endpoint
+  baseline with a scaled 6s confirm; error-based SQLi keyed off concrete DBMS
+  signatures, not the bare substring `sql`; CORS made credential-aware; MFA
+  no-rate-limit requires a real HTTP response; cvemap/jsluice/SecretFinder/
+  TruffleHog counts fixed to stop counting banners/errors as findings; nuclei
+  medium no longer mislabeled HIGH; per-CVE CVSS in the HTML report (was a
+  hardcoded 9.0 for every CVE); `INFORMATION_SCHEMA` no longer demoting real
+  critical SQLi to LOW via a substring match.
+
+### False negatives eliminated
+
+- recon URL-dedup `NameError` (silently no-op'd dedup); `open_ports.txt`
+  clobbered by an empty nmap re-derivation; scheme-retry httpx missing `-ip`
+  (empty `live/ips.txt` skipped TLS-SAN/vhost); 307/308 redirects uncounted;
+  brain post-scan hook ran before the CVE/zero-day phases (triaged an incomplete
+  set); intel.md CVE tables rendered "No results" for version-tagged/mixed-case
+  techs; agent dedup collapsed two tools' identical line-heads and `break`-hid a
+  later finding.
+
+### AI brain / active scanner
+
+- Models right-sized per role (`phi4:14b` narrator, `bugtraceai-apex` triage,
+  `devstral-small-2:24b` / `qwen2.5-coder:14b` code-gen, all env-overridable);
+  verdict parsing tolerant of markdown/whitespace and no longer substring-matching
+  *negative* verdicts; the 60s hard timeout that killed sqlmap/nuclei/ffuf raised
+  for long-running tools; runtime tooling failures (traceback / missing module /
+  command-not-found) excluded from the "ran a real test" gate; HAR upload
+  severity derives only from script-grounded lines, never `[MODEL CLAIM]` prose.
+
+### Reviewed by
+
+Independent `codex` and `grok` passes (full briefing + complete diff + read-only
+repo access) traced every writer→reader path; codex's report-ingestion findings
+and grok's residual threshold/should-fix items were folded in before release.
+
+## v9.24.0 — engagement-driven hardening (2026-06-05)
+
+Follow-up to the v9.23.0 false-positive purge, driven by the same live
+engagement. Closes the remaining cases where the intel/EOL/SSTI stages
+reported fabricated or stale signal, and finalizes the exploit code-gen
+model after live A/B testing.
+
+### Version-aware EOL & intel (`intel.py`, `eol_check.py`, `cve.py`)
+
+- **Version-aware EOL detection** — fingerprints now carry the detected
+  version (e.g. `php=7.4.33`, captured from `X-Powered-By` / generator
+  meta in `vikramaditya.py`). `intel.py` splits `name=version` before the
+  EOL lookup, so `php=7.4.33` correctly resolves to **expired** (EOL
+  2022-11-28, 🔴) instead of being reported "supported".
+- **Version-less junk-CVE filter** — added `NON_PRODUCT_TECHS` (hsts,
+  http/2, …) and `AMBIGUOUS_BARE_TECHS` (bootstrap, jquery, parsley.js,
+  vue, react, angular). Bare framework names no longer fan out into
+  unrelated NVD hits ("vue → HP-UX VUE 1994", WordPress-1.2-era CVEs);
+  an `NVD_MIN_YEAR = 2012` floor drops pre-modern noise. Mirrors the
+  same guard added to `cve.py` (`_is_searchable_tech`, 200-only
+  fingerprint).
+- **`intel.py` NameError fix** — `_split_tech` used `re` without
+  `import re`; added the missing import.
+
+### SSTI confirmation (`scanner.sh`, Check 4)
+
+- Replaced the `{{7*7}}` → `grep '\b49\b'` canary (which matched any
+  coincidental "49" on a page) with a distinctive `887*913=809831`
+  arithmetic probe. Static assets (`.css/.js/.map`, images, fonts) are
+  skipped, the baseline fetch must NOT already contain the result, and a
+  hit is confirmed only when `809831` is present **and** the literal
+  `887*913` is not reflected. Eliminates the 3 bogus
+  `[SSTI-CONFIRMED] engine=jinja2` hits on static WordPress assets.
+
+### Recon (`recon.sh`)
+
+- **Port-scan robustness** — guard the naabu→awk pipeline when naabu
+  writes no results file (was a stray error + empty `open_ports.txt`),
+  and add `nmap -Pn` so service fingerprinting still runs against
+  firewalled targets that drop ICMP/host-discovery probes.
+
+### Exploit code-gen model (`brain_scanner.py`)
+
+- Code-gen model A/B finalized against live targets: **`devstral-small-2:24b`**
+  validated as primary, `qwen2.5-coder:14b` fallback, `aya-expanse`
+  demoted to last resort. Still overridable via `BRAIN_SCANNER_MODEL`.
+
+### Docs
+
+- Full **README cleanup** — TOC moved to the top, a "What It Does"
+  elevator pitch, consistent header levels, release history collapsed to
+  a CHANGELOG pointer (1285 → ~770 lines). All operational sections
+  (Whitebox AWS, MFA/TOTP, HAR, engagement privacy, the per-role model
+  table) preserved.
+
+## v9.23.0 — detector / report / brain false-positive purge (2026-06-04)
+
+A full-pipeline audit (triggered by a clean-target run against
+`clientc.com`) found that several detectors were reporting fabricated
+signal and the report was simultaneously full of junk and missing real
+findings. All fixes were validated end-to-end on a fresh autonomous run
+(exit 0): the report went from **25 bogus findings** (two fake CVSS-10) to
+**8 real ones**.
+
+### Detectors (`hunt.py`)
+
+- **jsluice** — the installed BishopFox jsluice has no `--input-format`
+  flag (raw stdin is `-j`). The old call printed `unknown flag` to stdout,
+  which `tee` captured and the counter reported as secrets ("5 secrets
+  found" = 5 error lines). Now uses `-j` and counts only valid JSON.
+- **SecretFinder** — `-o cli` prints a `[ + ] URL:` banner per URL even
+  with zero matches; the counter counted banners as hits. Now counts only
+  real `\t->\t` match lines (labelled unverified).
+- **whatweb** — produced a silent 0-byte file because whatweb 0.6.3
+  **crashes on HTTPS under Ruby 3.4+/4.x** ("can't modify frozen Hash")
+  and all stderr was discarded. Now runs per-URL, logs stderr to
+  `whatweb_errors.log`, and falls back to the httpx tech tags.
+- **Drupal detection** — accepted a `301/302/403` on `/user/login` etc. as
+  proof of Drupal; an nginx http→https redirect fires on every path and
+  misclassified plain PHP/nginx hosts. Now requires an HTTP 200 whose body
+  contains `drupal`.
+- **cvemap** — skips cleanly when `PDCP_API_KEY` is unset (was a confusing
+  `rc=1`).
+
+### CVE / intel (`cve.py`, `intel.py`)
+
+- Dropped non-product tokens (`hsts`) and ambiguous bare framework names
+  (`bootstrap`, `jquery`, `parsley`) from keyword CVE search; mapped
+  `vite → npm/vite`. (`hsts` was being matched as if it were a product.)
+
+### Fingerprint (`vikramaditya.py`)
+
+- Tightened the Vite signature — it matched any `/assets/*.js` (e.g.
+  `jquery.min.js`), false-flagging Bootstrap/jQuery/PHP sites as Vite and
+  pulling ViteMoneyCoin / VITEC / Vitess junk into intel. Now requires a
+  real Vite marker. The report prompt is auto-skipped under `--autonomous`.
+
+### Reporting (`reporter.py`)
+
+- Version-less keyword CVEs are no longer emitted as findings (collapsed
+  into one clearly-labelled INFO context line); `email_auth/findings.json`
+  (No-DMARC etc.) is now loaded instead of silently ignored; HTML uses the
+  per-finding title.
+
+### Brain (`brain.py`, `brain_scanner.py`)
+
+- Added `NARRATION_SYSTEM` + grounding clauses so per-phase narration can no
+  longer fabricate findings ("permissive CORS" on a 0-finding scan, "a real
+  estate company in San Francisco").
+- The active scanner now validates generated scripts (`bash -n` / `compile`)
+  and refuses a verdict with zero successful runs — it was declaring "NOT
+  VULNERABLE" from a script that died on a syntax error and bailed at
+  iteration 2/15. Scan-plan placeholders are stripped and `bash -n`
+  validated before the file is marked executable.
+
+### Models right-sized per role (live A/B-validated)
+
+Each role was head-to-head tested on real engagement output, not leaderboard
+claims:
+- **Narration / analysis → `phi4:14b`** (now `MODEL_PRIORITY[0]`). Beat
+  `xploiter` (which fabricated findings) on faithfulness; lowest local
+  hallucination rate (Vectara 3.7 %).
+- **Triage → `bugtraceai-apex`** (kept). Beat `phi4` (inconsistent verdicts)
+  and `Foundation-Sec-8B-Reasoning` (echoed the verdict menu) on a 2-fixture
+  triage A/B.
+- **Exploit code-gen → `devstral-small-2:24b`** (primary, A/B-validated) with
+  `qwen2.5-coder:14b` as the fast fallback. Both emit valid runnable PoCs
+  (vs the demoted `aya-expanse`, a multilingual chat model that produced
+  malformed shell); Devstral wins on correctness (68 % SWE-bench, canonical
+  sqlmap-GET structure). `pick_model()` prefers Devstral when installed.
+- All overridable via `BRAIN_MODEL` / `TRIAGE_MODEL` / `BRAIN_SCANNER_MODEL`.
+
 ## v9.22.0 — methodology + token-scanner wire-up (2026-05-11)
 
 Two skill modules and one CLI tool were imported earlier from the

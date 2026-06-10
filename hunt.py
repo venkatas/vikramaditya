@@ -325,7 +325,7 @@ class ProcessWatchdog:
     process group with SIGKILL and asks Brain for a verdict.
 
     Usage:
-        proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid)
+        proc = subprocess.Popen(cmd, shell=True, start_new_session=True)
         wd = ProcessWatchdog(proc, watch_file, phase="RECON")
         proc.wait()
         wd.stop()
@@ -689,7 +689,7 @@ class ProcessWatchdog:
                         f"EARLY WARNING — {diag_secs}s no output. Asking brain to diagnose...\033[0m",
                         flush=True,
                     )
-                    _brain.watchdog_diagnose(
+                    diag_result = _brain.watchdog_diagnose(
                         self.phase, self.proc.pid, diag_secs,
                         self.watch_file, current_size,
                         meta={
@@ -705,6 +705,37 @@ class ProcessWatchdog:
                             "recent_files": changed_files,
                         }
                     )
+                    # v9.22.1 — Active Brain Supervisor Integration
+                    # Parse brain assessment and adapt timeouts dynamically
+                    if diag_result:
+                        assessment = "uncertain"
+                        for diag_line in diag_result.splitlines():
+                            if diag_line.startswith("ASSESSMENT:"):
+                                val = diag_line.split(":", 1)[1].strip().lower()
+                                if any(x in val for x in ("likely-stuck", "misconfigured")):
+                                    assessment = "stuck"
+                                elif any(x in val for x in ("likely-slow", "healthy-but-quiet")):
+                                    assessment = "slow"
+                                break
+                        
+                        if assessment == "stuck":
+                            print(
+                                f"\033[0;31m\033[1m[Watchdog/{self.phase}] Brain assessment: STUCK or MISCONFIGURED. "
+                                f"Triggering early SIGKILL to prevent resource exhaustion...\033[0m",
+                                flush=True,
+                            )
+                            _brain.watchdog_kill(self.phase, self.proc.pid, diag_secs)
+                            self._kill_proc()
+                            self.killed = True
+                            break
+                        elif assessment == "slow":
+                            extended_stale = self.max_stale * 2
+                            print(
+                                f"\033[0;32m\033[1m[Watchdog/{self.phase}] Brain assessment: HEALTHY-BUT-SLOW. "
+                                f"Dynamically extending max_stale from {self.max_stale} to {extended_stale} checks...\033[0m",
+                                flush=True,
+                            )
+                            self.max_stale = extended_stale
                 else:
                     print(
                         f"\033[0;36m[Watchdog/{self.phase}] {diag_secs}s without new bytes, "
@@ -875,7 +906,7 @@ def auto_repair_tools(tool_names: list[str], include_system: bool = False) -> di
                 stdin=subprocess.DEVNULL,
                 cwd=SCRIPT_DIR,
                 env=_tool_env(),
-                preexec_fn=os.setsid,
+                start_new_session=True,
             )
             stdout, _ = proc.communicate(timeout=900)
             result = type("R", (), {"returncode": proc.returncode, "stdout": stdout or "", "stderr": ""})()
@@ -915,6 +946,60 @@ def _dir_file_count(path: str) -> int:
     return total
 
 
+def _structured_finding_count(path: str) -> int:
+    """Count real findings under a findings directory, not raw file count.
+
+    v9.24 — ``_artifact_summary`` previously reported ``files=N`` for the
+    ``findings`` dir, conflating empty/placeholder/scaffolding files (e.g. an
+    empty ``candidates.txt`` or a tool's ``-o`` log) with actual findings. The
+    brain then announced "22 findings" when only 10 were real.
+
+    Parsing rule per file:
+      * ``.json`` — count list items, or dict entries, or JSON-object lines.
+      * other text — count non-empty, non-comment, non-banner lines.
+    Empty files contribute 0. Directories are walked recursively.
+    """
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            try:
+                if os.path.getsize(fpath) == 0:
+                    continue
+            except OSError:
+                continue
+            if fname.endswith(".json"):
+                try:
+                    with open(fpath, errors="ignore") as fh:
+                        data = json.load(fh)
+                    if isinstance(data, list):
+                        total += len(data)
+                    elif isinstance(data, dict):
+                        # Common shapes: {"findings": [...]} or a flat map.
+                        inner = data.get("findings") if "findings" in data else None
+                        total += len(inner) if isinstance(inner, list) else len(data)
+                    continue
+                except Exception:
+                    # Fall through to line-based count (JSONL / malformed).
+                    total += _count_json_findings(fpath)
+                    continue
+            # Plain-text findings: skip blanks, comments, and banner lines.
+            try:
+                with open(fpath, errors="ignore") as fh:
+                    for raw in fh:
+                        ln = raw.strip()
+                        if not ln:
+                            continue
+                        if ln.startswith(("#", "//", "=", "-", "*", "[")):
+                            continue
+                        total += 1
+            except OSError:
+                continue
+    return total
+
+
 def _artifact_summary(artifacts: dict[str, str] | None = None) -> str:
     if not artifacts:
         return "(no artifacts provided)"
@@ -931,6 +1016,14 @@ def _artifact_summary(artifacts: dict[str, str] | None = None) -> str:
                 continue
             if label == "upload":
                 lines.append(_upload_artifact_summary(path))
+                continue
+            if label == "findings":
+                # v9.24 — report a structured finding count (parsed), not the
+                # raw file count which over-reports placeholder/empty files.
+                lines.append(
+                    f"{label}: dir {path} | findings={_structured_finding_count(path)} "
+                    f"| files={_dir_file_count(path)}"
+                )
                 continue
             lines.append(f"{label}: dir {path} | files={_dir_file_count(path)}")
         else:
@@ -1083,6 +1176,167 @@ def _brain_phase_complete(phase: str, success: bool, detail: str = "", artifacts
     _brain.phase_complete(phase, success, "\n\n".join(summary_parts))
 
 
+_POSIX_SPAWN_OK = hasattr(os, "posix_spawn") and hasattr(os, "POSIX_SPAWN_DUP2")
+
+
+class _PosixSpawnProc:
+    """A small ``subprocess.Popen`` work-alike that launches via ``os.posix_spawn``
+    instead of ``fork()+exec``.
+
+    WHY THIS EXISTS — macOS fork() is not safe here. hunt.py's parent loads Apple's
+    Network.framework (in-process HTTP/TLS; on hosts with a VPN/endpoint-filter
+    NetworkExtension it also pulls in NEFlowDirector). That framework registers a
+    NON-fork-safe ``pthread_atfork`` *child* handler
+    (``nw_settings_child_has_forked`` -> ``os_log`` -> ``_os_log_preferences_refresh``).
+    Any ``subprocess.Popen`` that takes the fork()+exec path runs that handler in the
+    forked child *before* exec and SIGSEGVs at 0.0s — observed killing the SQLMAP,
+    CVE HUNT and REPORTS phases (``rc=-11 duration=0.0s``; 0 reports produced).
+
+    Both ``preexec_fn`` (set to ``os.setsid``) AND ``start_new_session=True`` force the
+    fork() path, so neither "fixes" it. ``posix_spawn`` does not run ``pthread_atfork``
+    handlers, and
+    ``setsid=True`` keeps the child a session/group leader so the watchdog's
+    ``os.killpg(os.getpgid(pid))`` still tears down the whole tree.
+
+    Implements only the Popen surface hunt.py + ProcessWatchdog use: ``.pid``,
+    ``.stdout``, ``.poll()``, ``.returncode``, ``.wait()``, ``.communicate()``, ``.kill()``.
+    """
+
+    def __init__(self, spec, env=None, cwd=None, capture=True, shell=True):
+        self._lock = threading.Lock()
+        self.returncode = None
+        self.stdout = None
+
+        # Normalise (argv, cwd) into a fork-safe posix_spawn invocation. We have no
+        # POSIX_SPAWN_CHDIR on every build, so cwd is applied via a `cd ... &&` shell
+        # wrapper (which also covers argv-mode commands that need a cwd).
+        if shell:
+            cmd = spec
+            if cwd:
+                cmd = f"cd {shlex.quote(cwd)} && ({cmd})"
+            program, argv, use_path = "/bin/sh", ["/bin/sh", "-c", cmd], False
+        else:
+            argv = list(spec)
+            if cwd:
+                inner = " ".join(shlex.quote(a) for a in argv)
+                program, argv, use_path = "/bin/sh", [
+                    "/bin/sh", "-c", f"cd {shlex.quote(cwd)} && exec {inner}"], False
+            else:
+                program, use_path = argv[0], True
+
+        file_actions = [(os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0)]
+        r = w = None
+        if capture:
+            r, w = os.pipe()
+            file_actions += [
+                (os.POSIX_SPAWN_DUP2, w, 1),
+                (os.POSIX_SPAWN_DUP2, w, 2),
+                (os.POSIX_SPAWN_CLOSE, r),
+                (os.POSIX_SPAWN_CLOSE, w),
+            ]
+
+        spawn = os.posix_spawnp if use_path else os.posix_spawn
+        try:
+            self.pid = spawn(program, argv, env if env is not None else os.environ,
+                             file_actions=file_actions, setsid=True)
+        except Exception:
+            if capture:
+                os.close(r); os.close(w)
+            raise
+        if capture:
+            os.close(w)
+            self.stdout = os.fdopen(r, "r", errors="replace")
+
+    def poll(self):
+        with self._lock:
+            if self.returncode is not None:
+                return self.returncode
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self.returncode = 0  # already reaped elsewhere; status unknowable
+                return self.returncode
+            if pid == 0:
+                return None
+            self.returncode = -os.WTERMSIG(status) if os.WIFSIGNALED(status) \
+                else os.WEXITSTATUS(status)
+            return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            rc = self.poll()
+            if rc is not None:
+                return rc
+            if deadline is not None and time.time() > deadline:
+                raise subprocess.TimeoutExpired("posix_spawn", timeout)
+            time.sleep(0.02)
+
+    def communicate(self, timeout=None):
+        # Single absolute deadline shared by the read and the reap, so total runtime
+        # cannot exceed `timeout` (a separate timeout on each step would allow ~2x).
+        deadline = None if timeout is None else time.time() + timeout
+        out = ""
+        if self.stdout is not None:
+            buf = []
+            reader = threading.Thread(target=lambda: buf.append(self.stdout.read()),
+                                      daemon=True)
+            reader.start()
+            reader.join(None if deadline is None else max(0.0, deadline - time.time()))
+            if reader.is_alive():
+                raise subprocess.TimeoutExpired("posix_spawn", timeout)
+            out = buf[0] if buf else ""
+        # stdout EOF does NOT imply the process exited — it may have closed/redirected its
+        # own stdout and kept running. poll() first so a genuinely-finished process is
+        # never a spurious timeout; otherwise reap within the REMAINING deadline only, so
+        # communicate() never outlives the caller's timeout.
+        if self.poll() is None:
+            self.wait(None if deadline is None else max(0.0, deadline - time.time()))
+        return out, ""
+
+    def kill(self):
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    def __del__(self):
+        # Backstop: reap if a caller path never waited, so we don't leak a zombie.
+        # Non-blocking (WNOHANG) — __del__ must never hang.
+        try:
+            if getattr(self, "returncode", 0) is None:
+                os.waitpid(self.pid, os.WNOHANG)
+        except Exception:
+            pass
+
+
+def _fork_safe_spawn(spec, env=None, cwd=None, capture=True, shell=True):
+    """Launch a subprocess WITHOUT fork() when possible (macOS Network.framework
+    atfork handlers SIGSEGV the forked child — see ``_PosixSpawnProc``).
+
+    Uses ``os.posix_spawn`` (no atfork handlers) on interpreters that support it;
+    otherwise falls back to the original fork-based ``subprocess.Popen`` so Linux/CI
+    and old interpreters are unchanged. Returns a Popen-or-Popen-like object."""
+    if _POSIX_SPAWN_OK:
+        return _PosixSpawnProc(spec, env=env, cwd=cwd, capture=capture, shell=shell)
+    # Fallback (no posix_spawn): original behaviour.
+    if shell:
+        return subprocess.Popen(
+            spec, shell=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None,
+            stdin=subprocess.DEVNULL, cwd=cwd, env=env, text=True,
+            start_new_session=True,
+        )
+    return subprocess.Popen(
+        spec,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        stdin=subprocess.DEVNULL, cwd=cwd, env=env, text=True,
+        start_new_session=True,
+    )
+
+
 def run_cmd(
     cmd: str,
     cwd: str = None,
@@ -1099,17 +1353,9 @@ def run_cmd(
             started_label = started_at.strftime("%Y-%m-%d %H:%M:%S")
             env = _tool_env()
 
-            proc = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                cwd=cwd,
-                env=env,
-                text=True,
-                preexec_fn=os.setsid,
-            )
+            # Fork-safe launch: posix_spawn avoids macOS Network.framework atfork
+            # SIGSEGV that killed SQLMAP/CVE HUNT/REPORTS at 0.0s (see _PosixSpawnProc).
+            proc = _fork_safe_spawn(cmd, env=env, cwd=cwd, capture=True, shell=True)
             log("info", f"START {label}: PID {proc.pid} @ {started_label}")
             log("info", f"Command: {cmd}")
 
@@ -1122,27 +1368,47 @@ def run_cmd(
             timed_out = False
             stdout = ""
             stderr = ""
+            chunks: list[bytes] = []
             try:
                 import select as _select
                 deadline = time.time() + timeout
-                chunks: list[str] = []
+                fd = proc.stdout.fileno() if proc.stdout else None
                 while True:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(cmd, timeout)
-                    if proc.stdout:
-                        ready, _, _ = _select.select([proc.stdout], [], [], min(0.5, remaining))
+                    if fd is not None:
+                        ready, _, _ = _select.select([fd], [], [], min(0.5, remaining))
                         if ready:
-                            chunk = proc.stdout.read(4096)
-                            if chunk:
-                                chunks.append(chunk)
+                            # os.read returns whatever is available (<=65536) the moment
+                            # the fd is ready — unlike TextIOWrapper.read(n), which can
+                            # block until n chars or EOF and so overrun the deadline.
+                            data = os.read(fd, 65536)
+                            if data:
+                                chunks.append(data)
+                                continue  # keep draining before re-checking exit
+                            # EOF: the write end is closed. A closed fd stays
+                            # select-ready forever, so stop watching it (otherwise the
+                            # loop busy-spins when the child closed stdout but kept
+                            # running). The process itself may still be alive.
+                            fd = None
+                    else:
+                        # Nothing left to read but process still running — poll its exit
+                        # on a short sleep instead of busy-spinning.
+                        time.sleep(min(0.1, max(0.0, remaining)))
                     if proc.poll() is not None:
+                        # Process exited; drain any buffered tail still in the pipe, but
+                        # never block past the deadline.
+                        while fd is not None and time.time() < deadline:
+                            ready, _, _ = _select.select([fd], [], [], 0.1)
+                            if not ready:
+                                break
+                            data = os.read(fd, 65536)
+                            if not data:
+                                break
+                            chunks.append(data)
                         break
-                if proc.stdout:
-                    tail = proc.stdout.read()
-                    if tail:
-                        chunks.append(tail)
-                stdout = "".join(chunks)
+                stdout = b"".join(chunks).decode("utf-8", "replace")
             except subprocess.TimeoutExpired:
                 timed_out = True
                 log("warn", f"{label}: timeout after {timeout}s — killing PID {proc.pid}")
@@ -1150,7 +1416,11 @@ def run_cmd(
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
                     proc.kill()
-                stdout, _ = proc.communicate()
+                try:
+                    proc.wait(timeout=10)  # reap the killed tree; don't hang
+                except Exception:
+                    pass
+                stdout = b"".join(chunks).decode("utf-8", "replace")
             finally:
                 watchdog.stop()
 
@@ -1162,12 +1432,7 @@ def run_cmd(
             log(end_level, f"END {label}: PID {proc.pid} rc={rc} duration={duration:.1f}s{timeout_note}")
             return rc == 0, (stdout or "") + (stderr or "")
 
-        proc = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            cwd=cwd, env=_tool_env(), text=True,
-            preexec_fn=os.setsid,
-        )
+        proc = _fork_safe_spawn(cmd, env=_tool_env(), cwd=cwd, capture=True, shell=True)
         try:
             stdout, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1187,20 +1452,29 @@ def run_cmd_args(
     cwd: str = None,
     timeout: int = 600,
 ) -> tuple[bool, str]:
+    # Fork-safe launch (posix_spawn): avoids the macOS Network.framework atfork
+    # SIGSEGV that fork()+exec triggers late in a run (see _PosixSpawnProc). stdout
+    # and stderr are merged into one stream, matching the previous concatenation.
+    proc = None
     try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            cwd=cwd,
-            timeout=timeout,
-            env=_tool_env(),
-        )
-        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
-    except subprocess.TimeoutExpired:
-        return False, "Command timed out"
+        proc = _fork_safe_spawn(list(args), env=_tool_env(), cwd=cwd,
+                                capture=True, shell=False)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.wait()
+            return False, "Command timed out"
+        return proc.returncode == 0, out or ""
     except Exception as exc:
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return False, str(exc)
 
 
@@ -1219,8 +1493,9 @@ def run_live(cmd: str, timeout: int = 3600,
         started_label = started_at.strftime("%Y-%m-%d %H:%M:%S")
         env = _tool_env()
 
-        # Use os.setsid so watchdog can kill the whole process group
-        proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid, env=env)
+        # Fork-safe launch (posix_spawn + setsid); see _PosixSpawnProc. setsid keeps
+        # the child a group leader so the watchdog can killpg the whole tree.
+        proc = _fork_safe_spawn(cmd, env=env, capture=False, shell=True)
         log("info", f"START {label}: PID {proc.pid} @ {started_label}")
         log("info", f"Command: {cmd}")
 
@@ -1243,6 +1518,10 @@ def run_live(cmd: str, timeout: int = 3600,
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
                 proc.kill()
+            try:
+                proc.wait(timeout=10)  # reap the killed child (no Popen GC to do it)
+            except Exception:
+                pass
         finally:
             if watchdog:
                 watchdog.stop()
@@ -1423,6 +1702,95 @@ def check_tools() -> tuple[list, list]:
     return installed, missing
 
 
+def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, str]]:
+    """Lightweight readiness layer beyond binary presence (v9.24 audit-fix).
+
+    ``check_tools`` only proves a binary exists on PATH. Several tools are
+    present-but-broken: GitHound with no ``config.yml``, Kiterunner with no
+    route wordlist, jwt_tool with no secrets wordlist, etc. Reporting them as
+    "installed" then "0 results" masks the fact that they never really ran.
+
+    Returns a list of ``{tool, reason}`` for installed tools that lack a
+    required config / key / wordlist. Does NOT mutate the global accumulator —
+    callers decide whether to surface (the run-time path uses ``_mark_degraded``
+    when a tool actually executes degraded).
+    """
+    if installed is None:
+        installed, _ = check_tools()
+    installed_set = set(installed)
+    gaps: list[dict[str, str]] = []
+
+    # GitHound needs a config.yml carrying GitHub credentials. It searches
+    # CWD then $HOME/.githound/config.yml (and historically ./config.yml).
+    if "git-hound" in installed_set:
+        candidates = [
+            os.path.join(os.getcwd(), "config.yml"),
+            os.path.join(HOME, ".githound", "config.yml"),
+            os.path.join(HOME, "git-hound", "config.yml"),
+        ]
+        if not any(os.path.isfile(p) for p in candidates):
+            gaps.append({"tool": "git-hound",
+                         "reason": "no config.yml found (GitHub creds) — GitHub secret scan cannot authenticate"})
+
+    # Kiterunner needs an API-route wordlist; without one it bruteforces nothing.
+    if "kiterunner" in installed_set:
+        kr_wl = os.path.join(WORDLIST_DIR, "api-endpoints.txt")
+        kr_wl_alt = os.path.join(WORDLIST_DIR, "routes-large.kite")
+        if not (os.path.isfile(kr_wl) or os.path.isfile(kr_wl_alt)):
+            gaps.append({"tool": "kiterunner",
+                         "reason": "no API route wordlist (api-endpoints.txt / routes-large.kite) — run --setup-wordlists"})
+
+    # jwt_tool weak-secret cracking needs a secrets wordlist.
+    if "jwt_tool" in installed_set:
+        jwt_wl = os.path.join(WORDLIST_DIR, "jwt-secrets.txt")
+        if not os.path.isfile(jwt_wl):
+            gaps.append({"tool": "jwt_tool",
+                         "reason": "no jwt-secrets.txt wordlist — weak-secret cracking disabled (run --setup-wordlists)"})
+
+    return gaps
+
+
+# ── Phase status mapping (v9.24 audit-fix) ─────────────────────────────────────
+# The run_* helpers return ``True`` on skip/no-op paths (tool missing, no
+# candidates, all-errored) as well as on real success, so the HUNT summary
+# marked everything ✓. Phases now report a tri-state status string and the
+# dashboard renders distinct glyphs.
+PHASE_STATUS_RAN = "ran"        # executed and produced a result
+PHASE_STATUS_SKIPPED = "skipped"  # skipped / N/A (tool absent, no candidates)
+PHASE_STATUS_ERROR = "error"    # attempted but errored / produced nothing usable
+
+_PHASE_STATUS_GLYPH = {
+    PHASE_STATUS_RAN:     "✓",
+    PHASE_STATUS_SKIPPED: "∅",
+    PHASE_STATUS_ERROR:   "✗",
+}
+
+
+def phase_status_glyph(status: str) -> str:
+    """Map a tri-state phase status to its display glyph (✓ / ∅ / ✗)."""
+    return _PHASE_STATUS_GLYPH.get(status, "✓" if status else "∅")
+
+
+def derive_phase_status(requested: bool, ran_truthy: bool,
+                        degraded: bool = False) -> str:
+    """Derive a tri-state phase status from the signals hunt_target has.
+
+    * ``error``   — the phase ran degraded (tool present-but-broken, all
+                    candidates dead, dependency import error, etc.).
+    * ``skipped`` — the phase was not requested, or returned falsy (run_*
+                    helpers return False on tool-missing / no-candidate paths).
+    * ``ran``     — requested, returned truthy, and not degraded.
+
+    This is a strict improvement over the old "any truthy → ✓": a degraded
+    phase now reports ✗ and a not-requested/no-op phase reports ∅.
+    """
+    if not requested:
+        return PHASE_STATUS_SKIPPED
+    if degraded:
+        return PHASE_STATUS_ERROR
+    return PHASE_STATUS_RAN if ran_truthy else PHASE_STATUS_SKIPPED
+
+
 def _file_nonempty(path: str) -> bool:
     return os.path.isfile(path) and os.path.getsize(path) > 0
 
@@ -1520,6 +1888,275 @@ def _collect_urls_from_file(path: str, *, require_query: bool = False,
     except OSError:
         return urls
     return urls
+
+
+# ── Degraded-capability tracking (v9.24 audit-fix) ─────────────────────────────
+# Tools may be *present* on PATH yet *broken* at runtime (missing config.yml,
+# absent API key, missing wordlist, exited instantly with empty output, etc.).
+# Binary-presence preflight can't see this. We accumulate a per-run list of
+# {tool, reason} and persist it to ``<findings>/coverage.json`` so the reporter
+# can render a "Degraded capabilities" section instead of silently reporting a
+# clean/0-result scan for a tool that never actually ran.
+_DEGRADED_CAPABILITIES: list[dict[str, str]] = []
+
+
+def _mark_degraded(tool: str, reason: str) -> None:
+    """Record a present-but-broken tool. De-duplicated on (tool, reason)."""
+    entry = {"tool": tool, "reason": reason}
+    if entry not in _DEGRADED_CAPABILITIES:
+        _DEGRADED_CAPABILITIES.append(entry)
+        log("warn", f"Degraded capability: {tool} — {reason}")
+
+
+def _reset_degraded() -> None:
+    """Clear the accumulator (per-target reset for multi-target runs)."""
+    _DEGRADED_CAPABILITIES.clear()
+
+
+def write_coverage_json(findings_dir: str) -> str | None:
+    """Persist the degraded-capabilities list to ``<findings_dir>/coverage.json``.
+
+    Integration contract with the reporter agent: a JSON list of
+    ``{"tool": str, "reason": str}``. Always written (even when empty) so the
+    reporter can distinguish "no degradations" from "coverage not measured".
+    Returns the path written, or None on failure.
+    """
+    if not findings_dir:
+        return None
+    try:
+        os.makedirs(findings_dir, exist_ok=True)
+        out = os.path.join(findings_dir, "coverage.json")
+        with open(out, "w") as fh:
+            json.dump(list(_DEGRADED_CAPABILITIES), fh, indent=2)
+        return out
+    except OSError:
+        return None
+
+
+# Strings that mean GitHound (and similar GitHub-secret scanners) printed a
+# config/auth error instead of real results. The historical counter stripped
+# lines starting with ``[!]`` and then reported the empty remainder as
+# "0 results — clean", masking the fact that the scan never authenticated.
+_GITHOUND_ERROR_SIGNALS: tuple[str, ...] = (
+    "config.yml was not found",
+    "config.yaml was not found",
+    "no github",          # "no GitHub tokens", "no GitHub credentials"
+    "no api key",
+    "no token",
+    "authentication failed",
+    "unauthorized",
+    "rate limit",
+    "could not authenticate",
+)
+
+
+def _githound_output_is_error(text: str) -> bool:
+    """True if GitHound output is a config/auth error rather than real results."""
+    low = (text or "").lower()
+    return any(sig in low for sig in _GITHOUND_ERROR_SIGNALS)
+
+
+# ── sqlmap candidate hygiene (v9.24 audit-fix) ─────────────────────────────────
+# Placeholder tokens left in URLs by crawlers/paramspider that sqlmap can't use
+# as a real value (e.g. ``?d=FUZZ&t=FUZZ``). Substituted with a benign ``1`` so
+# sqlmap has a baseline value to mutate; if substitution can't help (the whole
+# value IS the placeholder and nothing else), the URL is dropped.
+_SQLMAP_PLACEHOLDER_TOKENS: tuple[str, ...] = ("FUZZ", "PLACEHOLDER", "XXXXX", "{{", "}}")
+
+# Candidate URL path segments that are useless for SQLi — ASP.NET resource
+# handlers serve static, signed, cached blobs; sqlmap burns minutes for nothing.
+_SQLMAP_PATH_DENYLIST: tuple[str, ...] = (
+    "webresource.axd", "scriptresource.axd",
+)
+
+
+def _substitute_fuzz_placeholders(url: str) -> str:
+    """Replace crawler placeholder tokens in a URL's query values with ``1``.
+
+    ``?d=FUZZ&t=FUZZ`` → ``?d=1&t=1``. Case-insensitive on the token. Leaves
+    URLs without placeholders untouched.
+    """
+    if not url:
+        return url
+    out = url
+    for tok in _SQLMAP_PLACEHOLDER_TOKENS:
+        if tok.lower() in out.lower():
+            out = _re_module.sub(_re_module.escape(tok), "1", out, flags=_re_module.IGNORECASE)
+    return out
+
+
+def _is_denylisted_sqlmap_candidate(url: str) -> bool:
+    """True if URL targets an ASP.NET resource handler (no SQLi surface)."""
+    low = (url or "").lower()
+    return any(seg in low for seg in _SQLMAP_PATH_DENYLIST)
+
+
+def _sanitize_sqlmap_candidates(candidates: list[str]) -> list[str]:
+    """Drop denylisted handlers and substitute FUZZ→1; preserve order, dedupe."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        if not c or _is_denylisted_sqlmap_candidate(c):
+            continue
+        fixed = _substitute_fuzz_placeholders(c)
+        # If a placeholder token remains after substitution attempts, skip it.
+        if any(tok.lower() in fixed.lower() for tok in _SQLMAP_PLACEHOLDER_TOKENS):
+            continue
+        if fixed in seen:
+            continue
+        seen.add(fixed)
+        cleaned.append(fixed)
+    return cleaned
+
+
+# v9.24 audit-fix (finding D): HTTP statuses that mean "host is up, keep the
+# candidate". An auth-gated parameterized endpoint answers 401/403 unauthenticated
+# and 405 to HEAD — those are exactly the high-value targets the later
+# cookie-aware sqlmap run should probe. Only a 404/410 (resource gone) is a true
+# "dead candidate"; every other server response proves the host is reachable.
+_DEAD_HTTP_CODES: frozenset[int] = frozenset({404, 410})
+
+
+def _url_reachable(url: str, timeout: int = 8, cookies: str = "") -> bool:
+    """Lightweight reachability preflight: True if the host responds at all.
+
+    A SQLi candidate is "reachable" whenever the server answers — including
+    auth-gated 401/403 and method-not-allowed 405 — because the later
+    cookie-aware sqlmap run can still probe it (and authentication may unlock it).
+    Only HARD failures drop the candidate:
+
+      * network-level errors (connection refused / timeout / DNS failure)
+      * an explicit ``404``/``410`` (the resource genuinely does not exist)
+
+    finding D: previously this returned False for 401/403/405 and every other
+    4xx/5xx, silently discarding authenticated parameterized endpoints before
+    sqlmap ever saw them. ``cookies`` is threaded into the probe so a session
+    that has already authenticated sees the real (200) response.
+    """
+    import urllib.request
+    import urllib.error
+
+    def _probe(method: str) -> bool | None:
+        try:
+            headers = {"User-Agent": "hunt.py/1.0"}
+            if cookies:
+                headers["Cookie"] = cookies
+            req = urllib.request.Request(url, method=method, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code = getattr(resp, "status", None) or resp.getcode()
+                # 2xx/3xx — host up and serving (3xx-to-login still means up).
+                return 200 <= int(code) < 400
+        except urllib.error.HTTPError as e:
+            # The server responded with an error status — the host is UP.
+            # Only 404/410 means the candidate itself is dead. 401/403/405 and
+            # every other 4xx/5xx keep the candidate (auth-gated / WAF / 5xx
+            # are all worth probing). 405/501 to HEAD → retry with GET first.
+            if e.code in (405, 501):
+                return None  # signal "retry with GET"
+            return e.code not in _DEAD_HTTP_CODES
+        except Exception:
+            # Network-level failure (connrefused / timeout / DNS) — host down.
+            return False
+
+    res = _probe("HEAD")
+    if res is None:
+        # HEAD returned 405/501 — retry with GET. If GET *also* returns
+        # 405/501 (some endpoints reject both), the host still responded, so
+        # treat it as reachable (finding D: method-not-allowed != dead).
+        res = _probe("GET")
+        if res is None:
+            return True
+    return bool(res)
+
+
+def _filter_reachable_candidates(candidates: list[str], *,
+                                 limit: int | None = None,
+                                 timeout: int = 8,
+                                 cookies: str = "") -> tuple[list[str], int]:
+    """Return (reachable_subset, dead_count). Probes at most ``limit`` URLs.
+
+    ``cookies`` is threaded into each preflight probe so auth-gated endpoints
+    are judged against the authenticated response (finding D).
+    """
+    reachable: list[str] = []
+    dead = 0
+    probe_set = candidates[:limit] if limit else candidates
+    for c in probe_set:
+        # Only forward ``cookies`` when set, so callers/tests that monkeypatch
+        # ``_url_reachable`` with the legacy ``(u, timeout=...)`` signature keep
+        # working on the no-cookie path (backward compatibility).
+        if cookies:
+            ok = _url_reachable(c, timeout=timeout, cookies=cookies)
+        else:
+            ok = _url_reachable(c, timeout=timeout)
+        if ok:
+            reachable.append(c)
+        else:
+            dead += 1
+    return reachable, dead
+
+
+# Hostname tokens that indicate a database tier — the highest-value SQLi
+# surface. db-named in-scope hosts are seeded as sqlmap candidates (v9.24).
+_DB_HOST_TOKENS: tuple[str, ...] = (
+    "mssql", "mysql", "postgres", "postgresql", "oracle", "mariadb",
+    "mongodb", "mongo", "redis", "db", "database", "sql", "rds", "dbserver",
+)
+
+
+def _is_db_named_host(url_or_host: str) -> bool:
+    """True if the URL/host's *hostname* contains a database-tier token.
+
+    Matches on dot/dash-delimited labels (``db.example.com``, ``mysql-prod``)
+    so ``feedback.example.com`` is NOT matched on the substring "db".
+    """
+    raw = (url_or_host or "").strip()
+    if not raw:
+        return False
+    host = raw
+    if "://" in raw:
+        host = urlsplit(raw).netloc or raw
+    host = host.split("@")[-1].split(":")[0].lower()  # strip creds + port
+    labels: list[str] = []
+    for label in host.split("."):
+        labels.extend(label.split("-"))
+        labels.extend(label.split("_"))
+
+    def _label_is_db(label: str) -> bool:
+        # Exact token match, or a token followed by a numeric suffix
+        # (``mssql01``, ``db1``, ``mysql02``) — but NOT a substring match, so
+        # ``feedback`` (contains "db") and ``www`` are excluded.
+        for tok in _DB_HOST_TOKENS:
+            if label == tok:
+                return True
+            if label.startswith(tok) and label[len(tok):].isdigit():
+                return True
+        return False
+
+    return any(_label_is_db(label) for label in labels)
+
+
+def _collect_db_named_candidates(recon_dir: str, *, limit: int = 10) -> list[str]:
+    """Seed db-named in-scope live hosts as sqlmap candidate URLs.
+
+    Reads ``live/urls.txt`` (falls back to ``urls/live_hosts.txt``) and returns
+    URLs whose hostname matches a database-tier token. These rarely carry a
+    query string, so the standard aggregator silently dropped them.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for fname in (os.path.join(recon_dir, "live", "urls.txt"),
+                  os.path.join(recon_dir, "urls", "live_hosts.txt")):
+        for url in _collect_urls_from_file(fname, limit=500):
+            if not _is_db_named_host(url):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+            if len(out) >= limit:
+                return out
+    return out
 
 
 def _glob_results_csvs(sqli_dir: str) -> list[str]:
@@ -3044,6 +3681,57 @@ def select_targets(top_n: int = 10) -> list:
 
 
 # ── Core pipeline steps ────────────────────────────────────────────────────────
+def _is_safe_target(s: str) -> bool:
+    """True if `s` is a plain FQDN / IP / CIDR / label with no shell metacharacters.
+
+    The target is interpolated into shell command strings (run_recon builds a
+    `bash "<script>" "<domain>"` line with shell=True), so a value containing
+    $(), backticks, ;, |, &, quotes or spaces could inject or break paths.
+    A real target never needs those. (Codex HIGH — applies to any --target.)
+    """
+    return bool(re.fullmatch(r"[A-Za-z0-9._:/\-]+", s or ""))
+
+
+def _read_targets_file(path: str) -> list[str]:
+    """Read a host-list file → normalized, deduped hostnames.
+
+    Strips scheme (http/https), any path/query, surrounding whitespace; drops
+    blank lines and #-comments; lower-cases; preserves first-seen order. Backs
+    --targets-file (multi-host scope-lock) so an explicit authorized host list
+    can be scanned without subdomain enumeration.
+    """
+    hosts: list[str] = []
+    seen: set[str] = set()
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            s = re.sub(r"^https?://", "", s, flags=re.IGNORECASE)   # strip scheme
+            s = s.split("/")[0].split("?")[0].strip().rstrip(".").lower()  # strip path/query
+            # Accept ONLY a plain hostname[:port] — a crafted host like
+            # `x.$(cmd).com` must never reach a shell command / filename. (Codex HIGH)
+            if not re.fullmatch(r"[a-z0-9]([a-z0-9.-]{0,253}[a-z0-9])?(:\d{1,5})?", s):
+                continue
+            if s and s not in seen:
+                seen.add(s)
+                hosts.append(s)
+    return hosts
+
+
+def _derive_targets_label(hosts: list[str]) -> str:
+    """Most-common registrable apex (last two labels) across hosts — used for
+    session naming when --targets-file is given without an explicit --target."""
+    from collections import Counter
+    apexes: "Counter[str]" = Counter()
+    for h in hosts:
+        parts = h.split(":")[0].split(".")   # drop any :port before taking the apex
+        apexes[".".join(parts[-2:]) if len(parts) >= 2 else parts[0]] += 1
+    label = apexes.most_common(1)[0][0] if apexes else "targets"
+    # The label becomes a filename that is later shelled — keep it to safe chars.
+    return re.sub(r"[^a-z0-9.-]", "", label) or "targets"
+
+
 def run_recon(
     domain: str,
     quick: bool = False,
@@ -3052,6 +3740,7 @@ def run_recon(
     session_id: str | None = None,
     scope_lock: bool = False,
     max_urls: int = 100,
+    targets_file: str | None = None,
 ) -> bool:
     if resume:
         active_session_id, recon_dir = _activate_recon_session(
@@ -3100,6 +3789,21 @@ def run_recon(
             _hosts = expand_cidr(domain)
             log("info", f"CIDR {domain} → {len(_hosts)} host(s) to scan")
 
+    # Always PIN TARGETS_FILE for the child process: empty when unused, so an
+    # INHERITED TARGETS_FILE env var can't hijack the normal --target / IP / CIDR
+    # scope-lock paths (recon.sh checks it before CIDR). (Codex MEDIUM)
+    _targets_env = "TARGETS_FILE= "
+    if targets_file:
+        scope_lock = True  # an explicit host list is, by definition, scope-locked
+        try:
+            _n_hosts = sum(1 for _l in open(targets_file)
+                           if _l.strip() and not _l.lstrip().startswith("#"))
+        except OSError:
+            _n_hosts = 0
+        # Quote the path so a crafted value can't inject shell. (Codex HIGH)
+        _targets_env = f"TARGETS_FILE={shlex.quote(targets_file)} "
+        log("info", f"Host-list scope-lock: {_n_hosts} host(s) from "
+                    f"{os.path.basename(targets_file)} — subdomain enum skipped")
     _scope_env  = "SCOPE_LOCK=1 " if scope_lock else ""
     _type_env   = f'TARGET_TYPE="{_target_type}" '
     _maxurl_env = f"MAX_URLS={max_urls} " if max_urls > 0 else "MAX_URLS=0 "
@@ -3108,7 +3812,7 @@ def run_recon(
     if max_urls > 0:
         log("info", f"URL cap: {max_urls} URLs max (priority-ordered)")
     ok = run_live(
-        f'{adaptive_env}{_scope_env}{_type_env}{_maxurl_env}'
+        f'{adaptive_env}{_scope_env}{_type_env}{_maxurl_env}{_targets_env}'
         f'RECON_OUT_DIR="{recon_dir}" RECON_SESSION_ID="{active_session_id or ""}" '
         f'BATCH_SIZE={batch_size} bash "{script}" "{domain}" {quick_flag} {resume_flag}',
         timeout=_dynamic_timeout,
@@ -3370,6 +4074,27 @@ def run_nextjs_bypass(domain: str) -> bool:
     return True
 
 
+def _count_json_findings(path):
+    """Count only valid JSON-object lines. jsluice/trufflehog emit one JSON
+    object per finding; tool error lines (e.g. 'unknown flag') and blanks are
+    skipped instead of being miscounted as findings."""
+    n = 0
+    try:
+        with open(path, errors="ignore") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln.startswith("{"):
+                    continue
+                try:
+                    json.loads(ln)
+                    n += 1
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return n
+
+
 # ── NEW: JS Analysis ───────────────────────────────────────────────────────────
 def run_js_analysis(domain: str) -> bool:
     """
@@ -3420,39 +4145,82 @@ def run_js_analysis(domain: str) -> bool:
     trufflehog   = _tool_bin("trufflehog")
 
     # ── jsluice: endpoints + secrets ──
+    # v9.23 — the installed BishopFox jsluice has NO --input-format flag; raw stdin
+    # is -j/--raw-input. The old `secrets --input-format=js` made jsluice print
+    # "unknown flag: --input-format" to STDOUT (not stderr, so 2>/dev/null did not
+    # hide it); tee captured those error lines and the counter reported them as
+    # "secrets" (e.g. "5 secrets found" = 5 error lines). Use -j, dedup, and count
+    # only valid JSON objects.
     if _which(jsluice_bin):
         jsluice_out = os.path.join(js_dir, "jsluice_secrets.txt")
         endpoints_out = os.path.join(js_dir, "jsluice_endpoints.txt")
         cmd = (
             f'cat "{js_urls_file}" | while read url; do '
-            f'  curl -sk "$url" | {jsluice_bin} secrets --input-format=js 2>/dev/null; '
-            f'done | tee "{jsluice_out}"'
+            f'  curl -sk "$url" | {jsluice_bin} secrets -j 2>/dev/null; '
+            f'done | sort -u | tee "{jsluice_out}"'
         )
         run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         cmd2 = (
             f'cat "{js_urls_file}" | while read url; do '
-            f'  curl -sk "$url" | {jsluice_bin} urls --input-format=js 2>/dev/null; '
+            f'  curl -sk "$url" | {jsluice_bin} urls -j 2>/dev/null; '
             f'done | sort -u | tee "{endpoints_out}"'
         )
         run_cmd(cmd2, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         if os.path.exists(jsluice_out):
-            count = sum(1 for _ in open(jsluice_out) if _.strip())
-            log("ok", f"jsluice: {count} secrets found → {jsluice_out}")
+            count = _count_json_findings(jsluice_out)
+            log("ok", f"jsluice: {count} secret(s) found → {jsluice_out}")
     else:
         log("warn", "jsluice not found — skipping")
 
     # ── SecretFinder ──
+    # v9.23 — SecretFinder -o cli prints a "[ + ] URL: <url>" banner for EVERY
+    # scanned URL even with zero matches; real matches are printed on their own
+    # lines using a tab->tab separator. The old counter counted every non-blank
+    # line, so N URLs => "N hits". Count only the separator lines, and mark them
+    # unverified (most raw regex matches are noise: CSS, GUIDs, asset URLs).
     if os.path.isfile(secretfinder):
         sf_out = os.path.join(js_dir, "secretfinder.txt")
+        # v9.24 — do NOT blanket-suppress stderr. When SecretFinder's deps break
+        # (jsbeautifier/lxml import error, etc.) the old ``2>/dev/null`` hid the
+        # traceback, the tool exited ~0 in 0.1s with 0 bytes, and we reported a
+        # clean "0 matches". Merge stderr into the captured output (per-url so a
+        # single broken URL doesn't kill the loop) and assert plausibility.
         cmd = (
             f'cat "{js_urls_file}" | while read url; do '
-            f'  python3 "{secretfinder}" -i "$url" -o cli 2>/dev/null; '
+            f'  python3 "{secretfinder}" -i "$url" -o cli 2>&1; '
             f'done | tee "{sf_out}"'
         )
         run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         if os.path.exists(sf_out):
-            count = sum(1 for _ in open(sf_out) if _.strip())
-            log("ok", f"SecretFinder: {count} hits → {sf_out}")
+            count = 0
+            tb_signal = False
+            with open(sf_out, errors="ignore") as fh:
+                for ln in fh:
+                    if "\t->\t" in ln:
+                        count += 1
+                    low = ln.lower()
+                    # finding J: degrade ONLY on an explicit error signal — a
+                    # traceback, a missing-module / import error, a "command not
+                    # found" / "no such file" from the shell, or a SyntaxError.
+                    # The old fast+empty heuristic (js_count>0 && bytes==0 &&
+                    # dur<2.0) false-positived on a legit single-URL no-secrets
+                    # target that finishes <2s empty.
+                    if ("traceback (most recent call last)" in low
+                            or "modulenotfounderror" in low
+                            or "importerror" in low
+                            or "syntaxerror" in low
+                            or "command not found" in low
+                            or "no such file or directory" in low):
+                        tb_signal = True
+            # SecretFinder that printed an import/runtime error did not actually
+            # run — flag it instead of reporting "0 matches". An empty-but-clean
+            # file (no error markers) is a legitimate "no secrets found" result,
+            # even when the run finished quickly over a single JS URL.
+            if tb_signal:
+                _mark_degraded("secretfinder",
+                               "import/runtime error in output — dependency broken (see secretfinder.txt)")
+            else:
+                log("ok", f"SecretFinder: {count} raw match(es) [unverified] → {sf_out}")
     else:
         log("warn", "SecretFinder not found at ~/tools/SecretFinder/")
 
@@ -3478,7 +4246,7 @@ def run_js_analysis(domain: str) -> bool:
             watch_phase="JS ANALYSIS"
         )
         if os.path.exists(tf_out):
-            hits = sum(1 for _ in open(tf_out) if _.strip())
+            hits = _count_json_findings(tf_out)
             log("ok", f"TruffleHog: {hits} secrets → {tf_out}")
     else:
         log("warn", "trufflehog not found")
@@ -3517,7 +4285,7 @@ def run_secret_hunt(domain: str) -> bool:
             watch_phase="SECRET HUNT"
         )
         if os.path.exists(tf_out):
-            hits = sum(1 for _ in open(tf_out) if _.strip())
+            hits = _count_json_findings(tf_out)
             log("ok" if hits == 0 else "crit", f"TruffleHog recon scan: {hits} secrets → {tf_out}")
     else:
         log("warn", "trufflehog not in PATH")
@@ -3525,18 +4293,28 @@ def run_secret_hunt(domain: str) -> bool:
     # GitHound: search GitHub for secrets related to domain
     if _which(git_hound):
         gh_out = os.path.join(secret_dir, "githound.txt")
+        # v9.24 — capture stderr too: GitHound prints "[!] config.yml was not
+        # found." to stdout, but other auth/rate-limit errors land on stderr.
         ok, out = run_cmd(
-            f'echo "{domain}" | {git_hound} --dig-files --dig-commits 2>/dev/null | tee "{gh_out}"',
+            f'echo "{domain}" | {git_hound} --dig-files --dig-commits 2>&1 | tee "{gh_out}"',
             timeout=SECRET_TIMEOUT,
             watch_file=secret_dir,
             watch_phase="SECRET HUNT"
         )
         if os.path.exists(gh_out):
-            # Filter out GitHound's own [!] warning/error lines (e.g. "config.yml not found")
-            # so only actual match lines are counted as findings
-            count = sum(1 for line in open(gh_out)
-                        if line.strip() and not line.lstrip().startswith("[!]"))
-            log("ok" if count == 0 else "crit", f"GitHound: {count} results → {gh_out}")
+            gh_text = _read_text(gh_out)
+            # If GitHound emitted a config/auth error (e.g. missing config.yml),
+            # the scan never authenticated — do NOT report "0 results clean".
+            # Surface a clear degradation instead.
+            if _githound_output_is_error(gh_text):
+                _mark_degraded("git-hound",
+                               "not configured (config.yml / GitHub creds missing) — GitHub secret scan SKIPPED")
+            else:
+                # Count only actual match lines; GitHound prefixes informational
+                # warnings with "[!]" which are not findings.
+                count = sum(1 for line in gh_text.splitlines()
+                            if line.strip() and not line.lstrip().startswith("[!]"))
+                log("ok" if count == 0 else "crit", f"GitHound: {count} results → {gh_out}")
     else:
         log("warn", "git-hound not in PATH — skipping GitHub scan")
 
@@ -3821,8 +4599,21 @@ for url in urls:
             resp = urllib.request.urlopen(req, timeout=5)
             acao = resp.headers.get("Access-Control-Allow-Origin", "")
             acac = resp.headers.get("Access-Control-Allow-Credentials", "")
-            if acao == origin or acao == "*":
-                line = f"CORS | {{url}} | Origin: {{origin}} → ACAO: {{acao}} | Creds: {{acac}}"
+            cred = acac.strip().lower() == "true"
+            line = None
+            if acao == origin:
+                # Reflected attacker origin — always a real signal.
+                sev = "HIGH" if cred else "MEDIUM"
+                line = f"CORS-REFLECT | sev={{sev}} | {{url}} | Origin: {{origin}} → ACAO: {{acao}} | Creds: {{acac}}"
+            elif acao == "*":
+                if cred:
+                    # ACAO:* + ACAC:true — browsers reject this combo, but flag it.
+                    line = f"CORS-REFLECT | sev=MEDIUM | {{url}} | Origin: {{origin}} → ACAO: {{acao}} | Creds: {{acac}}"
+                else:
+                    # Wildcard without credentials is standard public behaviour,
+                    # non-exploitable (browsers refuse creds with ACAO:*) — info only.
+                    line = f"CORS-INFO | {{url}} | Origin: {{origin}} → ACAO: {{acao}} | Creds: {{acac}}"
+            if line:
                 findings.append(line)
                 print(line, flush=True)
         except Exception:
@@ -3844,9 +4635,22 @@ print(f"[CORS] {{len(findings)}} findings saved to {cors_out}")
     print(out.strip())
 
     if os.path.exists(cors_out):
-        count = sum(1 for _ in open(cors_out) if _.strip())
-        if count:
-            log("crit", f"CORS: {count} vulnerabilities → {cors_out}")
+        # Count only credentialed-reflection findings as vulnerabilities; benign
+        # public wildcards (CORS-INFO) are informational, not CRITICAL.
+        vuln_count = 0
+        info_count = 0
+        for ln in open(cors_out):
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln.startswith("CORS-INFO"):
+                info_count += 1
+            else:
+                vuln_count += 1
+        if vuln_count:
+            log("crit", f"CORS: {vuln_count} reflection vulnerabilities → {cors_out}")
+        elif info_count:
+            log("info", f"CORS: {info_count} wildcard (no-creds) endpoint(s) [informational] → {cors_out}")
         else:
             log("ok", "CORS: No misconfigurations found")
     _brain_phase_complete(
@@ -4087,16 +4891,51 @@ def run_cms_exploit(domain: str) -> bool:
         return False
 
     # ── Step 1: whatweb fingerprinting ──
+    # v9.23 — the old form `... | xargs -I{} whatweb --color=never {} 2>/dev/null
+    # | tee` silently produced a 0-byte file: ALL stderr was discarded, and whatweb
+    # 0.6.3 CRASHES on HTTPS under Ruby 3.4+/4.x ("can't modify frozen Hash"), so
+    # every https target failed invisibly. Now: run per-URL, keep stderr in a log,
+    # and fall back to the (reliable) httpx tech tags so the fingerprint file is
+    # never silently empty and downstream CMS detection still has data.
     whatweb_out = os.path.join(exploit_dir, "whatweb.txt")
+    whatweb_err = os.path.join(exploit_dir, "whatweb_errors.log")
     if _which(whatweb_bin):
         log("info", "whatweb: fingerprinting live hosts...")
-        run_cmd(
-            f'cat "{live_urls}" 2>/dev/null | head -50 | '
-            f'xargs -I{{}} {whatweb_bin} --color=never {{}} 2>/dev/null | tee "{whatweb_out}"',
-            timeout=300,
-            watch_file=exploit_dir,
-            watch_phase="CMS EXPLOIT"
-        )
+        open(whatweb_out, "w").close()
+        open(whatweb_err, "w").close()
+        targets = []
+        if os.path.isfile(live_urls):
+            with open(live_urls, errors="ignore") as fh:
+                targets = [u.strip() for u in fh
+                           if u.strip().startswith(("http://", "https://"))][:50]
+        for url in targets:
+            run_cmd(
+                f'{whatweb_bin} -a1 --color=never --follow-redirect=always '
+                f'--max-redirects=3 --open-timeout=25 --read-timeout=25 '
+                f'"{url}" >> "{whatweb_out}" 2>> "{whatweb_err}"',
+                timeout=70,
+                watch_file=exploit_dir,
+                watch_phase="CMS EXPLOIT"
+            )
+        wc = (sum(1 for _ in open(whatweb_out, errors="ignore") if _.strip())
+              if os.path.exists(whatweb_out) else 0)
+        if wc == 0:
+            note = ""
+            if os.path.exists(whatweb_err) and os.path.getsize(whatweb_err):
+                err_head = open(whatweb_err, errors="ignore").readline().strip()
+                if "frozen Hash" in err_head:
+                    note = (" (whatweb 0.6.3 incompatible with Ruby 3.4+/4.x on HTTPS — "
+                            "pin ruby<=3.3 or upgrade whatweb)")
+            # Fall back to httpx tech tags so the fingerprint is not lost.
+            if os.path.exists(live_file):
+                with open(whatweb_out, "a") as wf, open(live_file, errors="ignore") as lf:
+                    for line in lf:
+                        if line.strip():
+                            wf.write(f"# fallback(httpx): {line.strip()}\n")
+            log("warn", f"whatweb produced no output{note}; "
+                        f"using httpx tech tags (see {whatweb_err})")
+        else:
+            log("ok", f"whatweb: {wc} host line(s) → {whatweb_out}")
     else:
         log("warn", "whatweb not installed — skipping fingerprint step")
 
@@ -4153,8 +4992,11 @@ def run_cms_exploit(domain: str) -> bool:
         with open(source_file, errors="ignore") as fh:
             for line in fh:
                 lower = line.lower()
+                # v9.23 — dropped "/user/login": it is a generic path present on
+                # countless non-Drupal apps and was a single weak signal. The
+                # /misc/drupal.js|ajax.js|progress.js paths are Drupal-specific.
                 if any(marker in lower for marker in (
-                    "/misc/drupal.js", "/misc/ajax.js?v=", "/misc/progress.js?v=", "/user/login",
+                    "/misc/drupal.js", "/misc/ajax.js?v=", "/misc/progress.js?v=",
                 )):
                     remember_host(drupal_hosts_map, line.strip())
 
@@ -4180,16 +5022,29 @@ def run_cms_exploit(domain: str) -> bool:
                 remember_host(drupal_hosts_map, host.strip())
 
     if not drupal_hosts_map and os.path.isfile(live_urls):
+        # v9.23 — CONTENT-verified probe. The old version accepted 200/301/302/403
+        # on /misc/drupal.js, /user/login or /CHANGELOG.txt as proof of Drupal. An
+        # nginx http->https 301 fires on EVERY path, so it misclassified plain
+        # PHP/nginx hosts (e.g. http://clientc.com/user/login -> 301) as
+        # Drupal. Now require a real HTTP 200 whose BODY contains "drupal" on a
+        # Drupal-specific file — a redirect, 403, or SPA catch-all no longer counts.
         for host in open(live_urls, errors="ignore"):
-            host = host.strip()
+            host = host.strip().rstrip("/")
             if not host.startswith(("http://", "https://")):
                 continue
-            for path in ("/misc/drupal.js", "/user/login", "/CHANGELOG.txt"):
-                ok, status = run_cmd(
-                    f'curl -sk -o /dev/null -w "%{{http_code}}" --max-time 8 "{host}{path}"',
+            for path in ("/misc/drupal.js", "/core/misc/drupal.js",
+                         "/CHANGELOG.txt", "/core/CHANGELOG.txt"):
+                ok, body = run_cmd(
+                    f'curl -sk -L --max-redirs 3 --max-time 8 '
+                    f'-w "\\nHTTP_STATUS:%{{http_code}}" "{host}{path}"',
                     timeout=12
                 )
-                if ok and status in {"200", "301", "302", "403"}:
+                if not ok or not body:
+                    continue
+                m = re.search(r"HTTP_STATUS:(\d+)\s*$", body)
+                status = m.group(1) if m else ""
+                content = body[:m.start()] if m else body
+                if status == "200" and "drupal" in content.lower():
                     remember_host(drupal_hosts_map, host)
                     break
 
@@ -4240,8 +5095,21 @@ def run_cms_exploit(domain: str) -> bool:
                         timeout=30
                     )
                     results_text += f"\n## {cmd}\n{out}\n"
-                    if ok and out.strip():
+                    # Gate the verdict on actual command-output evidence, not
+                    # mere non-empty stdout (the PoC merges banners / "[*] ..."
+                    # status / "not vulnerable" lines into stdout via 2>&1).
+                    # The `id` command yields a deterministic `uid=N(` signature —
+                    # mirror the Tomcat CVE-2017-12615 `"uid=" in exec_out` gate.
+                    if ok and cmd == "id" and re.search(r"uid=\d+\(", out):
                         log("crit", f"RCE CONFIRMED on {host}: {cmd} → {out[:80]}")
+                        # Also emit a reporter-ingestible artifact under rce/. The
+                        # exploits/ dir is treated as meta and IGNORED by reporter.py,
+                        # so a confirmed RCE would otherwise never reach the report.
+                        rce_dir = os.path.join(findings_dir, "rce")
+                        os.makedirs(rce_dir, exist_ok=True)
+                        with open(os.path.join(rce_dir, f"RCE_CONFIRMED_drupalgeddon2_{safe}.txt"), "w") as rf:
+                            rf.write(f"[RCE-POC] RCE CONFIRMED — CVE-2018-7600 Drupalgeddon2 on "
+                                     f"{host} | cmd `id` → {out.strip()[:200]}\n")
                 with open(poc_out, "w") as f:
                     f.write(results_text)
                 log("ok", f"Drupalgeddon2 results → {poc_out}")
@@ -5097,7 +5965,11 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         return False
 
     post_params_file = os.path.join(recon_dir, "params", "post_params.json")
-    if not os.path.isfile(post_params_file):
+    # v9.24 — short-circuit when POST discovery already ran this session. On a
+    # 0-form target ``post_params.json`` is never written, so also honour the
+    # done-marker; otherwise lightpanda re-renders every page a second time.
+    post_params_done = os.path.join(recon_dir, "params", "post_params_done.marker")
+    if not os.path.isfile(post_params_file) and not os.path.isfile(post_params_done):
         log("info", "sqlmap preflight: discovering POST parameters first (lightpanda + arjun)...")
         run_post_param_discovery(domain, cookies=cookies)
 
@@ -5145,8 +6017,44 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         except Exception:
             pass
 
+    # v9.24 — seed db-named in-scope live hosts (mssql/mysql/db/postgres/oracle…)
+    # as sqlmap candidates. These are the highest-value SQLi surface yet the
+    # historical aggregator never included them (no query string → filtered out).
+    candidates.extend(_collect_db_named_candidates(recon_dir))
+
     candidates = [c for c in dict.fromkeys(candidates) if not _looks_like_payload_url(c)]
+
+    # v9.24 — candidate hygiene: drop WebResource.axd/ScriptResource.axd handlers
+    # (static signed blobs, zero SQLi surface) and substitute crawler placeholder
+    # tokens (``?d=FUZZ&t=FUZZ`` → ``?d=1&t=1``) so sqlmap has a real baseline
+    # value to mutate instead of fuzzing the literal string "FUZZ".
+    candidates = _sanitize_sqlmap_candidates(candidates)
     candidates = candidates[:20]  # top 20 GET candidates
+
+    # v9.24 audit-fix (finding L): remember whether ANY candidate was discovered
+    # before reachability filtering, so the "nothing to test" message can tell
+    # "all discovered candidates were unreachable" apart from "never discovered".
+    discovered_candidate_count = len(candidates)
+    all_candidates_unreachable = False
+
+    # v9.24 — reachability preflight: both candidates in the clientd run
+    # were dead (404/connection-refused at connect) yet the phase logged
+    # "complete". Probe each candidate; if none survive, emit a degradation so
+    # the report shows the phase tested nothing rather than passing silently.
+    if candidates:
+        # finding D: thread the engagement's session cookies into the preflight
+        # so auth-gated parameterized endpoints aren't dropped before the
+        # cookie-aware sqlmap run that follows.
+        reachable, dead = _filter_reachable_candidates(
+            candidates, limit=20, cookies=cookies)
+        if dead:
+            log("info", f"sqlmap preflight: {dead} unreachable candidate(s) dropped")
+        if not reachable:
+            log("warn", "sqlmap: all GET candidates unreachable — nothing to test")
+            _mark_degraded("sqlmap",
+                           f"all {len(candidates)} GET candidate(s) unreachable (404/refused) — no SQLi surface probed")
+            all_candidates_unreachable = True
+        candidates = reachable
 
     # v7.1.4 — OpenAPI/Swagger POST endpoints from api_audit.py Phase 6.5.
     # These don't go through ``sqlmap -m`` (which treats one URL per line as GET);
@@ -5157,7 +6065,15 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         log("info", f"sqlmap: {len(openapi_posts)} POST candidate(s) from OpenAPI specs")
 
     if not candidates and not openapi_posts:
-        log("warn", "No SQLi candidates found — run recon + param discovery first")
+        # finding L: distinguish "all discovered candidates were unreachable"
+        # (host(s) down / 404 / refused) from "no candidates ever discovered"
+        # (recon/param-discovery never produced parameterized URLs).
+        if all_candidates_unreachable:
+            log("warn",
+                f"sqlmap: all {discovered_candidate_count} candidate(s) "
+                f"unreachable (404/refused) — no SQLi surface to test")
+        else:
+            log("warn", "No SQLi candidates found — run recon + param discovery first")
         return False
 
     # v7.1.4 — thread session cookies into sqlmap so authenticated endpoints
@@ -5200,6 +6116,15 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     #      is what actually finds app-layer SQLi through JSON APIs.
     #   --smart          — let sqlmap skip non-numeric params heuristically
     #      so /api/feedback/submit's "message" field doesn't burn 5 minutes.
+    #
+    # v9.24 audit-fix (finding B): track POST run failures + confirmed hits so
+    # the final return reflects reality. Previously the function returned True
+    # unconditionally even when sqlmap timed out / crashed with no injectable
+    # result, masking a dead phase as success.
+    post_ok = True            # AND of every POST run's ok flag
+    post_attempted = False    # at least one POST invocation happened
+    injectable_found = False  # any confirmed injectable parameter (GET or POST)
+    last_post_out = ""        # tail of the most recent POST run (for degrade msg)
     for op in openapi_posts:
         body = json.dumps(op["json_body"] or {"test": "1"}, separators=(",", ":"))
         safe_name = (op["url"].replace("https://", "").replace("http://", "")
@@ -5221,6 +6146,9 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
             f'--output-dir="{sqli_dir}"',
             timeout=600,
         )
+        post_attempted = True
+        post_ok = post_ok and bool(ok_p)
+        last_post_out = out_p or last_post_out
         # v7.1.10 — sqlmap writes its results-CSV to the output dir; re-read
         # the most recent one (the -o flag used before was a boolean, not a
         # path, and silently did nothing). A hit has a non-empty Technique(s)
@@ -5235,22 +6163,49 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         if ("injectable" in combined_out.lower()
                 or "parameter:" in combined_out.lower()):
             log("crit", f"API SQLi FOUND: {op['method']} {op['url']}")
+            injectable_found = True
 
+    injections = 0
     if os.path.exists(sqli_out):
-        injections = sum(1 for line in open(sqli_out) if "injectable" in line.lower() or "injection" in line.lower())
+        injections = sum(1 for line in open(sqli_out)
+                         if "injectable" in line.lower() or "injection" in line.lower())
         if injections:
             log("crit", f"sqlmap: {injections} injectable parameter(s) found → {sqli_dir}")
+            injectable_found = True
         else:
             log("ok", f"sqlmap complete → {sqli_dir}")
     else:
         log("ok" if ok else "warn", f"sqlmap complete → {sqli_dir}")
 
+    # v9.24 audit-fix (finding B): fold POST ok_p failures into the overall
+    # run status, and only declare success on a clean completion or a confirmed
+    # hit. Previously this returned True even when every sqlmap invocation
+    # timed out / crashed and nothing injectable was found — masking a dead
+    # phase as ✓.
+    #   * run_ok      — every sqlmap invocation that actually ran exited cleanly.
+    #   * ran_anything— at least one GET batch or POST op was invoked.
+    run_ok = bool(ok) and post_ok
+    ran_anything = bool(candidates) or post_attempted
+
+    overall_ok = injectable_found or run_ok
     _brain_phase_complete(
         "SQLMAP",
-        ok,
-        detail=f"target={domain} candidates={len(candidates)}",
+        overall_ok,
+        detail=(f"target={domain} candidates={len(candidates)} "
+                f"injectable={injectable_found} run_ok={run_ok}"),
         artifacts={"sqlmap": sqli_dir},
     )
+
+    # Failure path: sqlmap ran (something was attempted) but exited non-clean
+    # (timeout / crash) AND produced no confirmed injectable result. Mark the
+    # phase degraded and report failure so the dashboard shows ✗, not ✓.
+    if ran_anything and not run_ok and not injectable_found:
+        tail = ((out or "") + (last_post_out or ""))[-500:] \
+            or "sqlmap exited non-zero with no injectable result"
+        _mark_degraded("sqlmap", tail)
+        log("warn", "sqlmap: run did not complete cleanly and found no SQLi — reporting failure")
+        return False
+
     return True
 
 
@@ -5602,6 +6557,15 @@ def run_post_param_discovery(domain: str,
 
     if not post_params and not post_urls:
         log("info", "No POST parameters discovered")
+        # v9.24 — record that discovery completed (0 forms) so the sqlmap
+        # preflight does not re-render the same pages with lightpanda a second
+        # time. ``post_params.json`` is never written on the empty path, so use
+        # a sentinel marker as the "already ran this session" signal.
+        try:
+            with open(os.path.join(params_dir, "post_params_done.marker"), "w") as mk:
+                mk.write("0\n")
+        except OSError:
+            pass
         _brain_phase_complete("POST-PARAMS", True, detail=f"target={domain} found=0")
         return False
 
@@ -5745,8 +6709,12 @@ def run_jwt_audit(domain: str) -> bool:
             timeout=15
         )
         results.append(f"## alg=none\n{out2}\n")
-        if "TAMPERED" in out2 or "forged" in out2.lower():
-            log("crit", f"JWT {i+1}: alg=none ACCEPTED — potential auth bypass!")
+        # `jwt_tool -X a` (no -t) only *generates* a forged alg=none token
+        # locally — it never sends it to the server, so it proves nothing
+        # about acceptance. The old "TAMPERED"/"forged" substring match fired
+        # on every token. Emit an informational replay candidate instead of a
+        # crit; confirm acceptance manually (or via -t URL with a -cv canary).
+        log("info", f"JWT {i+1}: alg=none forge candidate generated — replay against a live endpoint to confirm acceptance")
 
         # RS256→HS256 confusion
         ok3, out3 = run_cmd(
@@ -5845,6 +6813,25 @@ def run_browser_scan(
         )
         results = agent.run()
         total = sum(results.values()) if results else 0
+        # v9.24 audit-fix (finding A): distinguish a legit no-op skip (browser-use
+        # absent / no LLM → 0 tasks attempted) from total failure (every task
+        # errored). BrowserAgent exposes _tasks_completed / _tasks_errored; when
+        # results is empty AND tasks were attempted with completions==0, the phase
+        # is degraded, not skipped — surface it so the dashboard renders ✗ (ERROR)
+        # instead of hiding the phase behind a silent [OK].
+        tasks_errored = int(getattr(agent, "_tasks_errored", 0) or 0)
+        tasks_completed = int(getattr(agent, "_tasks_completed", 0) or 0)
+        if not results and tasks_errored > 0 and tasks_completed == 0:
+            reason = (f"all {tasks_errored} browser request(s) errored "
+                      f"(0 completed) — browser phase produced no result")
+            _mark_degraded("browser", reason)
+            log("err", f"Browser scan degraded: {reason}")
+            _brain_phase_complete(
+                phase_name, False,
+                detail=f"target={domain} headed={headed} degraded errors={tasks_errored}",
+                artifacts={"findings": findings_dir},
+            )
+            return False
         log("ok" if total else "info", f"Browser scan complete: {total} finding(s)")
         _brain_phase_complete(
             phase_name,
@@ -5855,6 +6842,9 @@ def run_browser_scan(
         return bool(results)
     except Exception as exc:
         log("err", f"Browser scan failed: {exc}")
+        # An exception escaping agent.run() is an unambiguous failure of a
+        # requested phase — mark degraded so it renders ✗ rather than ∅.
+        _mark_degraded("browser", f"browser phase raised: {exc}")
         _brain_phase_complete(phase_name, False, detail=f"target={domain} error={exc}")
         return False
 
@@ -5879,23 +6869,35 @@ def run_cve_hunt(domain: str) -> bool:
     # ── cvemap: cross-reference live hosts against NVD/EPSS/Shodan CVE data ───
     # Installed: go install github.com/projectdiscovery/cvemap/cmd/cvemap@latest
     cvemap_bin = shutil.which("cvemap") or os.path.join(GOBIN, "cvemap")
-    if os.path.exists(cvemap_bin):
+    # v9.23 — cvemap >= v0.0.7 requires a ProjectDiscovery Cloud (PDCP) API key;
+    # without it the binary exits with "api key cannot be empty", which previously
+    # surfaced as a confusing rc=1 phase failure. Skip cleanly with a hint instead.
+    pdcp_key = os.environ.get("PDCP_API_KEY") or os.environ.get("CVEMAP_API_KEY")
+    if not os.path.exists(cvemap_bin):
+        pass
+    elif not pdcp_key:
+        log("warn", "cvemap: skipped — no PDCP_API_KEY set "
+                    "(get a free key at https://cloud.projectdiscovery.io, then "
+                    "`export PDCP_API_KEY=...`)")
+    else:
         cvemap_out   = os.path.join(cve_dir, "cvemap_results.txt")
         httpx_file   = os.path.join(recon_dir, "live", "httpx_full.txt")
 
-        # Extract unique CPE/product names from httpx tech-detect output
         if os.path.exists(httpx_file):
-            log("info", "cvemap: correlating live tech stack with EPSS-ranked CVEs...")
-            # Run cvemap for top EPSS CVEs matching common web techs found in scope
+            log("info", "cvemap: pulling EPSS-ranked critical/high CVEs (top 50, global)...")
+            # -lsi -silent emits exactly one CVE-ID per line (no table header /
+            # separator / banner chrome), so the count below is accurate. The
+            # default table output counted every decorative row as a "CVE".
             run_live(
                 f'"{cvemap_bin}" -severity critical,high -epss-score 0.5 '
-                f'-limit 50 -o "{cvemap_out}" 2>/dev/null',
+                f'-limit 50 -lsi -silent -o "{cvemap_out}" 2>/dev/null',
                 timeout=120,
                 watch_file=cve_dir,
                 watch_phase="CVE HUNT"
             )
             if os.path.exists(cvemap_out):
-                hits = sum(1 for _ in open(cvemap_out) if _.strip())
+                hits = sum(1 for ln in open(cvemap_out)
+                           if ln.strip().upper().startswith("CVE-"))
                 if hits:
                     log("crit", f"cvemap: {hits} high-EPSS CVEs worth testing → {cvemap_out}")
     _brain_phase_complete(
@@ -6031,6 +7033,7 @@ def hunt_target(
     skip_scan: bool = False,
     scope_lock: bool = False,
     max_urls: int = 100,
+    targets_file: str | None = None,
     browser_scan: bool = False,
     browser_headed: bool = False,
     browser_model: str | None = None,
@@ -6054,11 +7057,27 @@ def hunt_target(
         "sqlmap":            False,
         "jwt_audit":         False,
         "browser_scan":      False,
+        # v9.24 — tri-state phase status (ran / skipped / error) so the dashboard
+        # no longer marks skipped/no-op/errored phases with ✓. Keyed by phase.
+        "phase_status":      {},
         "session_id":        None,
         "recon_dir":         "",
         "findings_dir":      "",
         "report_dir":        "",
     }
+    _reset_degraded()  # per-target reset of the degraded-capability accumulator
+
+    # v9.24 audit-fix (finding K): install-time readiness gaps (tool present on
+    # PATH but missing its config / key / wordlist — e.g. git-hound with no
+    # config.yml) were only logged at startup and never reached coverage.json,
+    # so the reporter's coverage chapter missed "present but broken" gaps. Seed
+    # them into the degraded accumulator AFTER the per-target reset so they are
+    # persisted by write_coverage_json below alongside run-time degradations.
+    try:
+        for _gap in check_tool_readiness():
+            _mark_degraded(_gap["tool"], _gap["reason"])
+    except Exception:
+        pass  # readiness probing is best-effort; never block the hunt
 
     explicit_phase_selection = any((
         js_scan, param_discover, api_fuzz, secret_hunt, cors_check,
@@ -6127,6 +7146,7 @@ def hunt_target(
             session_id=resume_session_id,
             scope_lock=scope_lock,
             max_urls=max_urls,
+            targets_file=targets_file,
         )
         if not result["recon"]:
             log("warn", f"Recon had issues for {domain}, continuing...")
@@ -6250,6 +7270,19 @@ def hunt_target(
             allow_unsafe=browser_unsafe,
         )
 
+    # ── Phase 11: CVE Hunt ─────────────────────────────────────────────────
+    # Run CVE Hunt + Zero-day Fuzzer BEFORE the brain post-scan hook so its
+    # chain-building, exploit attempts, and H1 report triage over the COMPLETE
+    # findings set (including findings/cves/ and findings/zero_day/) rather than
+    # an incomplete one. (The autonomous path already orders these correctly.)
+    if cve_hunt and not skip_has(skip_items, "cve_hunt"):
+        run_cve_hunt(domain)
+
+    # ── Phase 12: Zero-day Fuzzer ───────────────────────────────────────────
+    if zero_day and not skip_has(skip_items, "zero_day"):
+        log("warn", "Zero-day fuzzer — results require manual verification")
+        run_fuzzer(domain, deep=not quick)
+
     # Brain: post-scan hook — interpret + chains + triage + exploit + report
     findings_dir = result.get("findings_dir") or _resolve_findings_dir(domain, session_id=result.get("session_id"), create=True)
     recon_dir = result.get("recon_dir") or _resolve_recon_dir(domain, session_id=resume_session_id)
@@ -6261,14 +7294,49 @@ def hunt_target(
         log("info", "Brain: post-scan hook (triage + exploit + report)...")
         _brain.post_scan_hook(findings_dir, recon_dir)
 
-    # ── Phase 11: CVE Hunt ─────────────────────────────────────────────────
-    if cve_hunt and not skip_has(skip_items, "cve_hunt"):
-        run_cve_hunt(domain)
+    # ── v9.24: tri-state phase status + coverage.json ───────────────────────
+    # Derive ran/skipped/error per phase so the dashboard stops marking
+    # skipped/no-op/errored phases with ✓. A phase is "error" when a degraded
+    # capability was recorded for one of its tools during this run.
+    _degraded_tools = {d["tool"] for d in _DEGRADED_CAPABILITIES}
+    _phase_tool_map = {
+        "js_analysis":     {"secretfinder", "jsluice", "trufflehog"},
+        "secret_hunt":     {"git-hound", "trufflehog"},
+        "sqlmap":          {"sqlmap"},
+        "jwt_audit":       {"jwt_tool"},
+        "api_fuzz":        {"kiterunner", "feroxbuster"},
+        # v9.24 audit-fix (finding A): a total browser failure records a
+        # "browser" degradation; map it so the phase renders ✗ (ERROR), not ✓/∅.
+        "browser_scan":    {"browser"},
+    }
+    _phase_requested = {
+        "recon":           should_run_recon,
+        "js_analysis":     js_scan,
+        "secret_hunt":     secret_hunt,
+        "param_discovery": param_discover,
+        "api_fuzz":        api_fuzz and not quick,
+        "cors":            cors_check,
+        "scan":            should_run_vuln_scan and not (skip_scan or skip_has(skip_items, "scan", "vuln_scan")),
+        "cms_exploit":     cms_exploit,
+        "rce_scan":        rce_scan,
+        "sqlmap":          sqlmap_scan,
+        "jwt_audit":       jwt_audit,
+        "browser_scan":    browser_scan,
+    }
+    # v9.24 audit-fix (finding A): persist per-phase "requested" flags so the
+    # dashboard can DISPLAY a requested phase that ended up skipped/errored
+    # (a requested browser phase that produced nothing must not be hidden).
+    result["phase_requested"] = {k: bool(v) for k, v in _phase_requested.items()}
+    for _phase, _requested in _phase_requested.items():
+        _degraded = bool(_phase_tool_map.get(_phase, set()) & _degraded_tools)
+        result["phase_status"][_phase] = derive_phase_status(
+            bool(_requested), bool(result.get(_phase)), degraded=_degraded
+        )
 
-    # ── Phase 12: Zero-day Fuzzer ───────────────────────────────────────────
-    if zero_day and not skip_has(skip_items, "zero_day"):
-        log("warn", "Zero-day fuzzer — results require manual verification")
-        run_fuzzer(domain, deep=not quick)
+    # Persist the degraded-capabilities list for the reporter (integration
+    # contract). Always written (even empty) so the reporter can tell
+    # "no degradations" from "coverage not measured".
+    write_coverage_json(findings_dir)
 
     # ── Phase 13: Reports ───────────────────────────────────────────────────
     if selected_only_mode:
@@ -6293,18 +7361,42 @@ def print_dashboard(results: list) -> None:
         status = f"{GREEN}OK{NC}" if r["success"] else f"{RED}FAIL{NC}"
         print(f"  [{status}] {BOLD}{r['domain']}{NC}")
         phases = []
-        if r.get("recon"):           phases.append(f"{GREEN}Recon✓{NC}")
-        if r.get("js_analysis"):     phases.append(f"{CYAN}JS✓{NC}")
-        if r.get("secret_hunt"):     phases.append(f"{MAGENTA}Secrets✓{NC}")
-        if r.get("param_discovery"): phases.append(f"{BLUE}Params✓{NC}")
-        if r.get("api_fuzz"):        phases.append(f"{YELLOW}API✓{NC}")
-        if r.get("cors"):            phases.append(f"{CYAN}CORS✓{NC}")
-        if r.get("scan"):            phases.append(f"{GREEN}Scan✓{NC}")
-        if r.get("cms_exploit"):     phases.append(f"{RED}CMS✓{NC}")
-        if r.get("rce_scan"):        phases.append(f"{RED}RCE✓{NC}")
-        if r.get("sqlmap"):          phases.append(f"{RED}SQLi✓{NC}")
-        if r.get("jwt_audit"):       phases.append(f"{YELLOW}JWT✓{NC}")
-        if r.get("browser_scan"):    phases.append(f"{CYAN}Browser✓{NC}")
+        pstatus = r.get("phase_status") or {}
+        preq = r.get("phase_requested") or {}
+        # (result-key, label, color) — order preserved for display.
+        _phase_specs = [
+            ("recon",           "Recon",   GREEN),
+            ("js_analysis",     "JS",      CYAN),
+            ("secret_hunt",     "Secrets", MAGENTA),
+            ("param_discovery", "Params",  BLUE),
+            ("api_fuzz",        "API",     YELLOW),
+            ("cors",            "CORS",    CYAN),
+            ("scan",            "Scan",    GREEN),
+            ("cms_exploit",     "CMS",     RED),
+            ("rce_scan",        "RCE",     RED),
+            ("sqlmap",          "SQLi",    RED),
+            ("jwt_audit",       "JWT",     YELLOW),
+            ("browser_scan",    "Browser", CYAN),
+        ]
+        for key, label, color in _phase_specs:
+            if key in pstatus:
+                st = pstatus[key]
+                # v9.24 — show ∅ skipped / ✗ errored / ✓ ran-with-result.
+                # Hide phases that were never requested (∅ + not run) to keep
+                # the line readable; surface ✗ errors and ✓ successes.
+                # finding A: a *requested* phase that ended up skipped (returned
+                # falsy with no result) must STILL be shown — a total browser
+                # failure that fell through to SKIPPED was previously hidden,
+                # printing a silent [OK]. Only hide phases that were not requested.
+                if (st == PHASE_STATUS_SKIPPED and not r.get(key)
+                        and not preq.get(key)):
+                    continue
+                glyph = phase_status_glyph(st)
+                gcol = RED if st == PHASE_STATUS_ERROR else color
+                phases.append(f"{gcol}{label}{glyph}{NC}")
+            elif r.get(key):
+                # Legacy fallback (callers that don't populate phase_status).
+                phases.append(f"{color}{label}✓{NC}")
         if phases:
             print(f"       Phases : {' | '.join(phases)}")
         print(f"       Reports: {r.get('reports', 0)}")
@@ -6430,6 +7522,8 @@ Examples:
     )
     # Core
     parser.add_argument("--target",           type=str,  help="Target: FQDN, IP, or CIDR (e.g. example.com, 192.168.1.1, 10.0.0.0/24)")
+    parser.add_argument("--targets-file",     type=str,  metavar="PATH",
+                        help="Scan an explicit list of authorized hosts (one per line; URLs/#comments OK), NO subdomain enumeration. Implies --scope-lock. Use for a curated multi-host scope.")
     parser.add_argument("--quick",            action="store_true", help="Quick focused scan mode")
     parser.add_argument("--resume",           nargs="?", const="latest", metavar="SESSION_ID",
                         help="Resume an existing recon session. Omit SESSION_ID to reuse the latest session, or pass a specific session ID to continue that exact recon folder")
@@ -6526,6 +7620,38 @@ Examples:
     resume_requested = args.resume is not None
     resume_session_id = None if args.resume in (None, "", "latest") else args.resume
     skip_items = parse_skip_items(args.skip)
+
+    # ── --targets-file: explicit multi-host scope-lock (no subdomain enum) ────
+    targets_file = None
+    if getattr(args, "targets_file", None):
+        if not os.path.isfile(args.targets_file):
+            log("err", f"--targets-file not found: {args.targets_file}")
+            sys.exit(1)
+        if args.autonomous or getattr(args, "agent", False):
+            log("err", "--targets-file is not yet supported with --autonomous/--agent; use --full")
+            sys.exit(1)
+        _hosts = _read_targets_file(args.targets_file)
+        if not _hosts:
+            log("err", f"--targets-file {args.targets_file} has no valid hosts")
+            sys.exit(1)
+        _label = _derive_targets_label(_hosts)
+        _hostlist_dir = os.path.join(TARGETS_DIR, "_hostlists")
+        os.makedirs(_hostlist_dir, exist_ok=True)
+        targets_file = os.path.join(_hostlist_dir, f"{_label}.txt")
+        with open(targets_file, "w", encoding="utf-8") as _fh:
+            _fh.write("\n".join(_hosts) + "\n")
+        if not args.target:
+            args.target = _label
+        args.scope_lock = True
+        log("info", f"Host-list scope: {len(_hosts)} hosts → label '{args.target}' "
+                    f"(subdomain enum OFF, scope-locked)")
+
+    # Reject a target carrying shell metacharacters before it ever reaches a
+    # shell command string (run_recon / recon dirs). Covers user-supplied AND
+    # derived targets. (Codex HIGH)
+    if args.target and not _is_safe_target(args.target):
+        log("err", f"Unsafe --target {args.target!r}: only FQDN / IP / CIDR characters are allowed")
+        sys.exit(1)
 
     if resume_session_id and not args.target:
         log("err", "--resume SESSION_ID requires --target")
@@ -6662,6 +7788,12 @@ Examples:
     if missing:
         log("warn", f"Missing: {', '.join(missing)}")
 
+    # v9.24 — readiness layer: tools may be present on PATH yet broken (no
+    # config/key/wordlist). Surface those so a "34/34 installed" banner doesn't
+    # imply full capability when e.g. git-hound has no config.yml.
+    for _gap in check_tool_readiness(installed):
+        log("warn", f"Not ready: {_gap['tool']} — {_gap['reason']}")
+
     should_auto_repair = bool(missing) and (
         args.repair_tools or (args.autonomous and not args.no_auto_install_tools)
     )
@@ -6780,6 +7912,7 @@ Examples:
                 full=args.full,
                 scope_lock=args.scope_lock,
                 max_urls=args.max_urls,
+                targets_file=targets_file,
                 browser_scan=args.browser_scan,
                 browser_headed=args.browser_headed,
                 browser_model=args.browser_model,
