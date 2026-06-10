@@ -48,6 +48,15 @@ def _reset_scanner_llm_cache():
     brain_scanner._SCANNER_LLM_SIG = None
 
 
+@pytest.fixture(autouse=True)
+def _assume_key_valid(monkeypatch):
+    """Cloud providers now validate the key with a startup health-check (a bad key no
+    longer reports `available`). These tests exercise gemini's request *mechanics*
+    assuming a working key, so stub the health-check to pass — the real bad-key/fallback
+    path is covered in tests/test_brain_provider_healthcheck.py."""
+    monkeypatch.setattr(brain.LLMClient, "_healthcheck", lambda self: True)
+
+
 @pytest.fixture
 def gemini_env(monkeypatch):
     """Only the Gemini key present; other provider keys cleared."""
@@ -69,6 +78,9 @@ def test_gemini_init_base_and_auth(gemini_env):
 
 def test_gemini_no_key_is_unavailable(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    # No key → gemini can't init. The explicit-provider fallback would otherwise reach
+    # for local Ollama, so disable it to assert the no-key / nothing-to-fall-back state.
+    monkeypatch.setattr(brain, "_ollama_lib", None, raising=False)
     c = LLMClient("gemini")
     assert c.available is False
 
