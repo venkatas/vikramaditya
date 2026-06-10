@@ -157,7 +157,7 @@ TARGET_TYPE="${TARGET_TYPE:-$(_detect_target_type "$TARGET")}"
 if [ "$TARGET_TYPE" = "ip" ] || [ "$TARGET_TYPE" = "cidr" ]; then
     SCOPE_LOCK=1
 fi
-AMASS_TIMEOUT=600      # 10 minutes (was 5 min)
+AMASS_TIMEOUT="${AMASS_TIMEOUT:-180}"  # v10.1.2: 3 min (passive amass is low-yield + hang-prone; was 600)
 CURL_TIMEOUT=10        # per request
 HTTP_PROBE_TIMEOUT=5   # reduced: 5s per-host timeout (was 10) — avoids macOS TCP hang
 
@@ -290,8 +290,12 @@ run_phase5_port_scanning() {
             log_step "naabu top-1000 on $TARGET..."
             naabu -host "$TARGET" -top-ports 1000 -silent \
                 -o "$RECON_DIR/ports/naabu_results.txt" 2>/dev/null || true
-            awk -F: 'NF>1 {print $2"/open"}' "$RECON_DIR/ports/naabu_results.txt" \
-                | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
+            if [ -f "$RECON_DIR/ports/naabu_results.txt" ]; then
+                awk -F: 'NF>1 {print $2"/open"}' "$RECON_DIR/ports/naabu_results.txt" \
+                    | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
+            else
+                : > "$RECON_DIR/ports/open_ports.txt"
+            fi
 
             # v9.5.0 — fingerprintx adds structured per-port service banners
             # (auth-protocol detection: RDP/SSH/SMB/Postgres/MySQL/Mongo/etc).
@@ -306,32 +310,48 @@ run_phase5_port_scanning() {
             if [ -s "$RECON_DIR/ports/open_ports.txt" ]; then
                 PORT_CSV="$(cut -d/ -f1 "$RECON_DIR/ports/open_ports.txt" | paste -sd, -)"
                 log_step "nmap service fingerprinting on naabu-discovered ports: ${PORT_CSV:-none}"
-                nmap -sV -p "$PORT_CSV" -T4 --open "$TARGET" \
+                nmap -Pn -sV -p "$PORT_CSV" -T4 --open "$TARGET" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
                     -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
             else
                 log_warn "naabu found no open ports — falling back to nmap top-1000"
-                nmap -sV --top-ports 1000 -T4 --open "$TARGET" \
+                nmap -Pn -sV --top-ports 1000 -T4 --open "$TARGET" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
                     -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
             fi
         else
             log_step "nmap top-1000 on $TARGET..."
-            nmap -sV --top-ports 1000 -T4 --open "$TARGET" \
+            nmap -Pn -sV --top-ports 1000 -T4 --open "$TARGET" \
                 -oN "$RECON_DIR/ports/nmap_results.txt" \
                 -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
         fi
 
-        grep "open" "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null \
-            | sed -nE 's/.*[^0-9]([0-9]+)\/open.*/\1\/open/p' \
-            | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
+        # Re-derive open_ports.txt from the nmap greppable output. nmap -oG puts
+        # ALL ports for a host on ONE comma-separated "Ports:" line, so grep -oE
+        # is needed to capture every port (a leading-greedy sed would keep only
+        # the last). Only overwrite when nmap actually yielded ports — otherwise
+        # the naabu-derived list (lines 294-295) must survive an empty/failed
+        # nmap run. Merge to be safe, and stage via a temp file to avoid the
+        # truncate-before-pipeline race.
+        if [ -s "$RECON_DIR/ports/nmap_greppable.txt" ]; then
+            nmap_ports="$(grep -oE '[0-9]+/open' "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null | sort -u)"
+            if [ -n "$nmap_ports" ]; then
+                { printf '%s\n' "$nmap_ports"; cat "$RECON_DIR/ports/open_ports.txt" 2>/dev/null; } \
+                    | grep -E '^[0-9]+/open$' | sort -u > "$RECON_DIR/ports/open_ports.txt.new" 2>/dev/null \
+                    && mv "$RECON_DIR/ports/open_ports.txt.new" "$RECON_DIR/ports/open_ports.txt"
+            fi
+        fi
         log_done "Open ports: $(file_lines "$RECON_DIR/ports/open_ports.txt")"
 
         if [ -s "$RECON_DIR/priority/critical_hosts.txt" ]; then
             log_step "nmap non-standard ports on CRITICAL hosts..."
             while IFS= read -r host; do
-                HOSTNAME=$(echo "$host" | sed 's|https\?://||;s|[/:].*||')
-                nmap -sV -p 8080,8443,8888,9090,9200,5601,6379,27017,3306,5432,2375,2376 \
+                # v9.23 (macOS/BSD fix) — BSD sed lacks '\?'; 'https\?://'
+                # never matches so 's|[/:].*||' would collapse every host to
+                # bare 'https'/'http', breaking the nmap target and colliding
+                # the per-host output file. Use -E (portable extended regex).
+                HOSTNAME=$(echo "$host" | sed -E 's#https?://##; s#[/:].*##')
+                nmap -Pn -sV -p 8080,8443,8888,9090,9200,5601,6379,27017,3306,5432,2375,2376 \
                     --open -T4 "$HOSTNAME" \
                     -oN "$RECON_DIR/ports/nmap_critical_${HOSTNAME}.txt" 2>/dev/null || true
             done < <(head -5 "$RECON_DIR/priority/critical_hosts.txt")
@@ -399,7 +419,13 @@ if phase_done "$RECON_DIR/subdomains/all.txt"; then true; else
 
 # ── Scope-lock: skip all enum tools, test only the exact given target ─────────
 if [ "$SCOPE_LOCK" = "1" ]; then
-    if [ "$TARGET_TYPE" = "cidr" ]; then
+    if [ -n "${TARGETS_FILE:-}" ] && [ -s "${TARGETS_FILE:-}" ]; then
+        # Multi-host scope-lock (--targets-file): hunt.py already normalized this
+        # list — use it verbatim as the host set, no subdomain enumeration.
+        sort -u "$TARGETS_FILE" > "$RECON_DIR/subdomains/all.txt"
+        log_warn "SCOPE_LOCK active — explicit host list, subdomain enumeration skipped"
+        log_ok "Scope-locked: $(file_lines "$RECON_DIR/subdomains/all.txt") target(s) from host list"
+    elif [ "$TARGET_TYPE" = "cidr" ]; then
         log_info "CIDR target — running ping sweep to discover live hosts"
         if tool_ok nmap; then
             nmap -sn "$TARGET" -oG - 2>/dev/null \
@@ -456,10 +482,12 @@ else
     log_warn "assetfinder not installed"
 fi
 
-# amass — deeper passive (10 min timeout)
+# amass — deeper passive. v10.1.2: MUST use 'timeout -k' — amass ignores SIGTERM
+# (observed running 58 min under a plain `timeout 600`, which only TERMs once and
+# then waits forever), so escalate to SIGKILL 30s after the deadline.
 if tool_ok amass && [ "$QUICK_MODE" != "--quick" ]; then
-    log_step "amass passive (timeout: ${AMASS_TIMEOUT}s = 10 min)..."
-    timeout "$AMASS_TIMEOUT" amass enum -passive -d "$TARGET" \
+    log_step "amass passive (timeout: ${AMASS_TIMEOUT}s, hard-kill +30s)..."
+    timeout -k 30 "$AMASS_TIMEOUT" amass enum -passive -d "$TARGET" \
         -o "$RECON_DIR/subdomains/amass.txt" 2>/dev/null || true
     [ ! -f "$RECON_DIR/subdomains/amass.txt" ] && touch "$RECON_DIR/subdomains/amass.txt"
     # v9.0.1 fix — amass writes graph format
@@ -487,8 +515,15 @@ else
 fi
 
 # crt.sh — certificate transparency
+# v9.23 — a single no-retry curl made transient outages (crt.sh/OTX are flaky)
+# invisible: the phase logged "0 subdomains" indistinguishably from a genuine
+# empty result. Add a bounded retry + connect-timeout and tally passive sources
+# so a "0 from N/M sources" warning surfaces when several silently fail.
+PASSIVE_SOURCES_TOTAL=0
+PASSIVE_SOURCES_EMPTY=0
 log_step "crt.sh..."
-curl -s --max-time 30 "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null \
+curl -s --max-time 30 --connect-timeout 10 --retry 2 --retry-delay 2 \
+    "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -503,6 +538,8 @@ try:
 except: pass
 " > "$RECON_DIR/subdomains/crtsh.txt" 2>/dev/null || true
 log_done "crt.sh: $(file_lines "$RECON_DIR/subdomains/crtsh.txt") subdomains"
+PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
+[ "$(file_lines "$RECON_DIR/subdomains/crtsh.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
 
 # Wayback Machine subdomains
 log_step "Wayback Machine subdomains..."
@@ -515,7 +552,7 @@ log_done "wayback subs: $(file_lines "$RECON_DIR/subdomains/wayback_subs.txt") s
 
 # AlienVault OTX
 log_step "AlienVault OTX..."
-curl -s --max-time 20 \
+curl -s --max-time 20 --connect-timeout 10 --retry 2 --retry-delay 2 \
     "https://otx.alienvault.com/api/v1/indicators/domain/$TARGET/passive_dns" \
     2>/dev/null \
     | python3 -c "
@@ -529,6 +566,14 @@ try:
 except: pass
 " | sort -u > "$RECON_DIR/subdomains/otx.txt" 2>/dev/null || true
 log_done "OTX: $(file_lines "$RECON_DIR/subdomains/otx.txt") subdomains"
+PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
+[ "$(file_lines "$RECON_DIR/subdomains/otx.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
+
+# v9.23 — surface widespread passive-source failures so 0-result runs aren't
+# silently treated as "the target genuinely has no subdomains".
+if [ "${PASSIVE_SOURCES_TOTAL:-0}" -gt 0 ] && [ "$PASSIVE_SOURCES_EMPTY" -eq "$PASSIVE_SOURCES_TOTAL" ]; then
+    log_warn "passive returned 0 from $PASSIVE_SOURCES_EMPTY/$PASSIVE_SOURCES_TOTAL CT sources (crt.sh/OTX) — possible rate-limit/outage, results may be incomplete"
+fi
 
 # HackerTarget
 log_step "HackerTarget API..."
@@ -539,11 +584,31 @@ curl -s --max-time 20 \
 log_done "hackertarget: $(file_lines "$RECON_DIR/subdomains/hackertarget.txt") subdomains"
 
 # asnmap — enumerate IP ranges for the target org (ASN → CIDR → IPs)
-if tool_ok asnmap && [ "$QUICK_MODE" != "--quick" ]; then
+# v9.23 — asnmap (like cvemap) now requires a ProjectDiscovery Cloud (PDCP)
+# API key. Without one it drops to an INTERACTIVE prompt
+# ("[*] Enter PDCP API Key (exit to abort):") that BLOCKS the whole recon and,
+# when fed from a pipe, writes the prompt text into asnmap.json — which then
+# masquerades as valid output. Detect a missing key and skip cleanly (mirror
+# cvemap in hunt.py); always feed </dev/null so the prompt can never block.
+ASNMAP_HAS_KEY=0
+if [ -n "${PDCP_API_KEY:-}" ] || [ -n "${ASNMAP_API_KEY:-}" ] \
+   || [ -f "$HOME/.config/nuclei/.pdcp_auth.yaml" ] || [ -f "$HOME/.pdcp/credentials" ]; then
+    ASNMAP_HAS_KEY=1
+fi
+if tool_ok asnmap && [ "$QUICK_MODE" != "--quick" ] && [ "$ASNMAP_HAS_KEY" != "1" ]; then
+    log_warn "asnmap: skipped — no PDCP_API_KEY set (get a free key at https://cloud.projectdiscovery.io, then \`export PDCP_API_KEY=...\`)"
+elif tool_ok asnmap && [ "$QUICK_MODE" != "--quick" ]; then
     log_step "asnmap (ASN → IP range enumeration)..."
     mkdir -p "$RECON_DIR/asn"
-    asnmap -d "$TARGET" -silent -json \
+    asnmap -d "$TARGET" -silent -json </dev/null \
         > "$RECON_DIR/asn/asnmap.json" 2>/dev/null || true
+    # Guard: if the binary still emitted a prompt / non-JSON line (e.g. it
+    # prompts despite our key check), drop it so it never poses as real data.
+    if [ -s "$RECON_DIR/asn/asnmap.json" ] \
+       && ! head -1 "$RECON_DIR/asn/asnmap.json" | grep -q '^[[:space:]]*[{[]'; then
+        log_warn "asnmap: discarded non-JSON output (likely a PDCP key prompt)"
+        : > "$RECON_DIR/asn/asnmap.json"
+    fi
     # Extract CIDRs and expand to IPs if mapcidr is available
     if tool_ok mapcidr && [ -s "$RECON_DIR/asn/asnmap.json" ]; then
         python3 -c "
@@ -624,23 +689,55 @@ fi  # end SCOPE_LOCK else block
 fi  # end Phase 1 resume skip
 
 # ============================================================
-# Phase 2: DNS Resolution — httpx-only (v9.x: dropped dnsx, hangs on macOS)
+# Phase 2: DNS Resolution
 # ============================================================
-# v9.x change: dnsx historically hangs on macOS for large lists (no progress
-# after ~hundreds of hosts) and httpx already does its own DNS resolution
-# inline.  We now skip dnsx entirely and pass all.txt straight to httpx in
-# Phase 3.  IPs are extracted from httpx output via awk after the probe.
+# v9.23 fix: previously this phase did a blind `cp all.txt resolved.txt` with
+# NO resolution at all, then logged "Resolved candidates: N" — but all.txt is
+# mostly brute-force/permutation candidates, so the count was wildly inflated
+# (e.g. 691 "resolved" when only ~3 hosts actually exist). We now resolve for
+# real with dnsx when available (`</dev/null` so it can't block, a timeout +
+# list cap to dodge the documented macOS large-list hang). If dnsx is missing
+# we keep candidates UNRESOLVED but label them honestly so the number is never
+# mistaken for live hosts.
 echo ""
-log_info "Phase 2: DNS Resolution (httpx-only — dnsx removed in v9.x)"
+log_info "Phase 2: DNS Resolution"
 if phase_done "$RECON_DIR/subdomains/resolved.txt"; then true; else
-    log_step "Skipping dnsx; httpx will resolve + probe in Phase 3"
-    cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
+    DNSX_CAP="${DNSX_MAX:-20000}"          # cap to avoid macOS large-list hang
+    ALL_COUNT=$(file_lines "$RECON_DIR/subdomains/all.txt")
+    DNS_VALIDATED=0                         # 1 only if dnsx actually resolved >0
+    if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] \
+       && [ -s "$RECON_DIR/subdomains/all.txt" ] && [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
+        log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
+        timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
+            > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+        if [ -s "$RECON_DIR/subdomains/resolved.txt" ]; then
+            DNS_VALIDATED=1
+            RES_N=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
+            log_done "dnsx: $RES_N resolved (dropped $(( ALL_COUNT - RES_N )) non-resolving candidates)"
+        else
+            # dnsx ran but resolved nothing real — fall back to candidate list
+            # rather than an empty resolved.txt (httpx can still try).
+            cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
+            log_warn "dnsx resolved 0 — falling back to $ALL_COUNT unresolved candidates (httpx will filter live)"
+        fi
+    else
+        # No resolver available (or list too large): do NOT claim resolution.
+        cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
+        if ! tool_ok dnsx; then
+            log_warn "dnsx not installed — $ALL_COUNT brute-force candidates UNRESOLVED (httpx will filter live)"
+        else
+            log_warn "candidate list ($ALL_COUNT) exceeds dnsx cap ($DNSX_CAP) — skipping resolve, httpx will filter live"
+        fi
+    fi
     # v9.2.0 (P1-7) — when DNS wildcard was detected, every brute-forced
     # candidate "resolves" to the same dead IP. Filter the resolved list
     # using the wildcard IP we captured during _detect_dns_wildcard so
     # downstream Phase 3 (httpx) and Phase 4 (dirsearch) don't waste hours
     # probing a single virtual host 1000+ times. Apex is always preserved.
-    if [ "${WILDCARD_DNS:-0}" = "1" ] && [ -n "${WILDCARD_DNS_IP:-}" ] && command -v dig &>/dev/null; then
+    # v9.23: runs unconditionally whenever a wildcard IP was captured (the old
+    # WILDCARD_DNS=1 extra gate is gone — WILDCARD_DNS_IP is set only when a
+    # wildcard was actually detected, which is the correct trigger).
+    if [ -n "${WILDCARD_DNS_IP:-}" ] && command -v dig &>/dev/null; then
         TOTAL_BEFORE=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
         FILTERED="$RECON_DIR/subdomains/.resolved.filtered.txt"
         : > "$FILTERED"
@@ -660,7 +757,11 @@ if phase_done "$RECON_DIR/subdomains/resolved.txt"; then true; else
         TOTAL_AFTER=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
         log_step "Wildcard DNS filter: $TOTAL_BEFORE → $TOTAL_AFTER hosts (dropped $(( TOTAL_BEFORE - TOTAL_AFTER )) wildcard-only candidates)"
     fi
-    log_done "Resolved candidates: $(file_lines "$RECON_DIR/subdomains/resolved.txt") hosts (httpx will filter live)"
+    if [ "${DNS_VALIDATED:-0}" = "1" ]; then
+        log_done "Resolved hosts: $(file_lines "$RECON_DIR/subdomains/resolved.txt") (DNS-validated; httpx will probe live)"
+    else
+        log_done "Brute-force candidates: $(file_lines "$RECON_DIR/subdomains/resolved.txt") (UNRESOLVED; httpx will filter live)"
+    fi
 fi  # end Phase 2 resume skip
 
 RESOLVED_FILE="$RECON_DIR/subdomains/resolved.txt"
@@ -777,6 +878,7 @@ else
                 -title \
                 -tech-detect \
                 -content-length \
+                -ip \
                 -no-fallback \
                 -no-color \
                 -threads "$THREADS" \
@@ -797,7 +899,7 @@ else
 
     # Separate by status
     grep '\[200\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_200.txt"  2>/dev/null || true
-    grep '\[30[123]\]' "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_3xx.txt" 2>/dev/null || true
+    grep -E '\[30[12378]\]' "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_3xx.txt" 2>/dev/null || true
     grep '\[403\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_403.txt"  2>/dev/null || true
     grep '\[401\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_401.txt"  2>/dev/null || true
     grep '\[429\]'   "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/status_429.txt"  2>/dev/null || true
@@ -816,11 +918,26 @@ else
     # is `live/cdn_map.json`: {ip: {cdn: name, type: cdn|waf|cloud, source: ...}}.
     if tool_ok cdncheck && [ -s "$RECON_DIR/live/ips.txt" ]; then
         log_step "cdncheck (CDN/WAF/cloud-provider tagging)..."
-        cdncheck -i "$RECON_DIR/live/ips.txt" -resp -json -silent \
+        # v9.23 — current cdncheck dropped the `-json` flag in favour of `-jsonl`.
+        # Passing `-json` made the binary print "flag provided but not defined:
+        # -json" which (with `|| true` swallowing the failure) got written INTO
+        # cdn_map.json and still logged "cdncheck: 0" as if it succeeded.
+        # Feature-detect the right flag, then validate the output is real JSON.
+        CDN_JSON_FLAG="-jsonl"
+        cdncheck -h 2>&1 | grep -qE '(^|[^-])-json([^l]|$)' && CDN_JSON_FLAG="-json"
+        cdncheck -i "$RECON_DIR/live/ips.txt" -resp "$CDN_JSON_FLAG" -silent \
             > "$RECON_DIR/live/cdn_map.json" 2>/dev/null || true
-        if [ -s "$RECON_DIR/live/cdn_map.json" ]; then
+        # Validate: first non-empty line must look like JSON ({ or [), otherwise
+        # cdncheck emitted an error string — discard it and warn instead of
+        # silently logging a bogus "0".
+        if [ -s "$RECON_DIR/live/cdn_map.json" ] \
+           && head -1 "$RECON_DIR/live/cdn_map.json" | grep -q '^[[:space:]]*[{[]'; then
             CDN_HITS=$(grep -c '"cdn"\|"waf"' "$RECON_DIR/live/cdn_map.json" 2>/dev/null || echo 0)
             log_done "cdncheck: $CDN_HITS CDN/WAF-fronted hosts identified"
+        else
+            CDN_ERR=$(head -1 "$RECON_DIR/live/cdn_map.json" 2>/dev/null)
+            : > "$RECON_DIR/live/cdn_map.json"
+            log_warn "cdncheck: failed / produced no valid JSON${CDN_ERR:+ ($CDN_ERR)} — CDN tagging skipped"
         fi
     fi
 
@@ -1057,6 +1174,9 @@ for line in sys.stdin:
     parsed = urlparse(url)
     path = parsed.path
     query = parsed.query
+    # Collapse query params: q=12345 → q=N, id=abc → id=N, r=999 → r=N
+    # (defined here so 'q' is available to the listing-collapse check below)
+    q = re.sub(r'=[^&]+', '=N', query)
     # Collapse dates: /20260404.htm → /DATE.htm
     p = re.sub(r'/\d{8}\.\w+', '/DATE.ext', path)
     # Collapse numeric path segments: /12345 or /62094 → /NUM
@@ -1076,8 +1196,6 @@ for line in sys.stdin:
             p = parent + '/CAT'
     # Collapse UUIDs
     p = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'UUID', p)
-    # Collapse query params: q=12345 → q=N, id=abc → id=N, r=999 → r=N
-    q = re.sub(r'=[^&]+', '=N', query)
     # Build pattern key: host + collapsed path + collapsed query
     pattern = f'{parsed.netloc}{p}?{q}' if q else f'{parsed.netloc}{p}'
     if pattern not in seen_patterns:
@@ -1407,17 +1525,56 @@ if tool_ok ffuf && { [ -n "$WORDLIST" ] || [ -n "$RAFT_WORDLIST" ] || [ -f "$SUP
     MAX_FUZZ=$([ "$QUICK_MODE" = "--quick" ] && echo 3 || echo 10)
     FUZZ_COUNT=0
 
+    # v9.23 (perf) — scale the wordlist down for tiny attack surfaces. A full
+    # ~31k wordlist serially per host is wasteful when there are only 1-2 live
+    # targets; cap to FFUF_SMALL_WL (default 4000) for <=2 fuzz targets so the
+    # phase finishes in minutes instead of stalling against the recon timeout.
+    FUZZ_TARGET_COUNT=$(file_lines "$FUZZ_LIST_TMP")
+    FFUF_SMALL_WL="${FFUF_SMALL_WL:-4000}"
+    WL_FULL=$(file_lines "$COMBINED_WORDLIST")
+    if [ "$FUZZ_TARGET_COUNT" -le 2 ] && [ "$WL_FULL" -gt "$FFUF_SMALL_WL" ]; then
+        head -n "$FFUF_SMALL_WL" "$COMBINED_WORDLIST" > "${COMBINED_WORDLIST}.small" \
+            && mv "${COMBINED_WORDLIST}.small" "$COMBINED_WORDLIST"
+        log_step "ffuf: tiny surface ($FUZZ_TARGET_COUNT host) — wordlist trimmed $WL_FULL → $(file_lines "$COMBINED_WORDLIST")"
+    fi
+
+    # v10.1.1 (perf fix) — per-host wall-clock cap so no single host can stall
+    # the whole phase. MUST be -maxtime (entire-process cap): -maxtime-job only
+    # bounds ffuf *recursion* sub-jobs and does NOTHING on a flat single-job run,
+    # so the v10.1.0 attempt let each host grind the full wordlist (8-22 min).
+    # Each host is its own ffuf invocation, so -maxtime caps it per host. Default
+    # 300s, override with FFUF_MAXTIME.
+    FFUF_MAXTIME="${FFUF_MAXTIME:-300}"
+
     while IFS= read -r url && [ "$FUZZ_COUNT" -lt "$MAX_FUZZ" ]; do
         [ -z "$url" ] && continue
-        domain=$(echo "$url" | sed 's|https\?://||;s|[/:].*||')
+        # v9.23 (macOS/BSD fix) — BSD sed has no '\?' optional quantifier, so
+        # 'https\?://' never matches and 's|[/:].*||' would truncate every host
+        # to bare 'https'/'http', colliding all per-host ffuf output files.
+        # Use -E (extended regex) where 'https?://' is portable across GNU/BSD.
+        domain=$(echo "$url" | sed -E 's#https?://##; s#[/:].*##')
         log_step "ffuf: $url"
+        # v9.23 (FP) — pre-flight a random path. If the host answers a
+        # guaranteed-nonexistent path with 301 (a redirect catchall), exclude
+        # 301 for THIS host so the result file isn't flooded with redirect
+        # noise (mirrors the feroxbuster API phase, which already filters 301).
+        # Otherwise keep 301 as a match so real moved-permanently dirs surface.
+        FFUF_MC="200,201,301,302,401,403,405"
+        RAND_PATH="zz$(date +%s)$RANDOM-notfound"
+        CATCHALL_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            --max-time 8 --connect-timeout 5 "${url}/${RAND_PATH}" 2>/dev/null || echo "")
+        if [ "$CATCHALL_CODE" = "301" ]; then
+            FFUF_MC="200,201,302,401,403,405"
+            log_step "ffuf: $domain has a 301 catchall — excluding 301 from matches"
+        fi
         ffuf -u "${url}/FUZZ" \
             -w "$COMBINED_WORDLIST" \
-            -mc 200,201,301,302,401,403,405 \
+            -mc "$FFUF_MC" \
             -ac -t "$THREADS" \
             -rate "$RATE_LIMIT" \
             -sf \
             -timeout "$CURL_TIMEOUT" \
+            -maxtime "$FFUF_MAXTIME" \
             -o "$RECON_DIR/dirs/ffuf_${domain}.json" \
             -of json 2>/dev/null || true
         FUZZ_COUNT=$((FUZZ_COUNT + 1))

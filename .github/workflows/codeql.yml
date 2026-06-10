@@ -22,6 +22,10 @@ on:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    # CodeQL code scanning requires GitHub Advanced Security on PRIVATE repos.
+    # This repo is private (client data), so skip unless it's public. Security
+    # review is done locally instead (osv-scanner on the laptop, Codex reviews).
+    if: ${{ github.event.repository.visibility == 'public' }}
     # Runner size impacts CodeQL analysis time. To learn more, please see:
     #   - https://gh.io/recommended-hardware-resources-for-running-codeql
     #   - https://gh.io/supported-runners-and-hardware-resources

@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import ssl
 import sys
 import urllib.request
@@ -68,7 +69,55 @@ TECH_TO_PACKAGE = {
     "flask":     ("pip", "flask"),
     "rails":     ("gem", "rails"),
     "spring":    ("maven", "spring"),
+    # v9.23 — map the JS bundler so it resolves to the real npm package instead of
+    # a bare "vite" keyword (which NVD matched to ViteMoneyCoin / VITEC / Vitess).
+    "vite":      ("npm", "vite"),
 }
+
+# v9.23 — tokens that are protocols/headers/transport features, not products, plus
+# generic framework names whose bare NVD keyword search collides with unrelated
+# products. Mirrors cve.py. These get NO bare-keyword NVD search.
+NON_PRODUCT_TECHS = {
+    "hsts", "https", "http", "http/1.1", "http/2", "http/3", "h2", "h3",
+    "ssl", "tls", "preload", "gzip", "deflate", "br", "chunked", "keep-alive",
+    "cors", "csp", "set-cookie", "cookie", "etag", "cache-control",
+    "strict-transport-security",
+}
+AMBIGUOUS_BARE_TECHS = {
+    "bootstrap", "jquery", "parsley.js", "parsley", "modernizr",
+    "underscore", "moment", "select2",
+    # v9.23 — JS frameworks whose bare NVD keyword collides with unrelated products:
+    # "vue" matched HP-UX VUE 3.0 (1994), Pearson VUE, Carestream Vue RIS.
+    "vue", "vuejs", "vue.js", "react", "angular", "ember",
+}
+
+# v9.23 — drop ancient version-less keyword matches. A bare "wordpress"/"php"
+# search returns WordPress 1.2 (2004) / php.cgi (1999) CVEs on a stack actually
+# running WordPress 6.8 / PHP 7.4. CVEs published before this year are treated as
+# keyword noise unless a version correlation is present.
+NVD_MIN_YEAR = 2012
+
+
+def _split_tech(token: str) -> tuple[str, str]:
+    """'php=7.4.33' / 'php:7.4.33' -> ('php', '7.4.33'); bare 'php' -> ('php', '')."""
+    m = re.match(r"^\s*(.+?)\s*[=:]\s*([0-9][\w.\-]*)\s*$", token or "")
+    if m:
+        return m.group(1).strip().lower(), m.group(2).strip()
+    return (token or "").strip().lower(), ""
+
+
+def _nvd_searchable(tech: str) -> bool:
+    """True if a token is safe to send to NVD as a free-text keyword search."""
+    tl = (tech or "").lower().strip()
+    if not tl or len(tl) < 2:
+        return False
+    if tl in TECH_TO_PACKAGE:        # explicitly mapped -> trusted
+        return True
+    if tl in NON_PRODUCT_TECHS:
+        return False
+    if tl in AMBIGUOUS_BARE_TECHS:   # unmapped + ambiguous -> skip the keyword noise
+        return False
+    return True
 
 # ─── Tech → grep patterns to search for in source code ────────────────────────
 TECH_GREP_PATTERNS = {
@@ -167,6 +216,11 @@ def fetch_github_advisories(tech: str) -> list[dict]:
 
 def fetch_nvd_cves(tech: str) -> list[dict]:
     """Query NVD CVE API by keyword."""
+    # v9.23 — skip protocol/header tokens (e.g. "hsts") and unmapped ambiguous
+    # framework names (e.g. bare "bootstrap"/"jquery") whose keyword search returns
+    # unrelated products. Mapped tokens (TECH_TO_PACKAGE) still run.
+    if not _nvd_searchable(tech):
+        return []
     query = TECH_TO_PACKAGE.get(tech.lower(), (None, tech))[1]
     url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={urllib.parse.quote(query)}&resultsPerPage=5"
     data = fetch_url(url, timeout=15)
@@ -188,6 +242,13 @@ def fetch_nvd_cves(tech: str) -> list[dict]:
                 severity = m.get("cvssData", {}).get("baseSeverity", "UNKNOWN")
                 break
         published = cve.get("published", "")[:10]
+        # v9.23 — drop ancient version-less keyword noise (WordPress 1.2 / php.cgi
+        # 1999) that a bare-name search returns for a modern stack.
+        try:
+            if published and int(published[:4]) < NVD_MIN_YEAR:
+                continue
+        except ValueError:
+            pass
         results.append({
             "id":        cve_id,
             "source":    "NVD",
@@ -310,7 +371,10 @@ def fetch_cvemap(tech: str, limit: int = 20) -> list[dict]:
 def fetch_intel(techs: list[str]) -> list[dict]:
     """Collect intel from all sources for all techs."""
     all_results = []
-    for tech in techs:
+    for raw in techs:
+        # v9.23 — CVE/advisory searches use the bare product NAME; any attached
+        # version (e.g. "php=7.4.33") is consumed by the EOL block instead.
+        tech, _ver = _split_tech(raw)
         # v9.5.0 — cvemap first (local PD cache, fast); fall back to GHSA + NVD
         cvm = fetch_cvemap(tech)
         if cvm:
@@ -352,7 +416,12 @@ def build_markdown(techs: list[str], results: list[dict]) -> str:
     # v9.17.0 — Lifecycle / EOL block (data: endoflife.date, MIT licensed)
     if _EOL_AVAILABLE:
         try:
-            eol_results = eol_check.lookup_many([(t, None) for t in techs])
+            # v9.23 — pass the DETECTED VERSION so the EOL check matches the right
+            # lifecycle cycle. Previously this hardcoded None, so e.g. "php=7.4.33"
+            # was looked up as bare "php" and reported the generic latest cycle as
+            # "Supported" — false-negativing that PHP 7.4 is end-of-life.
+            eol_results = eol_check.lookup_many(
+                [(name, ver or None) for name, ver in (_split_tech(t) for t in techs)])
             mapped = [r for r in eol_results if r.get("slug")]
             if mapped:
                 lines += [
@@ -388,11 +457,22 @@ def build_markdown(techs: list[str], results: list[dict]) -> str:
         t = r["tech"]
         by_tech.setdefault(t, []).append(r)
 
+    _seen_tech = set()
     for tech in techs:
-        tech_results = by_tech.get(tech, [])
+        # v9.23 — normalize the raw token to the same canonical key the fetchers
+        # store under (lowercased, version-stripped). Without this, version-tagged
+        # or mixed-case tokens like "php=7.4.33"/"IIS" miss the by_tech lookup and
+        # render "_No results found_" even when CVEs were fetched.
+        name = _split_tech(tech)[0]
+        # Two raw tokens can collapse to the same canonical name (e.g. both "php"
+        # and "php=7.4.33") — render each tech section only once.
+        if name in _seen_tech:
+            continue
+        _seen_tech.add(name)
+        tech_results = by_tech.get(name, [])
         tech_results.sort(key=lambda x: severity_order(x.get("severity", "UNKNOWN")))
 
-        lines.append(f"## {tech.upper()}")
+        lines.append(f"## {name.upper()}")
         lines.append("")
 
         if not tech_results:
@@ -413,9 +493,11 @@ def build_markdown(techs: list[str], results: list[dict]) -> str:
         lines.append("")
 
         # Add grep patterns if available
-        patterns = TECH_GREP_PATTERNS.get(tech.lower(), [])
+        # _split_tech already lowercased + stripped any version suffix, so this
+        # now matches for version-tagged tokens (e.g. "php=7.4.33") too.
+        patterns = TECH_GREP_PATTERNS.get(name, [])
         if patterns:
-            lines.append(f"### Grep Patterns for `{tech}` (run in target repo)")
+            lines.append(f"### Grep Patterns for `{name}` (run in target repo)")
             lines.append("")
             lines.append("```bash")
             for p in patterns:
