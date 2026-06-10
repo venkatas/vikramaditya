@@ -50,6 +50,11 @@ jobs:
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@9a498708959aeaef5ef730655706c5a1df1edbc2" # v2.3.8
     with:
+      # Same reason as scan-scheduled: this repo is PRIVATE with no GitHub Advanced
+      # Security, so the SARIF upload to Security > Code-Scanning fails with
+      # "Code scanning is not enabled for this repository" and breaks every PR run.
+      # The diff scan + --gh-annotations + fail-on-vuln still run; only the upload is off.
+      upload-sarif: false
       scan-args: |-
         -r
         --skip-git
