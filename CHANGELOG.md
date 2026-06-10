@@ -1,5 +1,39 @@
 # Changelog
 
+## v10.3.4 — brain reliability: fail-loud on bad cloud key + reasoning-model triage (2026-06-10)
+
+Two engagement-found bugs where the AI brain produced **nothing** for a whole ~70-min
+scan while the run still reported `HUNT COMPLETE`.
+
+- **Silent dead-brain on a bad cloud key.** `_init_provider` marked HTTP providers
+  (gemini/openai/grok) `available=True` from key-presence + an HTTP session alone — no
+  check the key worked (only ollama did a real health-check) — and `chat()` swallowed
+  every exception → `""`. A `GEMINI_API_KEY` set to a Google `AQ.…` OAuth token (not an
+  `AIza…` key) ran the whole scan with every brain call empty. **Fix:** new
+  `LLMClient._healthcheck()` validates the key with one minimal chat request and
+  **classifies** the response — unavailable only on a *persistent* auth/billing failure
+  (401/403, 400 "valid API key", 429 credits/billing depleted), while transient errors
+  (timeout, connection, 5xx, plain rate-limit) and non-auth 4xx (404 model-not-found)
+  keep the provider. An explicitly-requested provider that comes back unavailable now
+  **falls back to local Ollama with a loud warning** instead of running brainless.
+  (The same bad key was observed returning both 400 and 429; `GET /models` returns 200
+  even for an invalid key, so the check uses a real chat call.)
+- **Triage returned `UNKNOWN` for everything (13/13 on a real run) with reasoning
+  models.** Ollama streams a reasoning model's chain-of-thought into a separate
+  `thinking` field; `brain._stream` kept only `content`, and the triage budget
+  `num_predict=1000` was exhausted by the `<think>` block before the `VERDICT:` line was
+  emitted → empty content → UNKNOWN → retry → UNKNOWN. **Fix:** `_stream` captures
+  `thinking`; for verdict parsing (gated `prefer_thinking_on_empty`, triage-only so raw
+  reasoning never lands in reports) it falls back to the thinking when content is empty,
+  and the triage budget is raised to 4000.
+- Tests: `tests/test_brain_provider_healthcheck.py` (classification + Ollama fallback)
+  and `tests/test_brain_reasoning_triage.py` (thinking-capture, no narration leak,
+  reasoning-model verdict). 2 Codex rounds converged; full suite green.
+- **Backlog:** the non-streaming Ollama paths (`_chat_ollama`, `chat_messages`,
+  `_stream_history`, scanner local mode) still read only `content`, so the same
+  reasoning-model empty-output can affect them — deferred because the exploit-EXECUTION
+  paths must retry-for-content rather than run raw thinking, which needs its own design.
+
 ## v10.3.3 — ACTUALLY fix macOS subprocess SIGSEGV (fork → posix_spawn) (2026-06-09)
 
 The v10.3.2 fix below was a **misdiagnosis** — the `rc=-11` (SIGSEGV at 0.0s)
