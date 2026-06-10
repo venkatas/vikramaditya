@@ -129,6 +129,20 @@ class LLMClient:
             self.provider = self._auto_detect()
         else:
             self._init_provider(self.provider)
+            # Fail loud, don't run brainless: an explicitly-requested cloud provider
+            # that fails its health-check (bad/expired key, unreachable) falls back to
+            # local Ollama instead of silently returning "" on every call all run.
+            if not self.available and self.provider != "ollama":
+                requested = self.provider
+                print(f"{YELLOW}[!] Brain provider '{requested}' unavailable "
+                      f"(bad/expired API key or unreachable endpoint) — falling back to "
+                      f"local Ollama.{NC}", flush=True)
+                self._init_provider("ollama")
+                if self.available:
+                    self.provider = "ollama"
+                else:
+                    print(f"{YELLOW}[!] Ollama fallback also unavailable — brain disabled. "
+                          f"Fix the API key or start Ollama.{NC}", flush=True)
 
     def _auto_detect(self) -> str:
         # Build dynamic priority: cloud providers with keys go first (instant, no server needed)
@@ -153,8 +167,52 @@ class LLMClient:
                 pass
         return "ollama"
 
+    def _healthcheck(self) -> bool:
+        """Validate a cloud provider's key with one minimal chat request so a PERSISTENT
+        auth/billing failure is caught at startup instead of silently returning "" on
+        every call for the whole run (a real engagement pasted a Google 'AQ.…' OAuth
+        token as GEMINI_API_KEY → 400 "Please pass a valid API key", later 429
+        "prepayment credits are depleted").
+
+        Returns False ONLY for a persistent auth/billing rejection (so the brain falls
+        back to local Ollama). Transient failures — timeout, connection error, 5xx, plain
+        rate-limit — and non-auth 4xx (e.g. 404 model-not-found) return True: we give the
+        key the benefit of the doubt rather than disabling the provider on a blip.
+
+        (GET /models is NOT usable: Gemini's OpenAI-compat /models returns 200 even for an
+        invalid key — only a real chat call surfaces the auth/billing error.)"""
+        import json as _json
+        try:
+            base = self._openai_compat_base()
+            model = self.DEFAULT_MODELS.get(self.provider) or ""
+            body = {"model": model, "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}]}
+            r = self._http.post(f"{base}/chat/completions",
+                                data=_json.dumps(body), timeout=20)
+        except Exception:
+            return True  # network/timeout/transient — don't penalise; real calls may work
+        code = getattr(r, "status_code", 0)
+        if 200 <= code < 300:
+            return True
+        if code in (401, 403):
+            return False
+        text = (getattr(r, "text", "") or "").lower()
+        # 400 with an auth/key body = bad/invalid key.
+        if code == 400 and any(s in text for s in
+                               ("api key", "api_key", "unauthenticated", "invalid auth", "permission")):
+            return False
+        # 429: distinguish a PERSISTENT billing/credit/account failure (fall back) from a
+        # plain transient rate-limit (keep — it clears on its own).
+        if code == 429 and any(s in text for s in
+                               ("credit", "billing", "depleted", "prepayment", "suspended", "account disabled")):
+            return False
+        # Other 4xx (404 model-not-found is a model issue, not a key issue), 5xx, and
+        # anything ambiguous: keep the provider.
+        return True
+
     def _init_provider(self, provider: str) -> None:
         self.available = False
+        self.provider  = provider
         if provider == "ollama":
             if _ollama_lib is None:
                 return
@@ -194,7 +252,7 @@ class LLMClient:
             self._http.headers.update({"Authorization": f"Bearer {key}",
                                        "Content-Type": "application/json"})
             self._openai_base = "https://api.openai.com/v1"
-            self.available    = True
+            self.available    = self._healthcheck()
             self.description  = "OpenAI API"
 
         elif provider == "mlx":
@@ -218,7 +276,7 @@ class LLMClient:
             self._http.headers.update({"Authorization": f"Bearer {key}",
                                        "Content-Type": "application/json"})
             self._grok_base  = "https://api.x.ai/v1"
-            self.available   = True
+            self.available   = self._healthcheck()
             self.description = "Grok API (xAI)"
 
         elif provider == "gemini":
@@ -233,7 +291,7 @@ class LLMClient:
             self._http.headers.update({"Authorization": f"Bearer {key}",
                                        "Content-Type": "application/json"})
             self._gemini_base = "https://generativelanguage.googleapis.com/v1beta/openai"
-            self.available    = True
+            self.available    = self._healthcheck()
             self.description  = "Gemini API (Google AI Studio)"
 
     def chat(self, model: str | None, system: str, user: str,
@@ -726,17 +784,20 @@ Keep it under 80 words total."""
 
     # ── Internal streaming helper ──────────────────────────────────────────────
     def _stream_fast(self, user_prompt: str, label: str, max_tokens: int = 1500,
-                     system: str = None, temperature: float = 0.3) -> str:
+                     system: str = None, temperature: float = 0.3,
+                     prefer_thinking_on_empty: bool = False) -> str:
         """Stream using the fast triage model (BaronLLM if installed)."""
         orig = self.model
         self.model = self.triage_model
         result = self._stream(user_prompt, label, max_tokens, system=system,
-                              temperature=temperature)
+                              temperature=temperature,
+                              prefer_thinking_on_empty=prefer_thinking_on_empty)
         self.model = orig
         return result
 
     def _stream(self, user_prompt: str, label: str, max_tokens: int = MAX_RESP,
-                system: str = None, temperature: float = 0.3) -> str:
+                system: str = None, temperature: float = 0.3,
+                prefer_thinking_on_empty: bool = False) -> str:
         """Call the active LLM provider, print response live (Ollama streams; cloud APIs print after).
 
         v9.23 — ``system`` defaults to the exploit-tuned BRAIN_SYSTEM, but
@@ -751,6 +812,7 @@ Keep it under 80 words total."""
         print(f"{DIM}{'─'*60}{NC}")
 
         full_text = ""
+        self._last_thinking = ""
         try:
             if self._llm.provider == "ollama":
                 # Streaming path — Ollama supports token-by-token streaming
@@ -768,10 +830,24 @@ Keep it under 80 words total."""
                         "num_ctx": MAX_CTX,
                     },
                 )
+                thinking_text = ""
                 for chunk in stream:
-                    token = chunk["message"]["content"]
-                    print(token, end="", flush=True)
+                    msg = chunk["message"]
+                    token = msg.get("content") or ""
+                    think = msg.get("thinking") or ""
+                    if token:
+                        print(token, end="", flush=True)
                     full_text += token
+                    thinking_text += think
+                self._last_thinking = thinking_text
+                # Reasoning models (qwen3, deepseek-r1, security-tuned "apex" models)
+                # stream their answer into the separate `thinking` field; when the
+                # token budget is spent on the <think> block, `content` comes back
+                # empty. For VERDICT/triage parsing, fall back to the reasoning so the
+                # verdict stays parseable. NOT enabled for narration/analysis/report
+                # callers — there, raw chain-of-thought must not land in saved reports.
+                if prefer_thinking_on_empty and not full_text.strip() and thinking_text.strip():
+                    full_text = thinking_text
             else:
                 # Non-streaming path for cloud providers
                 full_text = self._llm.chat(
@@ -1817,8 +1893,12 @@ IF DROP: What would need to change for this to become viable?"""
         # v9.23 — the 7-Question Gate is a faithful-evaluation task, not an
         # exploit-assertion one: pin NARRATION_SYSTEM + low temperature so a
         # hallucination-biased triage model cannot tilt the gate toward SUBMIT.
-        result = self._stream_fast(prompt, "Finding Triage", 1000,
-                                   system=NARRATION_SYSTEM, temperature=0.1)
+        # Budget 4000 (not 1000): reasoning triage models spend hundreds of tokens
+        # in the <think> block before emitting the VERDICT line — at 1000 they were
+        # truncated mid-thought and returned no verdict (observed: 13/13 UNKNOWN).
+        result = self._stream_fast(prompt, "Finding Triage", 4000,
+                                   system=NARRATION_SYSTEM, temperature=0.1,
+                                   prefer_thinking_on_empty=True)
         verdict = _parse_verdict(result)
 
         # v7.1.4 — baron-llm cold-start cosmetic bug: first invocation
@@ -1833,8 +1913,9 @@ IF DROP: What would need to change for this to become viable?"""
                 "Start your response with the literal token 'VERDICT:'.\n\n"
                 + prompt
             )
-            result = self._stream_fast(strict_prompt, "Finding Triage (retry)", 1000,
-                                       system=NARRATION_SYSTEM, temperature=0.1)
+            result = self._stream_fast(strict_prompt, "Finding Triage (retry)", 4000,
+                                       system=NARRATION_SYSTEM, temperature=0.1,
+                                       prefer_thinking_on_empty=True)
             verdict = _parse_verdict(result)
 
         # Deterministic Q6 polarity post-check. Q6 is a double-negative-prone
