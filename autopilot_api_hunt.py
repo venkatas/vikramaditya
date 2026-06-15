@@ -352,6 +352,7 @@ class EndpointDiscovery:
         self.session = session
         self.frontend_url = frontend_url
         self.endpoints = []
+        self.fetched_js: dict = {}   # {js_path: content} — retained for credential scanning
 
     def run(self) -> list[dict]:
         log("phase", "Phase 1: Endpoint Discovery")
@@ -466,6 +467,7 @@ class EndpointDiscovery:
                     continue
 
             log("info", f"  Fetched {len(fetched_js)} JS files (main + code-split chunks)")
+            self.fetched_js.update(fetched_js)   # retain for the credential scan in run_autopilot
 
             # Extract API paths from ALL fetched JS content
             # Noise filter: reject HTTP headers, sentry internals, CSS classes, etc.
@@ -1845,8 +1847,11 @@ def _auto_detect_login_url(session: AuthSession, username: str, password: str) -
     role_guess = username.split("@")[0] if "@" in username else "admin"
     # Extract tenant from email domain (e.g., dpo@acme-financial.dev → slug=acme-financial)
     tenant_guess = ""
-    if "@" in username:
-        domain_part = username.split("@")[1]
+    # domain_part MUST be defined unconditionally — it is referenced below when building
+    # CGI_LOGIN_PAGES (before its later re-assignment). A username WITHOUT an '@' (a plain
+    # login name, not an email) previously left it unbound → UnboundLocalError crash.
+    domain_part = username.split("@")[1] if "@" in username else ""
+    if domain_part:
         tenant_guess = domain_part.rsplit(".", 1)[0]  # strip TLD
 
     for path in DEV_TOKEN_PATHS:
@@ -1869,7 +1874,7 @@ def _auto_detect_login_url(session: AuthSession, username: str, password: str) -
                 continue
 
     # ── CGI/legacy form login (parse HTML form and submit) ──────────────
-    # For apps like CGI-webmail that use non-standard field names
+    # For apps like non-standard CGI webmail apps that use non-standard field names
     # (custom_input, domain, FormName, etc.)
     CGI_LOGIN_PAGES = [
         # (page to GET for form, fallback action URL)
@@ -2092,6 +2097,57 @@ def _auto_detect_api_base(domain_url: str, rate_limit: float = 5.0) -> str:
     # If no API base found, the API may be on the same origin (no prefix)
     log("info", "  No separate API base found — API may be on same origin")
     return domain_url.rstrip("/")
+
+
+def _report_js_credentials(output_dir, fetched_js, all_findings, saver, base_url):
+    """PASSIVE: report any TruffleHog-VERIFIED cloud credential found in the fetched JS bundles.
+
+    Closes the coverage gap where the authenticated/autopilot engine never ran the secret scan, so
+    a verified leaked key (the exact client-spa.example AWS-key-in-JS case) was silently dropped on
+    this path. Writes the fetched JS to ``<output_dir>/js/downloaded/`` + a manifest, runs TruffleHog,
+    then reuses ``cred_blast_radius.run(active=False)`` to emit ``findings/exposed_credentials/
+    findings.json`` (reporter Method 1h) and adds a CRITICAL entry to all_findings. Best-effort —
+    never raises into the scan; the active boto3 blast-radius stays opt-in on the hunt.py path.
+    """
+    if not output_dir or not fetched_js:
+        return
+    try:
+        import hashlib
+        import shutil
+        import subprocess as _sp
+        import cred_blast_radius
+        dl = os.path.join(output_dir, "js", "downloaded")
+        os.makedirs(dl, exist_ok=True)
+        with open(os.path.join(dl, "manifest.tsv"), "a", encoding="utf-8") as mf:
+            for path, content in fetched_js.items():
+                name = hashlib.md5(path.encode()).hexdigest() + ".js"
+                try:
+                    with open(os.path.join(dl, name), "w", encoding="utf-8", errors="ignore") as fh:
+                        fh.write(content or "")
+                    mf.write(f"{name}\t{path}\n")
+                except OSError:
+                    continue
+        th = shutil.which("trufflehog")
+        if th:
+            with open(os.path.join(output_dir, "js", "trufflehog.json"), "w", encoding="utf-8") as fh:
+                _sp.run([th, "filesystem", dl, "--json", "--no-update"],
+                        stdout=fh, stderr=_sp.DEVNULL, timeout=180)
+        findings_dir = os.path.join(output_dir, "findings")
+        summary = cred_blast_radius.run(output_dir, findings_dir, active=False)
+        if summary:
+            for item in summary.get("findings", []):
+                f = {"type": "exposed_credential", "severity": CRITICAL,
+                     "detail": f"Verified cloud credential exposed in front-end JS: {item['access_key_id']}",
+                     "url": base_url,
+                     "evidence": "TruffleHog Verified=true — see findings/exposed_credentials/findings.json"}
+                all_findings.append(f)
+                if saver:
+                    saver.save(f)
+                    saver.save_txt(f)
+            log("crit", f"  Exposed credentials: {summary['creds_assessed']} verified key(s) reported "
+                        f"→ {os.path.join(findings_dir, 'exposed_credentials')}")
+    except Exception as e:
+        log("warn", f"  cred reporting (autopilot) skipped: {e}")
 
 
 def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-view/",
@@ -2321,6 +2377,10 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
 
     # ── Brain-Supervised Dynamic Loop ──────────────────────────────────────────
     saver = FindingSaver(output_dir, "autopilot") if output_dir else None
+    # Passive verified-credential reporting (engine-agnostic): a leaked key in the JS the
+    # discovery phase fetched must be reported here too, not only on the hunt.py path.
+    _report_js_credentials(output_dir, getattr(discovery, "fetched_js", {}),
+                           all_findings, saver, base_url)
     ctx = BrainScanContext()
     ctx.endpoints = endpoints
 

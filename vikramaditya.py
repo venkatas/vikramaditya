@@ -46,7 +46,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
 # See CHANGELOG.md for the version-by-version delta.
-__version__ = "10.4.1"
+__version__ = "10.4.2"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -2049,7 +2049,12 @@ def main():
         elif _ost == "no_models":
             log("info", "Ollama running but no models pulled — brain disabled (e.g. `ollama pull qwen3-coder:30b`)")
         else:
-            log("info", "Ollama not installed — running without AI brain (`brew install ollama`)")
+            import shutil as _sh
+            if _sh.which("ollama"):
+                log("info", "Ollama binary present but its Python package is missing in this venv "
+                            "— brain disabled (`pip install ollama`)")
+            else:
+                log("info", "Ollama not installed — running without AI brain (`brew install ollama`)")
 
     # ── Step 4b: Fix verification mode ────────────────────────────────────
     verify_fix_mode = False

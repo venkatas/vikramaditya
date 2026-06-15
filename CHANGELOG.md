@@ -1,5 +1,24 @@
 # Changelog
 
+## v10.4.2 — live-monitoring fixes: autopilot crash + authenticated-path cred reporting (2026-06-15)
+
+Found while monitoring a live authenticated run on client-spa.example.
+
+- **CRASH (`autopilot_api_hunt.py`): `UnboundLocalError: domain_part`.** The authenticated Web App
+  VAPT engine crashed instantly when the login username had no `@` — `domain_part` was bound only
+  inside `if "@" in username` but referenced earlier when building `CGI_LOGIN_PAGES`. **Fix:** define
+  it unconditionally up front. (+regression test, red→green.)
+- **Coverage gap: the authenticated/autopilot path never reported verified leaked credentials.**
+  `autopilot_api_hunt.py` ran no secret scan, so a TruffleHog-verified AWS key in the front-end JS
+  (the client-spa case) was silently dropped on this path — only the `hunt.py` path reported it. **Fix:**
+  `EndpointDiscovery` now retains the JS it fetches; `run_autopilot` writes it, runs TruffleHog, and
+  reuses `cred_blast_radius.run(active=False)` to emit `findings/exposed_credentials/findings.json`
+  (reporter Method 1h) + a CRITICAL entry in the autopilot findings. Best-effort; never breaks a scan.
+- **Brain message accuracy:** the "absent" branch now distinguishes a missing venv **Python package**
+  (`pip install ollama`) from a missing **binary** (`brew install ollama`) via `shutil.which`.
+
+Tests: +8 (autopilot login no-`@`, autopilot cred reporting). Full suite 929 passed.
+
 ## v10.4.1 — run-audit fixes: verified-cred reporting, JS/OpenAPI hang, CMS false-positives (2026-06-15)
 
 A multi-agent audit of two real runs (client-spa.example, client-b.example) found 8 confirmed defects;
