@@ -1758,36 +1758,36 @@ def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, s
 PHASE_STATUS_RAN = "ran"        # executed and produced a result
 PHASE_STATUS_SKIPPED = "skipped"  # skipped / N/A (tool absent, no candidates)
 PHASE_STATUS_ERROR = "error"    # attempted but errored / produced nothing usable
+PHASE_STATUS_PARTIAL = "partial"  # produced a result, but an optional tool was degraded
 
 _PHASE_STATUS_GLYPH = {
     PHASE_STATUS_RAN:     "✓",
     PHASE_STATUS_SKIPPED: "∅",
     PHASE_STATUS_ERROR:   "✗",
+    PHASE_STATUS_PARTIAL: "⚠",
 }
 
 
 def phase_status_glyph(status: str) -> str:
-    """Map a tri-state phase status to its display glyph (✓ / ∅ / ✗)."""
+    """Map a phase status to its display glyph (✓ / ⚠ / ∅ / ✗)."""
     return _PHASE_STATUS_GLYPH.get(status, "✓" if status else "∅")
 
 
 def derive_phase_status(requested: bool, ran_truthy: bool,
                         degraded: bool = False) -> str:
-    """Derive a tri-state phase status from the signals hunt_target has.
+    """Derive a phase status from the signals hunt_target has.
 
-    * ``error``   — the phase ran degraded (tool present-but-broken, all
-                    candidates dead, dependency import error, etc.).
-    * ``skipped`` — the phase was not requested, or returned falsy (run_*
-                    helpers return False on tool-missing / no-candidate paths).
-    * ``ran``     — requested, returned truthy, and not degraded.
-
-    This is a strict improvement over the old "any truthy → ✓": a degraded
-    phase now reports ✗ and a not-requested/no-op phase reports ∅.
+    * ``error``   — degraded AND produced nothing (tool broken, all candidates dead, import error).
+    * ``partial`` — the phase RAN and produced a result, but an OPTIONAL tool was degraded. A
+                    producing phase (e.g. JS analysis that extracted secrets) must NOT read as a
+                    hard failure just because a fragile optional tool (e.g. secretfinder) broke.
+    * ``skipped`` — not requested, or returned falsy.
+    * ``ran``     — requested, returned truthy, not degraded.
     """
     if not requested:
         return PHASE_STATUS_SKIPPED
     if degraded:
-        return PHASE_STATUS_ERROR
+        return PHASE_STATUS_PARTIAL if ran_truthy else PHASE_STATUS_ERROR
     return PHASE_STATUS_RAN if ran_truthy else PHASE_STATUS_SKIPPED
 
 
@@ -4154,15 +4154,18 @@ def run_js_analysis(domain: str) -> bool:
     if _which(jsluice_bin):
         jsluice_out = os.path.join(js_dir, "jsluice_secrets.txt")
         endpoints_out = os.path.join(js_dir, "jsluice_endpoints.txt")
+        # --connect-timeout/--max-time: a single non-responding JS host (TCP SYN black-hole)
+        # must not stall the serial loop until the phase watchdog kills it (real client-b.example
+        # hang: jsluice-urls timed out at 1200s rc=-9). IFS= read -r for robust URL handling.
         cmd = (
-            f'cat "{js_urls_file}" | while read url; do '
-            f'  curl -sk "$url" | {jsluice_bin} secrets -j 2>/dev/null; '
+            f'cat "{js_urls_file}" | while IFS= read -r url; do '
+            f'  curl -sk --connect-timeout 5 --max-time 20 "$url" | {jsluice_bin} secrets -j 2>/dev/null; '
             f'done | sort -u | tee "{jsluice_out}"'
         )
         run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         cmd2 = (
-            f'cat "{js_urls_file}" | while read url; do '
-            f'  curl -sk "$url" | {jsluice_bin} urls -j 2>/dev/null; '
+            f'cat "{js_urls_file}" | while IFS= read -r url; do '
+            f'  curl -sk --connect-timeout 5 --max-time 20 "$url" | {jsluice_bin} urls -j 2>/dev/null; '
             f'done | sort -u | tee "{endpoints_out}"'
         )
         run_cmd(cmd2, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
@@ -4231,9 +4234,13 @@ def run_js_analysis(domain: str) -> bool:
         dl_dir = os.path.join(js_dir, "downloaded")
         os.makedirs(dl_dir, exist_ok=True)
         run_cmd(
-            f'cat "{js_urls_file}" | head -50 | while read url; do '
+            # Record a url->file manifest alongside the content-hash-named downloads so a
+            # finding (e.g. a verified key in a bundle) can carry its exact public URL without
+            # a live re-fetch. (Filename is md5(url+"\n").js — the trailing newline is echo's.)
+            f'cat "{js_urls_file}" | head -50 | while IFS= read -r url; do '
             f'  name=$(echo "$url" | md5sum | cut -d" " -f1).js; '
-            f'  curl -sk "$url" -o "{dl_dir}/$name" 2>/dev/null; '
+            f'  curl -sk --connect-timeout 5 --max-time 20 "$url" -o "{dl_dir}/$name" 2>/dev/null; '
+            f'  printf "%s\\t%s\\n" "$name" "$url" >> "{dl_dir}/manifest.tsv"; '
             f'done',
             timeout=300,
             watch_file=dl_dir,
@@ -4261,6 +4268,12 @@ def run_js_analysis(domain: str) -> bool:
 
 
 # ── NEW: Secret Hunt ───────────────────────────────────────────────────────────
+# Opt-in (--assess-creds): when the secret scan turns up a VERIFIED cloud credential, run a
+# STRICTLY READ-ONLY blast-radius assessment on it (cred_blast_radius). Default off because
+# auto-using a discovered 3rd-party key is engagement-scope-sensitive. Set from main().
+ASSESS_CREDS = False
+
+
 def run_secret_hunt(domain: str) -> bool:
     """
     TruffleHog on recon artifacts + GitHound on GitHub for the domain.
@@ -4317,6 +4330,22 @@ def run_secret_hunt(domain: str) -> bool:
                 log("ok" if count == 0 else "crit", f"GitHound: {count} results → {gh_out}")
     else:
         log("warn", "git-hound not in PATH — skipping GitHub scan")
+
+    # ── Discovered-credential reporting (ALWAYS) + blast-radius (opt-in: --assess-creds) ──
+    # A TruffleHog-VERIFIED cloud credential is a confirmed critical exposure — report it to the
+    # report ALWAYS (passive, no network), so a proven leaked key can never be silently dropped.
+    # Only the ACTIVE read-only blast-radius enumeration (boto3) is gated on --assess-creds.
+    try:
+        import cred_blast_radius
+        findings_dir = _resolve_findings_dir(domain, create=True)
+        summary = cred_blast_radius.run(recon_dir, findings_dir, active=ASSESS_CREDS, log=log)
+        if summary:
+            mode = "blast-radius assessed" if ASSESS_CREDS else \
+                   "reported (run --assess-creds for read-only blast-radius)"
+            log("crit", f"Exposed credentials: {summary['creds_assessed']} verified key(s) {mode} "
+                        f"→ {os.path.join(findings_dir, 'exposed_credentials')}")
+    except Exception as e:
+        log("warn", f"cred reporting failed: {e}")
 
     _brain_phase_complete(
         "SECRET HUNT",
@@ -7558,6 +7587,11 @@ Examples:
                         help="JS analysis: jsluice + SecretFinder + TruffleHog")
     parser.add_argument("--secret-hunt",      action="store_true",
                         help="Secret scan: TruffleHog on recon + GitHound on GitHub")
+    parser.add_argument("--assess-creds",     action="store_true",
+                        help="When the secret scan finds a VERIFIED cloud credential, run a "
+                             "READ-ONLY blast-radius assessment (identity, IAM/S3 reach, DB "
+                             "backups, PII scan). Actively uses the discovered key against the "
+                             "cloud account — only enable with authorization for that account.")
     parser.add_argument("--param-discover",   action="store_true",
                         help="Parameter discovery: Arjun + ParamSpider")
     parser.add_argument("--api-fuzz",         action="store_true",
@@ -7620,6 +7654,10 @@ Examples:
     resume_requested = args.resume is not None
     resume_session_id = None if args.resume in (None, "", "latest") else args.resume
     skip_items = parse_skip_items(args.skip)
+
+    # Opt-in discovered-credential blast-radius assessment (read-only); see run_secret_hunt.
+    global ASSESS_CREDS
+    ASSESS_CREDS = bool(getattr(args, "assess_creds", False))
 
     # ── --targets-file: explicit multi-host scope-lock (no subdomain enum) ────
     targets_file = None

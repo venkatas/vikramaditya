@@ -210,3 +210,61 @@ class TestEmailAuthPerFindingCVSS:
         _seed_email_auth(tmp_path, [{"severity": "medium", "title": "DMARC", "notes": "n", "cvss": "6.5"}])
         f = _email_auth_findings(load_findings(str(tmp_path)))[0]
         assert f.get("cvss") == "6.5"
+
+
+def _seed_exposed_creds(tmp_path, findings):
+    d = tmp_path / "exposed_credentials"
+    d.mkdir()
+    (d / "findings.json").write_text(json.dumps({"findings": findings}))
+    return d
+
+
+def _exposed_cred_findings(findings):
+    return [f for f in findings if f.get("vtype") == "exposed_credentials"]
+
+
+def _cred_finding(**over):
+    f = {
+        "title": "Verified cloud credential exposed — confirmed blast radius",
+        "severity": "critical",
+        "access_key_id": "AKIATESTKEY00000001",
+        "account": "111111111111",
+        "principal": "arn:aws:iam::111111111111:user/app",
+        "source_url": "https://victim.test/assets/index-abc.js",
+        "is_admin": False, "get_object": True, "bucket_count": 59,
+        "capabilities": {"s3:ListAllMyBuckets": True, "iam:GetUser": False},
+        "backups": [{"bucket": "db-backup", "Key": "prod.bak", "Size": 1234}],
+        "pii_indicators": [{"key": "hr/payroll.csv", "indicator": "payroll"}],
+        "remediation": "Disable/rotate the key immediately.",
+    }
+    f.update(over)
+    return f
+
+
+class TestExposedCredentialsIngestion:
+    """cred_blast_radius.py's exposed_credentials/findings.json must reach the report (Codex HIGH)."""
+
+    def test_finding_reaches_report(self, tmp_path):
+        _seed_exposed_creds(tmp_path, [_cred_finding()])
+        fs = _exposed_cred_findings(load_findings(str(tmp_path)))
+        assert len(fs) == 1, "a verified exposed credential must reach the report"
+        f = fs[0]
+        assert f["severity"] == "critical"
+        assert f["cvss"] == VULN_TEMPLATES["exposed_credentials"]["cvss"]  # authored 9.8
+        assert "AKIATESTKEY00000001" in f["poc"]
+        assert "s3:ListAllMyBuckets" in f["poc"]      # allowed capability surfaced
+        assert "index-abc.js" in f["url"]
+
+    def test_does_not_trigger_unmapped_warning(self, tmp_path, capsys):
+        _seed_exposed_creds(tmp_path, [_cred_finding()])
+        load_findings(str(tmp_path))
+        assert "'exposed_credentials/' is not" not in capsys.readouterr().out
+
+    def test_empty_findings_no_finding(self, tmp_path):
+        _seed_exposed_creds(tmp_path, [])
+        assert _exposed_cred_findings(load_findings(str(tmp_path))) == []
+
+    def test_non_critical_uses_severity_band_cvss(self, tmp_path):
+        _seed_exposed_creds(tmp_path, [_cred_finding(severity="high")])
+        f = _exposed_cred_findings(load_findings(str(tmp_path)))[0]
+        assert f["cvss"] == CVSS_DEFAULT["high"]

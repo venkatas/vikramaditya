@@ -306,6 +306,18 @@ VULN_TEMPLATES = {
             ("OWASP Cryptographic Failures", "https://owasp.org/Top10/A02_2021-Cryptographic_Failures/"),
         ],
     },
+    "exposed_credentials": {
+        "title": "Verified Cloud Credential Exposed on {host}",
+        "severity": "critical", "cvss": "9.8", "cwe": "CWE-798",
+        "impact": "A live cloud credential was found exposed and validated; read-only enumeration "
+                  "confirmed the access it grants (e.g. account-wide S3 read, downloadable database "
+                  "backups). An attacker can use it directly against the cloud account.",
+        "remediation": "Disable/rotate the key immediately, review CloudTrail for use, remove it "
+                       "from source, and re-architect to short-lived/scoped credentials.",
+        "references": [
+            ("OWASP Secrets Management", "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html"),
+        ],
+    },
     "cves": {
         "title": "Known CVE Vulnerability on {host}",
         "severity": "critical", "cvss": "9.0", "cwe": "CWE-1035",
@@ -763,6 +775,7 @@ def load_findings(findings_dir: str) -> list:
                       "brain_active",  # brain_active/ is handled by Method 1e below
                       "sqlmap",        # sqlmap/ is handled by Method 1f below
                       "email_auth",    # email_auth/findings.json handled by Method 1d below
+                      "exposed_credentials",  # handled by Method 1h below
                       "burp"}          # burp/findings.json handled by Method 1g below
         for entry in sorted(os.listdir(findings_dir)):
             full = os.path.join(findings_dir, entry)
@@ -997,6 +1010,60 @@ def load_findings(findings_dir: str) -> list:
                             f"Area  : {item.get('area','')}\n"
                             f"Result: {item.get('result','')}\n\n"
                             f"{item.get('notes','')}"),
+                })
+        except Exception:
+            pass
+
+    # Method 1h: Verified cloud-credential blast-radius (exposed_credentials/findings.json)
+    # cred_blast_radius.py writes a confirmed, READ-ONLY-verified assessment of a discovered &
+    # validated cloud key (identity, IAM/S3 reach, DB-backup inventory, PII indicators). Its JSON
+    # shape is not what the generic Method-1 .txt scan expects, so parse it here (mirrors 1d/1g).
+    exposed_cred_path = os.path.join(findings_dir, "exposed_credentials", "findings.json")
+    if os.path.isfile(exposed_cred_path):
+        try:
+            with open(exposed_cred_path, errors="replace") as f:
+                ec_data = _json.load(f)
+            items = ec_data.get("findings", []) if isinstance(ec_data, dict) else (ec_data or [])
+            for item in items:
+                sev = str(item.get("severity", "critical")).lower()
+                if sev not in SEVERITY_ORDER:
+                    sev = "critical"
+                # per-finding cvss (mirrors email_auth): explicit item cvss → template cvss when
+                # severity matches the template's → canonical severity→score map otherwise.
+                _ec_tmpl = VULN_TEMPLATES.get("exposed_credentials", {})
+                if item.get("cvss") is not None:
+                    _ec_cvss = str(item["cvss"])
+                elif sev == _ec_tmpl.get("severity"):
+                    _ec_cvss = _ec_tmpl.get("cvss", CVSS_DEFAULT.get(sev, "9.0"))
+                else:
+                    _ec_cvss = CVSS_DEFAULT.get(sev, "9.0")
+                caps = item.get("capabilities", {}) or {}
+                allowed = sorted(k for k, v in caps.items() if v)
+                backups = item.get("backups", []) or []
+                pii = item.get("pii_indicators", []) or []
+                poc = [
+                    f"Access key : {item.get('access_key_id', '')}",
+                    f"Account    : {item.get('account', '')}",
+                    f"Principal  : {item.get('principal', '')}",
+                    f"Source     : {item.get('source_url') or item.get('source_file', '')}",
+                    f"Admin      : {item.get('is_admin')}   GetObject: {item.get('get_object')}"
+                    f"   Buckets: {item.get('bucket_count')}",
+                    f"Allowed    : {', '.join(allowed)}",
+                ]
+                if backups:
+                    poc += ["", f"Backups ({len(backups)} listed, top 10):"]
+                    poc += [f"  {b.get('Size')}  {b.get('bucket', '')}/{b.get('Key', '')}"
+                            for b in backups[:10]]
+                if pii:
+                    poc += ["", f"PII-indicator filenames: {len(pii)}"]
+                results.append({
+                    "severity": sev,
+                    "cvss": _ec_cvss,
+                    "vtype": "exposed_credentials",
+                    "title": item.get("title", "Verified cloud credential exposed — confirmed blast radius"),
+                    "detail": item.get("remediation", ""),
+                    "url": item.get("source_url") or item.get("source_file", "N/A"),
+                    "poc": "\n".join(poc),
                 })
         except Exception:
             pass

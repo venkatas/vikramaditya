@@ -1,5 +1,79 @@
 # Changelog
 
+## v10.4.1 — run-audit fixes: verified-cred reporting, JS/OpenAPI hang, CMS false-positives (2026-06-15)
+
+A multi-agent audit of two real runs (client-spa.example, client-b.example) found 8 confirmed defects;
+this ships fixes for all of them.
+
+- **CRITICAL — a TruffleHog-verified leaked credential was silently dropped from the report.**
+  The only producer of the report's leaked-cred input was `cred_blast_radius.run()`, hard-gated on
+  `--assess-creds` (off by default). On client-spa, 4 `Verified:true` AWS keys in a JS bundle never
+  reached the report. **Fix:** decoupled PASSIVE reporting from ACTIVE enumeration —
+  `run_secret_hunt` now calls `cred_blast_radius.run(active=ASSESS_CREDS)` **unconditionally**, so a
+  verified credential is **always** reported (no network); only the read-only boto3 blast-radius
+  stays gated. New `cred_blast_radius._passive_result()`.
+- **HIGH — `--assess-creds` was unreachable from `vikramaditya.py`.** The interactive entry never
+  passed the flag, orphaning the v10.4.0 feature. **Fix:** `run_hunt(assess_creds=…)` makes it
+  reachable; the no-creds path opts in explicitly (interactive prompt / auto in autonomous) since
+  actively using a discovered third-party key is scope-sensitive. PASSIVE reporting of a verified
+  credential is unconditional (see above), so the key is reported either way. **Active mode is
+  also crash-safe:** the passive finding is written first, then boto3 enrichment is best-effort —
+  a boto3/session failure can no longer drop the verified credential.
+- **HIGH — JS analysis could hang for the full phase timeout.** The 3 per-URL `curl` loops had no
+  timeouts, so one SYN-black-holing host stalled the serial loop (client-b: jsluice-urls + download
+  timed out at 1200s/300s `rc=-9`, losing the manifest). **Fix:** `--connect-timeout 5 --max-time 20`
+  + `IFS= read -r` on all three loops.
+- **MEDIUM — CVE-hunter hallucinated CMS on SPAs.** `cve.py` Method 4 accepted a CMS on any
+  fingerprint-path HTTP 200 (`-o /dev/null`, status only); a React/Vite SPA returns 200 for every
+  path → 6 phantom CMS (joomla/drupal/typo3/umbraco/sitecore/sitefinity) → 18 bogus ancient CVEs in
+  `cve_database_matches.json`. **Fix:** `_cms_path_confirms()` requires 200 + body materially
+  different from a random-path baseline (rejects catch-alls) + a CMS-specific body marker.
+- **MEDIUM — OpenAPI discovery hung ~10 min** on a SYN-dropping host (`api_audit.discover_specs`
+  probed every host × 25 paths × 6s). **Fix:** `probe()` returns a connected-bool; per-host
+  fast-fail after 3 consecutive connect failures.
+- **MEDIUM — phase glyph showed `✗` for producing phases.** A phase that ran and produced output
+  but had an OPTIONAL tool degraded (e.g. broken `secretfinder`) was marked failed. **Fix:** new
+  `PHASE_STATUS_PARTIAL` (`⚠`) — degraded+produced ⇒ ⚠, degraded+nothing ⇒ ✗.
+- **MEDIUM — false "Ollama not installed".** `ollama_available()` probed localhost with no timeout
+  and ignored `brain.env`. **Fix:** `ollama_status()` loads `brain.env` (BRAIN_PROVIDER/OLLAMA_HOST)
+  then probes the configured host with a timeout, and the message distinguishes
+  absent / daemon-down / no-models.
+
+Tests: +13 (passive-report, run_hunt wiring, CMS body-gating, api_audit fast-fail, phase-PARTIAL).
+Full suite 922 passed.
+
+## v10.4.0 — discovered-credential blast-radius + brain.env auto-load + JS url manifest (2026-06-10)
+
+Engagement-driven: a TruffleHog-**verified live** AWS key hard-coded in a target's public
+JS bundle gave anonymous read of ~460 GB of production DB backups + Terraform state — but
+Vikramaditya had no way to turn "verified key" into impact; the entire blast-radius
+assessment had to be done by hand via boto3, **outside** the tool.
+
+- **Discovered-credential blast-radius (`cred_blast_radius.py`; opt-in `--assess-creds`).**
+  When the secret-hunt phase's TruffleHog flags a *verified* cloud credential, run a
+  **STRICTLY READ-ONLY** assessment of what it can actually reach — caller identity,
+  IAM-policy reach, account-wide S3 visibility (`ListAllMyBuckets`), per-bucket object
+  listing, a `HeadObject` read-content probe, a backup/DB/tfstate inventory, and a
+  strong-term PII filename scan — emitted as `findings/exposed_credentials/findings.json`
+  for the reporter. Every AWS call is asserted non-mutating (`assert_readonly`); the module
+  never writes. Gated behind `--assess-creds` because auto-using a third-party credential is
+  engagement-scope-sensitive. Validated in-situ: reproduced 59 buckets / 696 backups /
+  `get_object=True` against the engagement finding.
+- **JS url→file manifest.** The JS downloader named files `md5(url+"\n").js` with no URL
+  map, so a finding couldn't carry its public URL without a live re-fetch. The downloader
+  now writes `js/downloaded/manifest.tsv`; `cred_blast_radius.js_source_url()` reads it,
+  with a backward-compatible fallback that recomputes the md5 over `js_urls.txt` for old
+  sessions (resolved `…/assets/index-a69278c9.js` on a manifest-less session).
+- **`brain.env` auto-load.** `~/.config/vikramaditya/brain.env` (the documented local-LLM
+  config) was never read by the code — it only applied if the user `source`d it first, so a
+  stale inherited `BRAIN_PROVIDER`/`GEMINI_API_KEY` silently won and the brain ran on the
+  wrong models (qwen3:14b/bugtraceai instead of the pinned qwen3-coder:30b). `brain.py` now
+  auto-loads it at import (file-wins for brain-relevant keys, allowlisted so it can't clobber
+  `PATH`/`HOME`, `BRAIN_ENV_NOLOAD=1` escape hatch, `BRAIN_ENV_FILE` override).
+
+Tests: +7 `brain.env` autoload, +18 cred-blast-radius (parse/guard/classify/PII/manifest/
+mocked-enum/finding). All read-only; no mutating AWS calls anywhere in the module.
+
 ## v10.3.4 — brain reliability: fail-loud on bad cloud key + reasoning-model triage (2026-06-10)
 
 Two engagement-found bugs where the AI brain produced **nothing** for a whole ~70-min
