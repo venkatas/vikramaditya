@@ -46,7 +46,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
 # See CHANGELOG.md for the version-by-version delta.
-__version__ = "10.3.4"
+__version__ = "10.4.1"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -775,24 +775,52 @@ def run_har_vapt(analysis: dict, output_dir: str) -> str:
 # ── Ollama Detection ──────────────────────────────────────────────────────────
 
 def ollama_available() -> bool:
-    """Check if Ollama is installed and has at least one model."""
+    """True if the Ollama daemon is reachable with >=1 model.
+
+    v10.4.1 — imports brain first so brain.env (BRAIN_PROVIDER / OLLAMA_HOST) is loaded before
+    probing, then probes the daemon at the configured host with an explicit timeout. A bare
+    ``import ollama; ollama.list()`` defaulted to localhost with no timeout and reported "not
+    installed" on any transient/daemon hiccup — see ollama_status() for the honest reason.
+    """
+    return ollama_status() == "ok"
+
+
+def ollama_status() -> str:
+    """Classify Ollama availability: 'ok' | 'no_models' | 'daemon_down' | 'absent'."""
+    try:
+        import brain  # noqa: F401 — import triggers brain._load_brain_env()
+    except Exception:
+        pass
     try:
         import ollama
-        models = ollama.list()
-        return bool(models.get("models"))
     except Exception:
-        return False
+        return "absent"
+    try:
+        host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        client = ollama.Client(host=host, timeout=15)
+        models = client.list()
+        return "ok" if models.get("models") else "no_models"
+    except Exception:
+        return "daemon_down"
 
 
 # ── Engine Routing ────────────────────────────────────────────────────────────
 
-def run_hunt(target: str, full: bool = False, scope_lock: bool = False):
+def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
+             assess_creds: bool = False):
     """Route to hunt.py for domain/IP/CIDR recon + scan.
 
     v9.2.0 — pass PYTHONUNBUFFERED=1 to subprocess so phase markers flush in
     real time when the parent is being tee'd or run under nohup. Without this,
     long phases (cloud audit, sqlmap) appear stuck on the prior line for
     minutes because Python line-buffers stdout when it's not a TTY.
+
+    v10.4.1 — ``assess_creds`` adds ``--assess-creds`` so a TruffleHog-VERIFIED
+    cloud credential gets a READ-ONLY blast-radius assessment. It defaults OFF
+    because actively using a discovered third-party key is scope-sensitive — the
+    caller opts in explicitly (interactive prompt / autonomous). Passive
+    REPORTING of a verified credential happens unconditionally in hunt.py
+    regardless of this flag, so a leaked key is never silently dropped.
     """
     cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "hunt.py"),
            "--target", target]
@@ -800,6 +828,8 @@ def run_hunt(target: str, full: bool = False, scope_lock: bool = False):
         cmd.append("--full")
     if scope_lock:
         cmd.append("--scope-lock")
+    if assess_creds:
+        cmd.append("--assess-creds")
     print(f"\n  {B}[»]{N} Launching hunt.py → {target}\n", flush=True)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -2011,7 +2041,15 @@ def main():
     if use_brain_scanner:
         log("ok", "Brain active scanner: enabled")
     if not has_ollama:
-        log("info", "Ollama not installed — running without AI brain")
+        _ost = ollama_status()
+        if _ost == "daemon_down":
+            host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+            log("info", f"Ollama daemon not responding at {host} — brain disabled "
+                        f"(run `ollama serve`, or check OLLAMA_HOST in ~/.config/vikramaditya/brain.env)")
+        elif _ost == "no_models":
+            log("info", "Ollama running but no models pulled — brain disabled (e.g. `ollama pull qwen3-coder:30b`)")
+        else:
+            log("info", "Ollama not installed — running without AI brain (`brew install ollama`)")
 
     # ── Step 4b: Fix verification mode ────────────────────────────────────
     verify_fix_mode = False
@@ -2147,9 +2185,15 @@ def main():
         # No creds — run hunt.py for unauthenticated scan
         domain = urlparse(url).netloc
         scope_lock = autonomous or (not autonomous and confirm("Scope lock? (scan this exact host only, no subdomain expansion)", default_yes=False))
+        # A TruffleHog-VERIFIED leaked credential is ALWAYS reported (passive, no network). The
+        # ACTIVE read-only blast-radius (boto3 calls against the key's cloud account) is scope-
+        # sensitive — explicit opt-in: prompt interactively, auto-on only in autonomous mode.
+        assess_creds = autonomous or (not autonomous and confirm(
+            "If a VERIFIED cloud credential is found, actively assess its blast-radius? "
+            "(read-only AWS calls to the key's own account)", default_yes=False))
         log("info", "No credentials — running unauthenticated recon + vulnerability scan")
         print()
-        run_hunt(domain, full=True, scope_lock=scope_lock)
+        run_hunt(domain, full=True, scope_lock=scope_lock, assess_creds=assess_creds)
 
         # Post-scan: locate the hunt.py session findings dir and hand it to the
         # single final-report block below (after the brain scanner runs), so the

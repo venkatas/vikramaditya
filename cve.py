@@ -97,6 +97,55 @@ def add_tech(techs, raw, count=1):
     techs[tech] = techs.get(tech, 0) + count
 
 
+# CMS-specific body markers — a fingerprint path is only real evidence of the CMS if the response
+# body actually contains one of these (a status-200 alone is meaningless against an SPA catch-all).
+_CMS_MARKERS = {
+    "wordpress": ["wp-content", "wp-includes", 'content="wordpress'],
+    "joomla":    ["joomla", "com_content", "joomla!", "/media/jui/"],
+    "drupal":    ["drupal.settings", "/sites/default/", "x-generator: drupal", "drupal.js"],
+    "typo3":     ["typo3conf", "typo3temp", "typo3"],
+    "umbraco":   ["umbraco"],
+    "sitecore":  ["sitecore"],
+    "sitefinity": ["sitefinity", "telerik.web"],
+}
+
+
+def _norm_body(s: str) -> str:
+    """Whitespace-normalize a body for catch-all equality comparison."""
+    return " ".join((s or "").split())
+
+
+def _cms_path_confirms(tech, status, body, baseline_status, baseline_body):
+    """True only if a fingerprint-path response is REAL evidence of ``tech``.
+
+    Gate order: (1) HTTP 200; (2) a CMS-specific body marker MUST be present (primary evidence —
+    an SPA/React index has none); (3) reject an SPA/catch-all whose body is essentially IDENTICAL
+    to the baseline random-path 200. Marker-primary + exact-duplicate (not a length heuristic) so a
+    real CMS page that happens to be a similar length to the baseline is not false-negatived.
+    """
+    if str(status) != "200":
+        return False
+    low = body.lower()
+    if not any(m in low for m in _CMS_MARKERS.get(tech, [tech])):
+        return False
+    if str(baseline_status) == "200" and _norm_body(body) == _norm_body(baseline_body):
+        return False  # catch-all: the exact same page is served for the random baseline path
+    return True
+
+
+def _fetch_body_status(url, timeout=8):
+    """Fetch (body, status) for a URL via curl; ('', '000') on failure."""
+    ok, out = run_cmd(
+        f'curl -sk -w "\\nHTTPSTATUS:%{{http_code}}" --max-time {timeout} "{url}"',
+        timeout=timeout + 5)
+    if not ok:
+        return "", "000"
+    if "HTTPSTATUS:" in out:
+        body, _, status = out.rpartition("HTTPSTATUS:")
+        return body, status.strip()
+    return out, "000"
+
+
 def detect_technologies(domain, recon_dir=None):
     """Detect technologies running on the target."""
     print(f"[*] Detecting technologies on {domain}...")
@@ -193,16 +242,18 @@ def detect_technologies(domain, recon_dir=None):
         "/sitefinity/": "sitefinity",
     }
 
+    # v10.4.1 — body-evidence gating. A status-200-only probe (the old `-o /dev/null` check)
+    # mis-detected six CMS on React/Vite SPAs (client-spa.example): an SPA serves index.html with
+    # 200 for EVERY unmatched path. Baseline a random nonexistent path, then require 200 + a body
+    # that differs from that baseline (rejects catch-alls) + a CMS-specific body marker.
+    import random as _random
+    import string as _string
+    _rand = "/vikramaditya-baseline-" + "".join(
+        _random.choice(_string.ascii_lowercase + _string.digits) for _ in range(12))
+    base_body, base_status = _fetch_body_status(f"https://{domain}{_rand}")
     for path, tech in fingerprints.items():
-        success, output = run_cmd(
-            f'curl -s -o /dev/null -w "%{{http_code}}" "https://{domain}{path}" --max-time 5',
-            timeout=10
-        )
-        # v9.23 — only a real 200 counts. nginx http->https setups 301-redirect
-        # EVERY path, so accepting 301/302/403 here misclassified plain PHP/nginx
-        # hosts as Drupal (e.g. /user/login). A redirect/forbidden is not evidence
-        # the CMS path exists.
-        if success and output == "200":
+        body, status = _fetch_body_status(f"https://{domain}{path}")
+        if _cms_path_confirms(tech, status, body, base_status, base_body):
             add_tech(techs, tech)
 
     if techs:

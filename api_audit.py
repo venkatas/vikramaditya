@@ -326,14 +326,17 @@ def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
     visited = set()
     queued_links = []
 
-    def probe(spec_url: str) -> None:
+    def probe(spec_url: str) -> bool:
+        """Probe one candidate spec URL. Returns True if the host RESPONDED (any HTTP status),
+        False if the connection failed/timed out (status 0) — used for per-host fast-fail."""
         if spec_url in visited:
-            return
+            return True
         visited.add(spec_url)
 
         resp = fetch(spec_url)
+        connected = resp["status"] != 0          # 0 == connect/timeout failure (see fetch())
         if resp["status"] != 200 or not resp["body"]:
-            return
+            return connected
 
         parsed, fmt = parse_spec(resp["body"])
         if parsed is not None:
@@ -345,16 +348,27 @@ def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
             discovered_specs.append(spec_meta)
             operations.extend(ops)
             raw_specs.append((saved_as, parsed))
-            return
+            return True
 
         body_lower = resp["body"].lower()
         if "swagger-ui" in body_lower or "redoc" in body_lower or "openapi" in body_lower:
             for link in extract_html_spec_links(resp["final_url"], resp["body"]):
                 queued_links.append(link)
+        return True
 
+    # Per-host fast-fail: a host that black-holes connects (status 0) must not cost
+    # len(SPEC_PATHS) × timeout. Abandon a host after 3 consecutive connect failures.
+    # (Real client-b.example hang: ~10 min stuck on one SYN-dropping host × 30 paths × 6s.)
     for base_url in candidates:
+        consecutive_fail = 0
         for path in SPEC_PATHS:
-            probe(urljoin(base_url.rstrip("/") + "/", path.lstrip("/")))
+            ok = probe(urljoin(base_url.rstrip("/") + "/", path.lstrip("/")))
+            if ok:
+                consecutive_fail = 0
+            else:
+                consecutive_fail += 1
+                if consecutive_fail >= 3:
+                    break
 
     for extra in dedupe(queued_links):
         probe(extra)

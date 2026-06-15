@@ -142,9 +142,17 @@ def test_derive_phase_status_skipped_when_falsy():
             == hunt.PHASE_STATUS_SKIPPED)
 
 
-def test_derive_phase_status_error_when_degraded():
-    # Degraded wins even if the run_* helper returned truthy on a skip path.
+def test_derive_phase_status_partial_when_degraded_but_produced():
+    # A phase that RAN and produced a result but had an OPTIONAL tool degraded is PARTIAL (⚠),
+    # not a hard ERROR (✗). Real case: JS analysis extracted secrets while the fragile
+    # secretfinder dep was broken — it must not read as a failed phase.
     assert (hunt.derive_phase_status(requested=True, ran_truthy=True, degraded=True)
+            == hunt.PHASE_STATUS_PARTIAL)
+
+
+def test_derive_phase_status_error_when_degraded_and_no_output():
+    # Degraded AND produced nothing is a real ERROR.
+    assert (hunt.derive_phase_status(requested=True, ran_truthy=False, degraded=True)
             == hunt.PHASE_STATUS_ERROR)
 
 
@@ -152,6 +160,7 @@ def test_phase_status_glyphs():
     assert hunt.phase_status_glyph(hunt.PHASE_STATUS_RAN) == "✓"
     assert hunt.phase_status_glyph(hunt.PHASE_STATUS_SKIPPED) == "∅"
     assert hunt.phase_status_glyph(hunt.PHASE_STATUS_ERROR) == "✗"
+    assert hunt.phase_status_glyph(hunt.PHASE_STATUS_PARTIAL) == "⚠"
 
 
 # ── Issue 5: tool readiness layer ─────────────────────────────────────────────

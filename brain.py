@@ -75,6 +75,78 @@ try:
 except ImportError:
     _mlx_lm = None
 
+# ── brain.env auto-load ─────────────────────────────────────────────────────────
+# The documented local-LLM config lives at ~/.config/vikramaditya/brain.env as a shell
+# `export KEY=VALUE` file. Nothing used to read it, so the pinned provider/models only
+# took effect if the user remembered to `source` it first — otherwise a stale
+# BRAIN_PROVIDER / GEMINI_API_KEY inherited from the launching shell would win and silently
+# mis-route the brain (real 2026-06-10 incident: a dead Gemini key + qwen3:14b/bugtraceai
+# instead of the pinned qwen3-coder:30b, brainless for a whole run).
+# We load it here with FILE-WINS precedence — the file is the canonical brain config and the
+# inherited env is accidental cruft. Allowlisted keys ONLY (never clobber PATH/HOME/etc.).
+# Escape hatch: BRAIN_ENV_NOLOAD=1. Path override: BRAIN_ENV_FILE.
+_BRAIN_ENV_DEFAULT = os.path.expanduser("~/.config/vikramaditya/brain.env")
+
+
+# Only the brain's own provider API keys — NOT a blanket ``*_API_KEY`` (that would let brain.env
+# file-win an unrelated tool's key living in the same process).
+_BRAIN_PROVIDER_API_KEYS = frozenset({
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY",
+})
+
+
+def _brain_env_key_allowed(key: str) -> bool:
+    return (
+        key.startswith("BRAIN_")
+        or key.startswith("OLLAMA_")
+        or key.startswith("MLX_")
+        or key == "TRIAGE_MODEL"
+        or key in _BRAIN_PROVIDER_API_KEYS
+    )
+
+
+def _load_brain_env(path: str | None = None) -> dict:
+    """Load the brain.env `export KEY=VALUE` file into os.environ (file-wins, allowlisted).
+
+    Returns the dict of keys actually applied. Best-effort — never raises.
+    """
+    if os.environ.get("BRAIN_ENV_NOLOAD"):
+        return {}
+    path = path or os.environ.get("BRAIN_ENV_FILE") or _BRAIN_ENV_DEFAULT
+    applied: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not key or not _brain_env_key_allowed(key):
+            continue
+        if val and val[0] in "\"'":            # quoted value: take what's inside the quotes
+            quote = val[0]
+            end = val.find(quote, 1)
+            val = val[1:end] if end != -1 else val[1:]
+        else:                                   # unquoted: drop any trailing inline comment
+            val = val.split("#", 1)[0].strip()
+        if not val:
+            continue
+        os.environ[key] = val                   # file-wins over inherited env
+        applied[key] = val
+    return applied
+
+
+_load_brain_env()
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MLX_DEFAULT_MODEL = os.environ.get("MLX_MODEL", "mlx-community/Qwen2.5-14B-Instruct-4bit")
