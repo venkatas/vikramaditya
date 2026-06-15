@@ -30,6 +30,9 @@ _SECRET_PATTERNS = [
 ]
 _SECRET_ALLOW = {"AKIAIOSFODNN7EXAMPLE"}            # AWS's documented example key
 _SECRET_ALLOW_SUBSTR = ("AKIA[0-9A-Z]", "AKIA...")   # the literal regex / placeholder in docs
+# Obvious placeholder/fixture markers — a secret-shaped string carrying one of these is not a
+# real leaked key (this is a SECURITY tool: its docs/fixtures are full of example secrets).
+_FIXTURE_MARKERS = ("\\n", "abcd", "example", "placeholder", "your_", "fake", "dummy", "redacted", "xxxx")
 
 
 def _load_blocklist():
@@ -44,21 +47,37 @@ def _load_blocklist():
         return []
 
 
-def _added_lines(diff_args):
+def _added_changes(diff_args):
+    """Yield (path, added_line) for every added line, tracking the current file from the diff."""
     out = subprocess.run(["git", "diff", "--no-color", *diff_args],
                          capture_output=True, text=True).stdout
-    # only ADDED lines (new content), skip the +++ header
-    return [ln[1:] for ln in out.splitlines()
-            if ln.startswith("+") and not ln.startswith("+++")]
+    path = ""
+    for ln in out.splitlines():
+        if ln.startswith("+++ b/"):
+            path = ln[6:]
+        elif ln.startswith("+") and not ln.startswith("+++"):
+            yield path, ln[1:]
 
 
-def _scan(lines, terms):
+def _is_test_path(path):
+    """Test files legitimately carry FAKE secret-shaped fixtures (e.g. AKIAEXAMPLE...). Client
+    NAMES are still blocked there (blocklist), but the generic secret regex is relaxed."""
+    p = (path or "").lower()
+    base = p.rsplit("/", 1)[-1]
+    return "/tests/" in p or base.startswith("test_") or base.endswith("_test.py")
+
+
+def _scan(changes, terms):
     hits = []
-    for i, ln in enumerate(lines):
+    for path, ln in changes:
         low = ln.lower()
-        for t in terms:
+        for t in terms:                       # client names: blocked EVERYWHERE
             if t in low:
                 hits.append((t, ln.strip()[:120]))
+        if _is_test_path(path):               # don't flag fake AKIA fixtures in test files
+            continue
+        if any(mk in low for mk in _FIXTURE_MARKERS):
+            continue                          # placeholder/fixture secret, not a real key
         for rx, label in _SECRET_PATTERNS:
             for m in rx.findall(ln):
                 if m in _SECRET_ALLOW or any(s in ln for s in _SECRET_ALLOW_SUBSTR):
@@ -79,13 +98,13 @@ def main():
               f"({BLOCKLIST_FILE}); only secret patterns enforced.", file=sys.stderr)
 
     if args.staged:
-        lines = _added_lines(["--cached"])
+        changes = _added_changes(["--cached"])
     elif args.rng:
-        lines = _added_lines([args.rng])
+        changes = _added_changes([args.rng])
     else:
-        lines = _added_lines(["HEAD~1..HEAD"])
+        changes = _added_changes(["HEAD~1..HEAD"])
 
-    hits = _scan(lines, terms)
+    hits = _scan(changes, terms)
     if hits:
         print("\n🛑 LEAK-GUARD BLOCKED: client identifier / secret in the change:", file=sys.stderr)
         seen = set()
