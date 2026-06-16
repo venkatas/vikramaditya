@@ -75,6 +75,67 @@ try:
 except ImportError:
     _mlx_lm = None
 
+
+# ── Ollama over HTTP (no python package dependency) ──────────────────────────────
+# The brain talks to the Ollama daemon via its REST API rather than the `ollama` python
+# package, so it works on ANY interpreter (system python3 included) whenever the daemon is up.
+# Three runs had the brain OFF only because the launched interpreter lacked the `ollama` package.
+class _AttrDict(dict):
+    """dict that also supports attribute access, so `.models`/`["models"]` and `m.model`/`m.get(...)`
+    all work — matching the shapes the `ollama` SDK returned (objects AND dict access)."""
+    __getattr__ = dict.get
+
+
+def _wrap(o):
+    if isinstance(o, dict):
+        return _AttrDict({k: _wrap(v) for k, v in o.items()})
+    if isinstance(o, list):
+        return [_wrap(v) for v in o]
+    return o
+
+
+class _OllamaHTTP:
+    """Minimal Ollama client over the REST API (drop-in for the bits of `ollama.Client` we use)."""
+
+    def __init__(self, host=None):
+        self._base = (host or OLLAMA_HOST or "http://localhost:11434").rstrip("/")
+
+    def list(self):
+        import requests
+        r = requests.get(f"{self._base}/api/tags", timeout=15)
+        r.raise_for_status()
+        models = []
+        for m in (r.json() or {}).get("models", []):
+            name = m.get("model") or m.get("name")
+            models.append(_AttrDict({"model": name, "name": name}))
+        return _AttrDict({"models": models})
+
+    def chat(self, model=None, messages=None, stream=False, options=None, **kw):
+        import requests
+        payload = {"model": model, "messages": messages or [], "stream": bool(stream)}
+        if options:
+            payload["options"] = options
+        for k in ("format", "keep_alive", "think", "tools", "template"):
+            if k in kw and kw[k] is not None:
+                payload[k] = kw[k]
+        # connect bound short; read bound generous so a cold model load doesn't time out
+        if not stream:
+            r = requests.post(f"{self._base}/api/chat", json=payload, timeout=(10, 600))
+            r.raise_for_status()
+            return _wrap(r.json())
+        r = requests.post(f"{self._base}/api/chat", json=payload, stream=True, timeout=(10, 600))
+        r.raise_for_status()
+
+        def _gen():
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    yield _wrap(json.loads(line))
+                except ValueError:
+                    continue
+        return _gen()
+
 # ── brain.env auto-load ─────────────────────────────────────────────────────────
 # The documented local-LLM config lives at ~/.config/vikramaditya/brain.env as a shell
 # `export KEY=VALUE` file. Nothing used to read it, so the pinned provider/models only
@@ -286,10 +347,8 @@ class LLMClient:
         self.available = False
         self.provider  = provider
         if provider == "ollama":
-            if _ollama_lib is None:
-                return
             try:
-                self._ollama = _ollama_lib.Client(host=OLLAMA_HOST)
+                self._ollama = _OllamaHTTP(OLLAMA_HOST)  # HTTP — no `ollama` package needed
                 self._ollama.list()
                 self.available   = True
                 self.description = f"Ollama @ {OLLAMA_HOST}"
@@ -680,12 +739,9 @@ ABSOLUTE RULES:
 
 def _get_available_models() -> list[str]:
     """Query Ollama for installed models."""
-    if _ollama_lib is None:
-        return []
     try:
-        client = _ollama_lib.Client(host=OLLAMA_HOST)
+        client = _OllamaHTTP(OLLAMA_HOST)        # HTTP — no `ollama` package needed
         result = client.list()
-        # ollama SDK returns a ListResponse with .models list of Model objects
         return [m.model for m in result.models]
     except Exception:
         return []
