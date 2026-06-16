@@ -1,5 +1,23 @@
 # Changelog
 
+## v10.4.3 — brain talks to Ollama over HTTP (no python package dependency) (2026-06-16)
+
+The AI brain was OFF across several runs **only** because the launched interpreter lacked the
+`ollama` Python package — even though the Ollama daemon was running and other interpreters had the
+package. The brain disabled itself instead of just using the daemon.
+
+- **`brain.py` now talks to Ollama via its REST API** (`/api/tags`, `/api/chat`) through a thin
+  `_OllamaHTTP` client, instead of `import ollama`. It returns `_AttrDict`-wrapped responses so both
+  attribute (`r.models`, `m.model`, `chunk.message.content`) and dict (`chunk["message"]["content"]`)
+  access — matching every call site — keep working unchanged. Streaming `/api/chat` (NDJSON) is
+  consumed as before. The only requirement now is `requests` (already needed to run the tool) + the
+  daemon up; **the brain works on any interpreter** (system python included), not just the one with
+  the `ollama` package. Detection (`_init_provider`/`_get_available_models`) no longer gates on the
+  package. Validated: `LLMClient("ollama").available` is True on `.venv` python via HTTP.
+
+Tests: +6 (`_OllamaHTTP` list/chat/stream, AttrDict dual-access, HTTP-only availability). Existing
+provider-fallback tests updated to mock the REST probe instead of the removed `_ollama_lib`.
+
 ## v10.4.2 — live-monitoring fixes: autopilot crash + authenticated-path cred reporting (2026-06-15)
 
 Found while monitoring a live authenticated run on client-spa.example.
