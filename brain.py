@@ -95,39 +95,47 @@ def _wrap(o):
 
 
 class _OllamaHTTP:
-    """Minimal Ollama client over the REST API (drop-in for the bits of `ollama.Client` we use)."""
+    """Minimal Ollama client over the REST API using ONLY stdlib ``urllib`` — zero third-party
+    deps, so the brain works on any interpreter (system python included) whenever the daemon is up.
+    Drop-in for the bits of ``ollama.Client`` we use."""
 
     def __init__(self, host=None):
         self._base = (host or OLLAMA_HOST or "http://localhost:11434").rstrip("/")
 
+    def _urlopen(self, path, payload=None, timeout=600):
+        import urllib.request
+        url = f"{self._base}{path}"
+        if payload is None:
+            req = urllib.request.Request(url)
+        else:
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+        return urllib.request.urlopen(req, timeout=timeout)
+
     def list(self):
-        import requests
-        r = requests.get(f"{self._base}/api/tags", timeout=15)
-        r.raise_for_status()
+        resp = self._urlopen("/api/tags", timeout=15)
+        data = json.loads(resp.read().decode("utf-8", "ignore") or "{}")
         models = []
-        for m in (r.json() or {}).get("models", []):
+        for m in (data.get("models") or []):
             name = m.get("model") or m.get("name")
             models.append(_AttrDict({"model": name, "name": name}))
         return _AttrDict({"models": models})
 
     def chat(self, model=None, messages=None, stream=False, options=None, **kw):
-        import requests
         payload = {"model": model, "messages": messages or [], "stream": bool(stream)}
         if options:
             payload["options"] = options
         for k in ("format", "keep_alive", "think", "tools", "template"):
             if k in kw and kw[k] is not None:
                 payload[k] = kw[k]
-        # connect bound short; read bound generous so a cold model load doesn't time out
+        resp = self._urlopen("/api/chat", payload=payload, timeout=600)
         if not stream:
-            r = requests.post(f"{self._base}/api/chat", json=payload, timeout=(10, 600))
-            r.raise_for_status()
-            return _wrap(r.json())
-        r = requests.post(f"{self._base}/api/chat", json=payload, stream=True, timeout=(10, 600))
-        r.raise_for_status()
+            return _wrap(json.loads(resp.read().decode("utf-8", "ignore") or "{}"))
 
         def _gen():
-            for line in r.iter_lines(decode_unicode=True):
+            for raw in resp:                  # urllib HTTPResponse iterates NDJSON lines
+                line = raw.decode("utf-8", "ignore").strip()
                 if not line:
                     continue
                 try:

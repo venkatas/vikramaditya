@@ -1,5 +1,23 @@
 # Changelog
 
+## v10.4.4 — brain over stdlib urllib + fix the vikramaditya gate (zero-dep, any interpreter) (2026-06-16)
+
+v10.4.3 was incomplete: (1) `vikramaditya.py`'s OWN `ollama_status()` gate still did `import ollama`
+directly (so it disabled the brain + printed "package missing" before brain.py was ever consulted),
+and (2) the HTTP client used `requests`, which the launched interpreter (bare system `python3`) also
+lacked. The brain stayed off.
+
+- **`_OllamaHTTP` now uses stdlib `urllib`** (not `requests`) — **zero third-party deps**. The brain
+  works on ANY interpreter (system `/usr/bin/python3` included) with nothing installed, as long as the
+  Ollama daemon is up. Streaming `/api/chat` is read as NDJSON lines off the urllib response.
+- **`vikramaditya.py` `ollama_status()` rewritten** to probe via `brain._OllamaHTTP` (HTTP) instead of
+  `import ollama`, so the launcher's gate agrees with the brain and never depends on the package. The
+  brain-off message now reflects daemon/model state (`ollama serve` / `ollama pull`), not packages.
+- Validated on bare `/usr/bin/python3` (no `requests`, no `ollama`): `LLMClient("ollama").available`
+  → True, `ollama_status()` → "ok".
+
+Tests: HTTP tests + provider-fallback tests re-pointed to mock `urllib.request.urlopen`. Full suite 932 passed.
+
 ## v10.4.3 — brain talks to Ollama over HTTP (no python package dependency) (2026-06-16)
 
 The AI brain was OFF across several runs **only** because the launched interpreter lacked the

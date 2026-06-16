@@ -79,9 +79,10 @@ def test_gemini_init_base_and_auth(gemini_env):
 def test_gemini_no_key_is_unavailable(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     # No key → gemini can't init. The explicit-provider fallback would otherwise reach
-    # for local Ollama (now via REST), so make the daemon probe fail to assert the no-key state.
-    monkeypatch.setattr("requests.get",
-                        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("no daemon")))
+    # for local Ollama (now via stdlib urllib REST), so make the daemon probe fail.
+    import urllib.error
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda req, timeout=None: (_ for _ in ()).throw(urllib.error.URLError("down")))
     c = LLMClient("gemini")
     assert c.available is False
 
@@ -148,8 +149,9 @@ def test_auto_detect_picks_gemini_when_only_key(monkeypatch):
     for var in ("BRAIN_PROVIDER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     # Make local providers unavailable so auto-detect falls to the cloud key.
-    monkeypatch.setattr("requests.get",
-                        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("no daemon")))
+    import urllib.error
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda req, timeout=None: (_ for _ in ()).throw(urllib.error.URLError("down")))
     monkeypatch.setattr(brain, "_ollama_lib", None, raising=False)
     monkeypatch.setattr(brain, "_mlx_lm", None, raising=False)
     c = LLMClient()  # auto-detect
