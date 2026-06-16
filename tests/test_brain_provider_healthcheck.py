@@ -113,14 +113,13 @@ def test_explicit_provider_falls_back_to_ollama_on_bad_key(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "AQ.bad")
     monkeypatch.setattr("requests.Session.post",
                         _post_returning(400, "Please pass a valid API key"))
-    # ollama fallback now probes the REST API (no python pkg) — make /api/tags return a model
-    class _OkTags:
-        def raise_for_status(self):
-            pass
+    # ollama fallback now probes the REST API via stdlib urllib — make /api/tags return a model
+    import json as _json
 
-        def json(self):
-            return {"models": [{"model": "phi4:14b"}]}
-    monkeypatch.setattr("requests.get", lambda *a, **k: _OkTags())
+    class _Tags:
+        def read(self):
+            return _json.dumps({"models": [{"model": "phi4:14b"}]}).encode()
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=None: _Tags())
 
     c = brain.LLMClient(provider="gemini")
 

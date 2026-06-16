@@ -46,7 +46,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
 # See CHANGELOG.md for the version-by-version delta.
-__version__ = "10.4.3"
+__version__ = "10.4.4"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -786,20 +786,19 @@ def ollama_available() -> bool:
 
 
 def ollama_status() -> str:
-    """Classify Ollama availability: 'ok' | 'no_models' | 'daemon_down' | 'absent'."""
+    """Classify Ollama availability via the daemon's HTTP API (stdlib only, no `ollama` package).
+
+    'ok' | 'no_models' | 'daemon_down' | 'broken'. Uses brain._OllamaHTTP so this gate agrees with
+    the brain's own detection and never depends on the `ollama` python package being installed in
+    whatever interpreter launched vikramaditya.
+    """
     try:
-        import brain  # noqa: F401 — import triggers brain._load_brain_env()
+        import brain  # also triggers brain._load_brain_env() so OLLAMA_HOST/BRAIN_* apply
     except Exception:
-        pass
+        return "broken"
     try:
-        import ollama
-    except Exception:
-        return "absent"
-    try:
-        host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-        client = ollama.Client(host=host, timeout=15)
-        models = client.list()
-        return "ok" if models.get("models") else "no_models"
+        models = brain._OllamaHTTP().list().get("models") or []
+        return "ok" if models else "no_models"
     except Exception:
         return "daemon_down"
 
@@ -2042,19 +2041,14 @@ def main():
         log("ok", "Brain active scanner: enabled")
     if not has_ollama:
         _ost = ollama_status()
-        if _ost == "daemon_down":
-            host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-            log("info", f"Ollama daemon not responding at {host} — brain disabled "
-                        f"(run `ollama serve`, or check OLLAMA_HOST in ~/.config/vikramaditya/brain.env)")
-        elif _ost == "no_models":
+        host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        if _ost == "no_models":
             log("info", "Ollama running but no models pulled — brain disabled (e.g. `ollama pull qwen3-coder:30b`)")
-        else:
-            import shutil as _sh
-            if _sh.which("ollama"):
-                log("info", "Ollama binary present but its Python package is missing in this venv "
-                            "— brain disabled (`pip install ollama`)")
-            else:
-                log("info", "Ollama not installed — running without AI brain (`brew install ollama`)")
+        elif _ost == "broken":
+            log("info", "brain module failed to import — running without AI brain")
+        else:  # daemon_down — the brain now needs only the daemon (HTTP), no python package
+            log("info", f"Ollama daemon not responding at {host} — brain disabled "
+                        f"(run `ollama serve`, or set OLLAMA_HOST in ~/.config/vikramaditya/brain.env)")
 
     # ── Step 4b: Fix verification mode ────────────────────────────────────
     verify_fix_mode = False
