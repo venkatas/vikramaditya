@@ -17,6 +17,17 @@ import shutil
 import sys
 from datetime import datetime
 
+# v10.6.0 — verification-based severity gating + weighted risk scoring / framework
+# mapping (finding_schema.py, report_synthesis.py; adapted from xalgorix MIT). Both
+# are pure-stdlib and optional — the report renders unchanged if they're absent.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from finding_schema import VerificationMethod, adjust_severity, should_report
+    import report_synthesis
+    _SCHEMA_OK = True
+except Exception:
+    _SCHEMA_OK = False
+
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 
@@ -2123,6 +2134,16 @@ def render_html_report(findings: list, target: str, report_dir: str,
     counts   = {s: sum(1 for f in findings if f["severity"] == s)
                 for s in SEVERITY_COLOR}
     total    = len(findings)
+    # v10.6.0 — weighted overall risk score + label (report_synthesis)
+    _risk_html = ""
+    if _SCHEMA_OK:
+        try:
+            _score, _label = report_synthesis.risk_score(findings)
+            _scol = SEVERITY_COLOR.get(_label.lower(), "#6c757d")
+            _risk_html = (f'<p style="font-size:15px">Overall Risk Score: '
+                          f'<b style="color:{_scol}">{_score:.1f} / 10 ({_label})</b></p>')
+        except Exception:
+            _risk_html = ""
     # v7.4.5 — gather scan diagnostics for the report footer so a 0-
     # findings report still explains what was actually scanned.
     diagnostics = _collect_scan_diagnostics(report_dir, target)
@@ -2259,6 +2280,7 @@ The assessment identified <b>{total}</b> security finding(s).
 {"" if not (counts["critical"] or counts["high"]) else
 f'<b style="color:{SEVERITY_COLOR["critical"]}">{counts["critical"]} critical</b> and '
 f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity issues require immediate remediation.'}</p>
+{_risk_html}
 <h3>Risk Overview</h3>
 <table style="border-collapse:collapse;max-width:550px;margin-bottom:16px">{bar}</table>
 <table class="tbl" style="max-width:360px">
@@ -2390,6 +2412,15 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         f"**Consultant:** {consultant or '—'}  \n**Date:** {date_str}  \n"
         "**Classification:** CONFIDENTIAL",
         "", "---", "", "## Executive Summary", "",
+    ]
+    # v10.6.0 — weighted overall risk score + label (report_synthesis)
+    if _SCHEMA_OK:
+        try:
+            _score, _label = report_synthesis.risk_score(findings)
+            lines += [f"**Overall Risk Score:** {_score:.1f} / 10 ({_label})", ""]
+        except Exception:
+            pass
+    lines += [
         f"Total findings: **{len(findings)}**", "",
         "| Severity | Count |", "|----------|-------|",
     ]
@@ -2441,6 +2472,37 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
     return "\n".join(lines)
 
 
+def _apply_verification_gating(findings: list) -> list:
+    """v10.6.0 — downgrade/drop UNPROVEN findings before client render.
+
+    CONSERVATIVE by design: a finding is only treated as UNVERIFIED when it carries an
+    explicit verification tag OR is a brain MODEL CLAIM. Real scanner/tool findings (the
+    overwhelming majority — nuclei, sqlmap, CVE matches) are treated as tool-evidenced and
+    are NEVER dropped — hiding a real finding is worse than reporting an unproven one.
+    Only an explicit model-claim at medium+ severity is dropped (it's noise, not evidence).
+    """
+    if not _SCHEMA_OK:
+        return findings
+    kept = []
+    for f in findings:
+        raw = (f.get("raw") or "").upper()
+        explicit = f.get("verification_method")
+        if explicit:
+            method = VerificationMethod.from_string(explicit)
+        elif any(m in raw for m in ("MODEL CLAIM", "UNVERIFIED", "PENDING — VERIFY", "PENDING-VERIFY")):
+            method = VerificationMethod.UNVERIFIED
+        else:
+            method = VerificationMethod.EXPLOITED  # real tool finding → keep
+        sev = f.get("severity", "medium")
+        new_sev = adjust_severity(sev, method)
+        if new_sev != sev:
+            f["original_severity"] = sev
+            f["severity"] = new_sev
+        if should_report(f["severity"], method):
+            kept.append(f)
+    return kept
+
+
 def process_findings_dir(findings_dir: str, client: str = "",
                          consultant: str = "", title: str = "",
                          target_override: str = "") -> tuple:
@@ -2449,6 +2511,7 @@ def process_findings_dir(findings_dir: str, client: str = "",
         target = target_override
     os.makedirs(report_dir, exist_ok=True)
     findings = load_findings(findings_dir)
+    findings = _apply_verification_gating(findings)   # v10.6.0
     if not title:
         title = "Vulnerability Assessment & Penetration Test Report"
     html = render_html_report(findings, target, report_dir, client, consultant, title)
