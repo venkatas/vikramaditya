@@ -2769,6 +2769,68 @@ def _shell_env_prefix(env_map: dict[str, str]) -> str:
     return " ".join(f'{key}={shlex.quote(str(value))}' for key, value in env_map.items()) + " "
 
 
+def _write_exposed_data_pii_findings(results, findings_dir) -> int:
+    """v10.6.0 — write CRITICAL/HIGH exposed-data results (open dirs serving DB dumps /
+    PII) to findings/exposure/exposed_data_pii.txt so the reporter ingests them as
+    T1552 exposure findings. Low/info are skipped. Returns how many were written."""
+    lines = []
+    for r in results or []:
+        if r.get("severity") not in ("critical", "high"):
+            continue
+        parts = [f"[{r['severity'].upper()}] {r.get('url', '')}"]
+        if r.get("backups"):
+            parts.append("downloadable DB/data: " + ", ".join(list(r["backups"])[:10]))
+        if r.get("pii_indicators"):
+            inds = sorted({h.get("indicator", "") for h in r["pii_indicators"] if h.get("indicator")})
+            if inds:
+                parts.append("PII indicators: " + ", ".join(inds))
+        lines.append(" — ".join(parts))
+    if not lines:
+        return 0
+    out = os.path.join(findings_dir, "exposure", "exposed_data_pii.txt")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    try:
+        import storage
+        storage.atomic_write_text(out, "\n".join(lines) + "\n", mode=0o600)
+    except Exception:
+        with open(out, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+    return len(lines)
+
+
+def _scan_exposed_data_pii(domain: str, session_id: str | None = None) -> int:
+    """v10.6.0 — fetch recon-flagged exposed dirs (exposure/config_files.txt) and check
+    them for downloadable DB dumps / PII; write CRITICAL/HIGH findings. No-op when the
+    module or the exposed-dir list is absent. Closes the gap where the tool flagged an
+    exposed /db/ path but never looked inside it for actual PII."""
+    try:
+        import exposed_data_pii
+    except Exception:
+        return 0
+    recon_dir = _resolve_recon_dir(domain, session_id=session_id)
+    cfg = os.path.join(recon_dir, "exposure", "config_files.txt")
+    if not os.path.isfile(cfg):
+        return 0
+    urls: set = set()
+    try:
+        for ln in open(cfg, errors="ignore"):
+            urls.update(re.findall(r"https?://[^\s'\"]+", ln))
+    except OSError:
+        return 0
+    if not urls:
+        return 0
+    try:
+        results = exposed_data_pii.run(sorted(urls))
+    except Exception:
+        return 0
+    findings_dir = _resolve_findings_dir(domain, session_id=session_id, create=True)
+    n = _write_exposed_data_pii_findings(results, findings_dir)
+    if n:
+        log("crit", f"Exposed-data PII: {n} open dir(s) serving DB dumps / PII "
+                    f"→ findings/exposure/exposed_data_pii.txt")
+    return n
+
+
 def _propagate_exposed_paths(domain: str, session_id: str | None = None, limit_paths: int = 20, max_workers: int = 12) -> int:
     recon_dir = _resolve_recon_dir(domain, session_id=session_id)
     findings_dir = _resolve_findings_dir(domain, session_id=session_id, create=True)
@@ -3967,7 +4029,8 @@ def run_recon(
         propagated = _propagate_exposed_paths(domain, session_id=active_session_id)
         if propagated:
             log("warn", f"Cross-subdomain propagation surfaced {propagated} additional exposure hit(s)")
-        elif state.get("waf_hosts"):
+        _scan_exposed_data_pii(domain, session_id=active_session_id)  # v10.6.0 — look INSIDE exposed dirs
+        if not propagated and state.get("waf_hosts"):
             log("info", f"Persistent state: {len(state.get('waf_hosts', []))} WAF-heavy host(s) remembered")
     return ok
 
@@ -4123,6 +4186,7 @@ def run_vuln_scan(domain: str, quick: bool = False, skip_items: set[str] | None 
         propagated = _propagate_exposed_paths(domain, session_id=_runtime_session_id(domain) or _active_recon_session_id(domain))
         if propagated:
             log("warn", f"Cross-subdomain propagation surfaced {propagated} additional exposure hit(s)")
+        _scan_exposed_data_pii(domain, session_id=_runtime_session_id(domain) or _active_recon_session_id(domain))  # v10.6.0
     return ok
 
 
