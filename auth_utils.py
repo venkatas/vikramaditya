@@ -23,6 +23,25 @@ from pathlib import Path
 VERIFY_TLS = os.environ.get("VAPT_INSECURE_SSL", "0") != "1"
 
 
+class ReauthRequired(RuntimeError):
+    """Raised when the server signals the grant is dead (invalid_grant / refresh
+    token expired or revoked) and only a fresh interactive login can recover.
+
+    A subclass of RuntimeError so existing ``except RuntimeError`` callers still
+    catch it, while new code can catch it specifically to re-prompt the operator
+    instead of limping on unauthenticated for the rest of a long engagement.
+    """
+
+
+# Server responses that mean "this grant is permanently dead — re-auth needed",
+# as opposed to an ordinary wrong-password failure we should just report.
+_GRANT_DEAD_SIGNALS = (
+    "invalid_grant", "invalid grant", "token expired", "token_expired",
+    "refresh token", "refresh_token expired", "grant expired",
+    "expired token", "revoked",
+)
+
+
 # ── TOTP (RFC 6238) — stdlib only ─────────────────────────────────────────────
 def totp_code(
     secret: str,
@@ -212,6 +231,12 @@ class AuthSession:
         self._creds = None
         self._login_url = None
         self.token = None
+        # Expiry deadline (unix seconds) decoded from a JWT `exp` claim, or None
+        # for opaque bearers / cookie-auth. Lets callers proactively re-auth.
+        self.token_expires_at: int | None = None
+        # Sticky flag: the server told us the grant is dead and a fresh
+        # interactive login is required (see ReauthRequired).
+        self.requires_reauth = False
         # Suppress InsecureRequestWarning
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -219,6 +244,61 @@ class AuthSession:
     def set_token(self, token: str):
         self.token = token
         self._session.headers["Authorization"] = f"Bearer {token}"
+        # Track expiry from the JWT exp claim so the caller can refresh before
+        # a request 401s mid-scan. Opaque tokens leave it None (= unknown). We do
+        # NOT gate on is_jwt() — that requires a non-empty signature, which would
+        # skip alg=none tokens (empty 3rd segment). Any 3-segment token whose
+        # payload decodes is enough to read exp. exp may be a number OR a numeric
+        # string depending on the IdP.
+        self.token_expires_at = None
+        try:
+            if isinstance(token, str) and token.count(".") == 2:
+                exp = JWTHelper.decode_payload(token).get("exp")
+                if isinstance(exp, bool):
+                    pass  # JSON true/false is not an expiry
+                elif isinstance(exp, (int, float)):
+                    self.token_expires_at = int(exp)
+                elif isinstance(exp, str):
+                    self.token_expires_at = int(float(exp.strip()))
+        except Exception:
+            self.token_expires_at = None
+
+    def is_token_expired(self, skew: int = 0) -> bool:
+        """True if the current JWT's exp is at/past now (+skew seconds).
+
+        Unknown expiry (opaque token / cookie-auth) returns False — we only
+        report expiry we can actually prove from a decoded `exp` claim.
+        """
+        if self.token_expires_at is None:
+            return False
+        return (time.time() + skew) >= self.token_expires_at
+
+    @staticmethod
+    def _grant_is_dead(status: int, body) -> bool:
+        """Detect an invalid_grant / expired-or-revoked-refresh signal in a
+        login/refresh response so we can surface ReauthRequired instead of
+        silently failing.
+
+        Gated on a client-auth FAILURE status (400/401/403): a 2xx success body
+        that merely mentions "revoked"/"expired" (e.g. "your old token was revoked,
+        here is a new one") must NOT force a re-auth. The structured OAuth `error`
+        field is the authoritative signal; a text scan is the fallback for servers
+        that return the reason in prose or form-encoding."""
+        try:
+            code = int(status)
+        except Exception:
+            code = 0
+        if code not in (400, 401, 403):
+            return False
+        if isinstance(body, dict):
+            err = str(body.get("error", "")).strip().lower()
+            if err in ("invalid_grant", "invalid_token", "token_expired", "invalid_refresh_token"):
+                return True
+        try:
+            text = json.dumps(body, default=str).lower() if isinstance(body, (dict, list)) else str(body).lower()
+        except Exception:
+            text = str(body).lower()
+        return any(sig in text for sig in _GRANT_DEAD_SIGNALS)
 
     def auto_login(
         self,
@@ -320,7 +400,26 @@ class AuthSession:
             try:
                 body = resp.json()
             except Exception:
-                body = {}
+                # Non-JSON (form-encoded / plain-text) error bodies must still be
+                # scannable for an invalid_grant signal — keep the raw text rather
+                # than discarding it as {}. Downstream dict-shaped checks guard with
+                # isinstance(body, dict), so a string here is safe.
+                try:
+                    body = resp.text
+                except Exception:
+                    body = {}
+
+            # Grant is dead (invalid_grant / expired-or-revoked refresh): a fresh
+            # interactive login is the only recovery — fail loudly so the caller
+            # can re-prompt instead of limping on unauthenticated. This is a
+            # grant-level error, identical across payload shapes, so raise now.
+            if self._grant_is_dead(getattr(resp, "status_code", 0), body):
+                self.requires_reauth = True
+                raise ReauthRequired(
+                    "auto_login: server reports the grant is dead "
+                    "(invalid_grant / refresh token expired or revoked). "
+                    "A fresh interactive login is required."
+                )
 
             # Server explicitly asked for TOTP and we don't have one — surface it.
             if isinstance(body, dict) and body.get("requiresTotp") is True and not code:

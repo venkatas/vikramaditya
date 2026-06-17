@@ -111,6 +111,14 @@ try:
 except Exception:
     _skills = None
 
+# v10.6.0 — native structured HTTP probe (agent_http.py, adapted from xalgorix MIT):
+# lets the agent fuzz IDOR/numeric-IDs, replay auth-stripped requests, and inspect
+# open-redirect Location headers mid-loop without shelling out to curl.
+try:
+    import agent_http as _agent_http
+except Exception:
+    _agent_http = None
+
 # v10.6.0 — proportional finish-gating (coverage_gate.py, adapted from xalgorix MIT).
 try:
     import coverage_gate as _covgate
@@ -390,8 +398,9 @@ TOOLS: list[dict] = [
                 "Load a concise VAPT playbook for a vuln class BEFORE testing it: the "
                 "checks most often missed, confirm/validation steps, and false-positive "
                 "traps. Accepts a class or alias: xss, sqli, idor, ssrf, lfi, ssti, rce, "
-                "jwt, cors, redirect, takeover, upload. Call right before run_sqlmap_targeted, "
-                "run_cors_check, run_rce_scan, or run_jwt_audit."
+                "jwt, cors, redirect, takeover, upload, mass-assignment, data-exposure. "
+                "Call right before run_sqlmap_targeted, run_cors_check, run_rce_scan, "
+                "run_jwt_audit, or before http_request-based API authz/property testing."
             ),
             "parameters": {
                 "type": "object",
@@ -419,6 +428,34 @@ TOOLS: list[dict] = [
                     }
                 },
                 "required": ["notes"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "http_request",
+            "description": (
+                "Send ONE raw HTTP request to an in-scope target and get back a structured, "
+                "LLM-safe result (status, headers, body excerpt, redirect Location). Use this "
+                "to confirm a hypothesis directly: fuzz a numeric ID for IDOR (GET /api/user/2), "
+                "replay a request with the Authorization header stripped for auth-bypass, inspect "
+                "a 3xx Location for open-redirect (set follow_redirects=false), or probe an API "
+                "endpoint. Body is capped and binary content is summarised, so it is safe to call "
+                "repeatedly. Only standard methods are allowed; loopback/operator-listener targets "
+                "are refused."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Absolute URL of the in-scope target to request."},
+                    "method": {"type": "string", "description": "HTTP method (GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS). Default GET."},
+                    "headers": {"type": "object", "description": "Optional request headers. List values are joined per RFC 7230."},
+                    "body": {"type": "string", "description": "Optional raw request body (form/text)."},
+                    "json_body": {"type": "object", "description": "Optional JSON request body (sets Content-Type)."},
+                    "follow_redirects": {"type": "boolean", "description": "Follow 3xx (default true). Set false to inspect the Location header for open-redirect/SSRF."},
+                },
+                "required": ["url"],
             },
         },
     },
@@ -557,6 +594,19 @@ class ToolDispatcher:
         self.max_urls        = max_urls
         self.default_cookies = default_cookies
 
+    def _url_in_scope(self, url: str) -> bool:
+        """True if url's host is the engagement target domain or a subdomain of it.
+        Used to keep http_request (and its redirect hops) on-target under scope-lock."""
+        from urllib.parse import urlparse
+        try:
+            host = (urlparse(url).hostname or "").lower().rstrip(".")
+        except Exception:
+            return False
+        d = (self.domain or "").lower().rstrip(".")
+        if not host or not d:
+            return False
+        return host == d or host.endswith("." + d)
+
     def dispatch(self, name: str, args: dict) -> str:
         """Execute named tool and return text observation."""
         h = _h()
@@ -655,6 +705,47 @@ class ToolDispatcher:
                 if _skills is None:
                     return "read_playbook unavailable: skills_lib failed to import."
                 return _skills.read_playbook(args.get("name", ""))
+
+            elif name == "http_request":
+                # v10.6.0 — native HTTP probe. The generic scopeguard pass above
+                # already blocks loopback/operator-listener args; here we ALSO keep
+                # the probe on the engagement target when scope_lock is set, and
+                # re-validate every redirect hop (no SSRF/open-redirect escape).
+                if _agent_http is None:
+                    return "http_request unavailable: agent_http failed to import."
+                url = args.get("url", "")
+                if not url:
+                    return "ERROR: http_request requires a 'url'."
+                if self.scope_lock and not self._url_in_scope(url):
+                    return (f"[BLOCKED] http_request url {url} is out of scope. scope-lock is "
+                            f"on — only {self.domain} and its subdomains may be probed. Point at "
+                            f"the in-scope target host instead.")
+
+                def _allow_redirect(u: str) -> bool:
+                    if _scopeguard is not None and _scopeguard.scan_command(u):
+                        return False                          # never follow into loopback/listener
+                    if self.scope_lock and not self._url_in_scope(u):
+                        return False                          # never follow off the in-scope target
+                    return True
+
+                r = _agent_http.probe(
+                    args.get("method", "GET"), url,
+                    headers=args.get("headers"),
+                    body=args.get("body"),
+                    json_body=args.get("json_body"),
+                    follow_redirects=bool(args.get("follow_redirects", True)),
+                    allow_url=_allow_redirect,
+                )
+                if r["error"]:
+                    return f"http_request {r['method']} {url} → error: {r['error']}"
+                loc = r["headers"].get("Location") or r["headers"].get("location") or ""
+                head = (f"http_request {r['method']} {url} → {r['status']} "
+                        f"({r['content_type'] or 'no-ct'}, {r['bytes']} bytes, {r['elapsed_ms']}ms)"
+                        f"{' redirect→ ' + loc if loc else ''}")
+                if r.get("redirect_blocked"):
+                    head += (f"\n[OPEN-REDIRECT] target redirects off-scope to "
+                             f"{r['redirect_blocked']} — NOT followed (potential open-redirect/SSRF).")
+                return f"{head}\n{r['body']}"
 
             elif name == "update_working_memory":
                 notes = args.get("notes", "")
