@@ -104,6 +104,12 @@ try:
     import scopeguard as _scopeguard
 except Exception:
     _scopeguard = None
+
+# v10.6.0 — on-demand VAPT playbooks (skills_lib.py, adapted from xalgorix MIT).
+try:
+    import skills_lib as _skills
+except Exception:
+    _skills = None
     BRAIN_SYSTEM = ""
     MODEL_PRIORITY = ["qwen3:8b"]
     OLLAMA_HOST = "http://localhost:11434"
@@ -373,6 +379,25 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "read_playbook",
+            "description": (
+                "Load a concise VAPT playbook for a vuln class BEFORE testing it: the "
+                "checks most often missed, confirm/validation steps, and false-positive "
+                "traps. Accepts a class or alias: xss, sqli, idor, ssrf, lfi, ssti, rce, "
+                "jwt, cors, redirect, takeover, upload. Call right before run_sqlmap_targeted, "
+                "run_cors_check, run_rce_scan, or run_jwt_audit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string",
+                                        "description": "Vuln class or alias, e.g. sqli, idor, rce."}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "update_working_memory",
             "description": (
                 "Update your working notes about this target. Call this after making "
@@ -619,6 +644,12 @@ class ToolDispatcher:
             elif name == "read_findings_summary":
                 obs = self._read_findings_files(domain)
 
+            elif name == "read_playbook":
+                # v10.6.0 — return directly (no tool/network); skip the timing wrapper.
+                if _skills is None:
+                    return "read_playbook unavailable: skills_lib failed to import."
+                return _skills.read_playbook(args.get("name", ""))
+
             elif name == "update_working_memory":
                 notes = args.get("notes", "")
                 self.memory.working_memory = notes
@@ -678,6 +709,12 @@ class ToolDispatcher:
             if os.path.isfile(fp):
                 techs = [l.strip() for l in open(fp) if l.strip()][:10]
                 lines.append(f"Tech detected: {', '.join(techs)}")
+                # v10.6.0 — auto-suggest relevant playbooks for the detected stack.
+                if _skills is not None and techs:
+                    pbs = _skills.suggest_for_tech(techs)
+                    if pbs:
+                        lines.append("Suggested playbooks (call read_playbook before testing): "
+                                     + ", ".join(pbs))
                 break
 
         # Parameterized URLs
