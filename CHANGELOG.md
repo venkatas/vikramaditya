@@ -1,5 +1,40 @@
 # Changelog
 
+## v10.6.0 — xalgorix-port batch: native HTTP probe, auth re-auth resilience, API playbooks (2026-06-17)
+
+Second-pass adoption from the peer AI-VAPT tool (xalgorix, MIT). A capability-mining sweep flagged
+four items as real gaps Vikramaditya lacked; each is TDD'd and independently Codex-reviewed.
+
+- **`http_request` agent tool (`agent_http.py`).** The agent/brain had no native HTTP capability — it
+  could only reach the network by shelling out to curl/scanner.sh. `probe()` is a single structured,
+  LLM-safe call (status, headers, body excerpt, redirect Location) so the agent can fuzz IDOR /
+  numeric-IDs, replay an auth-stripped request for auth-bypass, and inspect open-redirects mid-loop.
+  Hardened: method whitelist, 50 KB body cap with streaming read (never buffers a giant response),
+  byte-sniff binary detection (not just Content-Type), multi-value headers, timeout cap (≤60 s), and
+  MANUAL redirect following that re-validates every hop — an in-scope open-redirect to loopback /
+  off-scope is surfaced as `[OPEN-REDIRECT]`, never followed (no SSRF / scope escape). Wired into
+  `agent.py` as a scope-gated tool: under `--scope-lock` it is confined to the target host + subdomains.
+- **Auth re-auth resilience (`auth_utils.py`).** `AuthSession` had zero handling for an expired/revoked
+  grant — a token going stale mid-engagement just 401-looped silently. Added `ReauthRequired` (a
+  `RuntimeError` subclass), JWT-`exp` expiry tracking (`is_token_expired(skew)`, incl. numeric-string
+  exp and `alg=none` tokens), and `invalid_grant` / revoked-refresh detection (status-gated to
+  400/401/403; structured `error` field first; non-JSON bodies still scanned) so a dead grant
+  re-prompts instead of failing silently.
+- **Two API-security playbooks** (`skills/playbooks/`): `mass-assignment` (auto-binding privilege
+  escalation — role/isAdmin aliasing, nested / `$set` payloads, framework variants, GET-after-PATCH
+  persistence) and `excessive-data-exposure` (over-fetching — list-vs-detail drift, `?fields=/?expand=`,
+  GraphQL field guessing). Reachable by alias and auto-suggested for REST/API/GraphQL/Swagger
+  fingerprints. Fills autopilot's auto-binding / over-fetching coverage gaps.
+- **CI:** CodeQL `paths-ignore` for `tests/` + bundled JS / vendor — the "incomplete URL substring
+  sanitization" rule misfires on test fixtures (`assert "<host>" in stdout`), which are not a runtime
+  attack surface.
+
+Independent Codex review found and this batch fixes 7 issues: http_request scope-escape, redirect-SSRF,
+unbounded body buffering, mislabeled-binary, JWT numeric / alg=none exp, non-JSON grant-dead
+false-negative, and grant-dead over-match. Tests: +29 across 4 new files. Targeted sweep over all
+changed modules + highest-blast-radius dependents: 125 passed (full suite deferred — a live engagement
+scan was saturating Ollama/CPU at commit time).
+
 ## v10.5.0 — a bare run is the FULLEST assessment (coverage defaults fixed) (2026-06-16)
 
 A bare invocation (`python3 vikramaditya.py <target>`) must enable EVERYTHING by default and narrow

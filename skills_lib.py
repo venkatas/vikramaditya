@@ -114,6 +114,16 @@ ALIASES: Dict[str, str] = {
     "unvalidated-redirect": "open-redirect",
     "subdomain-takeover": "subdomain-takeover",
     "dangling-dns": "subdomain-takeover",
+    # ── API-security playbooks (xalgorix port) ───────────────────────────
+    "mass-assignment": "mass-assignment",
+    "mass-assign": "mass-assignment",
+    "auto-binding": "mass-assignment",
+    "autobinding": "mass-assignment",
+    "bopla": "mass-assignment",
+    "excessive-data-exposure": "excessive-data-exposure",
+    "data-exposure": "excessive-data-exposure",
+    "over-fetching": "excessive-data-exposure",
+    "overfetching": "excessive-data-exposure",
 }
 
 
@@ -152,12 +162,12 @@ _TECH_SUGGESTIONS: Dict[str, List[str]] = {
     "iis": ["lfi", "file-upload-rce", "open-redirect"],
     "tomcat": ["file-upload-rce", "lfi", "auth-bypass"],
     # API / auth surfaces
-    "graphql": ["idor", "ssrf", "auth-bypass", "jwt"],
-    "rest": ["idor", "jwt", "auth-bypass", "cors"],
+    "graphql": ["idor", "excessive-data-exposure", "mass-assignment", "ssrf", "auth-bypass", "jwt"],
+    "rest": ["idor", "mass-assignment", "excessive-data-exposure", "jwt", "auth-bypass", "cors"],
     "jwt": ["jwt", "auth-bypass", "idor"],
     "oauth": ["open-redirect", "jwt", "auth-bypass"],
-    "swagger": ["idor", "auth-bypass", "jwt"],
-    "api": ["idor", "jwt", "auth-bypass", "cors"],
+    "swagger": ["idor", "mass-assignment", "excessive-data-exposure", "auth-bypass", "jwt"],
+    "api": ["idor", "mass-assignment", "excessive-data-exposure", "jwt", "auth-bypass", "cors"],
     # cloud hints (SSRF metadata, dangling DNS)
     "aws": ["ssrf", "subdomain-takeover"],
     "azure": ["ssrf", "subdomain-takeover"],
