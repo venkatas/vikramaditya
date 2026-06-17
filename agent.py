@@ -110,6 +110,12 @@ try:
     import skills_lib as _skills
 except Exception:
     _skills = None
+
+# v10.6.0 — proportional finish-gating (coverage_gate.py, adapted from xalgorix MIT).
+try:
+    import coverage_gate as _covgate
+except Exception:
+    _covgate = None
     BRAIN_SYSTEM = ""
     MODEL_PRIORITY = ["qwen3:8b"]
     OLLAMA_HOST = "http://localhost:11434"
@@ -1237,17 +1243,29 @@ class ReActAgent:
                     except Exception:
                         args = {}
 
-                # ── Persistence enforcement: block early finish ──────────
-                if name == "finish" and self.memory.step_count < self.MIN_STEPS_BEFORE_FINISH:
-                    remaining_needed = self.MIN_STEPS_BEFORE_FINISH - self.memory.step_count
-                    print(f"{YELLOW}[Agent] Finish blocked — only {self.memory.step_count} steps done, "
-                          f"need {remaining_needed} more. Continuing...{NC}", flush=True)
-                    results.append(
-                        f"[SYSTEM] Too early to finish. You have only run "
-                        f"{self.memory.step_count} tools. Run at least "
-                        f"{remaining_needed} more high-impact tools before concluding."
-                    )
-                    continue
+                # ── Persistence enforcement: proportional finish-gating ──────
+                # v10.6.0 — replace flat step_count<6 with coverage gating: a floor
+                # scaled to the attack-surface size + a requirement that the core
+                # vuln classes (web-vulns/sqli/rce/cors/jwt) are each attempted, with
+                # a specific nudge for what's still untested. Falls back to the flat
+                # floor if coverage_gate is unavailable.
+                if name == "finish":
+                    allowed, reason = True, ""
+                    if _covgate is not None:
+                        allowed, reason = _covgate.can_finish(
+                            self.memory.completed_steps,
+                            n_endpoints=self._estimate_surface(),
+                            hard_floor=self.MIN_STEPS_BEFORE_FINISH,
+                        )
+                    elif self.memory.step_count < self.MIN_STEPS_BEFORE_FINISH:
+                        allowed = False
+                        reason = (f"only {self.memory.step_count} tools run; run at least "
+                                  f"{self.MIN_STEPS_BEFORE_FINISH} before concluding.")
+                    if not allowed:
+                        print(f"{YELLOW}[Agent] Finish blocked — {reason} Continuing...{NC}",
+                              flush=True)
+                        results.append(f"[SYSTEM] Too early to finish. {reason}")
+                        continue
 
                 # ── Loop detection ───────────────────────────────────────
                 warn, must_break = self.loop_detector.record(name, args)
@@ -1303,15 +1321,23 @@ class ReActAgent:
                 name, args = parsed
                 print(f"{MAGENTA}[Agent] Parsed from text: {name}{NC}", flush=True)
 
-                # ── Persistence enforcement: block early finish (mirror native path) ──
-                if name == "finish" and self.memory.step_count < self.MIN_STEPS_BEFORE_FINISH:
-                    remaining_needed = self.MIN_STEPS_BEFORE_FINISH - self.memory.step_count
-                    print(f"{YELLOW}[Agent] Finish blocked (text path) — only "
-                          f"{self.memory.step_count} steps done, need {remaining_needed} more. "
-                          f"Continuing...{NC}", flush=True)
-                    return (f"[SYSTEM] Too early to finish. You have only run "
-                            f"{self.memory.step_count} tools. Run at least "
-                            f"{remaining_needed} more high-impact tools before concluding.")
+                # ── Persistence enforcement: proportional finish-gating (mirror native) ──
+                if name == "finish":
+                    allowed, reason = True, ""
+                    if _covgate is not None:
+                        allowed, reason = _covgate.can_finish(
+                            self.memory.completed_steps,
+                            n_endpoints=self._estimate_surface(),
+                            hard_floor=self.MIN_STEPS_BEFORE_FINISH,
+                        )
+                    elif self.memory.step_count < self.MIN_STEPS_BEFORE_FINISH:
+                        allowed = False
+                        reason = (f"only {self.memory.step_count} tools run; run at least "
+                                  f"{self.MIN_STEPS_BEFORE_FINISH} before concluding.")
+                    if not allowed:
+                        print(f"{YELLOW}[Agent] Finish blocked (text path) — {reason} "
+                              f"Continuing...{NC}", flush=True)
+                        return f"[SYSTEM] Too early to finish. {reason}"
 
                 # ── Loop detection (mirror native path) ──────────────────────────
                 warn, must_break = self.loop_detector.record(name, args)
@@ -1365,6 +1391,26 @@ class ReActAgent:
                 return name, {}
 
         return None
+
+    def _estimate_surface(self) -> int:
+        """Rough attack-surface size (parameterized endpoints, else crawled URLs, else
+        live hosts) used to scale the proportional finish floor. Defaults to a medium
+        estimate on any error so gating never crashes the loop."""
+        try:
+            recon_dir = _h()._resolve_recon_dir(self.domain)
+        except Exception:
+            return 50
+        for rel in ("urls/with_params.txt", "params/with_params.txt",
+                    "urls/all.txt", "live/httpx_full.txt"):
+            fp = os.path.join(recon_dir, rel)
+            try:
+                if os.path.isfile(fp):
+                    n = sum(1 for ln in open(fp, encoding="utf-8", errors="ignore") if ln.strip())
+                    if n:
+                        return n
+            except Exception:
+                continue
+        return 50
 
     def run(self) -> dict:
         """Run the full ReAct loop until done or max_steps reached."""

@@ -2485,14 +2485,16 @@ def _apply_verification_gating(findings: list) -> list:
         return findings
     kept = []
     for f in findings:
-        raw = (f.get("raw") or "").upper()
-        explicit = f.get("verification_method")
-        if explicit:
-            method = VerificationMethod.from_string(explicit)
-        elif any(m in raw for m in ("MODEL CLAIM", "UNVERIFIED", "PENDING — VERIFY", "PENDING-VERIFY")):
-            method = VerificationMethod.UNVERIFIED
-        else:
-            method = VerificationMethod.EXPLOITED  # real tool finding → keep
+        raw = (f.get("raw") or "").lstrip().upper()
+        explicit = (f.get("verification_method") or "").strip().lower()
+        # FAIL OPEN: only an EXPLICIT model-generated claim is unverified-and-droppable.
+        # We anchor on the brain_scanner marker PREFIX (not a substring-anywhere match) so a
+        # real scanner finding whose evidence text merely contains "UNVERIFIED"/"PENDING"
+        # (e.g. a leaked token "AKIAUNVERIFIED...") is NOT mistaken for a model claim.
+        is_model_claim = (raw.startswith("[MODEL CLAIM")
+                          or raw.startswith("[UNVERIFIED]")
+                          or explicit in ("model_claim", "unverified"))
+        method = VerificationMethod.UNVERIFIED if is_model_claim else VerificationMethod.EXPLOITED
         sev = f.get("severity", "medium")
         new_sev = adjust_severity(sev, method)
         if new_sev != sev:
@@ -2500,6 +2502,7 @@ def _apply_verification_gating(findings: list) -> list:
             f["severity"] = new_sev
         if should_report(f["severity"], method):
             kept.append(f)
+        # else: dropped — an explicit unverified model claim at medium+ (noise, not evidence)
     return kept
 
 

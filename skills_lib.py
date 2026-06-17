@@ -43,7 +43,20 @@ xalgorix credit embedded in each playbook when redistributing.
 from __future__ import annotations
 
 import os
+import re
 from typing import Dict, List
+
+
+def _tech_key_matches(key: str, low: str) -> bool:
+    """Match a routing key against a (lowercased) tech string. Plain substring by default
+    (so 'node' still hits 'nodejs', 'php' hits 'php/8.1'), with two targeted exclusions for
+    the substring false-positives: 'java' must not hit 'javascript', and 'go' must not hit
+    mid-word forms like 'django' / 'mongodb' (but 'go/1.21' / 'go1.21' still match)."""
+    if key == "java":
+        return re.search(r"java(?!script)", low) is not None
+    if key == "go":
+        return re.search(r"(?<![a-z])go(?![a-z])", low) is not None
+    return key in low
 
 # ── Locations ──────────────────────────────────────────────────────────────
 
@@ -246,7 +259,7 @@ def suggest_for_tech(techs: List[str]) -> List[str]:
             continue
         low = tech.lower()
         for key, pbs in _TECH_SUGGESTIONS.items():
-            if key in low:
+            if _tech_key_matches(key, low):
                 for pb in pbs:
                     if pb in available and pb not in seen:
                         seen.add(pb)
