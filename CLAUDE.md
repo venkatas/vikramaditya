@@ -13,6 +13,20 @@ No flags needed. It auto-detects the target type, fingerprints the tech stack,
 finds login pages and API endpoints, collects credentials interactively, enables
 the AI brain if Ollama is installed, and routes to the right scan engine.
 
+A bare run is the **fullest assessment**: subdomain enumeration is ON, the URL
+surface is uncapped, and the full checklist runs — even in autonomous mode.
+Coverage narrows ONLY behind an explicit flag (v10.5.0):
+
+| Flag | Effect |
+|------|--------|
+| `--scope-lock` | Exact host only — skip subdomain enumeration |
+| `--no-scope-lock` | Force full subdomain enum (override the interactive prompt) |
+| `--max-urls N` | Cap the crawled URL surface at N (default `0` = unlimited) |
+| `--focused` | Run the focused (high-yield) checklist instead of the full one |
+
+(Active third-party calls stay opt-in: `--assess-creds` for cloud-credential
+blast-radius, and the whitebox `autonomous_default` config gate.)
+
 ## Core Files
 
 | File | Role |

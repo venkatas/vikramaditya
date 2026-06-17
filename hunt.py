@@ -1723,14 +1723,11 @@ def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, s
     # GitHound needs a config.yml carrying GitHub credentials. It searches
     # CWD then $HOME/.githound/config.yml (and historically ./config.yml).
     if "git-hound" in installed_set:
-        candidates = [
-            os.path.join(os.getcwd(), "config.yml"),
-            os.path.join(HOME, ".githound", "config.yml"),
-            os.path.join(HOME, "git-hound", "config.yml"),
-        ]
-        if not any(os.path.isfile(p) for p in candidates):
+        # v10.5.0 — a missing config.yml OR one carrying only a placeholder token
+        # both make git-hound crash; flag either as "not configured".
+        if not _githound_config_ready(_githound_config_candidates()):
             gaps.append({"tool": "git-hound",
-                         "reason": "no config.yml found (GitHub creds) — GitHub secret scan cannot authenticate"})
+                         "reason": "no usable config.yml credential (GitHub creds missing or placeholder) — GitHub secret scan cannot authenticate"})
 
     # Kiterunner needs an API-route wordlist; without one it bruteforces nothing.
     if "kiterunner" in installed_set:
@@ -1937,6 +1934,8 @@ def write_coverage_json(findings_dir: str) -> str | None:
 # config/auth error instead of real results. The historical counter stripped
 # lines starting with ``[!]`` and then reported the empty remainder as
 # "0 results — clean", masking the fact that the scan never authenticated.
+# Specific, low-false-positive signals — any ONE means the scan never authenticated
+# or never reached GitHub (so it found nothing, regardless of what it printed).
 _GITHOUND_ERROR_SIGNALS: tuple[str, ...] = (
     "config.yml was not found",
     "config.yaml was not found",
@@ -1947,13 +1946,141 @@ _GITHOUND_ERROR_SIGNALS: tuple[str, ...] = (
     "unauthorized",
     "rate limit",
     "could not authenticate",
+    # v10.5.0 — git-hound v1.7.2 scrapes github.com/login for a CSRF token and
+    # crashes on missing creds / network failure (its Go panic stack trace was
+    # previously counted line-by-line as "results" → false CRITICAL).
+    "error getting csrf token",
+    "dial tcp",           # Go net-dial failure (login fetch never connected)
+)
+# Broad Go-crash strings that CAN legitimately appear inside a matched result
+# snippet (e.g. Go source). A crash is only declared when a panic indicator
+# co-occurs with a Go-runtime / git-hound stack marker — a real result won't have both.
+_GITHOUND_PANIC_MARKERS: tuple[str, ...] = (
+    "panic:", "runtime error", "nil pointer dereference",
+    "segmentation violation", "signal sigsegv",
+)
+_GITHOUND_STACK_MARKERS: tuple[str, ...] = (
+    "goroutine ", "git-hound", "grabcsrftoken", "github.com/tillson",
+    "/internal/app/", "runtime.goexit", "created by ",
 )
 
 
 def _githound_output_is_error(text: str) -> bool:
-    """True if GitHound output is a config/auth error rather than real results."""
+    """True if GitHound output is a config/auth/crash failure rather than real results."""
     low = (text or "").lower()
-    return any(sig in low for sig in _GITHOUND_ERROR_SIGNALS)
+    if any(sig in low for sig in _GITHOUND_ERROR_SIGNALS):
+        return True
+    # Go crash: a panic indicator AND a stack/tool marker must co-occur.
+    if (any(m in low for m in _GITHOUND_PANIC_MARKERS)
+            and any(s in low for s in _GITHOUND_STACK_MARKERS)):
+        return True
+    return False
+
+
+# A config.yml that only carries a scaffolded placeholder (or no credential at
+# all) makes git-hound v1.7.2 try a github.com login and crash. Treat these as
+# "not configured" and skip the run rather than feeding it a guaranteed crash.
+# Placeholders are matched at the VALUE level by exact/prefix/bracket form (NOT
+# substring-anywhere), so a real token that merely contains "todo"/"xxxx" is kept.
+_GITHOUND_CRED_FIELDS: tuple[str, ...] = (
+    "github_access_tokens", "github_tokens",            # list forms
+    "github_access_token", "github_token",              # scalar forms
+    "github_username", "github_password",
+)
+_GITHOUND_PLACEHOLDER_EXACT: frozenset = frozenset({
+    "xxxx", "todo", "changeme", "placeholder", "example", "example_token",
+    "your_token", "token", "none", "null", "username", "password",
+})
+_GITHOUND_PLACEHOLDER_PREFIXES: tuple[str, ...] = (
+    "replace_with", "replace-with", "your_", "your-", "changeme",
+    "placeholder", "example_token", "xxxxxxxx",
+)
+
+
+def _is_githound_placeholder(value: str) -> bool:
+    """True if a single credential value is empty or an obvious placeholder."""
+    s = (value or "").strip().strip("'\"").lower()
+    if not s:
+        return True
+    if s.startswith("<") and s.endswith(">"):     # <token>, <your-token>
+        return True
+    if s in _GITHOUND_PLACEHOLDER_EXACT:
+        return True
+    return any(s.startswith(p) for p in _GITHOUND_PLACEHOLDER_PREFIXES)
+
+
+def _githound_cred_values(text: str) -> list:
+    """Extract candidate credential VALUES from a git-hound config.yml.
+
+    Prefers a real YAML parse (which strips inline comments and resolves list/empty
+    forms); falls back to a comment-stripped line scan when PyYAML is unavailable.
+    """
+    vals: list = []
+    data = None
+    try:
+        import yaml as _yaml
+        data = _yaml.safe_load(text)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        for key in _GITHOUND_CRED_FIELDS:
+            v = data.get(key)
+            if isinstance(v, str):
+                vals.append(v)
+            elif isinstance(v, (list, tuple)):
+                vals.extend(x for x in v if isinstance(x, (str, int)))
+        return [str(v) for v in vals]
+    # Fallback: comment-stripped line scan (no PyYAML).
+    cur_is_cred_list = False
+    for raw in text.splitlines():
+        line = raw.split(" #", 1)[0].rstrip()          # strip inline YAML comment
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- "):                   # list item under a cred field
+            if cur_is_cred_list:
+                vals.append(stripped[2:].strip())
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip().lower()
+            cur_is_cred_list = key in _GITHOUND_CRED_FIELDS and not val.strip()
+            if key in _GITHOUND_CRED_FIELDS and val.strip():
+                v = val.strip()
+                if v.startswith("[") and v.endswith("]"):   # inline list
+                    vals.extend(x.strip() for x in v[1:-1].split(",") if x.strip())
+                else:
+                    vals.append(v)
+        else:
+            cur_is_cred_list = False
+    return vals
+
+
+def _githound_config_ready(candidates) -> bool:
+    """True only if some candidate config.yml exists AND carries at least one
+    non-empty, non-placeholder GitHub credential value. Guards against running
+    git-hound into a nil-pointer crash on a missing/placeholder/empty config
+    (live engagement run, 2026-06-16)."""
+    for p in candidates:
+        try:
+            if not os.path.isfile(p):
+                continue
+            text = _read_text(p)
+        except Exception:
+            continue
+        for v in _githound_cred_values(text):
+            if not _is_githound_placeholder(v):
+                return True
+    return False
+
+
+def _githound_config_candidates() -> list:
+    """Locations git-hound (and our readiness pre-check) look for config.yml."""
+    return [
+        os.path.join(os.getcwd(), "config.yml"),
+        os.path.join(HOME, ".githound", "config.yml"),
+        os.path.join(HOME, "git-hound", "config.yml"),
+    ]
 
 
 # ── sqlmap candidate hygiene (v9.24 audit-fix) ─────────────────────────────────
@@ -4304,7 +4431,14 @@ def run_secret_hunt(domain: str) -> bool:
         log("warn", "trufflehog not in PATH")
 
     # GitHound: search GitHub for secrets related to domain
-    if _which(git_hound):
+    if _which(git_hound) and not _githound_config_ready(_githound_config_candidates()):
+        # v10.5.0 — git-hound v1.7.2 nil-pointer-crashes when it has no usable
+        # credential (it scrapes github.com/login). Skip cleanly instead of
+        # running it into a crash whose stack trace looks like "results".
+        _mark_degraded("git-hound",
+                       "config.yml missing or placeholder creds — GitHub secret scan SKIPPED")
+        log("warn", "git-hound: no usable config.yml credential — skipping (would crash)")
+    elif _which(git_hound):
         gh_out = os.path.join(secret_dir, "githound.txt")
         # v9.24 — capture stderr too: GitHound prints "[!] config.yml was not
         # found." to stdout, but other auth/rate-limit errors land on stderr.
