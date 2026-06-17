@@ -97,6 +97,13 @@ try:
     _BRAIN_OK = True
 except Exception as _brain_err:
     _BRAIN_OK = False
+
+# v10.6.0 — host-gating (scopeguard.py, adapted from xalgorix MIT): block tool args
+# that target the operator's own machine/listener.
+try:
+    import scopeguard as _scopeguard
+except Exception:
+    _scopeguard = None
     BRAIN_SYSTEM = ""
     MODEL_PRIORITY = ["qwen3:8b"]
     OLLAMA_HOST = "http://localhost:11434"
@@ -524,6 +531,18 @@ class ToolDispatcher:
         h = _h()
         domain = self.domain
         t0 = time.time()
+
+        # v10.6.0 host-gating: refuse any tool arg pointing at the operator's own
+        # machine/listener (loopback / 0.0.0.0 / our bind:port / a local interface).
+        # RFC1918 / cloud-metadata SSRF targets are still allowed.
+        if _scopeguard is not None:
+            for _v in (args or {}).values():
+                if isinstance(_v, str):
+                    _hit = _scopeguard.scan_command(_v)
+                    if _hit:
+                        return (f"[BLOCKED] tool '{name}' arg targets {_hit} — the operator's "
+                                f"own machine/listener (out of scope). Refusing; point at the "
+                                f"authorized target host instead.")
 
         try:
             if name == "run_recon":

@@ -41,6 +41,14 @@ from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# v10.6.0 — host-gating: block LLM-authored exploit code from targeting the
+# operator's own machine/listener (see scopeguard.py, adapted from xalgorix MIT).
+try:
+    sys.path.insert(0, SCRIPT_DIR)
+    import scopeguard as _scopeguard
+except Exception:
+    _scopeguard = None
+
 # Colors
 G = "\033[0;32m"
 R = "\033[0;31m"
@@ -242,7 +250,20 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
     from a script that never executed. We now flag syntax errors distinctly
     (``syntax_error: True``) so the caller can force a rewrite instead of treating
     it as evidence — and never partially execute a broken script.
+
+    v10.6.0 — host-gating: refuse (never execute) any script whose target is the
+    operator's own machine/listener (loopback / 0.0.0.0 / our bind:port / a local
+    interface). RFC1918 / cloud-metadata SSRF targets are still allowed.
     """
+    if _scopeguard is not None:
+        _hit = _scopeguard.scan_command(code)
+        if _hit:
+            return {"stdout": "",
+                    "stderr": f"SCOPE BLOCKED (not executed): target {_hit} is the operator's "
+                              f"own machine/listener — out of scope. Point the exploit at the "
+                              f"authorized target host instead.",
+                    "returncode": 3, "scope_blocked": True}
+
     if lang in ("bash", "sh", "curl"):
         cmd = ["bash", "-c", code]
         # `bash -n` parses without executing — catches unbalanced quotes / EOF.
