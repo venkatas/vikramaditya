@@ -2528,8 +2528,14 @@ def _write_json(path: str, data: dict) -> None:
     # v10.6.0 — atomic write (temp+fsync+rename, see storage.py): an interrupted
     # scan can no longer truncate target_state.json into a corrupt half-write that
     # poisons the next resume. Same signature, so all callers upgrade transparently.
-    import storage
-    storage.atomic_write_json(path, data, mode=0o644)
+    # Guarded: falls back to the plain write if storage.py is absent (partial deploy).
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        import storage
+        storage.atomic_write_json(path, data, mode=0o644)
+    except ImportError:
+        with open(path, "w") as fh:
+            json.dump(data, fh, indent=2)
 
 
 def _target_state_path(domain: str) -> str:

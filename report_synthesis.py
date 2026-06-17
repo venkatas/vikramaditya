@@ -45,8 +45,10 @@ _SEVERITY_CVSS = {
     "high": 7.5,
     "medium": 5.0,
     "low": 2.5,
+    "info": 0.0,
+    "informational": 0.0,
 }
-_DEFAULT_CVSS = 1.0  # informational / unknown band
+_DEFAULT_CVSS = 0.0  # info / unknown band → 0.0 (was 1.0, which wrongly scored info-only as LOW)
 
 # Penalty weights per crit/high finding, and the overall penalty cap.
 _CRIT_WEIGHT = 0.15

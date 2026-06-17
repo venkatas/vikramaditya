@@ -60,3 +60,19 @@ def test_suggest_for_tech_maps_stacks():
 def test_playbooks_dir_exists_on_disk():
     assert os.path.isdir(skills_lib.PLAYBOOKS_DIR)
     assert len([f for f in os.listdir(skills_lib.PLAYBOOKS_DIR) if f.endswith(".md")]) >= 12
+
+
+def test_suggest_for_tech_letter_boundary_no_false_positives():
+    # 'javascript' must NOT trigger the 'java' route; 'django' must NOT trigger 'go'
+    js = skills_lib.suggest_for_tech(["JavaScript"])
+    java = skills_lib.suggest_for_tech(["Java/17"])
+    assert js != java or not java, "javascript wrongly matched the java route"
+    dj = set(skills_lib.suggest_for_tech(["Django/4.2"]))
+    go = set(skills_lib.suggest_for_tech(["Go/1.21"]))
+    # django's own playbooks are fine; it must not pull in go-only picks via substring
+    assert skills_lib._tech_key_matches("go", "django") is False
+    assert skills_lib._tech_key_matches("java", "javascript") is False
+    # but real version strings still match
+    assert skills_lib._tech_key_matches("go", "go1.21") is True
+    assert skills_lib._tech_key_matches("php", "apache/2.4 (php/8.1)") is True
+    assert skills_lib._tech_key_matches(".net", "asp.net") is True

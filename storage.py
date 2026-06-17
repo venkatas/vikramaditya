@@ -38,6 +38,19 @@ __all__ = [
 ]
 
 
+def _fsync_dir(directory: str) -> None:
+    """fsync a directory so a rename into it is durable across power loss.
+    No-op on platforms that can't fsync a directory (e.g. Windows)."""
+    try:
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except (OSError, AttributeError):
+        pass
+
+
 def atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
     """Atomically write ``data`` bytes to ``path`` with permission ``mode``.
 
@@ -57,10 +70,16 @@ def atomic_write_bytes(path: str, data: bytes, mode: int = 0o600) -> None:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
+            # Set mode BEFORE fsync so the permission metadata is part of the
+            # synced state, normalising any umask effect on O_CREAT.
+            try:
+                os.fchmod(fh.fileno(), mode)
+            except (OSError, AttributeError):
+                pass
             os.fsync(fh.fileno())
-        # Chmod after close so any umask effects on O_CREAT are normalised.
-        os.chmod(tmp, mode)
         os.replace(tmp, path)
+        # fsync the parent dir so the rename itself survives a crash/power loss.
+        _fsync_dir(directory)
     except BaseException:
         try:
             os.remove(tmp)

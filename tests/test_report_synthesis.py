@@ -220,3 +220,11 @@ def test_exec_summary_empty_findings():
     assert summary
     # clean-bill-of-health narrative
     assert "INFORMATIONAL" in summary or "no " in summary.lower()
+
+
+def test_info_only_scores_zero_informational():
+    import report_synthesis as rs
+    score, label = rs.risk_score([{"severity": "info"}])
+    assert score == 0.0 and label == "INFORMATIONAL"
+    score2, label2 = rs.risk_score([{"severity": "informational"}, {"severity": "info"}])
+    assert score2 == 0.0 and label2 == "INFORMATIONAL"
