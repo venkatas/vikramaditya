@@ -1,5 +1,71 @@
 # Changelog
 
+## v10.5.0 — a bare run is the FULLEST assessment (coverage defaults fixed) (2026-06-16)
+
+A bare invocation (`python3 vikramaditya.py <target>`) must enable EVERYTHING by default and narrow
+coverage ONLY behind an explicit flag. Several defaults silently did the opposite — most visibly,
+**autonomous mode (the default whenever Ollama is installed) force-enabled `--scope-lock`**, so
+subdomain enumeration was turned OFF on every bare domain run. A real engagement (2026-06-16)
+discovered ~14k URLs but tested only the apex host's top 100, with no subdomain enum —
+the whole multi-host attack surface was dropped silently. An adversarially-verified audit (3 finders ×
+per-finding skeptic) confirmed 6 coverage-reducing defaults and correctly spared the 2 intentional
+scope-safety gates (active-cloud blast-radius, interactive credential collection).
+
+- **Subdomain enum ON by default.** New `resolve_scope_lock(cli_scope_lock, autonomous, prompt)`:
+  explicit flag wins either direction; otherwise autonomous defaults to **full enumeration**
+  (`scope_lock=False`); otherwise the interactive prompt decides (default OFF). The old
+  `scope_lock = autonomous or confirm(...)` is gone.
+- **New CLI flags:** `--scope-lock` (restrict to exact host, skip subdomain enum), `--no-scope-lock`
+  (force full enum / override the prompt), `--max-urls N` (cap the URL surface; default **0 =
+  UNLIMITED**), `--focused` (run the focused checklist instead of the full one).
+- **URL cap unlimited by default.** `run_hunt` now always forwards `--max-urls <n>` (default 0) so the
+  unlimited setting reaches `recon.sh` and overrides hunt.py's legacy 100 default. Operators opt INTO
+  a cap with `--max-urls N`.
+- **Full checklist everywhere by default.** IP/CIDR, ASN→CIDR, and the fingerprint-error fallbacks now
+  run `full=cli["full"]` (was the narrower focused checklist for IP/CIDR and the fallback paths) and
+  honor an explicit `--scope-lock`.
+- **Active-cloud blast-radius now explicit opt-in even in autonomous** (Codex review, HIGH). New
+  `--assess-creds` flag + `resolve_assess_creds()`: a verified leaked key may belong to a THIRD party,
+  so autonomous no longer auto-fires read-only AWS calls (`assess_creds = autonomous or ...` is gone).
+  This aligns it with the whitebox `autonomous_default` gate; both active third-party calls stay
+  explicit. Passive reporting of a verified secret still happens unconditionally inside hunt.py.
+- **`--max-urls` fails fast** (Codex review, MED): a missing value, a following flag (e.g.
+  `--max-urls --scope-lock`, which previously silently swallowed `--scope-lock`), a non-integer, or a
+  negative now exits with a clear error instead of being silently ignored.
+- **Fingerprint-error fallbacks prompt consistently** (Codex review, LOW): the domain- and URL-error
+  fallback paths now pass the same interactive scope-lock prompt as the main path.
+
+Tests: +20 (`tests/test_vikramaditya_coverage_defaults.py` — flag parsing, run_hunt `--max-urls`
+plumbing, full `resolve_scope_lock` / `resolve_assess_creds` matrices, `--max-urls` validation). Full
+suite 1298 passed, 5 skipped (1 pre-existing, unrelated pmapper region test deselected). Removed two
+stale untracked Finder-duplicate test files (`test_auditfix_hunt 2.py`,
+`test_brain_gemini_provider 2.py`) that asserted superseded behavior.
+
+### Recon/secret-hunt hang + false-finding fixes (surfaced by a live engagement run, 2026-06-16)
+
+A live run under a local DNS outage exposed three independent gaps:
+- **gau/waymore now hard-kill on a deadline.** They query external archive providers (Wayback,
+  CommonCrawl, URLScan, OTX) and hang indefinitely when one stalls — gau was observed stuck ~4 min
+  producing 0 output, blocking the whole URL-collection phase. They now run under
+  `timeout -k 15 "$GAU_TIMEOUT"` / `"$WAYMORE_TIMEOUT"` (defaults 120s/180s), matching amass/dnsx.
+  katana already had `timeout 300`.
+- **A git-hound CRASH is no longer mis-counted as findings.** git-hound v1.7.2 scrapes
+  `github.com/login` for a CSRF token and nil-pointer-panics on missing creds / network failure; its
+  22-line Go stack trace was counted line-by-line as "**21 results**" (false CRITICAL). `_GITHOUND_ERROR_SIGNALS`
+  now recognizes the panic/login/network signals (`panic:`, `runtime error`, `nil pointer`,
+  `segmentation violation`, `signal sigsegv`, `error getting csrf token`, `i/o timeout`).
+- **git-hound is skipped when its config is unusable.** New `_githound_config_ready()` +
+  `_githound_config_candidates()`: a missing config.yml OR one carrying only a placeholder token is
+  treated as "not configured" — git-hound is skipped (degraded) rather than run into a guaranteed
+  crash. The readiness pre-check uses the same logic.
+
+Codex review hardened all three: error-detection now requires a Go-crash *cluster* (panic indicator +
+stack/tool marker) so a real result snippet containing `panic:`/`nil pointer` isn't discarded; config
+readiness parses YAML credential *values* (empty `github_access_tokens:` / `[]` → not ready; a real
+token with an incidental `todo` substring or an inline `# TODO` comment → still ready).
+
+Tests: +14 (`tests/test_recon_secret_hang_fixes.py`). Full suite 1312 passed, 5 skipped (1 deselected).
+
 ## v10.4.4 — brain over stdlib urllib + fix the vikramaditya gate (zero-dep, any interpreter) (2026-06-16)
 
 v10.4.3 was incomplete: (1) `vikramaditya.py`'s OWN `ollama_status()` gate still did `import ollama`

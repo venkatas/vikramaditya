@@ -135,6 +135,25 @@ def _score_hallucination(submit_urls: list[str], sqlmap_fps: set[str]) -> dict:
             "halluc_rate": round(fp_hits / len(submit_urls), 3)}
 
 
+def _brain_scan_cmd(findings, recon, model=None) -> list:
+    """Build the brain.py scan-phase command using brain.py's CURRENT CLI.
+
+    brain.py takes ``--phase scan --findings-dir <dir> --recon-dir <dir>`` — NOT a
+    positional ``scan <dir>`` (that form errored on argparse, so the bench measured
+    nothing). ``--model`` forces the model explicitly: brain.env file-wins over the
+    inherited env, so setting BRAIN_MODEL alone was silently overridden back to the
+    pinned default (every model secretly ran as qwen3-coder). Centralised so the
+    bake-off can't drift from brain.py's CLI again.
+    """
+    cmd = [sys.executable, "-u", str(REPO / "brain.py"),
+           "--phase", "scan",
+           "--findings-dir", str(findings),
+           "--recon-dir", str(recon)]
+    if model:
+        cmd += ["--model", str(model)]
+    return cmd
+
+
 def run_one_model(model: str, findings: Path, recon: Path,
                   out_dir: Path) -> dict:
     """Wipe findings/<sess>/brain, set BRAIN_MODEL+TRIAGE_MODEL env, run
@@ -148,13 +167,16 @@ def run_one_model(model: str, findings: Path, recon: Path,
     brain_root.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
+    # brain.env file-wins over inherited env, so it would clobber these back to the
+    # pinned default — disable the auto-load so the bench's model selection sticks.
+    env["BRAIN_ENV_NOLOAD"] = "1"
     env["BRAIN_MODEL"] = model
     env["TRIAGE_MODEL"] = model
+    env["BRAIN_SCANNER_MODEL"] = model
 
     log = out_dir / "brain.log"
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-u", str(REPO / "brain.py"), "scan",
-           str(findings), "--recon-dir", str(recon)]
+    cmd = _brain_scan_cmd(findings, recon, model=model)
     print(f"[*] {model} — brain.py scan ...")
     t0 = time.perf_counter()
     rc = -1

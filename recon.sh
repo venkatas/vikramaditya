@@ -158,6 +158,11 @@ if [ "$TARGET_TYPE" = "ip" ] || [ "$TARGET_TYPE" = "cidr" ]; then
     SCOPE_LOCK=1
 fi
 AMASS_TIMEOUT="${AMASS_TIMEOUT:-180}"  # v10.1.2: 3 min (passive amass is low-yield + hang-prone; was 600)
+# v10.5.0: gau/waymore query external archive providers (Wayback, CommonCrawl,
+# URLScan, OTX) and hang indefinitely when a provider stalls — observed gau stuck
+# ~4 min producing 0 output on a live engagement run. Hard-kill like amass/dnsx.
+GAU_TIMEOUT="${GAU_TIMEOUT:-120}"      # 2 min — historical-URL pull
+WAYMORE_TIMEOUT="${WAYMORE_TIMEOUT:-180}"  # 3 min — multi-source archive pull
 CURL_TIMEOUT=10        # per request
 HTTP_PROBE_TIMEOUT=5   # reduced: 5s per-host timeout (was 10) — avoids macOS TCP hang
 
@@ -1102,9 +1107,9 @@ if phase_done "$RECON_DIR/urls/gau.txt"; then true; else
 # gau — historical URLs from multiple sources
 if tool_ok gau; then
     log_step "gau (historical URLs)..."
-    echo "$TARGET" | gau --threads 5 \
+    echo "$TARGET" | timeout -k 15 "$GAU_TIMEOUT" gau --threads 5 \
         --o "$RECON_DIR/urls/gau.txt" 2>/dev/null || \
-    echo "$TARGET" | gau > "$RECON_DIR/urls/gau.txt" 2>/dev/null || true
+    echo "$TARGET" | timeout -k 15 "$GAU_TIMEOUT" gau > "$RECON_DIR/urls/gau.txt" 2>/dev/null || true
     log_done "gau: $(file_lines "$RECON_DIR/urls/gau.txt") URLs"
 else
     log_warn "gau not installed — using Wayback fallback"
@@ -1126,7 +1131,7 @@ fi
 # Pulls from Wayback, URLScan, CommonCrawl, VirusTotal, AlienVault
 if tool_ok waymore && [ "$QUICK_MODE" != "--quick" ]; then
     log_step "waymore (multi-source archive URLs)..."
-    waymore -i "$TARGET" -mode U -oU "$RECON_DIR/urls/waymore.txt" \
+    timeout -k 15 "$WAYMORE_TIMEOUT" waymore -i "$TARGET" -mode U -oU "$RECON_DIR/urls/waymore.txt" \
         2>/dev/null || true
     log_done "waymore: $(file_lines "$RECON_DIR/urls/waymore.txt") URLs"
 fi

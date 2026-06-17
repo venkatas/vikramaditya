@@ -46,7 +46,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
 # See CHANGELOG.md for the version-by-version delta.
-__version__ = "10.4.4"
+__version__ = "10.5.0"
 
 
 # ── Run-bookkeeping (v9.2.0 — P3-11) ──────────────────────────────────────────
@@ -805,8 +805,50 @@ def ollama_status() -> str:
 
 # ── Engine Routing ────────────────────────────────────────────────────────────
 
+def resolve_scope_lock(cli_scope_lock, autonomous: bool, prompt=None) -> bool:
+    """Decide the effective scope-lock for a domain/URL target.
+
+    v10.5.0 — a bare invocation must run the FULLEST assessment, so subdomain
+    enumeration is ON by default even in autonomous mode. The old logic
+    ``scope_lock = autonomous or confirm(...)`` silently forced scope-lock
+    whenever Ollama was installed, collapsing the whole subdomain attack
+    surface to the single apex host (real miss on a live domain engagement, 2026-06-16).
+
+    Precedence:
+      * explicit operator flag wins in either direction
+        (``--scope-lock`` -> True, ``--no-scope-lock`` -> False);
+      * otherwise autonomous defaults to full enumeration (scope_lock=False);
+      * otherwise (interactive, no flag) ask via ``prompt`` (default OFF).
+    """
+    if cli_scope_lock is not None:
+        return bool(cli_scope_lock)
+    if autonomous:
+        return False
+    return bool(prompt()) if prompt else False
+
+
+def resolve_assess_creds(cli_assess_creds, autonomous: bool, prompt=None) -> bool:
+    """Decide whether to ACTIVELY assess a discovered credential's blast-radius.
+
+    v10.5.0 — this fires read-only cloud API calls (e.g. boto3 STS/IAM/S3) against
+    the account the key belongs to, which may be a THIRD party's account rather
+    than the client's. That is scope-sensitive in a CERT-In engagement, so unlike
+    pure scan-coverage it is OFF by default even in autonomous mode (matching the
+    whitebox cloud-audit opt-in gate). Passive REPORTING of a verified leaked
+    credential still happens unconditionally inside hunt.py regardless.
+
+    Precedence: explicit ``--assess-creds`` flag wins; otherwise OFF (autonomous);
+    otherwise the interactive prompt decides (default OFF).
+    """
+    if cli_assess_creds is not None:
+        return bool(cli_assess_creds)
+    if autonomous:
+        return False
+    return bool(prompt()) if prompt else False
+
+
 def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
-             assess_creds: bool = False):
+             assess_creds: bool = False, max_urls: int = 0):
     """Route to hunt.py for domain/IP/CIDR recon + scan.
 
     v9.2.0 — pass PYTHONUNBUFFERED=1 to subprocess so phase markers flush in
@@ -829,6 +871,9 @@ def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
         cmd.append("--scope-lock")
     if assess_creds:
         cmd.append("--assess-creds")
+    # v10.5.0 — always forward the URL cap explicitly so 0 (unlimited, the
+    # default) reaches recon.sh and overrides hunt.py's legacy 100 default.
+    cmd += ["--max-urls", str(max_urls)]
     print(f"\n  {B}[»]{N} Launching hunt.py → {target}\n", flush=True)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -978,6 +1023,23 @@ Options:
   --skip-mindmap          v9.4.0 — skip the tech-stack mind map artifact
                           (default: emitted to recon/<target>/mindmap.md
                           before active scanning).
+  --scope-lock            v10.5.0 — restrict to the EXACT host: skip subdomain
+                          enumeration (assetfinder/subfinder/amass/crt.sh).
+                          Default is OFF — a bare run enumerates subdomains even
+                          in autonomous mode. (IP/CIDR auto-lock regardless.)
+  --no-scope-lock         v10.5.0 — force full subdomain enumeration even when a
+                          prompt would otherwise ask; overrides the interactive
+                          scope-lock question.
+  --max-urls N            v10.5.0 — cap the crawled URL surface at N (priority-
+                          ordered: params > JS > API > rest). Default 0 =
+                          UNLIMITED — every discovered URL is tested.
+  --focused               v10.5.0 — run the focused (high-yield) checklist
+                          instead of the full one. Default is the FULL checklist.
+  --assess-creds          v10.5.0 — if a VERIFIED leaked cloud credential is
+                          found, ACTIVELY assess its blast-radius (read-only AWS
+                          calls). OFF by default even in autonomous mode — the key
+                          may belong to a third party. (Passive reporting of a
+                          verified secret happens regardless.)
   --intel                 v9.4.0 — fetch GHSA + NVD CVE feed for the
                           detected tech stack into recon/<target>/intel.md.
                           Auto-runs when --autonomous; explicit flag in
@@ -1072,6 +1134,12 @@ def print_cli_usage() -> None:
     print(CLI_USAGE.strip())
 
 
+def _cli_error(msg: str) -> "NoReturn":
+    """Print a CLI usage error and exit non-zero (fail fast on bad operator input)."""
+    sys.stderr.write(f"error: {msg}\n")
+    raise SystemExit(2)
+
+
 def parse_cli_args() -> dict:
     """Parse command-line arguments. Minimal — most decisions are automatic."""
     args = {
@@ -1082,6 +1150,17 @@ def parse_cli_args() -> dict:
         "code_url": "",
         "legacy": False,
         "help": False,
+        # v10.5.0 — coverage defaults: a bare run is the FULLEST assessment;
+        # coverage narrows ONLY behind an explicit flag.
+        #   scope_lock: None = unset (autonomous => full subdomain enum); True/False = explicit.
+        #   full:       full checklist ON by default; --focused opts out.
+        #   max_urls:   0 = unlimited URL surface; --max-urls N caps it.
+        "scope_lock": None,
+        "full": True,
+        "max_urls": 0,
+        # active read-only cloud blast-radius — scope-sensitive, explicit opt-in
+        # (None = unset; autonomous does NOT auto-fire it).
+        "assess_creds": None,
         # v10.2.0 — Burp Suite REST API integration
         "burp": False,
         "burp_only": False,
@@ -1185,6 +1264,31 @@ def parse_cli_args() -> dict:
             args["skip_passive"] = True; i += 1
         elif argv[i] == "--skip-mindmap":
             args["skip_mindmap"] = True; i += 1
+        # v10.5.0 — explicit coverage opt-outs (defaults run the fullest assessment)
+        elif argv[i] == "--scope-lock":
+            args["scope_lock"] = True; i += 1
+        elif argv[i] == "--no-scope-lock":
+            args["scope_lock"] = False; i += 1
+        elif argv[i] == "--focused":
+            args["full"] = False; i += 1
+        elif argv[i] == "--assess-creds":
+            args["assess_creds"] = True; i += 1
+        elif argv[i] == "--max-urls":
+            # Fail fast: a missing value, a following long-flag (e.g.
+            # `--max-urls --scope-lock`), a non-int, or a negative is an operator
+            # error — never silently ignore it (silently ignoring also swallowed
+            # the next flag, dropping its coverage effect).
+            val = argv[i + 1] if i + 1 < len(argv) else None
+            if val is None or val.startswith("--"):
+                _cli_error(f"--max-urls expects a non-negative integer (got {val!r})")
+            try:
+                n = int(val)
+            except ValueError:
+                _cli_error(f"--max-urls expects a non-negative integer (got {val!r})")
+            if n < 0:
+                _cli_error(f"--max-urls must be >= 0 (0 = unlimited; got {n})")
+            args["max_urls"] = n
+            i += 2
         elif argv[i] == "--intel":
             args["intel"] = True; i += 1
         elif argv[i] == "--oauth-audit" and i + 1 < len(argv):
@@ -1914,7 +2018,7 @@ def main():
             print(f"  {D}Aborted.{N}")
             return
         for c in cidrs:
-            run_hunt(c, full=True)
+            run_hunt(c, full=cli["full"], max_urls=cli["max_urls"])
         return
 
     # --- CIDR / IP → hunt.py directly ---
@@ -1923,7 +2027,9 @@ def main():
         if not autonomous and not confirm("Proceed with scan?"):
             print(f"  {D}Aborted.{N}")
             return
-        run_hunt(target_info["value"])
+        # v10.5.0 — full checklist by default (matches the domain/ASN paths);
+        # subdomain enum is N/A for an IP/CIDR so hunt.py scope-locks itself.
+        run_hunt(target_info["value"], full=cli["full"], max_urls=cli["max_urls"])
         return
 
     # --- Bare domain → hunt.py ---
@@ -1951,7 +2057,12 @@ def main():
                 os.path.join(SCRIPT_DIR, "recon", target_info["value"]),
                 autonomous=autonomous,
             )
-            run_hunt(target_info["value"], full=True)
+            run_hunt(target_info["value"], full=cli["full"],
+                     scope_lock=resolve_scope_lock(
+                         cli["scope_lock"], autonomous,
+                         prompt=lambda: confirm("Scope lock? (scan this exact host only, "
+                                                "no subdomain expansion)", default_yes=False)),
+                     max_urls=cli["max_urls"])
             return
         else:
             target_info = classify_target(url_to_check)
@@ -1978,7 +2089,12 @@ def main():
         else:
             if not autonomous and not confirm("Try recon-only scan anyway?"):
                 return
-            run_hunt(urlparse(url).netloc)
+            run_hunt(urlparse(url).netloc, full=cli["full"],
+                     scope_lock=resolve_scope_lock(
+                         cli["scope_lock"], autonomous,
+                         prompt=lambda: confirm("Scope lock? (scan this exact host only, "
+                                                "no subdomain expansion)", default_yes=False)),
+                     max_urls=cli["max_urls"])
             return
 
     show_summary(target_info, fp)
@@ -2183,16 +2299,27 @@ def main():
     elif not creds:
         # No creds — run hunt.py for unauthenticated scan
         domain = urlparse(url).netloc
-        scope_lock = autonomous or (not autonomous and confirm("Scope lock? (scan this exact host only, no subdomain expansion)", default_yes=False))
+        # v10.5.0 — autonomous no longer FORCES scope-lock (that silently skipped
+        # subdomain enumeration on every bare domain). Explicit flag wins; else
+        # autonomous runs full enum; else the interactive prompt decides (default OFF).
+        scope_lock = resolve_scope_lock(
+            cli["scope_lock"], autonomous,
+            prompt=lambda: confirm("Scope lock? (scan this exact host only, no subdomain expansion)",
+                                   default_yes=False))
         # A TruffleHog-VERIFIED leaked credential is ALWAYS reported (passive, no network). The
         # ACTIVE read-only blast-radius (boto3 calls against the key's cloud account) is scope-
-        # sensitive — explicit opt-in: prompt interactively, auto-on only in autonomous mode.
-        assess_creds = autonomous or (not autonomous and confirm(
-            "If a VERIFIED cloud credential is found, actively assess its blast-radius? "
-            "(read-only AWS calls to the key's own account)", default_yes=False))
+        # sensitive — the key may belong to a THIRD party — so it is explicit opt-in even in
+        # autonomous mode (matches the whitebox cloud-audit gate). Passive reporting of a verified
+        # leaked credential still happens unconditionally inside hunt.py regardless.
+        assess_creds = resolve_assess_creds(
+            cli["assess_creds"], autonomous,
+            prompt=lambda: confirm(
+                "If a VERIFIED cloud credential is found, actively assess its blast-radius? "
+                "(read-only AWS calls to the key's own account)", default_yes=False))
         log("info", "No credentials — running unauthenticated recon + vulnerability scan")
         print()
-        run_hunt(domain, full=True, scope_lock=scope_lock, assess_creds=assess_creds)
+        run_hunt(domain, full=cli["full"], scope_lock=scope_lock,
+                 assess_creds=assess_creds, max_urls=cli["max_urls"])
 
         # Post-scan: locate the hunt.py session findings dir and hand it to the
         # single final-report block below (after the brain scanner runs), so the
