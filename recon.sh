@@ -802,6 +802,23 @@ elif [ "$RESOLVED_COUNT" -gt 1000 ]; then
     log_warn "Medium-large target: $RESOLVED_COUNT resolved hosts — switching to BATCH_SIZE=50"
 fi
 
+# ── gap #4 (v10.6.0): the apex must ALWAYS be probed ─────────────────────────
+# Under wildcard DNS, every permutation candidate "resolves", and the capped
+# priority-probe list (keyword-first, 1500) crowded the bare apex out — a live
+# target (HTTP 200) was reported "0 live hosts" and never assessed. Force the
+# apex (+ www) to the TOP of the probe set for domain targets, regardless of
+# wildcard / cap / keywords, so the real site is always tested.
+if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    _PROBE_WITH_APEX="$RECON_DIR/subdomains/.probe_with_apex.txt"
+    { echo "$TARGET"; echo "www.$TARGET"; cat "$HTTPX_TARGET_FILE" 2>/dev/null; } \
+        | awk 'NF && !seen[$0]++' > "$_PROBE_WITH_APEX" 2>/dev/null || true
+    if [ -s "$_PROBE_WITH_APEX" ]; then
+        HTTPX_TARGET_FILE="$_PROBE_WITH_APEX"
+        RESOLVED_COUNT=$(file_lines "$HTTPX_TARGET_FILE")
+        log_step "Apex force-included in probe set ($TARGET, www.$TARGET) — $RESOLVED_COUNT hosts to probe"
+    fi
+fi
+
 # ============================================================
 # Phase 3: HTTP Probing in Batches of BATCH_SIZE
 # ============================================================
