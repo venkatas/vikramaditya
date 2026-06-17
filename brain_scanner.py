@@ -39,6 +39,8 @@ import tempfile
 import time
 from datetime import datetime
 
+import procutil  # fork-safe subprocess launch (macOS Network.framework atfork SIGSEGV fix)
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # v10.6.0 — host-gating: block LLM-authored exploit code from targeting the
@@ -267,12 +269,13 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
     if lang in ("bash", "sh", "curl"):
         cmd = ["bash", "-c", code]
         # `bash -n` parses without executing — catches unbalanced quotes / EOF.
+        # Fork-safe launch (procutil): plain subprocess.run forks and SIGSEGVs on macOS
+        # once Network.framework is loaded (rc=-11). stderr is merged into stdout.
         try:
-            chk = subprocess.run(["bash", "-n", "-c", code],
-                                 capture_output=True, text=True, timeout=15)
-            if chk.returncode != 0:
+            chk = procutil.run_capture(["bash", "-n", "-c", code], timeout=15, shell=False)
+            if chk["returncode"] != 0:
                 return {"stdout": "", "stderr": f"SCRIPT SYNTAX ERROR (not executed): "
-                                                f"{chk.stderr.strip()[:500]}",
+                                                f"{chk['stdout'].strip()[:500]}",
                         "returncode": 2, "syntax_error": True}
         except Exception:
             pass
@@ -286,20 +289,24 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
     else:
         return {"stdout": "", "stderr": f"Unsupported language: {lang}", "returncode": -1}
 
+    # Fork-safe launch (procutil): plain subprocess.run uses fork()+exec, which SIGSEGVs
+    # (rc=-11, EMPTY output) on macOS once Network.framework is loaded — that crash made
+    # the brain rule REAL findings false positives (e.g. an exposed /db/ SQL dump).
+    # posix_spawn does not run the offending pthread_atfork handler. stderr→stdout merged.
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+        result = procutil.run_capture(
+            cmd, timeout=timeout, shell=False,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             cwd=SCRIPT_DIR,
         )
+        if result.get("timed_out"):
+            return {"stdout": "", "stderr": f"TIMEOUT after {timeout}s", "returncode": -9,
+                    "timed_out": True, "timeout": timeout}
         return {
-            "stdout": result.stdout[:5000],  # Cap output
-            "stderr": result.stderr[:2000],
-            "returncode": result.returncode,
+            "stdout": result["stdout"][:5000],  # Cap output (stderr merged into stdout)
+            "stderr": result["stderr"][:2000],
+            "returncode": result["returncode"],
         }
-    except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": f"TIMEOUT after {timeout}s", "returncode": -9,
-                "timed_out": True, "timeout": timeout}
     except Exception as e:
         return {"stdout": "", "stderr": str(e), "returncode": -1}
 
