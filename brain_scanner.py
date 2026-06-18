@@ -270,12 +270,14 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
         cmd = ["bash", "-c", code]
         # `bash -n` parses without executing — catches unbalanced quotes / EOF.
         # Fork-safe launch (procutil): plain subprocess.run forks and SIGSEGVs on macOS
-        # once Network.framework is loaded (rc=-11). stderr is merged into stdout.
+        # once Network.framework is loaded (rc=-11). Keep stderr separate so bash's parse
+        # error is read from stderr; a syntax-check TIMEOUT is NOT a syntax error.
         try:
-            chk = procutil.run_capture(["bash", "-n", "-c", code], timeout=15, shell=False)
-            if chk["returncode"] != 0:
+            chk = procutil.run_capture(["bash", "-n", "-c", code], timeout=15,
+                                       shell=False, merge_stderr=False)
+            if not chk.get("timed_out") and chk["returncode"] != 0:
                 return {"stdout": "", "stderr": f"SCRIPT SYNTAX ERROR (not executed): "
-                                                f"{chk['stdout'].strip()[:500]}",
+                                                f"{(chk['stderr'] or chk['stdout']).strip()[:500]}",
                         "returncode": 2, "syntax_error": True}
         except Exception:
             pass
@@ -292,10 +294,12 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
     # Fork-safe launch (procutil): plain subprocess.run uses fork()+exec, which SIGSEGVs
     # (rc=-11, EMPTY output) on macOS once Network.framework is loaded — that crash made
     # the brain rule REAL findings false positives (e.g. an exposed /db/ SQL dump).
-    # posix_spawn does not run the offending pthread_atfork handler. stderr→stdout merged.
+    # posix_spawn does not run the offending pthread_atfork handler. merge_stderr=False
+    # keeps the streams SEPARATE so the tooling-error detector (which scans stderr for a
+    # script's own traceback) still distinguishes that from a target-returned traceback.
     try:
         result = procutil.run_capture(
-            cmd, timeout=timeout, shell=False,
+            cmd, timeout=timeout, shell=False, merge_stderr=False,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             cwd=SCRIPT_DIR,
         )
