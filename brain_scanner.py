@@ -405,15 +405,18 @@ Write a ```bash block with:
   nuclei -u "URL" -severity critical,high,medium -silent
   nuclei -u "URL" -tags sqli,xss,lfi,rce,ssrf -silent
 
-*** Directory discovery: USE ffuf ***
-  ffuf -u "URL/FUZZ" -w wordlist.txt -mc 200,301,302,403
+*** Directory discovery: USE ffuf — wordlists SHIP IN THIS REPO (paths are relative to cwd);
+    /usr/share/seclists is NOT installed here, so do NOT use it (ffuf will error on a missing list) ***
+  ffuf -u "URL/FUZZ" -w wordlists/common.txt -mc 200,301,302,403
+  (other lists: wordlists/api-endpoints.txt, wordlists/high_value_paths.txt, wordlists/lfi.txt)
+  For a KNOWN path/file already named by recon, do NOT ffuf — just `curl` it directly and show the bytes.
 
 ONLY use custom Python for: IDOR (iterating IDs), business logic, timing oracles,
 CSRF token analysis, file upload content crafting, session manipulation.
 If you find yourself writing "requests.post" with SQL payloads, STOP and use sqlmap instead.
 
-Directory/file discovery → ffuf:
-  ffuf -u "URL/FUZZ" -w /path/to/wordlist.txt -mc 200,301,302,403
+Directory/file discovery → ffuf (use the repo wordlists, NOT /usr/share/seclists which is absent):
+  ffuf -u "URL/FUZZ" -w wordlists/common.txt -mc 200,301,302,403
 
 SSTI → use Python requests with math canary payloads:
   {{7*7}} → if response contains "49", SSTI confirmed
