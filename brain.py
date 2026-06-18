@@ -2428,8 +2428,12 @@ NEXT ACTION: <one concrete action>
             # mu.ac.in validation (2026-06-18) showed this crashed EVERY autonomous exploit
             # command (17x) so the brain could never land a grounded PoC. posix_spawn avoids the
             # offending pthread_atfork handler. merge_stderr=False keeps the (stdout, stderr) split.
+            # sqlmap -r/-m/-l silently tests NOTHING under non-tty stdin (it falls
+            # into "STDIN for parsing targets list"); give those a pty on fd 0 so the
+            # brain's SQLi->RCE escalation actually drives sqlmap. See procutil.
+            _pty = procutil.sqlmap_needs_pty(cmd)
             proc = procutil._fork_safe_spawn(cmd, env=env, cwd=cwd, capture=True,
-                                             shell=True, merge_stderr=False)
+                                             shell=True, merge_stderr=False, pty_stdin=_pty)
             stdout, stderr = proc.communicate(timeout=timeout)
             return proc.returncode, (stdout or "")[:8000], (stderr or "")[:2000]
         except _sp.TimeoutExpired:
@@ -2483,37 +2487,44 @@ NEXT ACTION: <one concrete action>
         return False
 
     def _stream_history(self, messages: list, label: str,
-                        max_tokens: int = MAX_RESP) -> str:
-        """Stream a response from a full message history (multi-turn)."""
+                        max_tokens: int = MAX_RESP, stop: list | None = None,
+                        empty_retries: int = 2) -> str:
+        """Stream a response from a full message history (multi-turn).
+
+        ``stop=None`` keeps the default refusal-truncation stop sequences; pass
+        ``stop=[]`` to disable them (the authorized exploit loop wants the full
+        command even if the model waffles first). An EMPTY stream is never a valid
+        result (it silently aborted the SQLi->RCE exploit loop before run_command
+        ever ran), so retry up to ``empty_retries`` times before giving up."""
         if not self.enabled:
             return ""
-        print(f"\n{MAGENTA}{BOLD}[BRAIN/{self.model}] {label}{NC}")
-        print(f"{DIM}{'─'*60}{NC}")
-        full_text = ""
-        try:
-            stream = self.client.chat(
-                model=self.model,
-                messages=messages,
-                stream=True,
-                options={
-                    "num_predict": max_tokens,
-                    "temperature": 0.25,
-                    "top_p": 0.9,
-                    "num_ctx": MAX_CTX,
-                    "stop": [
-                        "I cannot assist", "I'm unable to help",
-                        "ethical implications", "without proper authorization",
-                    ],
-                },
-            )
-            for chunk in stream:
-                token = chunk["message"]["content"]
-                print(token, end="", flush=True)
-                full_text += token
-        except Exception as exc:
-            print(f"\n{YELLOW}[!] Brain error: {exc}{NC}")
-        print(f"\n{DIM}{'─'*60}{NC}\n")
-        return full_text
+        if stop is None:
+            stop = ["I cannot assist", "I'm unable to help",
+                    "ethical implications", "without proper authorization"]
+        options = {"num_predict": max_tokens, "temperature": 0.25,
+                   "top_p": 0.9, "num_ctx": MAX_CTX}
+        if stop:
+            options["stop"] = stop
+
+        for attempt in range(empty_retries + 1):
+            suffix = "" if attempt == 0 else f" (retry {attempt}/{empty_retries})"
+            print(f"\n{MAGENTA}{BOLD}[BRAIN/{self.model}] {label}{suffix}{NC}")
+            print(f"{DIM}{'─'*60}{NC}")
+            full_text = ""
+            try:
+                stream = self.client.chat(model=self.model, messages=messages,
+                                          stream=True, options=options)
+                for chunk in stream:
+                    token = chunk["message"]["content"]
+                    print(token, end="", flush=True)
+                    full_text += token
+            except Exception as exc:
+                print(f"\n{YELLOW}[!] Brain error: {exc}{NC}")
+            print(f"\n{DIM}{'─'*60}{NC}\n")
+            if full_text.strip() or attempt == empty_retries:
+                return full_text
+            print(f"{YELLOW}[!] empty response — retrying{NC}")
+        return ""
 
     @staticmethod
     def _extract_command(text: str) -> str | None:
@@ -2579,8 +2590,16 @@ Rules:
 
         for iteration in range(6):
             label = f"EXPLOIT/{vuln_type} round {iteration + 1}"
-            resp  = self._stream_history(history, label, max_tokens=600)
+            # stop=[] : this is an authorized engagement — do NOT truncate the
+            # response on incidental "ethical implications"-type phrasing, and the
+            # empty-retry in _stream_history keeps a transient empty stream from
+            # silently killing the loop before run_command runs.
+            resp  = self._stream_history(history, label, max_tokens=600, stop=[])
             full_transcript += f"## Round {iteration + 1}\n{resp}\n\n"
+
+            if not resp.strip():
+                full_transcript += "_(no model response after retries — aborting loop)_\n\n"
+                break
 
             if "EXPLOIT_DONE" in resp or iteration == 5:
                 if "CONFIRMED:" in resp:
