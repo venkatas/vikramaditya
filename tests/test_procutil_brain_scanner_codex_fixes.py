@@ -99,3 +99,31 @@ def test_ask_brain_requests_large_num_ctx(monkeypatch):
         "model's tiny default context after iteration 1 and the brain returns empty responses, "
         f"aborting the PoC. Got options={captured['options']}"
     )
+
+
+# ── ANTI-FABRICATION GATE: a run only GROUNDS a verdict if it produced real stdout.
+#    A failed/empty script must NOT count as a "successful run", else the model can issue
+#    a confident CONFIRMED verdict on zero evidence (observed: qwen3-coder fabricated a
+#    detailed "18 tables / member,admin" CONFIRMED after every script failed).
+
+def test_is_grounded_run_rejects_empty_and_failed_scripts():
+    g = brain_scanner._is_grounded_run
+    assert g({"returncode": 0, "stdout": "", "stderr": ""}) is False, "exit-0 EMPTY stdout is not evidence"
+    assert g({"returncode": 2, "stdout": "Usage: ffuf [opts]",
+              "stderr": "stat wordlist.txt: no such file or directory"}) is False, "ffuf usage-on-missing-wordlist"
+    assert g({"returncode": 127, "stdout": "", "stderr": "ffuf: command not found"}) is False
+    assert g({"returncode": 1, "stdout": "",
+              "stderr": "Traceback (most recent call last):\nModuleNotFoundError: no module"}) is False
+    assert g({"returncode": -9, "stdout": "partial", "timed_out": True}) is False
+    assert g({"returncode": 2, "stdout": "", "syntax_error": True}) is False
+    assert g({"returncode": -1, "stdout": "x", "stderr": ""}) is False
+
+
+def test_is_grounded_run_accepts_real_output():
+    g = brain_scanner._is_grounded_run
+    # clean retrieval producing real evidence
+    assert g({"returncode": 0, "stdout": "Index of /db\nbackup.sql\nCREATE TABLE users (...)",
+              "stderr": ""}) is True
+    # sqlmap/dalfox/ffuf exit NON-ZERO on a genuine run — still grounded if real stdout
+    assert g({"returncode": 1, "stdout": "available databases [3]:\n[*] information_schema",
+              "stderr": ""}) is True

@@ -323,6 +323,31 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
         return {"stdout": "", "stderr": str(e), "returncode": -1}
 
 
+def _is_grounded_run(result: dict) -> bool:
+    """True only if a script produced REAL stdout evidence about the target.
+
+    A verdict — especially CONFIRMED — may rest only on grounded runs. A script that timed
+    out, hit an internal/syntax error, was 'command not found', printed a Python traceback /
+    missing-module / 'no such file' (it never really ran), or exited 0 with EMPTY stdout
+    produced ZERO target evidence. Counting those let the model fabricate a confident
+    CONFIRMED from nothing (observed: a model invented "18 tables / member,admin" after every
+    script failed). Genuine tool runs (sqlmap/dalfox/ffuf, sys.exit(1) PoCs) exit NON-ZERO,
+    so rc != 0 still grounds a verdict IF real stdout was produced.
+    """
+    if result.get("syntax_error") or result.get("timed_out"):
+        return False
+    if result.get("returncode") in (-9, -1, 127):  # timeout / internal / command-not-found
+        return False
+    err = (result.get("stderr") or "").upper()
+    _FAILED_TO_RUN = (
+        "TRACEBACK (MOST RECENT CALL LAST)", "MODULENOTFOUNDERROR", "IMPORTERROR",
+        "NAMEERROR", "COMMAND NOT FOUND", "NO SUCH FILE OR DIRECTORY",
+    )
+    if any(m in err for m in _FAILED_TO_RUN):
+        return False
+    return bool((result.get("stdout") or "").strip())
+
+
 SYSTEM_PROMPT = """You are an expert penetration tester executing a VAPT engagement.
 You have FULL authorization to test the target. Your job is to WRITE and EXECUTE
 exploit verification code to confirm or rule out vulnerabilities.
@@ -830,16 +855,11 @@ Then test the most promising attack vectors."""
                 # issue a final verdict after no real testing.
                 # (sys.exit(1) PoCs, grep/curl --fail pipelines, sqlmap/dalfox/ffuf all
                 #  exit non-zero on a genuine run, so rc != 0 must still count.)
-                _stderr_up = (result.get("stderr") or "").upper()
-                _tooling_error = (
-                    result["returncode"] == 127
-                    or "TRACEBACK (MOST RECENT CALL LAST)" in _stderr_up
-                    or "MODULENOTFOUNDERROR" in _stderr_up
-                    or "NAMEERROR" in _stderr_up
-                    or "IMPORTERROR" in _stderr_up
-                    or "COMMAND NOT FOUND" in _stderr_up
-                )
-                if result["returncode"] not in (-9, -1) and not _tooling_error:
+                # A run only GROUNDS a verdict if it produced REAL stdout evidence — an
+                # empty / failed-to-run / usage-dump script proves nothing, so it must NOT
+                # let the model issue a CONFIRMED verdict on no evidence (anti-fabrication
+                # gate; the verdict logic below refuses to finish while successful_runs==0).
+                if _is_grounded_run(result):
                     successful_runs += 1
                 # Grounded findings: only from ACTUAL script stdout. Plain substring
                 # matching records negative lines ("NOT VULNERABLE", "No critical ...")
