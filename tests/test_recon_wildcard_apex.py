@@ -67,3 +67,20 @@ def test_apex_forcing_dedups_when_apex_already_present(tmp_path):
     )
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout
     assert out.splitlines().count(apex) == 1, "apex must appear exactly once after dedup"
+
+
+# ── PROBE_CAP env-control (v10.6.0): large-target liveness probe is no longer hardcoded 1500 ──
+
+def test_probe_cap_is_env_controllable():
+    s = _recon_src()
+    assert 'PROBE_CAP="${PROBE_CAP:-1500}"' in s, "probe cap must default to 1500 but be overridable"
+    # the keyword/fill splits derive from PROBE_CAP, not a hardcoded 1000/500
+    assert 'head -"$_KW_CAP"' in s and 'head -"$_FILL_CAP"' in s
+    assert "head -1000" not in s and "head -500" not in s, "old hardcoded caps must be gone"
+
+
+def test_probe_cap_zero_means_uncapped():
+    s = _recon_src()
+    # a PROBE_CAP=0 branch probes ALL resolved hosts (no priority_probe truncation)
+    assert '[ "$PROBE_CAP" -gt 0 ]' in s
+    assert "PROBE_CAP=0" in s and "uncapped" in s.lower()
