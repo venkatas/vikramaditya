@@ -137,3 +137,27 @@ def test_system_prompt_points_ffuf_at_repo_wordlists():
     assert "wordlists/common.txt" in sp, "ffuf must point at the repo's shipped wordlist (resolves via cwd=repo root)"
     assert "/path/to/wordlist.txt" not in sp, "placeholder path makes the model guess a missing /usr/share/seclists path"
     assert "seclists" in sp.lower(), "prompt should warn /usr/share/seclists is NOT installed here"
+
+
+# ── findings-registration: a GROUNDED confirmed verdict must register as a finding the
+#    reporter KEEPS — not vanish (Findings: 0) because severity & 'CONFIRMED' were on
+#    separate lines, nor be tagged [MODEL CLAIM] (which the reporter drops at med+).
+
+def test_verdict_findings_grounded_registers_and_reporter_keeps_it():
+    vf = brain_scanner._verdict_findings
+    resp = "## Final Verdict\n> **CONFIRMED**\nExposed SQL dump (CRITICAL) with real PII emails."
+    out = vf(resp, grounded=True)
+    assert out, "a grounded CONFIRMED verdict must register at least one finding"
+    assert all("[MODEL CLAIM" not in f for f in out), "grounded findings must NOT be tagged [MODEL CLAIM] (reporter drops those)"
+    assert any("VERIFIED" in f.upper() for f in out)
+
+
+def test_verdict_findings_ungrounded_is_model_claim():
+    out = brain_scanner._verdict_findings("CONFIRMED: SQLi (HIGH)", grounded=False)
+    assert out and all("[MODEL CLAIM" in f for f in out), "ungrounded claims stay [MODEL CLAIM] for reporter gating"
+
+
+def test_verdict_findings_skips_negated_and_fp():
+    vf = brain_scanner._verdict_findings
+    assert vf("NOT VULNERABLE (LOW)", grounded=True) == []
+    assert vf("This is a false positive — unexploitable", grounded=True) == []

@@ -348,6 +348,40 @@ def _is_grounded_run(result: dict) -> bool:
     return bool((result.get("stdout") or "").strip())
 
 
+def _verdict_findings(response: str, grounded: bool) -> list:
+    """Findings to record from an ACCEPTED final verdict, so a confirmed result is captured
+    in the report (was silently lost as 'Findings: 0' when the severity word and 'CONFIRMED'
+    landed on SEPARATE lines).
+
+    A GROUNDED verdict (>=1 script produced real output — guaranteed by the gate that lets a
+    CONFIRMED verdict through) is tagged ``[VERIFIED ...]`` so reporter verification-gating
+    KEEPS it; an ungrounded one stays ``[MODEL CLAIM ...]`` (the reporter drops those at med+).
+    Negated / false-positive lines are skipped. Captures any non-negated line asserting a
+    positive verdict even if no severity word shares that line.
+    """
+    NEG = ("NOT VULNERABLE", "NOT EXPLOITABLE", "NO CRITICAL", "NO HIGH", "NOT CONFIRMED",
+           "UNABLE TO CONFIRM", "NOTHING CONFIRMED", "NO VULNERABILIT", "NOT CONFIRM",
+           "FALSE POSITIVE")
+    POS = ("CONFIRMED", "EXPLOITABLE", "VULNERABLE")
+    tag = "[VERIFIED — grounded run]" if grounded else "[MODEL CLAIM — verify PoC]"
+    out, seen = [], set()
+    for line in response.split("\n"):
+        s = line.strip().lstrip("#>*-• ").strip()
+        up = s.upper()
+        if not s or any(n in up for n in NEG):
+            continue
+        if any(p in up for p in POS) and s not in seen:
+            seen.add(s)
+            out.append(f"{tag} {s[:200]}")
+    # Positive verdict but no single line carried a positive keyword cleanly → register a
+    # summary so a grounded confirmation is never dropped from the report.
+    if not out:
+        upr = response.upper()
+        if any(p in upr for p in POS) and not any(n in upr for n in NEG):
+            out.append(f"{tag} Vulnerability CONFIRMED by the brain (see report for grounded evidence)")
+    return out[:5]
+
+
 SYSTEM_PROMPT = """You are an expert penetration tester executing a VAPT engagement.
 You have FULL authorization to test the target. Your job is to WRITE and EXECUTE
 exploit verification code to confirm or rule out vulnerabilities.
@@ -771,21 +805,12 @@ Then test the most promising attack vectors."""
                         "block so it actually runs."})
                     continue
                 log("ok", "Brain issued final verdict")
-                # Only accept verdict-prose lines as findings if they are explicitly
-                # CONFIRMED/EXPLOITABLE; tag them as model claims pending PoC review so
-                # they are never mistaken for tool-verified findings. Substring matching
-                # alone records negative verdicts ("NOT VULNERABLE (LOW)", "No CRITICAL
-                # ... CONFIRMED") as findings — skip any line carrying a negation marker.
-                NEG_MARKERS = ("NOT VULNERABLE", "NOT EXPLOITABLE", "NO CRITICAL", "NO HIGH",
-                               "NOT CONFIRMED", "UNABLE TO CONFIRM", "NOTHING CONFIRMED",
-                               "NO VULNERABILIT", "NOT CONFIRM")
-                for line in response.split('\n'):
-                    up = line.upper()
-                    if any(neg in up for neg in NEG_MARKERS):
-                        continue
-                    if any(sev in up for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]) \
-                       and any(k in up for k in ["CONFIRMED", "EXPLOITABLE", "VULNERABLE"]):
-                        findings.append(f"[MODEL CLAIM — verify PoC] {line.strip()}")
+                # Record the verdict so the report captures it. The gate above guarantees
+                # successful_runs>0 here, so a positive verdict is GROUNDED → tagged
+                # [VERIFIED ...] (reporter keeps it); negated/FP lines are skipped. Fixes the
+                # bug where a grounded confirmation vanished as 'Findings: 0' because the
+                # severity word and 'CONFIRMED' landed on separate lines.
+                findings.extend(_verdict_findings(response, grounded=successful_runs > 0))
                 break
             else:
                 # Ask brain to write code
