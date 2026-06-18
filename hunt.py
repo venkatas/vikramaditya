@@ -6396,24 +6396,13 @@ def _sqli_rce_hints(conf: dict, req_abs: str, target_url: str) -> str:
     return "\n".join(lines)
 
 
-def _sqlmap_dump_looks_blank(out: str) -> bool:
-    """True only when a sqlmap --dump's extraction FAILED (tampers corrupting the
-    heavier data payloads): EVERY data row is (almost) all ``<blank>`` AND a
-    retrieval-error marker is present.
-
-    Decided at TABLE level with the column-header row skipped, so:
-      • a dump with ANY real data row is NOT flagged (don't discard real PoC rows),
-      • a PK-only row (``| 1 | <blank> | <blank> |``) still counts as failed
-        (>=80% blank), and
-      • a genuine empty-string row — which sqlmap also renders ``<blank>`` — does
-        NOT trigger a needless re-scan, because a corroborating HTTP-500 /
-        "unable to retrieve" marker is required."""
-    if not out or "<blank>" not in out:
+def _sqlmap_has_real_dump_rows(out: str) -> bool:
+    """True if a sqlmap --dump grid contains at least one DATA row with >=2
+    non-blank cells (real data was extracted). The column-header row (the single
+    grid row before the second separator) and single-column listing grids (e.g.
+    the table list) are excluded, so this means 'a real dumped record exists'."""
+    if not out:
         return False
-    low = out.lower()
-    if "internal server error" not in low and "unable to retrieve" not in low:
-        return False  # blank cells with no retrieval error = real empty-string data
-    data_rows = failed_rows = 0
     seps = 0
     for ln in out.splitlines():
         s = ln.strip()
@@ -6428,16 +6417,29 @@ def _sqlmap_dump_looks_blank(out: str) -> bool:
         if seps < 2:                      # first grid row (seps==1) is the header
             continue
         cells = [c.strip() for c in s.strip("|").split("|")]
-        if not any(cells):
-            continue
-        data_rows += 1
-        blanks = sum(1 for c in cells if c == "<blank>")
-        non_blank = len(cells) - blanks
-        # Failed = at most the PK survived (<=1 real cell), or >=80% blank (wide row
-        # where only a couple cells leaked). Both gated by the error marker above.
-        if non_blank <= 1 or blanks >= 0.8 * len(cells):
-            failed_rows += 1
-    return data_rows > 0 and failed_rows == data_rows
+        if sum(1 for c in cells if c and c != "<blank>") >= 2:
+            return True
+    return False
+
+
+def _sqlmap_dump_failed(out: str) -> bool:
+    """True when a sqlmap --dump did NOT extract real data AND shows retrieval
+    errors — covering BOTH tamper-induced failure modes observed on the-target:
+      (a) a data grid rendered entirely ``<blank>`` (extraction reached rows but
+          every cell failed), and
+      (b) extraction that errors out BEFORE any grid ('the SQL query provided does
+          not return any output' / 'unable to retrieve' / HTTP 500).
+    A clean empty table (0 entries, no errors) or ANY real data row returns False,
+    so there is no needless re-scan and real PoC rows are never discarded."""
+    if not out:
+        return False
+    low = out.lower()
+    err = ("internal server error" in low
+           or "unable to retrieve" in low
+           or "does not return any output" in low)
+    if not err:
+        return False
+    return not _sqlmap_has_real_dump_rows(out)
 
 
 # ── NEW: sqlmap via raw request file (--request-file) ───────────────────────────
@@ -6544,22 +6546,22 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # for a dump and it came back all-`<blank>`, re-fetch fresh and tamper-less so
     # request-file mode produces actual PoC data, not just a detection.
     dump_requested = "--dump" in (extra_flags or "")
-    if dump_requested and tamper and _sqlmap_dump_looks_blank(out):
-        log("warn", "Dump returned all-<blank> with tampers active — retrying WITHOUT "
-                    "tampers (--fresh-queries); tampers can corrupt data extraction")
+    if dump_requested and tamper and _sqlmap_dump_failed(out):
+        log("warn", "Dump extraction failed with tampers active (blank/errored) — "
+                    "retrying WITHOUT tampers (--fresh-queries); tampers can corrupt "
+                    "the heavier data-extraction payloads")
         cmd2 = _build('', '--fresh-queries')
         log("info", f"Running: {cmd2}")
         ok2, out2 = run_cmd(cmd2, timeout=2400, watch_file=sqli_dir,
                             watch_phase="SQLMAP-RF-NOTAMPER", pty_stdin=True)
         print(out2[-4000:] if len(out2) > 4000 else out2)
-        # Adopt the retry ONLY if it actually produced data. If it's ALSO blank
-        # (flaky WAF / injection that only fired with the tamper), keep run 1 so a
-        # worse retry never silently discards real rows. (run 1 was all-blank to get
-        # here, so adopting a non-blank run 2 is strictly an improvement.)
-        if not _sqlmap_dump_looks_blank(out2):
+        # Adopt the retry ONLY if it actually extracted real rows; otherwise keep
+        # run 1 so a flaky/worse retry never discards data. (run 1 extracted nothing
+        # to get here, so adopting a retry that DID is strictly an improvement.)
+        if _sqlmap_has_real_dump_rows(out2):
             ok, out = ok2, out2
         else:
-            log("warn", "Tamper-less retry also returned blank — keeping original output")
+            log("warn", "Tamper-less retry produced no data either — keeping original output")
 
     # ── Parse results: robust CONFIRMED-injection detection ──────────────────
     conf = _parse_sqlmap_confirmation(out)

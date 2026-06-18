@@ -10,9 +10,9 @@ cell `<blank>`), while a tamper-less re-dump returned real rows instantly. So:
 import hunt
 
 
-# ── blank-dump detector (table-level, header-aware, error-corroborated) ──────
+# ── dump-failure detector (covers BOTH tamper-induced modes) ─────────────────
 
-# Failed extraction: all data rows <blank> AND a retrieval-error marker present.
+# Mode (a): a data grid rendered entirely <blank> + retrieval-error marker.
 BLANK_ROW = (
     "Table: tblemployees\n"
     "[3 entries]\n"
@@ -25,6 +25,13 @@ BLANK_ROW = (
     "[12:40] [WARNING] unable to retrieve the number of entries\n"
     "500 (Internal Server Error) - 488 times\n"
 )
+# Mode (b): extraction errors out BEFORE any grid (the real tblClients case).
+COUNT_FAILURE = (
+    "[INFO] fetching entries of column(s) 'Name,EmailId,Password' for table 'tblClients'\n"
+    "[WARNING] the SQL query provided does not return any output\n"
+    "[WARNING] unable to retrieve the number of column(s) entries for table 'tblClients'\n"
+    "500 (Internal Server Error) - 72 times\n"
+)
 REAL_ROW = (
     "Table: tblemployees\n"
     "[1 entry]\n"
@@ -34,7 +41,7 @@ REAL_ROW = (
     "| user@example.invalid | S3cr3tP@ss |\n"
     "+--------------------------+----------+\n"
 )
-PARTIAL_REAL = (  # some rows real, some blank -> NOT flagged (keep the real data)
+PARTIAL_REAL = (  # some rows real, some blank -> NOT a failure (keep the real data)
     "Table: t\n"
     "+---------+----------+\n"
     "| emailid | password |\n"
@@ -44,15 +51,11 @@ PARTIAL_REAL = (  # some rows real, some blank -> NOT flagged (keep the real dat
     "+---------+----------+\n"
     "unable to retrieve some entries\n"
 )
-EMPTY_STRINGS_NO_ERROR = (  # genuine empty-string row, NO error -> real data, no rescan
+EMPTY_CLEAN = (  # genuine empty table, NO error -> not a failure, no rescan
     "Table: cfg\n"
-    "+-----+-------+\n"
-    "| key | value |\n"
-    "+-----+-------+\n"
-    "| <blank> | <blank> |\n"
-    "+-----+-------+\n"
+    "[WARNING] table 'public.cfg' appears to be empty\n"
 )
-PK_ONLY = (  # S1: only the PK extracted across a wide row -> failed extraction
+PK_ONLY = (  # only the PK extracted across a wide row -> failed extraction
     "Table: tblClients\n"
     "+----+------+-------+---------+\n"
     "| id | Name | Email | Phone   |\n"
@@ -63,28 +66,35 @@ PK_ONLY = (  # S1: only the PK extracted across a wide row -> failed extraction
 )
 
 
-def test_detector_flags_all_blank_with_error_marker():
-    assert hunt._sqlmap_dump_looks_blank(BLANK_ROW) is True
+def test_failed_flags_all_blank_grid():            # mode (a)
+    assert hunt._sqlmap_dump_failed(BLANK_ROW) is True
 
 
-def test_detector_passes_real_row():
-    assert hunt._sqlmap_dump_looks_blank(REAL_ROW) is False
+def test_failed_flags_count_stage_failure():       # mode (b) — the real tblClients case
+    assert hunt._sqlmap_dump_failed(COUNT_FAILURE) is True
 
 
-def test_detector_keeps_partial_real_data():  # M1: must not flag if ANY real row
-    assert hunt._sqlmap_dump_looks_blank(PARTIAL_REAL) is False
+def test_failed_passes_real_row():
+    assert hunt._sqlmap_dump_failed(REAL_ROW) is False
+    assert hunt._sqlmap_has_real_dump_rows(REAL_ROW) is True
 
 
-def test_detector_ignores_empty_strings_without_error():  # S2: no needless rescan
-    assert hunt._sqlmap_dump_looks_blank(EMPTY_STRINGS_NO_ERROR) is False
+def test_failed_keeps_partial_real_data():         # M1: never discard real rows
+    assert hunt._sqlmap_dump_failed(PARTIAL_REAL) is False
+    assert hunt._sqlmap_has_real_dump_rows(PARTIAL_REAL) is True
 
 
-def test_detector_flags_pk_only_wide_row():  # S1: PK-only is a failed extraction
-    assert hunt._sqlmap_dump_looks_blank(PK_ONLY) is True
+def test_failed_ignores_empty_table_without_error():  # S2: no needless rescan
+    assert hunt._sqlmap_dump_failed(EMPTY_CLEAN) is False
 
 
-def test_detector_passes_when_no_dump():
-    assert hunt._sqlmap_dump_looks_blank("[*] starting\nthe back-end DBMS is PostgreSQL") is False
+def test_failed_flags_pk_only_wide_row():          # S1: PK-only is a failure
+    assert hunt._sqlmap_dump_failed(PK_ONLY) is True
+    assert hunt._sqlmap_has_real_dump_rows(PK_ONLY) is False
+
+
+def test_failed_passes_when_no_dump():
+    assert hunt._sqlmap_dump_failed("[*] starting\nthe back-end DBMS is PostgreSQL") is False
 
 
 # ── auto-retry wiring ────────────────────────────────────────────────────────
