@@ -778,23 +778,34 @@ RESOLVED_COUNT=$(file_lines "$RESOLVED_FILE")
 # timeout before httpx_full.txt is populated.  Scale up automatically.
 LARGE_TARGET=0
 HTTPX_TARGET_FILE="$RESOLVED_FILE"   # default: probe everything
+# v10.6.0 — httpx liveness-probe cap on large targets is now env-controllable
+# (was hardcoded 1500). PROBE_CAP=0 means NO cap → probe every resolved host
+# (full subdomain coverage on big estates, at the cost of a longer probe).
+PROBE_CAP="${PROBE_CAP:-1500}"
 
-if [ "$RESOLVED_COUNT" -gt 5000 ]; then
+if [ "$RESOLVED_COUNT" -gt 5000 ] && [ "$PROBE_CAP" -gt 0 ]; then
     LARGE_TARGET=1
     BATCH_SIZE=100
+    _KW_CAP=$(( PROBE_CAP * 2 / 3 )); _FILL_CAP=$(( PROBE_CAP - _KW_CAP ))
     log_warn "Large target: $RESOLVED_COUNT resolved hosts — switching to BATCH_SIZE=100"
-    log_step "Building priority-filtered probe list (keyword + cap 1500)..."
+    log_step "Building priority-filtered probe list (keyword + cap $PROBE_CAP)..."
     PRIORITY_PROBE="$RECON_DIR/subdomains/priority_probe.txt"
     # Step 1: keyword-priority hosts first
     grep -iE "(admin|api|portal|login|vpn|mail|dev|staging|test|beta|upload|backup|legacy|ftp|app|dashboard|internal|intranet|monitor|jenkins|grafana|kibana|jira|proxy|gateway|auth|oauth|token|swagger|openapi|console|manage|corp|secure|access|secret|config|db|database|git|ci|cd|build|deploy|infra|cloud|prod|uat|qa|preprod)" \
-        "$RESOLVED_FILE" 2>/dev/null | head -1000 > "$PRIORITY_PROBE" || true
-    # Step 2: fill up to 1500 with remaining hosts not already selected
-    grep -vxFf "$PRIORITY_PROBE" "$RESOLVED_FILE" 2>/dev/null | head -500 >> "$PRIORITY_PROBE" || true
+        "$RESOLVED_FILE" 2>/dev/null | head -"$_KW_CAP" > "$PRIORITY_PROBE" || true
+    # Step 2: fill up to PROBE_CAP with remaining hosts not already selected
+    grep -vxFf "$PRIORITY_PROBE" "$RESOLVED_FILE" 2>/dev/null | head -"$_FILL_CAP" >> "$PRIORITY_PROBE" || true
     awk '!seen[$0]++' "$PRIORITY_PROBE" > "${PRIORITY_PROBE}.dedup" && mv "${PRIORITY_PROBE}.dedup" "$PRIORITY_PROBE"
     PRIORITY_COUNT=$(file_lines "$PRIORITY_PROBE")
     log_step "Priority probe list: $PRIORITY_COUNT hosts (from $RESOLVED_COUNT resolved)"
     HTTPX_TARGET_FILE="$PRIORITY_PROBE"
     RESOLVED_COUNT="$PRIORITY_COUNT"
+
+elif [ "$RESOLVED_COUNT" -gt 5000 ]; then
+    # PROBE_CAP=0 → uncapped: probe ALL resolved hosts (full coverage, slower)
+    LARGE_TARGET=1
+    BATCH_SIZE=100
+    log_warn "Large target: $RESOLVED_COUNT resolved hosts, PROBE_CAP=0 — probing ALL (uncapped)"
 
 elif [ "$RESOLVED_COUNT" -gt 1000 ]; then
     LARGE_TARGET=1
