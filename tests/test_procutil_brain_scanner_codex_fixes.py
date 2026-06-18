@@ -127,3 +127,13 @@ def test_is_grounded_run_accepts_real_output():
     # sqlmap/dalfox/ffuf exit NON-ZERO on a genuine run — still grounded if real stdout
     assert g({"returncode": 1, "stdout": "available databases [3]:\n[*] information_schema",
               "stderr": ""}) is True
+
+
+# ── exec-env fix: steer ffuf at the REPO's real wordlists (resolve via cwd=repo), not the
+#    absent /usr/share/seclists the models default to (which made every ffuf script fail).
+
+def test_system_prompt_points_ffuf_at_repo_wordlists():
+    sp = brain_scanner.SYSTEM_PROMPT
+    assert "wordlists/common.txt" in sp, "ffuf must point at the repo's shipped wordlist (resolves via cwd=repo root)"
+    assert "/path/to/wordlist.txt" not in sp, "placeholder path makes the model guess a missing /usr/share/seclists path"
+    assert "seclists" in sp.lower(), "prompt should warn /usr/share/seclists is NOT installed here"
