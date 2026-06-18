@@ -43,6 +43,13 @@ import procutil  # fork-safe subprocess launch (macOS Network.framework atfork S
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Context window for the exploit-verification loop. MUST be large: brain_scanner runs a
+# MULTI-ITERATION loop (system prompt + each round's code + its output accumulate), so the
+# model's small default (~4096) overflows after iteration 1 → Ollama returns EMPTY responses
+# → the loop aborts with 0 findings, i.e. the engine silently "backs off" mid-PoC. brain.py
+# already sends num_ctx=32768; the scanner must match. Env-overridable for tight-RAM hosts.
+_SCANNER_NUM_CTX = int(os.environ.get("BRAIN_SCANNER_NUM_CTX", "32768"))
+
 # v10.6.0 — host-gating: block LLM-authored exploit code from targeting the
 # operator's own machine/listener (see scopeguard.py, adapted from xalgorix MIT).
 try:
@@ -209,7 +216,8 @@ def ask_brain(model: str, messages: list[dict], max_tokens: int = 4000) -> str:
             messages=messages,
             options={
                 "num_predict": max_tokens,
-                "temperature": 0.1,
+                "num_ctx": _SCANNER_NUM_CTX,  # else the multi-iteration verify loop overflows
+                "temperature": 0.1,           # the default ctx → empty responses → aborts the PoC
                 "repeat_penalty": 1.3,   # Prevent S_S_S_S degeneration
                 "top_p": 0.9,
             },

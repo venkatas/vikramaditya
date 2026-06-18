@@ -78,3 +78,24 @@ def test_execute_script_syntax_check_timeout_not_misreported(monkeypatch):
     monkeypatch.setattr(brain_scanner.procutil, "run_capture", fake_run_capture)
     r = brain_scanner.execute_script("bash", "echo hi")
     assert not r.get("syntax_error"), "a syntax-check TIMEOUT must not be flagged as a script syntax error"
+
+
+# ── ask_brain must request a LARGE num_ctx (else multi-iteration verify overflows
+#    the default ~4096 ctx → empty responses → the engine ABORTS mid-PoC = "backs off")
+
+def test_ask_brain_requests_large_num_ctx(monkeypatch):
+    import ollama
+    monkeypatch.setenv("BRAIN_PROVIDER", "ollama")
+    captured = {}
+
+    def fake_chat(model=None, messages=None, options=None, **kw):
+        captured["options"] = options or {}
+        return {"message": {"content": "ok"}}
+
+    monkeypatch.setattr(ollama, "chat", fake_chat)
+    brain_scanner.ask_brain("ravenx-cyberagent:latest", [{"role": "user", "content": "hi"}])
+    assert captured["options"].get("num_ctx", 0) >= 8192, (
+        "brain_scanner.ask_brain omitted num_ctx → the exploit-verification loop overflows the "
+        "model's tiny default context after iteration 1 and the brain returns empty responses, "
+        f"aborting the PoC. Got options={captured['options']}"
+    )
