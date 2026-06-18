@@ -2419,32 +2419,33 @@ NEXT ACTION: <one concrete action>
         Stdout/stderr are capped at 8K each to avoid flooding context.
         """
         import subprocess as _sp
+        import procutil
+        env = {**os.environ, "PATH": f"{os.path.expanduser('~/go/bin')}:{os.environ.get('PATH', '')}"}
         proc = None
         try:
-            proc = _sp.Popen(
-                cmd, shell=True, stdout=_sp.PIPE, stderr=_sp.PIPE, text=True,
-                cwd=cwd, start_new_session=True,
-                env={**os.environ, "PATH": f"{os.path.expanduser('~/go/bin')}:{os.environ.get('PATH', '')}"},
-            )
+            # Fork-safe launch (posix_spawn): plain subprocess.Popen uses fork()+exec, which
+            # SIGSEGVs (rc=-11, EMPTY output) on macOS once Network.framework is loaded. The
+            # mu.ac.in validation (2026-06-18) showed this crashed EVERY autonomous exploit
+            # command (17x) so the brain could never land a grounded PoC. posix_spawn avoids the
+            # offending pthread_atfork handler. merge_stderr=False keeps the (stdout, stderr) split.
+            proc = procutil._fork_safe_spawn(cmd, env=env, cwd=cwd, capture=True,
+                                             shell=True, merge_stderr=False)
             stdout, stderr = proc.communicate(timeout=timeout)
-            return proc.returncode, stdout[:8000], stderr[:2000]
+            return proc.returncode, (stdout or "")[:8000], (stderr or "")[:2000]
         except _sp.TimeoutExpired:
-            stdout = ""
-            stderr = ""
             if proc is not None:
                 try:
-                    os.killpg(proc.pid, signal.SIGTERM)
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
-                    pass
-                try:
-                    stdout, stderr = proc.communicate(timeout=3)
-                except _sp.TimeoutExpired:
                     try:
-                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.kill()
                     except Exception:
                         pass
-                    stdout, stderr = proc.communicate()
-            return -1, stdout[:8000], f"Command timed out after {timeout}s\n{stderr[:1800]}"
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+            return -1, "", f"Command timed out after {timeout}s"
         except Exception as exc:
             return -1, "", str(exc)
 
