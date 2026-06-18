@@ -47,10 +47,11 @@ class _PosixSpawnProc:
     ``.returncode``, ``.wait()``, ``.communicate()``, ``.kill()``.
     """
 
-    def __init__(self, spec, env=None, cwd=None, capture=True, shell=True):
+    def __init__(self, spec, env=None, cwd=None, capture=True, shell=True, merge_stderr=True):
         self._lock = threading.Lock()
         self.returncode = None
         self.stdout = None
+        self.stderr = None
 
         # Normalise (argv, cwd) into a fork-safe posix_spawn invocation. We have no
         # POSIX_SPAWN_CHDIR on every build, so cwd is applied via a `cd ... &&` shell
@@ -70,27 +71,37 @@ class _PosixSpawnProc:
                 program, use_path = argv[0], True
 
         file_actions = [(os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0)]
-        r = w = None
+        r_out = w_out = r_err = w_err = None
         if capture:
-            r, w = os.pipe()
-            file_actions += [
-                (os.POSIX_SPAWN_DUP2, w, 1),
-                (os.POSIX_SPAWN_DUP2, w, 2),
-                (os.POSIX_SPAWN_CLOSE, r),
-                (os.POSIX_SPAWN_CLOSE, w),
-            ]
+            r_out, w_out = os.pipe()
+            file_actions.append((os.POSIX_SPAWN_DUP2, w_out, 1))
+            if merge_stderr:
+                file_actions.append((os.POSIX_SPAWN_DUP2, w_out, 2))  # both streams -> one pipe
+            else:
+                r_err, w_err = os.pipe()
+                file_actions.append((os.POSIX_SPAWN_DUP2, w_err, 2))  # stderr kept separate
+            for _fd in (r_out, w_out, r_err, w_err):
+                if _fd is not None:
+                    file_actions.append((os.POSIX_SPAWN_CLOSE, _fd))
 
         spawn = os.posix_spawnp if use_path else os.posix_spawn
         try:
             self.pid = spawn(program, argv, env if env is not None else os.environ,
                              file_actions=file_actions, setsid=True)
         except Exception:
-            if capture:
-                os.close(r); os.close(w)
+            for _fd in (r_out, w_out, r_err, w_err):
+                if _fd is not None:
+                    try:
+                        os.close(_fd)
+                    except Exception:
+                        pass
             raise
         if capture:
-            os.close(w)
-            self.stdout = os.fdopen(r, "r", errors="replace")
+            os.close(w_out)
+            self.stdout = os.fdopen(r_out, "r", errors="replace")
+            if not merge_stderr:
+                os.close(w_err)
+                self.stderr = os.fdopen(r_err, "r", errors="replace")
 
     def poll(self):
         with self._lock:
@@ -118,26 +129,36 @@ class _PosixSpawnProc:
             time.sleep(0.02)
 
     def communicate(self, timeout=None):
-        # Single absolute deadline shared by the read and the reap, so total runtime
+        # Single absolute deadline shared by the reads and the reap, so total runtime
         # cannot exceed `timeout` (a separate timeout on each step would allow ~2x).
+        # stdout and stderr (when separate) are drained CONCURRENTLY — reading one while
+        # the child fills the other pipe to capacity would deadlock.
         deadline = None if timeout is None else time.time() + timeout
-        out = ""
-        if self.stdout is not None:
-            buf = []
-            reader = threading.Thread(target=lambda: buf.append(self.stdout.read()),
-                                      daemon=True)
-            reader.start()
-            reader.join(None if deadline is None else max(0.0, deadline - time.time()))
-            if reader.is_alive():
+        bufs = {}
+        threads = []
+        for _name, _stream in (("out", self.stdout), ("err", self.stderr)):
+            if _stream is not None:
+                def _read(n=_name, s=_stream):
+                    try:
+                        bufs[n] = s.read()
+                    except Exception:
+                        bufs[n] = ""
+                t = threading.Thread(target=_read, daemon=True)
+                t.start()
+                threads.append(t)
+        for t in threads:
+            t.join(None if deadline is None else max(0.0, deadline - time.time()))
+            if t.is_alive():
                 raise subprocess.TimeoutExpired("posix_spawn", timeout)
-            out = buf[0] if buf else ""
+        out = bufs.get("out", "") or ""
+        err = bufs.get("err", "") or ""
         # stdout EOF does NOT imply the process exited — it may have closed/redirected its
         # own stdout and kept running. poll() first so a genuinely-finished process is
         # never a spurious timeout; otherwise reap within the REMAINING deadline only, so
         # communicate() never outlives the caller's timeout.
         if self.poll() is None:
             self.wait(None if deadline is None else max(0.0, deadline - time.time()))
-        return out, ""
+        return out, err
 
     def kill(self):
         try:
@@ -155,44 +176,50 @@ class _PosixSpawnProc:
             pass
 
 
-def _fork_safe_spawn(spec, env=None, cwd=None, capture=True, shell=True):
+def _fork_safe_spawn(spec, env=None, cwd=None, capture=True, shell=True, merge_stderr=True):
     """Launch a subprocess WITHOUT fork() when possible (macOS Network.framework
     atfork handlers SIGSEGV the forked child — see ``_PosixSpawnProc``).
 
     Uses ``os.posix_spawn`` (no atfork handlers) on interpreters that support it;
     otherwise falls back to the original fork-based ``subprocess.Popen`` so Linux/CI
-    and old interpreters are unchanged. Returns a Popen-or-Popen-like object."""
+    and old interpreters are unchanged. ``merge_stderr`` (default True) folds stderr into
+    stdout; pass False to capture them separately. Returns a Popen-or-Popen-like object."""
     if _POSIX_SPAWN_OK:
-        return _PosixSpawnProc(spec, env=env, cwd=cwd, capture=capture, shell=shell)
+        return _PosixSpawnProc(spec, env=env, cwd=cwd, capture=capture, shell=shell,
+                               merge_stderr=merge_stderr)
     # Fallback (no posix_spawn): original behaviour.
+    _err = subprocess.STDOUT if merge_stderr else subprocess.PIPE
     if shell:
         return subprocess.Popen(
             spec, shell=True,
             stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.STDOUT if capture else None,
+            stderr=(_err if capture else None),
             stdin=subprocess.DEVNULL, cwd=cwd, env=env, text=True,
             start_new_session=True,
         )
     return subprocess.Popen(
         spec,
         stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.STDOUT if capture else None,
+        stderr=(_err if capture else None),
         stdin=subprocess.DEVNULL, cwd=cwd, env=env, text=True,
         start_new_session=True,
     )
 
 
-def run_capture(spec, timeout=None, env=None, cwd=None, shell=True) -> dict:
+def run_capture(spec, timeout=None, env=None, cwd=None, shell=True, merge_stderr=True) -> dict:
     """Fork-safe drop-in replacement for ``subprocess.run(..., capture_output=True)``.
 
-    Returns ``{"stdout", "stderr", "returncode", "timed_out"}``. stdout and stderr are
-    merged into ``stdout`` (the fork-safe spawner captures one combined stream); stderr
-    is kept as "" so callers that read both keys still work. On timeout the child (and
-    its session group) is killed and ``timed_out`` is True with returncode -9.
+    Returns ``{"stdout", "stderr", "returncode", "timed_out"}``. By default stderr is
+    merged into ``stdout`` (one combined stream) and ``stderr`` is "". Pass
+    ``merge_stderr=False`` to capture them SEPARATELY — required by callers (e.g.
+    brain_scanner) that distinguish a script's own crash (stderr) from a target's
+    response (stdout). On timeout the child AND its session group are killed, the child
+    is reaped (no zombie), and ``timed_out`` is True with returncode -9.
     """
-    proc = _fork_safe_spawn(spec, env=env, cwd=cwd, capture=True, shell=shell)
+    proc = _fork_safe_spawn(spec, env=env, cwd=cwd, capture=True, shell=shell,
+                            merge_stderr=merge_stderr)
     try:
-        out, _ = proc.communicate(timeout=timeout)
+        out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -201,10 +228,15 @@ def run_capture(spec, timeout=None, env=None, cwd=None, shell=True) -> dict:
                 proc.kill()
             except Exception:
                 pass
+        # Reap so a timed-out child never lingers as a zombie (bounded; never hangs).
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
         return {"stdout": "", "stderr": f"TIMEOUT after {timeout}s",
                 "returncode": -9, "timed_out": True}
     rc = proc.returncode
     if rc is None:
         rc = proc.poll()
-    return {"stdout": out or "", "stderr": "",
+    return {"stdout": out or "", "stderr": err or "",
             "returncode": rc if rc is not None else 0, "timed_out": False}
