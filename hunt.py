@@ -6557,7 +6557,8 @@ def _sqlmap_targeted_extract(req_abs: str, sqli_dir: str, schema: str, table: st
 def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                              level: int = 5, risk: int = 3,
                              extra_flags: str = "",
-                             tamper: str = "space2comment,between") -> bool:
+                             tamper: str = "space2comment,between",
+                             lean: bool = False, escalate: bool = False) -> bool:
     """
     Run sqlmap against a raw Burp-style HTTP request file.
     Usage: hunt.py --request-file req.txt [--target domain]
@@ -6626,11 +6627,15 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # --batch: non-interactive  |  --level 5 / --risk 3: maximum coverage
     # --dbs --tables: enumerate on injection  |  --random-agent: rotate UA
     # --tamper: WAF-evasion (configurable via `tamper`; "" disables — see retry below)
+    # lean mode: omit --dbs --tables so a targeted --sql-query/--dump makes only the few
+    # requests it needs (heavy re-enumeration every call is what trips edge rate-limiting /
+    # 421 Misdirected Request storms on protected targets).
+    enum_clause = '' if lean else '--dbs --tables '
     def _build(tamper_clause: str, extra: str = "") -> str:
         return (
             f'sqlmap -r "{req_abs}" '
             f'--batch --level={level} --risk={risk} '
-            f'--dbs --tables --random-agent {tamper_clause}'
+            f'{enum_clause}--random-agent {tamper_clause}'
             f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
             f'--timeout=15 --retries=2 '
             f'{extra_flags} {extra}'
@@ -6763,7 +6768,11 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # the narration hook above only assesses. brain.run_command auto-allocates a pty
     # for any `sqlmap -r` it issues, so the escalation's sqlmap calls don't re-hit
     # the non-tty STDIN bug.
-    if conf["confirmed"] and _brain and _brain.enabled:
+    # OPT-IN ONLY: this loop runs MODEL-GENERATED sqlmap including --os-shell and
+    # --file-write (webshell) against the LIVE target. Off by default so a confirmation
+    # run never autonomously attempts RCE/file-write on production (the model also emits
+    # wrong DB names / empty responses). Enable deliberately with --sqli-rce.
+    if escalate and conf["confirmed"] and _brain and _brain.enabled:
         evidence = _sqlmap_evidence_block(conf)
         extra = _sqli_rce_hints(conf, req_abs, target_url)
         log("phase", f"SQLi→RCE escalation (brain exploit loop) → {target_url}")
@@ -6772,6 +6781,10 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                                    findings_dir=findings_dir, extra_context=extra)
         except Exception as e:
             log("warn", f"brain exploit loop error: {e}")
+    elif conf["confirmed"]:
+        log("info", "SQLi confirmed — autonomous SQLi→RCE escalation NOT run "
+                    "(opt-in via --sqli-rce; it issues model-generated os-shell/file-write "
+                    "against the live target).")
 
     return bool(conf["confirmed"])
 
@@ -8055,6 +8068,14 @@ Examples:
                              "Tampers help WAF-evasion DETECTION but can corrupt data "
                              "EXTRACTION — a blank --dump auto-retries tamper-less. "
                              "(default: space2comment,between)")
+    parser.add_argument("--sqlmap-lean",      action="store_true",
+                        help="Request-file mode: SKIP the heavy --dbs --tables enumeration. Use with "
+                             "--sqlmap-extra '--sql-query ...'/'--dump ...' for a low-request, "
+                             "rate-limit-friendly targeted pull off the cached injection.")
+    parser.add_argument("--sqli-rce",         action="store_true",
+                        help="Request-file mode: ENABLE the autonomous SQLi→RCE brain escalation "
+                             "(issues model-generated os-shell/file-write at the target). "
+                             "OFF by default — opt in deliberately.")
 
     args = parser.parse_args()
     resume_requested = args.resume is not None
@@ -8210,6 +8231,8 @@ Examples:
             risk=args.sqlmap_risk,
             extra_flags=args.sqlmap_extra,
             tamper=args.sqlmap_tamper,
+            lean=args.sqlmap_lean,
+            escalate=args.sqli_rce,
         )
         sys.exit(0 if found else 1)
 
