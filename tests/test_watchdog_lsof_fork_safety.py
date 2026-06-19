@@ -67,3 +67,36 @@ def test_socket_status_handles_timeout_gracefully(monkeypatch):
 
 def test_socket_status_empty_pids_is_noop():
     assert _watchdog()._socket_status(set()) == (False, False, "(no tracked pids)")
+
+
+def test_descendant_status_routes_through_fork_safe_run_capture(monkeypatch):
+    # The process-tree sampler (ps) is the OTHER per-tick fork() site; it must also use
+    # run_capture. This exercises ps AND the nested lsof call via _socket_status.
+    import types
+    seen = []
+
+    def fake_run_capture(spec, **kw):
+        seen.append((spec[0], kw))
+        out = ("1234 1 9.0 R 01:00 00:30.00 nuclei -l targets.txt\n"
+               if spec[0] == "ps" else _FAKE_LSOF)
+        return {"stdout": out, "stderr": "", "returncode": 0, "timed_out": False}
+
+    monkeypatch.setattr(hunt, "run_capture", fake_run_capture)
+
+    def _boom(*a, **k):
+        raise AssertionError("watchdog used subprocess.check_output (fork path) — must use run_capture")
+    monkeypatch.setattr(hunt.subprocess, "check_output", _boom)
+
+    wd = _watchdog()
+    wd.proc = types.SimpleNamespace(pid=1234)
+    wd._last_proc_signature = ""
+    wd._last_cpu_times = {}
+
+    busy, _pc, _summ, _cpu, sock_active, _sc, _ss = wd._descendant_status()
+
+    cmds = [c for c, _ in seen]
+    assert "ps" in cmds                                   # process-tree sample via run_capture
+    assert "lsof" in cmds                                 # nested socket sample too
+    assert all(kw.get("shell") is False for _, kw in seen)
+    assert busy is True                                  # state=R -> busy
+    assert sock_active is True                            # ESTABLISHED via nested _socket_status

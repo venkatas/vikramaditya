@@ -535,11 +535,14 @@ class ProcessWatchdog:
     def _descendant_status(self) -> tuple[bool, bool, str, bool, bool, bool, str]:
         """Return process activity signals for the subprocess tree."""
         try:
-            ps_out = subprocess.check_output(
+            # Fork-safe (same macOS Network.framework atfork SIGSEGV as _socket_status): this
+            # process-tree sampler also fires every tick, so it must use os.posix_spawn, not
+            # subprocess.check_output's fork()+exec. See test_watchdog_lsof_fork_safety.py.
+            res = run_capture(
                 ["ps", "-axo", "pid=,ppid=,%cpu=,state=,etime=,time=,command="],
-                stderr=subprocess.DEVNULL,
-                text=True,
+                shell=False, merge_stderr=False, timeout=15,
             )
+            ps_out = "" if res.get("timed_out") else res["stdout"]
         except Exception as exc:
             summary = f"(ps failed: {exc})"
             self._last_descendant_summary = summary
