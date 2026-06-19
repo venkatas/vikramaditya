@@ -1,0 +1,11 @@
+#!/bin/sh
+# Committed leak-guard pre-push hook (install: git config core.hooksPath .githooks). FAIL CLOSED.
+root="$(git rev-parse --show-toplevel)"; z="0000000000000000000000000000000000000000"; rc=0
+command -v python3 >/dev/null 2>&1 || { echo "🛑 leak-guard: python3 missing — blocking push"; exit 1; }
+while read l_ref l_sha r_ref r_sha; do
+  [ "$l_sha" = "$z" ] && continue
+  base="$(git merge-base origin/main "$l_sha" 2>/dev/null || echo "$l_sha~1")"
+  python3 "$root/scripts/leak_guard.py" --range "$base..$l_sha" || rc=1
+done
+[ "$rc" -ne 0 ] && { echo "🛑 leak-guard: pre-push BLOCKED"; exit 1; }
+exit 0

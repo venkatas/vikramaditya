@@ -1,3 +1,14 @@
+# ── ALL client/engagement data under ONE git-ignored root (ALLOWLIST) ─────────
+# Durable boundary (see docs/leak-prevention): everything client-specific lives here
+# and is ignored; only the two scaffold files are tracked. Loose dumps anywhere are
+# belt-and-suspenders-ignored by extension.
+/engagements/**
+!/engagements/
+!/engagements/.gitkeep
+!/engagements/README.md
+*.sql
+*.har
+
 # ── Scan output (client data — never commit) ──────────────────────────────────
 recon/
 findings/
@@ -117,3 +128,6 @@ schemathesis-report/
 # Client-specific config & logs — never commit (contains real targets/accounts)
 whitebox_config.yaml
 logs/
+
+# IDE/agent local config (not part of the tool)
+.antigravitycli/

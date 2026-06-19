@@ -1,0 +1,10 @@
+#!/bin/sh
+# Committed leak-guard hook — travels with the clone (install: git config core.hooksPath .githooks).
+# FAIL CLOSED: any failure to RUN the guard blocks the commit (a missing interpreter must never
+# silently let a commit through).
+root="$(git rev-parse --show-toplevel)"
+command -v python3 >/dev/null 2>&1 || { echo "🛑 leak-guard: python3 missing — blocking commit"; exit 1; }
+python3 "$root/scripts/leak_guard.py" --staged
+rc=$?
+[ "$rc" -ne 0 ] && { echo "🛑 leak-guard: pre-commit BLOCKED (rc=$rc)"; exit 1; }
+exit 0

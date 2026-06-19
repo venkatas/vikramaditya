@@ -50,3 +50,47 @@ def test_is_test_path():
     assert leak_guard._is_test_path("a/b/test_bar.py")
     assert not leak_guard._is_test_path("hunt.py")
     assert not leak_guard._is_test_path("scripts/leak_guard.py")
+
+
+# ── DO-NOW hardening: filename matching + fail-closed ────────────────────────
+
+def test_client_name_in_filename_blocked():
+    # content is clean, but the client identifier is in the FILE NAME (the colleqbt_*.sql vector)
+    changes = [("engagements/acmebank_dump.sql", "id,name")]
+    hits = leak_guard._scan(changes, TERMS)
+    assert any(w == "acmebank" and "filename" in line for w, line in hits)
+
+
+def test_filename_match_via_extra_paths():
+    # a binary/renamed file with no added text lines still caught via extra_paths
+    hits = leak_guard._scan([], TERMS, extra_paths=["data/zorpmail_backup.bak"])
+    assert any(w == "zorpmail" for w, _ in hits)
+
+
+def test_clean_filename_and_content_not_flagged():
+    assert leak_guard._scan([("hunt.py", "x = 1")], TERMS) == []
+
+
+def test_fail_closed_on_empty_blocklist(monkeypatch):
+    monkeypatch.setattr(leak_guard, "_load_blocklist", lambda: [])
+    monkeypatch.delenv("LEAK_GUARD_ALLOW_NO_BLOCKLIST", raising=False)
+    monkeypatch.setattr(sys, "argv", ["leak_guard.py", "--staged"])
+    assert leak_guard.main() == 2          # blocks, does NOT silently pass
+
+
+def test_empty_blocklist_override_allows(monkeypatch):
+    monkeypatch.setattr(leak_guard, "_load_blocklist", lambda: [])
+    monkeypatch.setenv("LEAK_GUARD_ALLOW_NO_BLOCKLIST", "1")
+    monkeypatch.setattr(leak_guard, "_added_changes", lambda a: [])
+    monkeypatch.setattr(leak_guard, "_changed_paths", lambda a: [])
+    monkeypatch.setattr(sys, "argv", ["leak_guard.py", "--staged"])
+    assert leak_guard.main() == 0
+
+
+def test_fails_closed_on_internal_error(monkeypatch):
+    monkeypatch.setattr(leak_guard, "_load_blocklist", lambda: ["acmebank"])
+    def boom(*a, **k):
+        raise RuntimeError("git exploded")
+    monkeypatch.setattr(leak_guard, "_added_changes", boom)
+    monkeypatch.setattr(sys, "argv", ["leak_guard.py", "--staged"])
+    assert leak_guard.main() == 2          # internal error -> fail closed, not exit 0
