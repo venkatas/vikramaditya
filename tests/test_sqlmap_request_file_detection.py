@@ -98,7 +98,9 @@ def test_confirmed_injection_drives_exploit_loop(tmp_path, monkeypatch):
                    "Host: target.example.invalid\n\n{\"prefixText\":\"s\"}\n")
     fake = _wire(monkeypatch, tmp_path, (True, REAL_CONFIRMED))
 
-    result = hunt.run_sqlmap_request_file(str(req), domain="target.example.invalid")
+    # escalate=True: the autonomous SQLi→RCE loop is now opt-in (it issues os-shell/file-write
+    # at the live target); this test exercises that mechanism explicitly.
+    result = hunt.run_sqlmap_request_file(str(req), domain="target.example.invalid", escalate=True)
 
     assert result is True
     assert len(fake.exploit_calls) == 1, "confirmed injection must drive ONE exploit loop"
@@ -114,7 +116,7 @@ def test_no_injection_skips_exploit_loop(tmp_path, monkeypatch):
     req.write_text("POST https://x.example.invalid/y HTTP/1.1\nHost: x.example.invalid\n\na=1\n")
     fake = _wire(monkeypatch, tmp_path, (False, STDIN_BROKEN))
 
-    result = hunt.run_sqlmap_request_file(str(req), domain="x.example.invalid")
+    result = hunt.run_sqlmap_request_file(str(req), domain="x.example.invalid", escalate=True)
 
     assert result is False
     assert fake.exploit_calls == [], "no confirmed injection => no exploit loop"
