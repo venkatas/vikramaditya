@@ -491,11 +491,16 @@ class ProcessWatchdog:
         if not tracked_pids:
             return False, False, "(no tracked pids)"
         try:
-            lsof_out = subprocess.check_output(
+            # Fork-safe: run_capture launches via os.posix_spawn (NOT fork()+exec), so it never
+            # runs Apple Network.framework's pthread_atfork child handler that SIGSEGVs the forked
+            # child at 0.0s on macOS. This sampler fires every `interval`s while the parent holds
+            # live Network.framework state, so a subprocess.check_output here crashed (rc=-11)
+            # constantly — one Python crash report per tick. See test_watchdog_lsof_fork_safety.py.
+            res = run_capture(
                 ["lsof", "-nP", "-a", "-p", ",".join(str(pid) for pid in sorted(tracked_pids)), "-iTCP"],
-                stderr=subprocess.DEVNULL,
-                text=True,
+                shell=False, merge_stderr=False, timeout=15,
             )
+            lsof_out = "" if res.get("timed_out") else res["stdout"]
         except Exception as exc:
             summary = f"(lsof failed: {exc})"
             self._last_socket_summary = summary
@@ -1179,7 +1184,7 @@ def _brain_phase_complete(phase: str, success: bool, detail: str = "", artifacts
 # Fork-safe process spawner (macOS Network.framework atfork SIGSEGV fix, v10.3.3).
 # Canonical implementation now lives in procutil.py so brain_scanner shares the EXACT
 # same launcher (its exploit commands were still fork()+exec and SIGSEGV'd on macOS).
-from procutil import _POSIX_SPAWN_OK, _PosixSpawnProc, _fork_safe_spawn  # noqa: E402,F401
+from procutil import _POSIX_SPAWN_OK, _PosixSpawnProc, _fork_safe_spawn, run_capture  # noqa: E402,F401
 
 
 def run_cmd(
