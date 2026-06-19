@@ -66,7 +66,7 @@ def test_parse_dedups_same_key_across_files(tmp_path):
 
 def test_parse_captures_secret_and_extra(tmp_path):
     p = tmp_path / "t.json"
-    p.write_text(_th_record("AWS", True, "AKIAXYZ0000000000001", "topsecret",
+    p.write_text(_th_record("AWS", True, "AKIAEXAMPLEXYZ000001", "topsecret",
                             account="222222222222", arn="arn:aws:iam::222222222222:user/client-spa"))
     c = cbr.parse_verified_creds(str(p))[0]
     assert c.secret == "topsecret"
@@ -232,7 +232,7 @@ def test_run_passive_emits_finding_without_boto3(tmp_path):
     recon = tmp_path / "recon"
     (recon / "secrets").mkdir(parents=True)
     (recon / "secrets" / "trufflehog_recon.json").write_text(
-        _th_record("AWS", True, "AKIAPASSIVE000000001", "sek",
+        _th_record("AWS", True, "AKIAEXAMPLEPASSIV001", "sek",
                    account="111111111111", arn="arn:aws:iam::111111111111:user/app") + "\n")
     findings = tmp_path / "findings"
     # no session_factory: if the passive path wrongly attempted boto3 it would blow up
@@ -240,7 +240,7 @@ def test_run_passive_emits_finding_without_boto3(tmp_path):
     assert summary and summary["creds_assessed"] == 1
     assert summary["active"] is False
     data = json.loads((findings / "exposed_credentials" / "findings.json").read_text())["findings"]
-    assert data[0]["access_key_id"] == "AKIAPASSIVE000000001"
+    assert data[0]["access_key_id"] == "AKIAEXAMPLEPASSIV001"
     assert data[0]["severity"] == "critical"
     assert data[0]["account"] == "111111111111"
 
@@ -269,7 +269,7 @@ def test_run_returns_none_when_no_verified_creds(tmp_path):
     recon = tmp_path / "recon"
     (recon / "secrets").mkdir(parents=True)
     (recon / "secrets" / "trufflehog_recon.json").write_text(
-        _th_record("AWS", False, "AKIAUNVERIFIED000001", "s") + "\n")
+        _th_record("AWS", False, "AKIAEXAMPLEUNVER0001", "s") + "\n")
     assert cbr.run(str(recon), str(tmp_path / "findings"), active=False) is None
 
 
