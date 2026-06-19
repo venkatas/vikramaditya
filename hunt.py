@@ -325,7 +325,7 @@ class ProcessWatchdog:
     process group with SIGKILL and asks Brain for a verdict.
 
     Usage:
-        proc = subprocess.Popen(cmd, shell=True, start_new_session=True)
+        proc = _fork_safe_spawn(cmd, shell=True)   # fork-safe (posix_spawn) launch
         wd = ProcessWatchdog(proc, watch_file, phase="RECON")
         proc.wait()
         wd.stop()
@@ -905,28 +905,15 @@ def auto_repair_tools(tool_names: list[str], include_system: bool = False) -> di
 
         log("info", f"Auto-installing {name}...")
         try:
-            proc = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                stdin=subprocess.DEVNULL,
-                cwd=SCRIPT_DIR,
-                env=_tool_env(),
-                start_new_session=True,
-            )
-            stdout, _ = proc.communicate(timeout=900)
-            result = type("R", (), {"returncode": proc.returncode, "stdout": stdout or "", "stderr": ""})()
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                proc.kill()
-            proc.wait()
-            log("warn", f"Auto-install timed out for {name}")
-            results["failed"].append(name)
-            continue
+            # Fork-safe (macOS Network.framework atfork SIGSEGV): posix_spawn, not Popen fork().
+            # run_capture handles the timeout + killpg internally (timed_out / rc=-9).
+            res = run_capture(cmd, shell=True, cwd=SCRIPT_DIR, env=_tool_env(),
+                              merge_stderr=True, timeout=900)
+            if res["timed_out"]:
+                log("warn", f"Auto-install timed out for {name}")
+                results["failed"].append(name)
+                continue
+            result = type("R", (), {"returncode": res["returncode"], "stdout": res["stdout"], "stderr": ""})()
         except Exception as exc:
             log("warn", f"Auto-install error for {name}: {exc}")
             results["failed"].append(name)
@@ -1511,15 +1498,13 @@ def _lightpanda_fetch_forms(url: str, cookies: str = "",
         cmd_parts.append(url)
 
         try:
-            result = subprocess.run(
-                cmd_parts,
-                capture_output=True, text=True, timeout=timeout,
-            )
-            html_content = result.stdout
-            if result.returncode != 0 and not html_content:
-                log("warn", f"lightpanda fetch error on {url}: {result.stderr[:200]}")
-        except subprocess.TimeoutExpired:
-            log("warn", f"lightpanda fetch timeout on {url}")
+            # Fork-safe (macOS Network.framework atfork SIGSEGV): posix_spawn, not run() fork().
+            res = run_capture(cmd_parts, shell=False, merge_stderr=False, timeout=timeout)
+            html_content = res["stdout"]
+            if res["timed_out"]:
+                log("warn", f"lightpanda fetch timeout on {url}")
+            elif res["returncode"] != 0 and not html_content:
+                log("warn", f"lightpanda fetch error on {url}: {res['stderr'][:200]}")
         except Exception as e:
             log("warn", f"lightpanda fetch exception on {url}: {e}")
     else:
@@ -2469,19 +2454,17 @@ def _looks_textual_content_type(content_type: str, body: bytes = b"") -> bool:
 
 def _probe_url_headers(url: str, timeout: int = 6) -> tuple[int, str]:
     try:
-        proc = subprocess.run(
+        # Fork-safe (macOS Network.framework atfork SIGSEGV): posix_spawn, not run() fork().
+        res = run_capture(
             ["curl", "-sk", "-o", "/dev/null", "-D", "-", "--max-time", str(timeout), url],
-            capture_output=True,
-            text=True,
-            timeout=timeout + 2,
-            check=False,
+            shell=False, merge_stderr=False, timeout=timeout + 2,
         )
     except Exception:
         return 0, ""
 
     status = 0
     content_type = ""
-    for line in (proc.stdout or "").splitlines():
+    for line in (res["stdout"] or "").splitlines():
         if line.upper().startswith("HTTP/"):
             parts = line.split()
             if len(parts) >= 2 and parts[1].isdigit():
@@ -2503,15 +2486,29 @@ def _classify_exposed_file(url: str, domain: str, session_id: str | None = None,
     except ImportError:
         return None
 
+    import tempfile
+    # Fork-safe (macOS Network.framework atfork SIGSEGV): launch via posix_spawn. curl writes the
+    # body to a temp FILE (not a pipe) so we read raw BYTES — run_capture decodes to text, which
+    # would corrupt the magic bytes Magika classifies on.
+    tmp_path = None
     try:
-        proc = subprocess.run(
-            ["curl", "-sk", "--max-time", str(timeout), "-r", "0-8191", url],
-            capture_output=True, timeout=timeout + 2, check=False,
+        fd, tmp_path = tempfile.mkstemp(prefix="vik_exposed_", suffix=".bin")
+        os.close(fd)
+        run_capture(
+            ["curl", "-sk", "--max-time", str(timeout), "-r", "0-8191", "-o", tmp_path, url],
+            shell=False, merge_stderr=False, timeout=timeout + 2,
         )
+        with open(tmp_path, "rb") as _fh:
+            body = _fh.read()
     except Exception:
         return None
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
-    body = proc.stdout
     if not body or len(body) < 16:
         return None
 
@@ -5534,14 +5531,14 @@ def run_rce_scan(domain: str) -> bool:
     if not oob_url and _which(interactsh_bin):
         log("info", "Starting interactsh-client for Log4Shell OOB callbacks...")
         try:
-            # Merge stderr→stdout so we capture the OOB URL regardless of which
-            # stream interactsh-client uses (it often prints it on stderr).
-            interactsh_proc = subprocess.Popen(
+            # Merge stderr→stdout so we capture the OOB URL regardless of which stream
+            # interactsh-client uses (it often prints it on stderr). Fork-safe launch
+            # (posix_spawn): a subprocess.Popen here fork()s under live Network.framework
+            # state and SIGSEGVs the child on macOS. _fork_safe_spawn returns a Popen-like
+            # object with a text .stdout pipe + .poll()/.terminate().
+            interactsh_proc = _fork_safe_spawn(
                 [interactsh_bin, "-json", "-o", interactsh_log],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True
+                shell=False, capture=True, merge_stderr=True,
             )
             # Non-blocking readline with a hard deadline so this phase
             # never deadlocks waiting on an empty pipe.

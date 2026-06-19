@@ -231,6 +231,15 @@ class _PosixSpawnProc:
             pass
         self._close_pty()
 
+    def terminate(self):
+        # SIGTERM (graceful) — subprocess.Popen-API parity so a caller that started a
+        # long-running background child via _fork_safe_spawn (e.g. interactsh-client) can
+        # .terminate() it. Reaping happens via the caller's later poll()/wait().
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except Exception:
+            pass
+
     def __del__(self):
         # Backstop: reap if a caller path never waited, so we don't leak a zombie.
         # Non-blocking (WNOHANG) — __del__ must never hang.
