@@ -94,3 +94,126 @@ def test_fails_closed_on_internal_error(monkeypatch):
     monkeypatch.setattr(leak_guard, "_added_changes", boom)
     monkeypatch.setattr(sys, "argv", ["leak_guard.py", "--staged"])
     assert leak_guard.main() == 2          # internal error -> fail closed, not exit 0
+
+
+# ── Red-team gap fixes (HARD secrets split as "AKIA"+... so THIS test file never trips the guard
+#    it tests — the guard now blocks marker-less HARD secrets even on a test path) ──────────────
+
+_AK = "AKIA"          # split prefix: keeps a contiguous real-shaped key out of the source bytes
+
+
+def test_marker_adjacent_aws_key_is_blocked():
+    # GAP 1: a real-shaped key on a line that ALSO contains a fixture WORD must still block
+    changes = [("config.py", 'KEY = "' + _AK + '1234567890QRSTUV"  # example default')]
+    assert any(w == "AWS access key" for w, _ in leak_guard._scan(changes, TERMS))
+
+
+def test_marker_inside_token_still_allowed():
+    # suppression is now scoped to the token: AKIAEXAMPLE… stays a fixture
+    changes = [("config.py", 'KEY = "' + _AK + 'EXAMPLE000000001"  # default')]
+    assert leak_guard._scan(changes, TERMS) == []
+
+
+def test_real_akia_in_test_file_now_blocked():
+    # GAP 4: HARD secrets are no longer skipped on a test path (a real key in a fixture leaks)
+    changes = [("tests/test_x.py", 'k = "' + _AK + '1234567890QRSTUV"')]
+    assert any(w == "AWS access key" for w, _ in leak_guard._scan(changes, TERMS))
+
+
+def test_github_token_blocked():
+    assert any(w == "GitHub token"
+               for w, _ in leak_guard._scan([("app.py", 'gh = "ghp_' + "a" * 36 + '"')], TERMS))
+
+
+def test_slack_token_blocked():
+    line = 'sl = "xoxb-' + "1" * 12 + '-zzzz"'
+    assert any(w == "Slack token" for w, _ in leak_guard._scan([("app.py", line)], TERMS))
+
+
+def test_google_api_key_blocked():
+    assert any(w == "Google API key"
+               for w, _ in leak_guard._scan([("app.py", 'g = "AIza' + "b" * 35 + '"')], TERMS))
+
+
+def test_jwt_in_source_is_blocked():
+    jwt = "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 10
+    assert any("JWT" in w for w, _ in leak_guard._scan([("svc.py", f'auth = "{jwt}"')], TERMS))
+
+
+def test_jwt_in_test_file_is_allowed():
+    # SOFT patterns stay lenient on test paths (fixture JWTs are common there)
+    jwt = "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 10
+    assert leak_guard._scan([("tests/test_auth.py", f'auth = "{jwt}"')], TERMS) == []
+
+
+def test_hardcoded_password_blocked():
+    assert any(w == "hardcoded password"
+               for w, _ in leak_guard._scan([("svc.py", 'password = "S3cr3tP@ssword"')], TERMS))
+
+
+def test_password_with_marker_allowed():
+    assert leak_guard._scan([("svc.py", 'password = "your_password_here"')], TERMS) == []
+
+
+def test_basic_auth_url_blocked():
+    line = 'u = "https://admin:Hunter2Password@10.0.0.5/api"'
+    assert any(w == "basic-auth URL" for w, _ in leak_guard._scan([("svc.py", line)], TERMS))
+
+
+def test_separator_variant_client_name_blocked():
+    # GAP 5: 'acme-bank' / spaced variants of the >=5-char term 'acmebank' caught via normalization
+    assert any(w == "acmebank"
+               for w, _ in leak_guard._scan([("app.py", 'host = "acme-bank.internal"')], TERMS))
+
+
+def test_dotted_client_filename_blocked():
+    hits = leak_guard._scan([], TERMS, extra_paths=["data/acme.bank.export.csv"])
+    assert any(w == "acmebank" for w, _ in hits)
+
+
+def test_short_term_not_fuzzy_matched():
+    # a <5-char term is NOT normalized (bounds false positives): a spaced form is not matched
+    assert leak_guard._scan([("app.py", "a c m e widget here")], ["acme"]) == []
+
+
+def test_dump_artifact_blocked_by_extension():
+    # GAP 5b: a renamed dump with NO client token in the name is still blocked by extension
+    hits = leak_guard._scan([("retrieved_dump.sql", "INSERT INTO t VALUES (1)")], TERMS)
+    assert any(w == "dump artifact" for w, _ in hits)
+
+
+def test_dump_artifact_allowlist_env(monkeypatch):
+    monkeypatch.setenv("LEAK_GUARD_ALLOW_DUMPS", "schema_fixture.sql")
+    assert leak_guard._scan([("schema_fixture.sql", "create table t (id int)")], TERMS) == []
+
+
+def test_private_key_fixture_still_allowed_after_hardening():
+    # the existing one-line placeholder PEM literal must still pass (regression guard)
+    changes = [("docs/plan.md", 'txt = "-----BEGIN RSA PRIVATE KEY-----\\nABCD\\n-----END RSA PRIVATE KEY-----"')]
+    assert leak_guard._scan(changes, TERMS) == []
+
+
+# ── GAP 3: commit-message leaks (no diff carries them) ────────────────────────
+
+def test_commit_message_client_name_blocked(monkeypatch, tmp_path):
+    monkeypatch.setattr(leak_guard, "_load_blocklist", lambda: ["acmebank"])
+    f = tmp_path / "MSG"
+    f.write_text("fix: patch acmebank login flow\n")
+    monkeypatch.setattr(sys, "argv", ["leak_guard.py", "--msg-file", str(f)])
+    assert leak_guard.main() == 1
+
+
+def test_commit_message_secret_blocked(monkeypatch, tmp_path):
+    monkeypatch.setattr(leak_guard, "_load_blocklist", lambda: ["acmebank"])
+    f = tmp_path / "MSG"
+    f.write_text("debug: leaked key " + _AK + "1234567890QRSTUV in prod\n")
+    monkeypatch.setattr(sys, "argv", ["leak_guard.py", "--msg-file", str(f)])
+    assert leak_guard.main() == 1
+
+
+def test_clean_commit_message_passes(monkeypatch, tmp_path):
+    monkeypatch.setattr(leak_guard, "_load_blocklist", lambda: ["acmebank"])
+    f = tmp_path / "MSG"
+    f.write_text("fix: harden the leak guard against marker-adjacent secrets\n")
+    monkeypatch.setattr(sys, "argv", ["leak_guard.py", "--msg-file", str(f)])
+    assert leak_guard.main() == 0
