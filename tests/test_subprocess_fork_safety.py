@@ -40,10 +40,16 @@ def test_no_unsafe_preexec_setsid_anywhere():
     assert offenders == [], f"unsafe preexec_fn=os.setsid (fork-segfault risk) in: {offenders}"
 
 
-def test_launchers_use_start_new_session():
+def test_launchers_create_killpg_able_session():
+    # Launchers must create their own session so the watchdog can killpg the whole tree —
+    # either via the legacy start_new_session=True OR the fork-safe posix_spawn path
+    # (_fork_safe_spawn / run_capture launch via os.posix_spawn(..., setsid=True), which
+    # REPLACED start_new_session to dodge the macOS Network.framework atfork SIGSEGV).
     for fname in LAUNCHER_FILES:
         txt = (REPO / fname).read_text(encoding="utf-8", errors="replace")
-        assert "start_new_session=True" in txt, f"{fname} no longer sets start_new_session=True"
+        assert ("start_new_session=True" in txt
+                or "_fork_safe_spawn" in txt or "run_capture" in txt), \
+            f"{fname} creates no killpg-able session (start_new_session or posix_spawn setsid)"
 
 
 def test_start_new_session_yields_killable_process_group():
