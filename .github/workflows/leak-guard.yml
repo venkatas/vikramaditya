@@ -1,0 +1,49 @@
+name: leak-guard
+
+# Server-side backstop: the SAME leak_guard.py runs on every PR/push to main, so a
+# bypassed local hook (--no-verify) or a hookless clone is still gated. The real client
+# blocklist is injected from the LEAK_BLOCKLIST repo secret (never committed); without it
+# the job still enforces the secret/shape patterns (fail-open only on the NAME list).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  leak-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Restore client blocklist (if provided)
+        env:
+          LEAK_BLOCKLIST_CONTENT: ${{ secrets.LEAK_BLOCKLIST }}
+        run: |
+          mkdir -p "$HOME/.config/vikramaditya"
+          if [ -n "$LEAK_BLOCKLIST_CONTENT" ]; then
+            printf '%s\n' "$LEAK_BLOCKLIST_CONTENT" > "$HOME/.config/vikramaditya/leak_blocklist.txt"
+            echo "blocklist restored from LEAK_BLOCKLIST secret"
+          else
+            echo "LEAK_GUARD_ALLOW_NO_BLOCKLIST=1" >> "$GITHUB_ENV"
+            echo "::warning::No LEAK_BLOCKLIST secret set — enforcing secret/shape patterns only (no client-name matching). Add the secret to enable full coverage."
+          fi
+      - name: Run leak-guard on the change
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}" 2>/dev/null || true
+            RANGE="origin/${{ github.base_ref }}...HEAD"
+          else
+            BEFORE="${{ github.event.before }}"
+            case "$BEFORE" in 0000000000000000000000000000000000000000|"") BEFORE="HEAD~1" ;; esac
+            RANGE="${BEFORE}..${{ github.sha }}"
+          fi
+          echo "scanning range: $RANGE"
+          python3 scripts/leak_guard.py --range "$RANGE"
