@@ -1,7 +1,7 @@
 """
 Targeted per-column --sql-query fallback (v10.6.0).
 
-On reflection-limited endpoints (the-target's GetSearch autocomplete) a full --dump of a
+On reflection-limited endpoints (the target's GetSearch autocomplete) a full --dump of a
 wide table returns nothing — the rows overflow the limited UNION reflection. Fetching
 each column as ONE short --sql-query expression (+ --no-cast, explicit identifier
 quoting) recovers the data; this is the in-situ technique that pulled the citizen

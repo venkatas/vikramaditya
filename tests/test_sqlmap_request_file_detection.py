@@ -94,17 +94,17 @@ def _wire(monkeypatch, tmp_path, run_cmd_ret):
 
 def test_confirmed_injection_drives_exploit_loop(tmp_path, monkeypatch):
     req = tmp_path / "req.txt"
-    req.write_text("POST https://the-target.example.invalid/TT/X HTTP/1.1\n"
-                   "Host: the-target.example.invalid\n\n{\"prefixText\":\"s\"}\n")
+    req.write_text("POST https://target.example.invalid/TT/X HTTP/1.1\n"
+                   "Host: target.example.invalid\n\n{\"prefixText\":\"s\"}\n")
     fake = _wire(monkeypatch, tmp_path, (True, REAL_CONFIRMED))
 
-    result = hunt.run_sqlmap_request_file(str(req), domain="the-target.example.invalid")
+    result = hunt.run_sqlmap_request_file(str(req), domain="target.example.invalid")
 
     assert result is True
     assert len(fake.exploit_calls) == 1, "confirmed injection must drive ONE exploit loop"
     call = fake.exploit_calls[0]
     assert call["vuln_type"] == "SQL Injection"
-    assert call["target_url"].startswith("https://the-target.example.invalid/")
+    assert call["target_url"].startswith("https://target.example.invalid/")
     assert "PostgreSQL" in call["evidence"]
     assert "os-shell" in call["extra"].lower()  # DBMS-scoped RCE hint present
 

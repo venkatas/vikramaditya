@@ -6671,7 +6671,7 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
 
     # ── Targeted per-column fallback (reflection-limited endpoints) ──────────
     # If a dump still failed (e.g. a wide table whose full rows overflow a limited
-    # UNION reflection — the-target's GetSearch autocomplete), fall back to fetching
+    # UNION reflection — the target's GetSearch autocomplete), fall back to fetching
     # each requested -C column as ONE short --sql-query expression. This recovered
     # the citizen IdProof/IdProofType values where the full --dump returned nothing.
     if dump_requested and _sqlmap_dump_failed(out):
