@@ -1,0 +1,10 @@
+#!/bin/sh
+# Committed leak-guard commit-msg hook (install: git config core.hooksPath .githooks). FAIL CLOSED.
+# Catches a client name / secret placed ONLY in the commit MESSAGE — the diff-based pre-commit and
+# pre-push scans are blind to message text, and a prior leak was remediated by scrubbing messages.
+root="$(git rev-parse --show-toplevel)"
+command -v python3 >/dev/null 2>&1 || { echo "🛑 leak-guard: python3 missing — blocking commit"; exit 1; }
+python3 "$root/scripts/leak_guard.py" --msg-file "$1"
+rc=$?
+[ "$rc" -ne 0 ] && { echo "🛑 leak-guard: commit-msg BLOCKED (rc=$rc)"; exit 1; }
+exit 0
