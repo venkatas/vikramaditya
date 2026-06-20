@@ -72,6 +72,19 @@ done
 # Normalize GitHub URLs to owner/repo
 TARGET=$(echo "$TARGET" | sed -E 's|^https?://github\.com/||' | sed 's|/$||' | sed 's|\.git$||')
 
+# Validate inputs (defense-in-depth: reject anything that isn't a plain
+# numeric option or an allowed org/repo identifier). Targets and options may
+# originate from org listings, scope files, or upstream scanner output rather
+# than a fully trusted operator, so we never let shell metacharacters through.
+case "$DEPTH" in    ''|*[!0-9]*) log_err "Invalid --depth (must be a positive integer): $DEPTH"; exit 2 ;; esac
+case "$LIMIT" in    ''|*[!0-9]*) log_err "Invalid --limit (must be a positive integer): $LIMIT"; exit 2 ;; esac
+case "$PARALLEL" in ''|*[!0-9]*) log_err "Invalid --parallel (must be a positive integer): $PARALLEL"; exit 2 ;; esac
+# TARGET: "org:name" or "owner/repo" style identifiers only.
+if ! printf '%s' "$TARGET" | grep -Eq '^(org:)?[A-Za-z0-9._/-]+$'; then
+    log_err "Invalid target (allowed: owner/repo, org:name, github URL): $TARGET"
+    exit 2
+fi
+
 # Check sisakulint
 if ! command -v sisakulint &>/dev/null; then
     log_err "sisakulint not found."
@@ -98,15 +111,16 @@ echo "  Time:   $(date)"
 echo "============================================="
 echo ""
 
-# Build sisakulint command
-CMD="sisakulint -remote \"$TARGET\" -D $DEPTH -l $LIMIT -p $PARALLEL"
-[ -n "$RECURSIVE" ] && CMD="$CMD -r"
+# Build sisakulint command as an argv array (no eval, no word-splitting,
+# no shell metacharacter interpretation of $TARGET or the numeric options).
+args=( -remote "$TARGET" -D "$DEPTH" -l "$LIMIT" -p "$PARALLEL" )
+[ -n "$RECURSIVE" ] && args+=( -r )
 
-log_info "Running: $CMD"
+log_info "Running: sisakulint ${args[*]}"
 echo ""
 
 # Run sisakulint and capture output (don't fail on non-zero exit — findings cause exit 1)
-eval "$CMD" 2>&1 | tee "$SCAN_RESULTS" || true
+sisakulint "${args[@]}" 2>&1 | tee "$SCAN_RESULTS" || true
 
 echo ""
 

@@ -199,5 +199,99 @@ def test_run_returns_results_when_a_task_completes(tmp_path, monkeypatch):
     assert sum(results.values()) == 0
 
 
+# ── 4. FormDiscoveryTask output is no longer silently dropped ───────────────
+
+def test_form_discovery_untagged_lines_are_written(tmp_path):
+    """FormDiscoveryTask emits untagged 'PAGE_URL FORM_ACTION_URL' lines.
+    _write_finding must keep them instead of requiring a '[form_discovery]'
+    tag (which the prompt never instructs the model to emit)."""
+    task = ba.FormDiscoveryTask("https://acme.invalid", str(tmp_path))
+    result_text = (
+        "https://acme.invalid/login https://acme.invalid/auth/submit\n"
+        "https://acme.invalid/contact https://acme.invalid/api/contact\n"
+        "Found 2 dynamically rendered forms.\n"  # non-http narration -> dropped
+    )
+    written = ba.BrowserAgent.__dict__["_write_finding"](
+        _StubAgentForWrite(), task, result_text
+    )
+    assert written == 2, "both http-prefixed form lines must be persisted"
+    out = Path(task.output_file()).read_text(encoding="utf-8").splitlines()
+    assert out == [
+        "https://acme.invalid/login https://acme.invalid/auth/submit",
+        "https://acme.invalid/contact https://acme.invalid/api/contact",
+    ]
+
+
+def test_tagged_tasks_still_require_their_vtype_tag(tmp_path):
+    """Regression guard: the form_discovery special-case must NOT loosen the
+    filter for the normal tagged tasks (e.g. open_redirect)."""
+    task = ba.OpenRedirectTask("https://acme.invalid", str(tmp_path))
+    result_text = (
+        "https://acme.invalid/?url=x [open_redirect] [medium] confirmed\n"
+        "https://acme.invalid/?url=y just a bare url with no tag\n"
+    )
+    written = ba.BrowserAgent.__dict__["_write_finding"](
+        _StubAgentForWrite(), task, result_text
+    )
+    assert written == 1, "only the tagged open_redirect line should be kept"
+    out = Path(task.output_file()).read_text(encoding="utf-8").splitlines()
+    assert out == ["https://acme.invalid/?url=x [open_redirect] [medium] confirmed"]
+
+
+class _StubAgentForWrite:
+    """_write_finding only touches `self` for nothing — it is effectively a
+    static helper. A bare stub lets us exercise it without constructing a full
+    BrowserAgent (and its filesystem side effects)."""
+
+
+# ── 5. Partial-failure surfacing (some tasks complete, others error) ────────
+
+def test_run_marks_partial_when_some_complete_and_some_error(tmp_path, monkeypatch):
+    """A mix of completed + errored tasks must NOT be reported as a clean
+    success: run() still returns the results dict (findings preserved) but the
+    agent exposes partial=True so the orchestrator can render a degraded state."""
+    monkeypatch.setattr(ba, "_browser_use_ok", True)
+
+    agent = _make_agent(tmp_path)
+    agent.llm = object()
+    monkeypatch.setattr(agent, "_init_llm", lambda: True)
+
+    state = {"calls": 0}
+
+    async def _fake_run_task(task):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            agent._tasks_completed += 1  # one cheap GET task completes
+            return 0
+        agent._tasks_errored += 1        # the rest error (multimodal 400/timeout)
+        return 0
+
+    monkeypatch.setattr(agent, "_run_task", _fake_run_task)
+    monkeypatch.setattr(agent, "_task_allowed", lambda task: True)
+
+    results = agent.run()
+    assert results != {}, "partial phase must still return findings, not {}"
+    assert agent._tasks_completed > 0 and agent._tasks_errored > 0
+    assert agent.partial is True, "partial flag must be set when any task errors"
+
+
+def test_run_not_partial_when_all_complete(tmp_path, monkeypatch):
+    monkeypatch.setattr(ba, "_browser_use_ok", True)
+    agent = _make_agent(tmp_path)
+    agent.llm = object()
+    monkeypatch.setattr(agent, "_init_llm", lambda: True)
+
+    async def _fake_run_task(task):
+        agent._tasks_completed += 1
+        return 0
+
+    monkeypatch.setattr(agent, "_run_task", _fake_run_task)
+    monkeypatch.setattr(agent, "_task_allowed", lambda task: True)
+
+    agent.run()
+    assert agent._tasks_errored == 0
+    assert agent.partial is False, "a fully-clean phase must not be marked partial"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))

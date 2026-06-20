@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from urllib.parse import urlparse
 
 import pytest
 
@@ -165,3 +166,149 @@ class TestLogDedup:
                  'https://target/?x=2', 'z', param='')
         # Dedup collapses both to one since query-string is stripped from the key.
         assert len(eng.vulnerabilities) == 1
+
+
+# ---------------------------------------------------------------------------
+# Engagement-scope allowlist — third-party HAR hosts must NOT be attacked
+# ---------------------------------------------------------------------------
+
+
+def _analysis(endpoints, target_domain="app.acme.invalid", domains=None):
+    """Build a synthetic har_analysis dict with NO real client data."""
+    return {
+        "session_data": {},
+        "endpoints": endpoints,
+        "attack_surface": {"domains": domains or []},
+        "config": {"target_domain": target_domain},
+    }
+
+
+class TestScopeAllowlist:
+    def test_fail_closed_to_target_domain(self) -> None:
+        # No explicit allowlist → only the first-seen target host is in scope.
+        eng = HARVAPTEngine(_analysis([]))
+        assert eng.allowed_hosts == {"app.acme.invalid"}
+
+    def test_explicit_allowlist_used(self) -> None:
+        eng = HARVAPTEngine(_analysis([]),
+                            allowed_hosts=["app.acme.invalid", "API.ACME.invalid:8443"])
+        # Normalised: lowercased, port stripped.
+        assert eng.allowed_hosts == {"app.acme.invalid", "api.acme.invalid"}
+
+    def test_in_scope_predicate(self) -> None:
+        eng = HARVAPTEngine(_analysis([]))
+        assert eng._in_scope("https://app.acme.invalid/login") is True
+        assert eng._in_scope("https://app.acme.invalid:443/login") is True
+        # Third-party hosts that routinely appear in real HARs.
+        assert eng._in_scope("https://analytics.tracker.invalid/collect") is False
+        assert eng._in_scope("https://cdn.jsdelivr.invalid/lib.js") is False
+
+    def test_empty_allowlist_fails_closed(self) -> None:
+        # No target_domain and no explicit hosts → nothing is in scope.
+        eng = HARVAPTEngine(_analysis([], target_domain=""))
+        assert eng.allowed_hosts == set()
+        assert eng._in_scope("https://anything.invalid/x") is False
+
+    def test_fuzzable_endpoints_drops_out_of_scope_host(self) -> None:
+        eps = [
+            {"url": "https://app.acme.invalid/api?id=1", "path": "/api",
+             "method": "GET", "status_code": 200,
+             "query_params": {"id": ["1"]}, "post_params": {}},
+            {"url": "https://analytics.tracker.invalid/c?uid=9", "path": "/c",
+             "method": "GET", "status_code": 200,
+             "query_params": {"uid": ["9"]}, "post_params": {}},
+        ]
+        eng = HARVAPTEngine(_analysis(eps))
+        kept = eng._fuzzable_endpoints()
+        hosts = {urlparse(e["url"]).netloc for e in kept}
+        assert hosts == {"app.acme.invalid"}
+        assert "analytics.tracker.invalid" in eng._dropped_hosts
+
+    def test_auth_endpoints_scope_filtered(self) -> None:
+        eps = [
+            {"url": "https://app.acme.invalid/login", "path": "/login",
+             "method": "POST", "status_code": 200, "content_type": "application/json"},
+            {"url": "https://sso.idp.invalid/token", "path": "/token",
+             "method": "POST", "status_code": 200, "content_type": "application/json"},
+        ]
+        eng = HARVAPTEngine(_analysis(eps))
+        kept = eng._auth_endpoints()
+        assert {urlparse(e["url"]).netloc for e in kept} == {"app.acme.invalid"}
+
+    def test_upload_endpoints_scope_filtered(self) -> None:
+        eps = [
+            {"url": "https://app.acme.invalid/up", "path": "/up", "method": "POST",
+             "has_file_upload": True},
+            {"url": "https://files.thirdparty.invalid/up", "path": "/up",
+             "method": "POST", "has_file_upload": True},
+        ]
+        eng = HARVAPTEngine(_analysis(eps))
+        kept = eng._real_upload_endpoints()
+        assert {urlparse(e["url"]).netloc for e in kept} == {"app.acme.invalid"}
+
+
+# ---------------------------------------------------------------------------
+# Time-based SQLi confirmation — must re-run the LONG payload, not reuse it
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedSession:
+    """Session stub whose request latency is driven by a queue of sleeps."""
+
+    def __init__(self, latencies):
+        # latencies: list of seconds the *next* requests should appear to take
+        self._latencies = list(latencies)
+        self.calls = 0
+
+    def _do(self, *a, **k):
+        import time as _t
+        self.calls += 1
+        dur = self._latencies.pop(0) if self._latencies else 0.0
+        if dur:
+            _t.sleep(dur)
+        return _StubResponse("", status_code=200)
+
+    post = _do
+    get = _do
+
+
+def _sqli_engine(latencies):
+    eng = HARVAPTEngine.__new__(HARVAPTEngine)
+    eng.vulnerabilities = []
+    eng._emitted_keys = set()
+    eng.test_results = {}
+    eng.allowed_hosts = {"app.acme.invalid"}
+    eng._dropped_hosts = set()
+    eng.session = _ScriptedSession(latencies)
+    one_ep = {
+        "url": "https://app.acme.invalid/api", "path": "/api", "method": "GET",
+        "status_code": 200, "query_params": {"id": ["1"]}, "post_params": {},
+        "_fuzz_params": {"id": "1"},
+    }
+    eng.endpoints = [one_ep]
+    return eng
+
+
+class TestTimeBasedSQLiConfirmation:
+    def test_single_jitter_spike_is_not_confirmed(self) -> None:
+        # Error-based loop fires first (7 SQLI_ERROR payloads, all fast=0s),
+        # then the time-based loop runs 3 templates. We make ONLY the very
+        # first long-payload request slow (a one-off 5s jitter spike); every
+        # subsequent request — including the confirmation re-run of the long
+        # payload — is fast. The old code reused the first `elapsed` and would
+        # FALSELY confirm. The fixed code re-runs the long payload and must NOT.
+        # 7 error requests (fast) + [slow first long, fast long-confirm, fast short] + ...
+        latencies = [0.0] * 7 + [5.0, 0.0, 0.0]
+        eng = _sqli_engine(latencies)
+        eng.test_sql_injection()
+        tb = [v for v in eng.vulnerabilities if v["type"] == "SQL Injection (Time-Based)"]
+        assert tb == [], "one-off jitter spike must not be reported as time-based SQLi"
+
+    def test_reproducible_delay_is_confirmed(self) -> None:
+        # Genuine injection: BOTH long-payload hits are slow, short is fast.
+        latencies = [0.0] * 7 + [5.0, 5.0, 0.0]
+        eng = _sqli_engine(latencies)
+        eng.test_sql_injection()
+        tb = [v for v in eng.vulnerabilities if v["type"] == "SQL Injection (Time-Based)"]
+        assert len(tb) == 1
+        assert tb[0]["severity"] == "critical"

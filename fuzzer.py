@@ -30,35 +30,34 @@ import hashlib
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+import procutil
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FINDINGS_DIR = os.path.join(BASE_DIR, "findings")
 
 
 def run_cmd(cmd, timeout=15):
-    proc = None
+    """Run an argv LIST with shell=False via the fork-safe procutil runner.
+
+    ``cmd`` MUST be an argv list (no shell). This is deliberate: every value
+    that flows in here (crawled URLs, header values, attacker-influenceable
+    recon content) is passed as a distinct argv element, so shell
+    metacharacters can never be interpreted. Routing through
+    ``procutil.run_capture`` (os.posix_spawn) also avoids the macOS
+    Network.framework fork() SIGSEGV that raw Popen-after-network-IO hits.
+    """
+    if isinstance(cmd, str):
+        # Fail closed: a string would re-introduce shell-injection. Callers
+        # must pass an argv list.
+        raise TypeError("run_cmd requires an argv list (shell=False), not a string")
     try:
-        proc = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
+        result = procutil.run_capture(
+            list(cmd), timeout=timeout, shell=False, merge_stderr=False,
         )
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return proc.returncode == 0, stdout, stderr
-    except subprocess.TimeoutExpired:
-        if proc is not None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                proc.kill()
-            proc.wait()
-        return False, "", "timeout"
     except Exception as e:
-        if proc is not None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                proc.kill()
-            proc.wait()
         return False, "", str(e)
+    success = result.get("returncode") == 0 and not result.get("timed_out")
+    return success, result.get("stdout", ""), result.get("stderr", "")
 
 
 def curl_request(url, method="GET", headers=None, data=None, timeout=10):
@@ -75,10 +74,12 @@ def curl_request(url, method="GET", headers=None, data=None, timeout=10):
     if data:
         cmd_parts.extend(["-d", data])
 
-    cmd_parts.append(f'"{url}"')
-    cmd = " ".join(cmd_parts)
+    # Append the URL as its OWN argv element (no surrounding quotes, no join).
+    # run_cmd executes with shell=False, so metacharacters in a crawled URL or
+    # header value cannot be interpreted by a shell.
+    cmd_parts.append(url)
 
-    success, stdout, stderr = run_cmd(cmd, timeout=timeout + 5)
+    success, stdout, stderr = run_cmd(cmd_parts, timeout=timeout + 5)
 
     if not success or not stdout:
         return None, None, None
@@ -250,7 +251,14 @@ class ZeroDayFuzzer:
         if not headers:
             return
 
+        # Only assess security headers on a real content (2xx) response.
+        # Redirects (3xx) and error pages (4xx/5xx) legitimately omit
+        # CSP/X-Frame-Options/etc, so flagging them produces false positives.
+        if not (200 <= (status or 0) < 300):
+            return
+
         headers_lower = headers.lower()
+        is_https = self.target.lower().startswith("https://")
 
         required_headers = {
             "strict-transport-security": "Missing HSTS header",
@@ -261,6 +269,10 @@ class ZeroDayFuzzer:
         }
 
         for header, desc in required_headers.items():
+            # HSTS is neither sent nor honored over plain HTTP (RFC 6797),
+            # so flagging it on an http:// target is a guaranteed false positive.
+            if header == "strict-transport-security" and not is_https:
+                continue
             if header not in headers_lower:
                 self.add_finding("missing_header", "low", desc, f"URL: {self.target}")
 
@@ -347,8 +359,9 @@ class ZeroDayFuzzer:
         for param in redirect_params:
             for payload in payloads[:3]:  # Test top 3 payloads per param
                 url = f"{base_url}/?{param}={payload}"
-                # Use curl with -L to follow redirects but capture all headers
-                cmd = f'curl -sI -D- --max-time 10 "{url}" 2>/dev/null'
+                # Use curl to capture all headers; argv list -> shell=False so the
+                # URL (built from attacker-influenceable target) is never shell-parsed.
+                cmd = ["curl", "-sI", "-D-", "--max-time", "10", url]
                 success, stdout, _ = run_cmd(cmd, timeout=15)
                 if success and stdout:
                     location = re.search(r'location:\s*(.+)', stdout, re.I)
@@ -444,12 +457,22 @@ class ZeroDayFuzzer:
             url = f"{base_url}/{payload}"
             status, headers, body = curl_request(url)
             if status == 200 and body:
-                # Check if there's any reflection or error that indicates processing
-                if "polluted" in body and "__proto__" not in body:
+                # Strip the literal submitted payload (key + value) from the body
+                # before testing, so a plain URL/query echo does not (a) mask a
+                # real reflection of the value, nor (b) defeat the check just
+                # because the request URL containing "__proto__" is reflected.
+                echoed = payload.lstrip("?#")
+                cleaned = body.replace(echoed, "")
+                # The value "polluted" surviving AFTER removing the echoed
+                # payload indicates server-side processing of the value rather
+                # than a trivial whole-URL echo. This is only a heuristic
+                # indicator (a server-side body check cannot confirm client-side
+                # prototype pollution), so it is reported informationally.
+                if "polluted" in cleaned:
                     self.add_finding(
-                        "prototype_pollution", "high",
-                        "Potential prototype pollution",
-                        f"URL: {url}\nPayload value reflected without key"
+                        "prototype_pollution", "info",
+                        "Possible prototype-pollution reflection (manual review)",
+                        f"URL: {url}\nPayload value reflected after stripping the echoed key"
                     )
 
     def test_cache_poisoning(self):
@@ -569,6 +592,11 @@ def main():
     parser.add_argument("--recon-dir", type=str, help="Recon directory to load URLs from")
     parser.add_argument("--findings-dir", type=str, help="Directory to store zero-day findings")
     parser.add_argument("--deep", action="store_true", help="Run additional deep checks")
+    parser.add_argument(
+        "--max-urls", type=int, default=0,
+        help="Cap the number of recon URLs to fuzz (default 0 = unlimited). "
+             "When the cap drops URLs, a [DEGRADED] marker is emitted.",
+    )
     args = parser.parse_args()
 
     if not args.target and not args.recon_dir:
@@ -587,7 +615,18 @@ def main():
         live_file = os.path.join(args.recon_dir, "live", "urls.txt")
         if os.path.exists(live_file):
             with open(live_file) as f:
-                targets.extend([line.strip() for line in f if line.strip()][:10])
+                urls = [line.strip() for line in f if line.strip()]
+            # No silent cap: fuzz the FULL recon-derived surface by default.
+            # A cap only applies when --max-urls is explicitly set (> 0), and
+            # it is loud (logged + degradation marker) so dropped coverage is
+            # never hidden.
+            if args.max_urls and len(urls) > args.max_urls:
+                dropped = len(urls) - args.max_urls
+                print(f"[DEGRADED] capping {len(urls)} recon URLs to "
+                      f"{args.max_urls}; {dropped} URL(s) dropped (--max-urls)")
+                urls = urls[:args.max_urls]
+            print(f"[recon] loaded {len(urls)} URL(s) from {live_file}")
+            targets.extend(urls)
 
     for target in targets:
         fuzzer = ZeroDayFuzzer(target, findings_dir=args.findings_dir, deep=args.deep)

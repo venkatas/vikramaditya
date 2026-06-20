@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,30 @@ from urllib.parse import urlparse
 
 REPO = Path(__file__).resolve().parent
 RESTLER_DOCKER = "mcr.microsoft.com/restlerfuzzer/restler:latest"
+
+
+def _resolve_target(base_url: str) -> tuple[str, int, bool]:
+    """Normalize base_url and return (host, port, use_ssl).
+
+    Fails CLOSED rather than silently passing an empty target_ip to RESTler:
+    a scheme-less value like ``api.example.invalid/v1`` leaves urlparse's
+    ``.hostname`` as None (the whole string lands in ``.path``), which would
+    otherwise make RESTler connect to nothing and report a falsely "secure"
+    (empty) findings set. We prepend a default scheme so the host is always
+    resolvable, and raise SystemExit when no host can be derived.
+    """
+    raw = (base_url or "").strip()
+    candidate = raw if "://" in raw else "https://" + raw
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise SystemExit(
+            f"[!] --base-url has no resolvable host: {base_url!r} "
+            "(did you omit http://?)"
+        )
+    use_ssl = parsed.scheme != "http"
+    port = parsed.port or (443 if use_ssl else 80)
+    return host, port, use_ssl
 
 
 def _which(name: str) -> str | None:
@@ -104,17 +129,18 @@ def compile_grammar(spec: str, work_dir: Path) -> int:
 
 def test_stage(work_dir: Path, base_url: str, token: str | None) -> int:
     """RESTler 'test' — smoke test each request once with valid sequences."""
+    host, port, use_ssl = _resolve_target(base_url)
     args = ["test", "--grammar_file",
             str(work_dir / "Compile" / "grammar.py"),
             "--dictionary_file",
             str(work_dir / "Compile" / "dict.json"),
-            "--target_ip", urlparse(base_url).hostname or "",
-            "--target_port", str(urlparse(base_url).port or
-                                 (443 if base_url.startswith("https") else 80)),
-            "--use_ssl" if base_url.startswith("https") else "--no_ssl"]
+            "--target_ip", host,
+            "--target_port", str(port),
+            "--use_ssl" if use_ssl else "--no_ssl"]
     if token:
         args += ["--token_refresh_cmd",
-                 f"echo '{token}'", "--token_refresh_interval", "999999"]
+                 f"echo {shlex.quote(token)}",
+                 "--token_refresh_interval", "999999"]
     return _run_restler(args, spec_dir=str(work_dir / "Compile"),
                         work_dir=work_dir / "Test", timeout=1800)
 
@@ -122,18 +148,19 @@ def test_stage(work_dir: Path, base_url: str, token: str | None) -> int:
 def fuzz_stage(work_dir: Path, base_url: str, token: str | None,
                time_budget_h: float) -> int:
     """RESTler 'fuzz' — smart payload mutation; long-running."""
+    host, port, use_ssl = _resolve_target(base_url)
     args = ["fuzz", "--grammar_file",
             str(work_dir / "Compile" / "grammar.py"),
             "--dictionary_file",
             str(work_dir / "Compile" / "dict.json"),
-            "--target_ip", urlparse(base_url).hostname or "",
-            "--target_port", str(urlparse(base_url).port or
-                                 (443 if base_url.startswith("https") else 80)),
-            "--use_ssl" if base_url.startswith("https") else "--no_ssl",
+            "--target_ip", host,
+            "--target_port", str(port),
+            "--use_ssl" if use_ssl else "--no_ssl",
             "--time_budget", str(time_budget_h)]
     if token:
         args += ["--token_refresh_cmd",
-                 f"echo '{token}'", "--token_refresh_interval", "999999"]
+                 f"echo {shlex.quote(token)}",
+                 "--token_refresh_interval", "999999"]
     return _run_restler(args, spec_dir=str(work_dir / "Compile"),
                         work_dir=work_dir / "Fuzz",
                         timeout=int(time_budget_h * 3600 + 600))
@@ -165,10 +192,19 @@ def main(argv: list[str] | None = None) -> int:
         if rc != 0:
             print("[!] compile failed; aborting later stages")
             return rc
+    # Propagate stage return codes so a failed/degraded run is not read as
+    # success by an orchestrator invoking us with check=False.
+    worst_rc = 0
     if args.mode in ("test", "all") and args.base_url:
-        test_stage(work_dir, args.base_url, args.token)
+        rc = test_stage(work_dir, args.base_url, args.token)
+        if rc != 0:
+            print(f"[!] test stage exited rc={rc}")
+            worst_rc = worst_rc or rc
     if args.mode in ("fuzz", "all") and args.base_url:
-        fuzz_stage(work_dir, args.base_url, args.token, args.time_budget)
+        rc = fuzz_stage(work_dir, args.base_url, args.token, args.time_budget)
+        if rc != 0:
+            print(f"[!] fuzz stage exited rc={rc}")
+            worst_rc = worst_rc or rc
 
     summary = {
         "tool": "vikramaditya.restler_audit",
@@ -178,10 +214,11 @@ def main(argv: list[str] | None = None) -> int:
         "mode": args.mode,
         "time_budget_h": args.time_budget,
         "ran_at": datetime.now().isoformat(timespec="seconds"),
+        "worst_rc": worst_rc,
     }
     (work_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"[+] summary → {work_dir / 'summary.json'}")
-    return 0
+    return worst_rc
 
 
 if __name__ == "__main__":

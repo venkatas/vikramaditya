@@ -132,18 +132,33 @@ def _run_buttercup(target: str, recon_dir: str | None,
     # PoV proofs. Tally if present.
     findings = run_dir / "buttercup" / "findings.json"
     pov_count = 0
+    parse_error = None
     if findings.exists():
         try:
             data = json.loads(findings.read_text())
-            pov_count = len(data.get("povs", []) or data if isinstance(data, list) else [])
-        except Exception:
-            pass
-    return {
+            # Buttercup's findings.json may be either a bare list of PoVs
+            # ([...]) or a dict with a "povs" key ({"povs": [...]}). Count
+            # both shapes explicitly — the old one-liner mis-parsed due to
+            # the conditional-expression having lower precedence than `or`,
+            # so it always yielded 0.
+            if isinstance(data, list):
+                pov_count = len(data)
+            elif isinstance(data, dict):
+                pov_count = len(data.get("povs", []) or [])
+            else:
+                parse_error = f"unexpected findings.json type: {type(data).__name__}"
+        except Exception as e:
+            parse_error = f"{type(e).__name__}: {e}"
+            print(f"[!] failed to parse {findings}: {parse_error}", file=sys.stderr)
+    out = {
         "engine": "trailofbits.buttercup",
         "elapsed_s": elapsed,
         "pov_count": pov_count,
         "exit_code": rc,
     }
+    if parse_error:
+        out["_parse_error"] = parse_error
+    return out
 
 
 def _compare(vikram: dict, butter: dict, run_dir: Path, target: str) -> str:

@@ -15,13 +15,15 @@ import vikramaditya  # noqa: E402
 def _capture_cmd(monkeypatch):
     captured = {}
 
-    def _fake_run(cmd, **kw):
+    # v10.6.0 — run_hunt now launches through the fork-safe streaming helper
+    # (procutil posix_spawn) instead of raw subprocess.run, to avoid the macOS
+    # Network.framework fork()+exec SIGSEGV after in-process HTTP fingerprinting.
+    def _fake_stream(cmd, **kw):
         captured["cmd"] = cmd
-        class _R:  # noqa: D401
-            returncode = 0
-        return _R()
+        captured["kw"] = kw
+        return 0
 
-    monkeypatch.setattr(vikramaditya.subprocess, "run", _fake_run)
+    monkeypatch.setattr(vikramaditya, "_run_streaming", _fake_stream)
     return captured
 
 

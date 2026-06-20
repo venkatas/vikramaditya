@@ -134,28 +134,29 @@ def check_h1_dups(program_handle: str, vuln_keyword: str) -> list[dict]:
         return []
 
     query = {
-        "query": f"""{{
+        "query": """query($h: String!, $kw: String!) {
           hacktivity_items(
             first: 10,
-            order_by: {{ field: popular, direction: DESC }},
-            where: {{
-              team: {{ handle: {{ _eq: "{program_handle}" }} }},
-              report: {{ title: {{ _icontains: "{vuln_keyword}" }} }}
-            }}
-          ) {{
-            nodes {{
-              ... on HacktivityDocument {{
-                report {{
+            order_by: { field: popular, direction: DESC },
+            where: {
+              team: { handle: { _eq: $h } },
+              report: { title: { _icontains: $kw } }
+            }
+          ) {
+            nodes {
+              ... on HacktivityDocument {
+                report {
                   title
                   severity_rating
                   disclosed_at
                   url
                   state
-                }}
-              }}
-            }}
-          }}
-        }}"""
+                }
+              }
+            }
+          }
+        }""",
+        "variables": {"h": program_handle, "kw": vuln_keyword or ""},
     }
     try:
         req = urllib.request.Request(
@@ -262,7 +263,8 @@ def gate2_in_scope(program_handle: str) -> tuple[bool, dict]:
         print(f"\n  {DIM}Checking HackerOne scope for '{program_handle}'...{RESET}")
         try:
             query = {
-                "query": f'{{ team(handle: "{program_handle}") {{ policy_scopes(archived: false) {{ edges {{ node {{ asset_type asset_identifier eligible_for_bounty }} }} }} }} }}'
+                "query": 'query($h: String!) { team(handle: $h) { policy_scopes(archived: false) { edges { node { asset_type asset_identifier eligible_for_bounty } } } } }',
+                "variables": {"h": program_handle},
             }
             req = urllib.request.Request(
                 "https://hackerone.com/graphql",

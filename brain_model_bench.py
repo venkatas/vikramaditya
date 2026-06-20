@@ -57,6 +57,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -123,13 +124,33 @@ def _tally(brain_dir: Path) -> dict:
     return out
 
 
+def _norm_url(u: str) -> str:
+    """Normalise a URL for FP-set membership: drop the fragment, drop a
+    trailing '/', and lowercase the scheme+host so equality is robust to
+    cosmetic noise WITHOUT falling back to substring containment."""
+    u = (u or "").strip()
+    # Drop fragment.
+    u = u.split("#", 1)[0]
+    # Strip a single trailing slash on the path (but keep "scheme://host/").
+    if u.endswith("/") and "://" in u and not u.endswith("://"):
+        u = u[:-1]
+    return u
+
+
 def _score_hallucination(submit_urls: list[str], sqlmap_fps: set[str]) -> dict:
     """Of the SUBMIT-verdict URLs, how many were already labelled FP by
-    sqlmap? Higher = worse model."""
+    sqlmap? Higher = worse model.
+
+    Uses normalised exact set membership (an equality join), NOT substring
+    containment: a bidirectional `fp in u or u in fp` test counted a genuine
+    novel SUBMIT URL (e.g. http://x/admin) as an FP merely because a shorter
+    FP URL (http://x/a) is a path-prefix of it, inflating the halluc_rate and
+    mis-ranking the recommended model. `sqlmap_fps` is a set, so membership is
+    O(1) and correct."""
     if not submit_urls:
         return {"submit_total": 0, "submit_fp": 0, "halluc_rate": 0.0}
-    fp_hits = sum(1 for u in submit_urls
-                  if any(fp in u or u in fp for fp in sqlmap_fps))
+    fp_norm = {_norm_url(fp) for fp in sqlmap_fps}
+    fp_hits = sum(1 for u in submit_urls if _norm_url(u) in fp_norm)
     return {"submit_total": len(submit_urls),
             "submit_fp": fp_hits,
             "halluc_rate": round(fp_hits / len(submit_urls), 3)}
@@ -161,9 +182,19 @@ def run_one_model(model: str, findings: Path, recon: Path,
     measurements dict."""
     brain_root = findings / "brain"
     snapshot = None
+    # Relocate the operator's real findings/brain triage output (if any) to a
+    # collision-proof snapshot dir. The restore MUST always run — wrap the
+    # bench work in try/finally so a Ctrl-C / SIGTERM / unexpected exception in
+    # the hours-long N-model bake-off never orphans the operator's data. The
+    # snapshot name embeds pid + a uuid so two runs (or a prior failed restore)
+    # in the same wall-clock second can't collide.
     if brain_root.exists():
-        snapshot = findings.parent / f".brain_snapshot_{int(time.time())}"
+        snapshot = (findings.parent /
+                    f".brain_snapshot_{int(time.time())}_{os.getpid()}_"
+                    f"{uuid.uuid4().hex[:8]}")
         shutil.move(str(brain_root), str(snapshot))
+        print(f"[bench] relocated real findings/brain -> {snapshot}; "
+              f"will restore on completion")
     brain_root.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
@@ -181,27 +212,30 @@ def run_one_model(model: str, findings: Path, recon: Path,
     t0 = time.perf_counter()
     rc = -1
     try:
-        with open(log, "w") as fh:
-            rc = subprocess.run(cmd, env=env, cwd=str(REPO),
-                                stdout=fh, stderr=subprocess.STDOUT,
-                                timeout=3600).returncode
-    except subprocess.TimeoutExpired:
-        rc = 124
-    elapsed = round(time.perf_counter() - t0, 2)
+        try:
+            with open(log, "w") as fh:
+                rc = subprocess.run(cmd, env=env, cwd=str(REPO),
+                                    stdout=fh, stderr=subprocess.STDOUT,
+                                    timeout=3600).returncode
+        except subprocess.TimeoutExpired:
+            rc = 124
+        elapsed = round(time.perf_counter() - t0, 2)
 
-    # Snapshot the produced brain/
-    bake = out_dir / "brain"
-    if bake.exists():
-        shutil.rmtree(bake)
-    if brain_root.exists() and any(brain_root.iterdir()):
-        shutil.copytree(str(brain_root), str(bake))
+        # Snapshot the produced brain/
+        bake = out_dir / "brain"
+        if bake.exists():
+            shutil.rmtree(bake)
+        if brain_root.exists() and any(brain_root.iterdir()):
+            shutil.copytree(str(brain_root), str(bake))
 
-    tally = _tally(brain_root)
-
-    # Restore original brain/ if there was one
-    if snapshot and snapshot.exists():
-        shutil.rmtree(brain_root, ignore_errors=True)
-        shutil.move(str(snapshot), str(brain_root))
+        tally = _tally(brain_root)
+    finally:
+        # Always restore the operator's original brain/ — even on Ctrl-C,
+        # SIGTERM, or any exception above.
+        if snapshot and snapshot.exists():
+            shutil.rmtree(brain_root, ignore_errors=True)
+            shutil.move(str(snapshot), str(brain_root))
+            print(f"[bench] restored real findings/brain from {snapshot}")
 
     return {"model": model, "elapsed_s": elapsed, "exit": rc, **tally}
 

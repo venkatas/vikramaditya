@@ -232,6 +232,9 @@ class BrowserAgent:
         # from "every browser request errored" (degraded/failure).
         self._tasks_completed = 0
         self._tasks_errored = 0
+        # Set when run() finishes with completions>0 AND errors>0 — a partial
+        # phase the orchestrator should render as degraded, not clean success.
+        self._partial = False
         (self.findings_dir / "browser" / "screenshots").mkdir(parents=True, exist_ok=True)
 
     def _init_llm(self) -> bool:
@@ -308,6 +311,15 @@ class BrowserAgent:
             for raw in result_text.splitlines():
                 line = raw.strip()
                 if not line:
+                    continue
+                # FormDiscoveryTask emits untagged "PAGE_URL FORM_ACTION_URL"
+                # lines (no "[form_discovery]" tag), so the tagged-line filter
+                # below would silently drop every one of them. Keep any
+                # http-prefixed line for this discovery task instead.
+                if task.vtype == "form_discovery":
+                    if line.startswith("http"):
+                        fh.write(line + "\n")
+                        lines_written += 1
                     continue
                 if line.startswith("http") and f"[{task.vtype}]" in line:
                     fh.write(line + "\n")
@@ -458,8 +470,36 @@ class BrowserAgent:
             )
             return {}
 
+        # Partial failure: some tasks completed but others errored (e.g. a
+        # text-only model 400-ing on multimodal XSS/CSRF tasks while the
+        # GET-based OpenRedirectTask completes). The non-empty results dict
+        # would otherwise let the orchestrator render the phase as a clean
+        # success and hide that high-value validations errored. Surface a
+        # distinct warning and expose a `partial` flag so the orchestrator
+        # can downgrade the phase from ✓ to a visible degraded/partial state.
+        if self._tasks_errored > 0:
+            self._partial = True
+            _log(
+                "warn",
+                f"Browser phase partial — {self._tasks_completed} task(s) "
+                f"completed, {self._tasks_errored} errored",
+            )
+
         _log("ok" if total else "info", f"Browser phase complete — {total} finding(s)")
         return results
+
+    @property
+    def partial(self) -> bool:
+        """True when the phase ran but at least one task errored.
+
+        Distinct from the fully-degraded case (run() returns {} when every
+        attempted task errored). A partial phase still returns findings but
+        should be rendered as degraded/partial, not a clean success, by the
+        orchestrator.
+        """
+        return bool(getattr(self, "_partial", False)) or (
+            self._tasks_completed > 0 and self._tasks_errored > 0
+        )
 
 
 class BrowserTask:
@@ -588,8 +628,10 @@ class FormDiscoveryTask(BrowserTask):
     """
     Discovers JS-rendered forms invisible to static crawlers.
     Output format: PAGE_URL FORM_ACTION_URL (one per line, no brackets).
-    This file is NOT loaded by reporter.py — it is a feed-forward artifact
-    for future scanner phases (e.g. passed back into scanner.sh URL lists).
+    This file is NOT loaded by reporter.py and currently has no downstream
+    consumer — it is written purely as a standalone recon artifact. (A future
+    phase could feed these URLs back into scanner.sh URL lists, but no such
+    feed-forward is implemented today.)
     """
     vtype    = "form_discovery"
     severity = "info"

@@ -264,13 +264,17 @@ def fetch_nvd_cves(tech: str) -> list[dict]:
 
 def fetch_hackerone_hacktivity(keyword: str, limit: int = 5) -> list[dict]:
     """Query HackerOne Hacktivity public GraphQL for a keyword."""
+    # Pass the keyword as a GraphQL variable, never interpolated into the
+    # document text. Interpolating it directly let a target-controlled token
+    # (e.g. a quote-bearing Server header) terminate the GraphQL string and
+    # silently drop HackerOne intel for that tech.
     query = {
-        "query": f"""{{
+        "query": f"""query($kw: String!) {{
           hacktivity_items(
             first: {limit},
             order_by: {{ field: popular, direction: DESC }},
             where: {{
-              report: {{ title: {{ _icontains: "{keyword}" }} }},
+              report: {{ title: {{ _icontains: $kw }} }},
               disclosed_at: {{ _is_null: false }}
             }}
           ) {{
@@ -285,7 +289,8 @@ def fetch_hackerone_hacktivity(keyword: str, limit: int = 5) -> list[dict]:
               }}
             }}
           }}
-        }}"""
+        }}""",
+        "variables": {"kw": keyword},
     }
     data = fetch_url(
         "https://hackerone.com/graphql",
@@ -557,28 +562,31 @@ def main():
     # If program specified, add program-specific HackerOne results
     if args.hackerone_program:
         print(f"  {CYAN}Fetching HackerOne disclosures for program: {args.hackerone_program}{RESET}")
+        # Pass the program handle as a GraphQL variable, never interpolated
+        # into the document text (see fetch_hackerone_hacktivity above).
         query = {
-            "query": f"""{{
+            "query": """query($handle: String!) {
               hacktivity_items(
                 first: 20,
-                order_by: {{ field: popular, direction: DESC }},
-                where: {{
-                  team: {{ handle: {{ _eq: "{args.hackerone_program}" }} }},
-                  disclosed_at: {{ _is_null: false }}
-                }}
-              ) {{
-                nodes {{
-                  ... on HacktivityDocument {{
-                    report {{
+                order_by: { field: popular, direction: DESC },
+                where: {
+                  team: { handle: { _eq: $handle } },
+                  disclosed_at: { _is_null: false }
+                }
+              ) {
+                nodes {
+                  ... on HacktivityDocument {
+                    report {
                       title
                       severity_rating
                       disclosed_at
                       url
-                    }}
-                  }}
-                }}
-              }}
-            }}"""
+                    }
+                  }
+                }
+              }
+            }""",
+            "variables": {"handle": args.hackerone_program},
         }
         data = fetch_url(
             "https://hackerone.com/graphql",

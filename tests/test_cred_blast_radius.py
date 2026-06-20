@@ -72,6 +72,36 @@ def test_parse_captures_secret_and_extra(tmp_path):
     assert c.secret == "topsecret"
     assert c.extra.get("account") == "222222222222"
     assert c.source_file.endswith("abc.js")
+    assert c.session_token == ""  # long-lived AKIA key carries no STS token
+
+
+def test_parse_extracts_verified_session_key(tmp_path):
+    """A VERIFIED AWSSessionKey (temporary STS, ASIA…) must NOT be dropped by the
+    detector-name allowlist, and its session token must be captured for boto3."""
+    p = tmp_path / "trufflehog.json"
+    p.write_text(_th_record(
+        "AWSSessionKey", True, "ASIAEXAMPLE000000001", "tempsecret",
+        account="333333333333", session_token="FQoGZXIvYXdzEXAMPLETOKEN",
+    ))
+    creds = cbr.parse_verified_creds(str(p))
+    assert len(creds) == 1
+    c = creds[0]
+    assert c.provider == "aws"
+    assert c.access_key_id == "ASIAEXAMPLE000000001"
+    assert c.secret == "tempsecret"
+    assert c.session_token == "FQoGZXIvYXdzEXAMPLETOKEN"
+
+
+def test_parse_skips_verified_non_aws_with_degradation_marker(tmp_path):
+    """A VERIFIED non-AWS cred is out of scope but must surface a degradation marker,
+    never vanish silently."""
+    p = tmp_path / "trufflehog.json"
+    p.write_text(_th_record("GitHub", True, "ghp_EXAMPLE000000000001", "ghsecret"))
+    markers = []
+    creds = cbr.parse_verified_creds(str(p), log=lambda lvl, msg: markers.append((lvl, msg)))
+    assert creds == []
+    assert markers and markers[0][0] == "degraded"
+    assert "GitHub" in markers[0][1]
 
 
 # ── read-only guard ──────────────────────────────────────────────────────────────

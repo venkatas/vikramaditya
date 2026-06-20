@@ -157,6 +157,39 @@ class TestEstimateDKIMRSABits:
     def test_garbage_base64_returns_none(self) -> None:
         assert email_audit.estimate_dkim_rsa_bits("not valid base64 !@#") is None
 
+    @staticmethod
+    def _nested_recursion_der(levels: int) -> str:
+        # v10.6.0 regression — build a maliciously deep SPKI-like structure
+        # where each level is SEQUENCE { SEQUENCE(alg) , BIT STRING { <next> } }
+        # so estimate_dkim_rsa_bits recurses on the BIT STRING payload at every
+        # level. Without a depth bound this overflows Python's recursion limit
+        # and raises an uncaught RecursionError that aborts the whole audit.
+        alg = bytes.fromhex("300D06092A864886F70D0101010500")
+
+        def wrap(inner: bytes) -> bytes:
+            bitstr_body = b"\x00" + inner
+            bitstr = b"\x03" + _der_length_bytes(len(bitstr_body)) + bitstr_body
+            outer_body = alg + bitstr
+            return b"\x30" + _der_length_bytes(len(outer_body)) + outer_body
+
+        # Innermost payload: a small INTEGER so a (hypothetically) un-bounded
+        # walk would terminate normally — proving the bound, not bad input.
+        node = b"\x30\x06\x02\x01\x01\x02\x01\x01"
+        for _ in range(levels):
+            node = wrap(node)
+        return base64.b64encode(node).decode("ascii")
+
+    def test_deeply_nested_der_does_not_raise(self) -> None:
+        # Far deeper than Python's recursion limit would tolerate unbounded.
+        b64 = self._nested_recursion_der(2000)
+        # Must return cleanly (None), never raise RecursionError.
+        assert email_audit.estimate_dkim_rsa_bits(b64) is None
+
+    def test_depth_bound_rejects_beyond_cap(self) -> None:
+        # A structure nested past the cap degrades to None instead of crashing.
+        b64 = self._nested_recursion_der(10)
+        assert email_audit.estimate_dkim_rsa_bits(b64) is None
+
 
 def _der_length_bytes(n: int) -> bytes:
     """Encode an ASN.1 DER length."""
@@ -164,6 +197,53 @@ def _der_length_bytes(n: int) -> bytes:
         return bytes([n])
     body = n.to_bytes((n.bit_length() + 7) // 8, "big")
     return bytes([0x80 | len(body)]) + body
+
+
+class TestFetchUrlTextHardening:
+    """v10.6.0 — MTA-STS policy fetch must bound the response body and refuse
+    redirects, since the policy host (mta-sts.<domain>) is target-controlled."""
+
+    class _FakeResp:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self, n=-1):
+            return self._payload[:n] if n is not None and n >= 0 else self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def test_oversized_body_rejected(self, monkeypatch) -> None:
+        huge = b"a" * (email_audit.MTA_STS_MAX_BODY_BYTES + 100)
+        monkeypatch.setattr(
+            email_audit._NO_REDIRECT_OPENER, "open",
+            lambda *a, **k: self._FakeResp(huge),
+        )
+        body, err = email_audit.fetch_url_text("https://mta-sts.acme.invalid/p", 5.0)
+        assert body is None
+        assert err == "policy body exceeds size limit"
+
+    def test_normal_body_returned(self, monkeypatch) -> None:
+        payload = b"version: STSv1\nmode: enforce\nmx: mail.acme.invalid\nmax_age: 86400\n"
+        monkeypatch.setattr(
+            email_audit._NO_REDIRECT_OPENER, "open",
+            lambda *a, **k: self._FakeResp(payload),
+        )
+        body, err = email_audit.fetch_url_text("https://mta-sts.acme.invalid/p", 5.0)
+        assert err is None
+        assert "mode: enforce" in body
+
+    def test_redirect_handler_rejects(self) -> None:
+        import urllib.request
+        handler = email_audit._RejectRedirectHandler()
+        req = urllib.request.Request("https://mta-sts.acme.invalid/p")
+        with pytest.raises(Exception):
+            handler.redirect_request(
+                req, None, 302, "Found", {}, "https://evil.invalid/elsewhere"
+            )
 
 
 # ---------------------------------------------------------------------------

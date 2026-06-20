@@ -679,6 +679,23 @@ SEVERITY_COLOR = {
     "info":     "#6c757d",
 }
 CVSS_DEFAULT = {"critical": "9.0", "high": "7.5", "medium": "5.0", "low": "2.5", "info": "0.0"}
+
+
+def _severity_counts(findings: list) -> dict:
+    """Per-severity counts for the Executive Summary table that ALWAYS reconcile
+    with len(findings). Loaders normalize severity, but as defense-in-depth any
+    finding whose severity is not a canonical SEVERITY_COLOR key is folded into
+    the 'info' bucket here so the table can never silently sum to less than Total
+    (which would happen with a bare exact-match comprehension)."""
+    counts = {s: 0 for s in SEVERITY_COLOR}
+    for f in findings:
+        sev = str(f.get("severity", "")).strip().lower()
+        if sev in ("informational", "information"):
+            sev = "info"
+        if sev not in counts:
+            sev = "info"
+        counts[sev] += 1
+    return counts
 SUBDIR_VTYPE = {
     "sqli": "sqli", "xss": "xss", "ssti": "ssti", "upload": "upload",
     "rce": "rce", "lfi": "lfi", "idor": "idor", "ssrf": "ssrf",
@@ -912,8 +929,9 @@ def load_findings(findings_dir: str) -> list:
                         })
                     else:
                         unconfirmed_cves.append((cve_id, product, score))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load CVE file {fn}: {e!r} — "
+                      "CVE findings from this file may be MISSING")
 
     # Collapse unconfirmed keyword matches into a single INFO context item.
     if unconfirmed_cves:
@@ -981,8 +999,9 @@ def load_findings(findings_dir: str) -> list:
                                 "url": url,
                                 "poc": line,
                             })
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load cves_custom file {fn}: "
+                      f"{e!r} — custom-template findings from this file may be MISSING")
 
     # Method 1d: Email authentication posture (email_auth/findings.json)
     # v9.23 — subspace_sentinel writes SPF/DKIM/DMARC/DNSSEC/MTA-STS results as a
@@ -1026,8 +1045,10 @@ def load_findings(findings_dir: str) -> list:
                             f"Result: {item.get('result','')}\n\n"
                             f"{item.get('notes','')}"),
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load "
+                  f"{os.path.relpath(email_auth_path, findings_dir)}: {e!r} — "
+                  "email-auth findings may be MISSING from this report")
 
     # Method 1h: Verified cloud-credential blast-radius (exposed_credentials/findings.json)
     # cred_blast_radius.py writes a confirmed, READ-ONLY-verified assessment of a discovered &
@@ -1080,8 +1101,10 @@ def load_findings(findings_dir: str) -> list:
                     "url": item.get("source_url") or item.get("source_file", "N/A"),
                     "poc": "\n".join(poc),
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load "
+                  f"{os.path.relpath(exposed_cred_path, findings_dir)}: {e!r} — "
+                  "exposed-credential findings may be MISSING from this report")
 
     # Method 1f: sqlmap-confirmed SQL injection (sqlmap/sqlmap_results.txt + results-*.csv)
     # v10.0.1 — hunt.py runs sqlmap with --results-file → sqlmap/sqlmap_results.txt, and
@@ -1221,8 +1244,10 @@ def load_findings(findings_dir: str) -> list:
                 if item.get("cvss"):
                     finding["cvss"] = str(item["cvss"])
                 results.append(finding)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load "
+                  f"{os.path.relpath(burp_path, findings_dir)}: {e!r} — "
+                  "Burp findings may be MISSING from this report")
 
     # Method 1e: Brain active scanner output (brain_active/iteration_*.json)
     # brain_scanner.run_brain_scanner writes iteration_NN.json files whose
@@ -1241,11 +1266,44 @@ def load_findings(findings_dir: str) -> list:
                                 if fn.startswith("iteration_") and fn.endswith(".json"))
             brain_findings = []
             if iter_files:
-                # The last iteration carries the cumulative findings_so_far list.
-                with open(os.path.join(brain_active_path, iter_files[-1]),
-                          errors="replace") as f:
-                    brain_data = _json.load(f)
-                brain_findings = brain_data.get("findings_so_far", []) or []
+                # findings_so_far is CUMULATIVE, so the newest intact iteration
+                # carries the full confirmed list. A scan killed mid-write
+                # (SIGKILL/OOM/disk-full/laptop-sleep) leaves the newest
+                # iteration_NN.json truncated; a bare _json.load on iter_files[-1]
+                # would raise and abandon the WHOLE brain_active block (the outer
+                # `except: pass`), silently dropping every script-confirmed
+                # active-scan finding. Walk newest→oldest and use the first
+                # parseable file; emit a visible degradation marker if none parse.
+                brain_data = None
+                for _cand in reversed(iter_files):
+                    try:
+                        with open(os.path.join(brain_active_path, _cand),
+                                  errors="replace") as f:
+                            brain_data = _json.load(f)
+                        break
+                    except Exception:
+                        continue
+                if brain_data is None:
+                    print(f"[reporter] WARNING: all {len(iter_files)} "
+                          "brain_active/iteration_*.json files failed to parse "
+                          "(likely a truncated write from a killed scan) — "
+                          "script-confirmed active-scan findings may be MISSING "
+                          "from this report")
+                    results.append({
+                        "severity": "info",
+                        "cvss": CVSS_DEFAULT.get("info", "0.0"),
+                        "vtype": "misconfig",
+                        "title": ("Brain active-scan findings UNAVAILABLE "
+                                  "(iteration files unparseable)"),
+                        "detail": (f"All {len(iter_files)} brain_active/iteration_*.json "
+                                   "files failed to parse (likely a truncated write from "
+                                   "a killed scan). Script-confirmed active-scan findings "
+                                   "could NOT be loaded — manual review required."),
+                        "url": "N/A",
+                        "poc": "Source: brain_active/iteration_*.json (corrupt/truncated).",
+                    })
+                else:
+                    brain_findings = brain_data.get("findings_so_far", []) or []
             # Defence-in-depth: a file-access/traversal claim is only kept as a
             # finding if the file's content actually appears in the script output.
             # findings_so_far is cumulative, so aggregate EVERY iteration's raw
@@ -1267,6 +1325,37 @@ def load_findings(findings_dir: str) -> list:
                 from brain_scanner import _access_claim_unproven
             except Exception:
                 _access_claim_unproven = None
+            try:
+                from brain_scanner import _ACCESS_CLAIM_RE, _USAGE_BANNER_RE
+            except Exception:
+                _ACCESS_CLAIM_RE = _USAGE_BANNER_RE = None
+
+            def _claim_unproven(_line, _out):
+                """Reporter-side proof gate. Keeps brain_scanner's signature
+                whitelist as a fast-accept, but does NOT treat the narrow
+                _FILE_PROOF_RE signature as the SOLE proof: a grounded read of a
+                non-whitelisted file (source code, YAML/JSON config, /etc/hosts,
+                a log file, /proc/self/environ) prints substantive retrieved
+                content that the signature regex cannot represent — dropping it
+                is a silent false-negative on a real file-disclosure finding.
+                So when the imported gate flags a claim as unproven, re-check
+                whether the output carries multiple substantive content lines
+                beyond the claim/banner itself. A bare `echo "[CRITICAL]
+                accessible"` prints zero such lines and stays demoted."""
+                if not _access_claim_unproven:
+                    return False
+                if not _access_claim_unproven(_line, _out):
+                    return False  # not a claim, or already proven by signature
+                # Imported gate says "unproven". Apply the generic content check.
+                if _ACCESS_CLAIM_RE is None:
+                    return True   # cannot reason about content → keep strict
+                content = [ln for ln in (_out or "").splitlines()
+                           if ln.strip()
+                           and not _ACCESS_CLAIM_RE.search(ln)
+                           and not (_USAGE_BANNER_RE and _USAGE_BANNER_RE.search(ln))]
+                substantive = [ln for ln in content if len(ln.strip()) >= 8]
+                return len(substantive) < 2  # <2 real content lines ⇒ still unproven
+
             model_claims = []
             for line in brain_findings:
                 line = (line or "").strip()
@@ -1280,7 +1369,7 @@ def load_findings(findings_dir: str) -> list:
                 # that NO iteration's output actually proves (no file content) — a
                 # buggy PoC (`echo "[CRITICAL] ... accessible" || echo`) prints it
                 # unconditionally. Demote to unverified context, never a finding.
-                if _access_claim_unproven and _access_claim_unproven(line, all_iter_output):
+                if _claim_unproven(line, all_iter_output):
                     model_claims.append("UNVERIFIED (no file content as proof): " + line)
                     continue
                 # Script-output-grounded line → real finding. Reuse the custom-line
@@ -1314,8 +1403,9 @@ def load_findings(findings_dir: str) -> list:
                     "url": "N/A",
                     "poc": "Source: brain_active/iteration_*.json (model claims; not script-verified).",
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load brain_active findings: "
+                  f"{e!r} — brain active-scan findings may be MISSING from this report")
 
     # Method 1c: HAR VAPT / Legacy crawler results (har_vapt_*.json / legacy_vapt_*.json)
     for fn in sorted(os.listdir(findings_dir)):
@@ -1324,8 +1414,18 @@ def load_findings(findings_dir: str) -> list:
                 with open(os.path.join(findings_dir, fn)) as f:
                     har_data = _json.load(f)
                 for vuln in har_data.get("vulnerabilities", []):
+                    # Normalize severity so external/legacy HAR JSON ("Critical",
+                    # "informational", " high ") still lands in a per-severity
+                    # bucket; otherwise it counts in Total but not in the
+                    # Executive Summary table (which exact-matches SEVERITY_COLOR
+                    # keys), so the table fails to reconcile with Total.
+                    _hs = str(vuln.get("severity", "medium")).strip().lower()
+                    if _hs in ("informational", "information"):
+                        _hs = "info"
+                    if _hs not in SEVERITY_ORDER:
+                        _hs = "medium"
                     results.append({
-                        "severity": vuln.get("severity", "medium"),
+                        "severity": _hs,
                         "vtype": vuln.get("type", "misconfig").lower().replace(" ", "_"),
                         "title": vuln.get("type", "Finding"),
                         "detail": vuln.get("details", ""),
@@ -1334,8 +1434,9 @@ def load_findings(findings_dir: str) -> list:
                                f"Payload: {vuln.get('payload','')}\n"
                                f"Evidence: {vuln.get('evidence','')}",
                     })
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load {fn}: {e!r} — "
+                      "HAR/legacy findings from this file may be MISSING")
 
     # Method 2: Flat JSON findings (autopilot_api_hunt.py output)
     # Reads finding_*.json files directly in the findings dir.
@@ -1351,7 +1452,14 @@ def load_findings(findings_dir: str) -> list:
             try:
                 with open(os.path.join(findings_dir, fn)) as f:
                     data = _json.load(f)
-                sev = data.get("severity", "medium").lower()
+                sev = str(data.get("severity", "medium")).strip().lower()
+                # Normalize so a hand-edited finding_*.json with "informational"
+                # / "none" / a typo doesn't escape every per-severity bucket and
+                # desync the Executive Summary table from Total.
+                if sev in ("informational", "information"):
+                    sev = "info"
+                if sev not in SEVERITY_ORDER:
+                    sev = "medium"
                 vtype = data.get("type", "misconfig")
                 tmpl = VULN_TEMPLATES.get(vtype, VULN_TEMPLATES.get("misconfig", {}))
                 evidence = data.get("evidence", "")
@@ -1623,7 +1731,9 @@ def load_findings(findings_dir: str) -> list:
                 if key not in _seen_m2:
                     _seen_m2.add(key)
                     results.append(finding)
-            except Exception:
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load finding file {fn}: "
+                      f"{e!r} — this finding may be MISSING from the report")
                 continue
 
     results.sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 4))
@@ -2135,8 +2245,7 @@ Scan Diagnostics</h2>
 def render_html_report(findings: list, target: str, report_dir: str,
                        client: str, consultant: str, title: str) -> str:
     date_str = datetime.now().strftime("%d %B %Y")
-    counts   = {s: sum(1 for f in findings if f["severity"] == s)
-                for s in SEVERITY_COLOR}
+    counts   = _severity_counts(findings)
     total    = len(findings)
     # v10.6.0 — weighted overall risk score + label (report_synthesis)
     _risk_html = ""
@@ -2408,8 +2517,7 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 def render_markdown_report(findings: list, target: str, report_dir: str,
                            client: str, consultant: str, title: str) -> str:
     date_str = datetime.now().strftime("%d %B %Y")
-    counts   = {s: sum(1 for f in findings if f["severity"] == s)
-                for s in SEVERITY_COLOR}
+    counts   = _severity_counts(findings)
     lines    = [
         f"# {title}",
         f"**Target:** {target}  \n**Client:** {client or '—'}  \n"

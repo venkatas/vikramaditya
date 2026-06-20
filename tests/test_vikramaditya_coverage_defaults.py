@@ -109,13 +109,14 @@ def test_focused_flag_opts_out_of_full(monkeypatch):
 def _capture_cmd(monkeypatch):
     captured = {}
 
-    def _fake_run(cmd, **kw):
+    # v10.6.0 — run_hunt launches through the fork-safe streaming helper
+    # (procutil posix_spawn) rather than raw subprocess.run. Patch that so the
+    # test never actually spawns hunt.py.
+    def _fake_stream(cmd, **kw):
         captured["cmd"] = cmd
-        class _R:
-            returncode = 0
-        return _R()
+        return 0
 
-    monkeypatch.setattr(vikramaditya.subprocess, "run", _fake_run)
+    monkeypatch.setattr(vikramaditya, "_run_streaming", _fake_stream)
     return captured
 
 

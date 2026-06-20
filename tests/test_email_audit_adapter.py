@@ -23,9 +23,11 @@ import email_audit_adapter as adapter
 
 
 class TestSeverityMap:
-    def test_critical_downgrades_to_high(self) -> None:
-        """subspace 'critical' = config gap, not RCE — map to high."""
-        assert adapter._to_schema_severity("critical") == "high"
+    def test_critical_passes_through(self) -> None:
+        """v10.6.0: 'critical' is a valid journal severity and is rendered
+        natively by reporter.py — it must NOT be silently downgraded to high,
+        which understated real spoofability (SPF +all / SPF /0)."""
+        assert adapter._to_schema_severity("critical") == "critical"
 
     def test_standard_severities_preserved(self) -> None:
         assert adapter._to_schema_severity("high") == "high"
@@ -141,10 +143,10 @@ class TestToFindingEntries:
         assert "Fix:" in dmarc["notes"]
         assert "p=none" in dmarc["notes"]
 
-    def test_critical_downgrades_to_high_in_finding(self, sample_audit_report) -> None:
+    def test_critical_preserved_in_finding(self, sample_audit_report) -> None:
         findings = adapter.to_finding_entries(sample_audit_report, "target.com")
         dnssec = next(f for f in findings if f["area"] == "dnssec")
-        assert dnssec["severity"] == "high"  # was 'critical' in input
+        assert dnssec["severity"] == "critical"  # passed through, not downgraded
 
     def test_cross_finding_emitted_as_posture(self, sample_audit_report) -> None:
         findings = adapter.to_finding_entries(sample_audit_report, "target.com")
@@ -162,6 +164,89 @@ class TestToFindingEntries:
     def test_non_dict_input_returns_empty_list(self) -> None:
         assert adapter.to_finding_entries(["not", "a", "dict"], "x.com") == []
         assert adapter.to_finding_entries("garbage", "x.com") == []
+
+
+class TestCrossFindingsFromFlatIssues:
+    """v10.6.0 regression — build_report() does NOT emit a top-level
+    "cross_findings" key; it folds derive_cross_findings() into the FLAT
+    report["issues"] list tagged area="Cross-check". The adapter must read
+    that list, or the HIGH "spoofable" verdict is silently dropped before it
+    reaches the reporter/journal."""
+
+    def _report_like_build_report(self):
+        # Mirrors email_audit.build_report() output shape: no "cross_findings"
+        # key, cross items live in the flat top-level "issues" list with
+        # area="Cross-check" (as asdict(Issue) produces them).
+        return {
+            "summary": {"target": "acme.invalid", "target_type": "domain"},
+            "checks": {
+                "spf": {"status": "issues", "issues": []},
+                "dmarc": {"status": "issues", "issues": []},
+            },
+            "issues": [
+                {
+                    "severity": "high",
+                    "area": "Cross-check",
+                    "title": "High spoofing and impersonation exposure",
+                    "detail": "DMARC not enforcing and SPF missing or weak.",
+                    "recommendation": "Tighten SPF and move DMARC to reject.",
+                },
+                {
+                    "severity": "low",
+                    "area": "Cross-check",
+                    "title": "No SMTP transport security policy or reporting",
+                    "detail": "Domain accepts mail but no MTA-STS/TLS-RPT.",
+                    "recommendation": "Deploy MTA-STS and TLS-RPT.",
+                },
+            ],
+            "remediation_plan": [],
+            "ai_analysis": None,
+        }
+
+    def test_high_cross_finding_reaches_findings(self) -> None:
+        findings = adapter.to_finding_entries(
+            self._report_like_build_report(), "acme.invalid"
+        )
+        cross = [f for f in findings if f["area"] == "cross"]
+        assert len(cross) == 2
+        high = next(f for f in cross if f["severity"] == "high")
+        assert high["title"] == "High spoofing and impersonation exposure"
+        assert high["vuln_class"] == "email_posture"
+        assert high["endpoint"] == "dns:posture:acme.invalid"
+        assert "DMARC not enforcing" in high["notes"]
+
+    def test_low_cross_finding_reaches_findings(self) -> None:
+        findings = adapter.to_finding_entries(
+            self._report_like_build_report(), "acme.invalid"
+        )
+        cross = [f for f in findings if f["area"] == "cross"]
+        assert any(f["severity"] == "low" for f in cross)
+
+    def test_explicit_cross_findings_key_still_wins(self) -> None:
+        # Forward-compat: if a future build_report adds a top-level
+        # "cross_findings" key, that takes precedence over flat-issue scraping.
+        report = self._report_like_build_report()
+        report["cross_findings"] = [{
+            "severity": "high",
+            "title": "Explicit cross verdict",
+            "detail": "from explicit key",
+        }]
+        findings = adapter.to_finding_entries(report, "acme.invalid")
+        cross = [f for f in findings if f["area"] == "cross"]
+        assert len(cross) == 1
+        assert cross[0]["title"] == "Explicit cross verdict"
+
+    def test_non_cross_flat_issues_not_misclassified(self) -> None:
+        # A flat issue from a real check area must NOT be picked up by the
+        # cross-finding scrape (only area in {cross, cross_check}).
+        report = self._report_like_build_report()
+        report["issues"].append({
+            "severity": "high", "area": "SPF",
+            "title": "SPF ends in +all", "detail": "spoofable",
+        })
+        findings = adapter.to_finding_entries(report, "acme.invalid")
+        cross = [f for f in findings if f["area"] == "cross"]
+        assert len(cross) == 2  # SPF issue NOT scraped as a cross-finding
 
 
 class TestLoadAndConvert:

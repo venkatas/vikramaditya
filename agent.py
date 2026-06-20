@@ -49,6 +49,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import storage  # atomic temp+fsync+os.replace write primitives (crash/^C/TCC-safe)
+
 # ── LangGraph optional import ──────────────────────────────────────────────────
 try:
     from langgraph.graph import StateGraph, END
@@ -519,8 +521,23 @@ class HuntMemory:
                 self.observation_buf  = data.get("observation_buf", [])[-10:]
                 self.completed_steps  = data.get("completed_steps", [])
                 self.step_count       = data.get("step_count", 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                # A corrupt/half-written session file must NOT be silently
+                # reset to defaults — that throws away resume state without a
+                # word. Preserve the bad file for forensics and surface the
+                # problem loudly so the operator knows resume state was lost.
+                try:
+                    backup = f"{self.session_file}.corrupt.{int(time.time())}"
+                    os.replace(self.session_file, backup)
+                    where = backup
+                except OSError:
+                    where = self.session_file
+                print(
+                    f"{RED}[Agent] WARNING: could not parse session file "
+                    f"{self.session_file} ({exc}); starting fresh. "
+                    f"Corrupt file preserved at {where}.{NC}",
+                    file=sys.stderr, flush=True,
+                )
 
     def save(self) -> None:
         Path(self.session_file).parent.mkdir(parents=True, exist_ok=True)
@@ -532,7 +549,11 @@ class HuntMemory:
             "step_count":      self.step_count,
             "saved_at":        datetime.now().isoformat(),
         }
-        Path(self.session_file).write_text(json.dumps(data, indent=2))
+        # Atomic write: serialise in memory, write a temp sibling, fsync, then
+        # os.replace over the destination. _load() therefore always sees either
+        # the previous complete file or the new complete file — never a
+        # truncated one (crash / ^C / full disk / revoked macOS TCC lock).
+        storage.atomic_write_json(self.session_file, data)
 
     def add_observation(self, tool: str, text: str) -> None:
         """Record a tool output to the sliding observation window."""

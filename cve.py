@@ -22,6 +22,12 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FINDINGS_DIR = os.path.join(BASE_DIR, "findings")
 
+# Exposed-config check: 0 = probe ALL live hosts (the uncapped CLAUDE.md contract).
+# Set CVE_CONFIG_MAX_HOSTS=N to cap for runtime reasons; when a cap truncates the
+# host list, a degradation marker is printed so a "clean" result is never mistaken
+# for a complete one. (audit-fix: was a silent hardcoded [:20])
+CVE_CONFIG_MAX_HOSTS = int(os.environ.get("CVE_CONFIG_MAX_HOSTS", "0") or "0")
+
 
 def resolve_domain_from_recon_dir(recon_dir):
     recon_dir = os.path.abspath(recon_dir)
@@ -605,10 +611,26 @@ def check_exposed_configs(domain, recon_dir=None):
 
     hosts = [f"https://{domain}"]
     if recon_dir:
+        # Prefer priority-ranked order (highest-risk first) so that if a cap is
+        # ever applied, the most important hosts survive the truncation. The
+        # live/urls.txt file is `sort -u` (alphabetical), so capping it would
+        # silently drop hosts by name rather than by risk.
+        ranked_file = os.path.join(recon_dir, "priority", "prioritized_hosts.txt")
         live_file = os.path.join(recon_dir, "live", "urls.txt")
-        if os.path.exists(live_file):
-            with open(live_file) as f:
-                hosts = [line.strip() for line in f if line.strip()][:20]
+        src_file = ranked_file if os.path.exists(ranked_file) else live_file
+        if os.path.exists(src_file):
+            with open(src_file) as f:
+                all_hosts = [line.strip() for line in f if line.strip()]
+            if all_hosts:
+                hosts = all_hosts
+                # Honor the uncapped contract unless an explicit cap is set.
+                if CVE_CONFIG_MAX_HOSTS > 0 and len(all_hosts) > CVE_CONFIG_MAX_HOSTS:
+                    hosts = all_hosts[:CVE_CONFIG_MAX_HOSTS]
+                    print(
+                        f"    [!] Coverage degraded: probing {CVE_CONFIG_MAX_HOSTS} "
+                        f"of {len(all_hosts)} live hosts for exposed configs "
+                        f"(capped via CVE_CONFIG_MAX_HOSTS)"
+                    )
 
     for host in hosts:
         for path in config_paths:
