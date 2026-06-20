@@ -165,6 +165,20 @@ class _PosixSpawnProc:
             except Exception:
                 pass
 
+    def _close_streams(self):
+        """Close the captured stdout/stderr READ-pipe fds once the child is reaped, so a
+        long-lived parent (the brain runs many commands per session) never accumulates
+        open read-pipe fds. Idempotent and tolerant: a reader thread that raises on the
+        concurrent close already falls back to "" in communicate(). Mirrors _close_pty()."""
+        for _attr in ("stdout", "stderr"):
+            s = getattr(self, _attr, None)
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                setattr(self, _attr, None)
+
     def poll(self):
         with self._lock:
             if self.returncode is not None:
@@ -174,12 +188,14 @@ class _PosixSpawnProc:
             except ChildProcessError:
                 self.returncode = 0  # already reaped elsewhere; status unknowable
                 self._close_pty()
+                self._close_streams()
                 return self.returncode
             if pid == 0:
                 return None
             self.returncode = -os.WTERMSIG(status) if os.WIFSIGNALED(status) \
                 else os.WEXITSTATUS(status)
             self._close_pty()
+            self._close_streams()
             return self.returncode
 
     def wait(self, timeout=None):
@@ -230,6 +246,7 @@ class _PosixSpawnProc:
         except Exception:
             pass
         self._close_pty()
+        self._close_streams()
 
     def terminate(self):
         # SIGTERM (graceful) — subprocess.Popen-API parity so a caller that started a
@@ -250,6 +267,10 @@ class _PosixSpawnProc:
             pass
         try:
             self._close_pty()
+        except Exception:
+            pass
+        try:
+            self._close_streams()
         except Exception:
             pass
 
@@ -310,6 +331,22 @@ def run_capture(spec, timeout=None, env=None, cwd=None, shell=True, merge_stderr
         # Reap so a timed-out child never lingers as a zombie (bounded; never hangs).
         try:
             proc.wait(timeout=10)
+        except Exception:
+            pass
+        # Close the captured read-pipe fds after the reap so a timed-out command does
+        # not leak stdout/stderr fds (communicate() raised before its poll() ran, and on
+        # the fork-based fallback Popen the streams are otherwise never closed here).
+        try:
+            _cs = getattr(proc, "_close_streams", None)
+            if _cs is not None:
+                _cs()
+            else:  # fork-based subprocess.Popen fallback
+                for _s in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+                    if _s is not None:
+                        try:
+                            _s.close()
+                        except Exception:
+                            pass
         except Exception:
             pass
         return {"stdout": "", "stderr": f"TIMEOUT after {timeout}s",

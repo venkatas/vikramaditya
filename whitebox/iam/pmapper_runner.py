@@ -1,9 +1,12 @@
 from __future__ import annotations
 import os
 import shutil
-import subprocess
+import sys
 from pathlib import Path
-from whitebox.profiles import CloudProfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import procutil  # noqa: E402  fork-safe launch (macOS Network.framework atfork SIGSEGV fix)
+from whitebox.profiles import CloudProfile  # noqa: E402
 
 # PMapper 1.1.5 has dependency issues in modern venvs; install in an isolated
 # venv (default ~/.venvs/pmapper) with a patched case_insensitive_dict.py to
@@ -83,22 +86,33 @@ def build_graph(profile: CloudProfile, out_dir: Path, timeout: int | None = None
         env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONWARNINGS"] = "ignore::DeprecationWarning"
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-    (out_dir / "stdout.log").write_text(proc.stdout or "")
-    (out_dir / "stderr.log").write_text(proc.stderr or "")
+    # Launch via procutil (os.posix_spawn): cloud_hunt does in-process boto3/HTTPS
+    # region discovery before this runner, loading Apple's Network.framework, so a
+    # raw subprocess.run fork()+exec SIGSEGVs (rc=-11) the pmapper child on macOS.
+    # Pass env= (PYTHONNOUSERSITE/region narrowing) through; keep streams separate so
+    # stdout.log / stderr.log and the distutils-noise filter stay byte-identical.
+    res = procutil.run_capture(cmd, timeout=timeout, env=env, shell=False, merge_stderr=False)
+    if res["timed_out"]:
+        (out_dir / "error.log").write_text(
+            f"pmapper timed out after {timeout}s\nbinary: {binary}\n"
+        )
+        raise RuntimeError(f"pmapper timed out after {timeout}s; see {out_dir / 'error.log'}")
+    stdout, stderr, rc = res["stdout"], res["stderr"], res["returncode"]
+    (out_dir / "stdout.log").write_text(stdout or "")
+    (out_dir / "stderr.log").write_text(stderr or "")
 
-    if proc.returncode != 0:
+    if rc != 0:
         clean_stderr = "\n".join(
-            l for l in (proc.stderr or "").splitlines()
+            l for l in (stderr or "").splitlines()
             if "_distutils_hack" not in l
             and "distutils-precedence" not in l
             and l.strip()
         )
         (out_dir / "error.log").write_text(
-            f"pmapper exited {proc.returncode}\nbinary: {binary}\n\n"
-            f"stdout:\n{proc.stdout}\n\nstderr (cleaned):\n{clean_stderr}\n"
+            f"pmapper exited {rc}\nbinary: {binary}\n\n"
+            f"stdout:\n{stdout}\n\nstderr (cleaned):\n{clean_stderr}\n"
         )
-        raise RuntimeError(f"pmapper exited {proc.returncode}; see {out_dir / 'error.log'}")
+        raise RuntimeError(f"pmapper exited {rc}; see {out_dir / 'error.log'}")
 
     storage_root = Path(env.get("PMAPPER_STORAGE") or (Path.home() / ".principalmapper"))
     src_dir = storage_root / profile.account_id

@@ -168,8 +168,8 @@ TOOLS: list[dict] = [
                     },
                     "max_urls": {
                         "type": "integer",
-                        "description": "Max URLs to collect (default 100, use 200+ for thorough recon).",
-                        "default": 100,
+                        "description": "Max URLs to collect (default 0 = unlimited; set a positive N to cap).",
+                        "default": 0,
                     },
                 },
                 "required": [],
@@ -586,7 +586,7 @@ class ToolDispatcher:
     """Execute tool calls and return plain-text observations."""
 
     def __init__(self, domain: str, memory: HuntMemory,
-                 scope_lock: bool = False, max_urls: int = 100,
+                 scope_lock: bool = False, max_urls: int = 0,
                  default_cookies: str = ""):
         self.domain          = domain
         self.memory          = memory
@@ -624,6 +624,21 @@ class ToolDispatcher:
                         return (f"[BLOCKED] tool '{name}' arg targets {_hit} — the operator's "
                                 f"own machine/listener (out of scope). Refusing; point at the "
                                 f"authorized target host instead.")
+        else:
+            # FAIL CLOSED: scopeguard failed to import, so we cannot vet LLM-authored
+            # host/URL/command args against the operator's own machine/listener. Rather
+            # than silently fail OPEN (which would let the LLM aim a probe at loopback /
+            # our own bind:port), refuse any tool call that carries a free-form
+            # network-target arg. Pure-control tools (finish, update_working_memory,
+            # read_playbook, recon/scan toggles) have no such arg and still run.
+            _FREEFORM_TARGET_ARGS = ("url", "command", "cmd", "host", "target",
+                                     "request_file", "body", "headers")
+            for _k in (args or {}):
+                if _k in _FREEFORM_TARGET_ARGS:
+                    return (f"[BLOCKED] tool '{name}' carries a free-form '{_k}' arg but "
+                            f"scopeguard is unavailable — cannot verify it does not target the "
+                            f"operator's own machine/listener. Failing CLOSED (refusing) rather "
+                            f"than running an unvetted LLM-authored target.")
 
         try:
             if name == "run_recon":
@@ -1699,7 +1714,7 @@ def run_agent_hunt(
     domain: str,
     *,
     scope_lock: bool = False,
-    max_urls: int = 100,
+    max_urls: int = 0,
     max_steps: int = 20,
     time_budget_hours: float = 2.0,
     cookies: str = "",
@@ -1812,7 +1827,7 @@ Examples:
     parser.add_argument("--max-steps",   type=int,   default=20,  help="Max ReAct iterations (default 20)")
     parser.add_argument("--cookie",      type=str,   default="",  help="Session cookie for POST discovery")
     parser.add_argument("--scope-lock",  action="store_true",     help="Stick to exact target only")
-    parser.add_argument("--max-urls",    type=int,   default=100, help="Max URLs in recon (default 100)")
+    parser.add_argument("--max-urls",    type=int,   default=0, help="Max URLs in recon (default 0 = unlimited)")
     parser.add_argument("--model",       type=str,   default=None, help="Ollama model override")
     parser.add_argument("--langgraph",   action="store_true",     help="Use real LangGraph backend")
     parser.add_argument("--resume",      type=str,   default=None, help="Resume session ID")

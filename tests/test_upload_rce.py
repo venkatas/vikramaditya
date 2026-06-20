@@ -46,6 +46,28 @@ def test_generate_upload_variants_covers_bypass_techniques():
     assert poly["content"][:3] in ("GIF", "\x89PN") or poly["content"].startswith("GIF8"), "polyglot needs image magic bytes"
 
 
+# ── null-byte variant must send a REAL NUL, not the literal text '%00' ─────────
+
+def test_null_byte_variant_uses_real_nul():
+    variants = upload_rce.generate_upload_variants("shell")
+    nb = next(v for v in variants if v["technique"] == "null_byte")
+    # The path-truncation bypass relies on a raw NUL byte (0x00) — the literal
+    # string '%00' tests nothing (the server never percent-decodes a multipart
+    # filename). The real-NUL variant must carry an actual 0x00.
+    assert "\x00" in nb["filename"], "null_byte filename must contain a raw NUL (0x00)"
+    assert "%00" not in nb["filename"], "null_byte filename must not be the literal '%00' text"
+    assert nb["filename"] == "shell.php\x00.jpg"
+
+
+def test_null_byte_encoded_variant_kept_separately():
+    variants = upload_rce.generate_upload_variants("shell")
+    techs = {v["technique"] for v in variants}
+    assert "null_byte_encoded" in techs, "the literal %00 variant should be retained separately"
+    enc = next(v for v in variants if v["technique"] == "null_byte_encoded")
+    assert enc["filename"] == "shell.php%00.jpg"
+    assert "\x00" not in enc["filename"]
+
+
 # ── grounded confirmation: executed-RCE vs stored-only vs nothing ─────────────
 
 def test_confirm_rce_detects_executed_command():

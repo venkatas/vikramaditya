@@ -231,6 +231,12 @@ class AuthSession:
         self._creds = None
         self._login_url = None
         self.token = None
+        # Cookie name carrying the auth token for explicit-token requests. Defaults to
+        # 'cf_at' but is overwritten in auto_login() with whichever cookie the server
+        # actually set the JWT in (cf_at/access_token/jwt/token/session), so cookie-only
+        # (non-Bearer) apps are sent the token under the RIGHT cookie name — otherwise an
+        # explicit-token request would carry an unrecognised 'cf_at' and falsely 401.
+        self._auth_cookie_name = "cf_at"
         # Expiry deadline (unix seconds) decoded from a JWT `exp` claim, or None
         # for opaque bearers / cookie-auth. Lets callers proactively re-auth.
         self.token_expires_at: int | None = None
@@ -446,6 +452,9 @@ class AuthSession:
                 cookie_val = resp.cookies.get(cookie_name) or self._session.cookies.get(cookie_name)
                 if cookie_val and cookie_val.count(".") == 2:
                     self.token = cookie_val
+                    # Remember which cookie the server uses so explicit-token requests
+                    # send the token under the SAME name (not a hardcoded 'cf_at').
+                    self._auth_cookie_name = cookie_name
                     return cookie_val
 
             # Cookie-auth fallback when the server replied 2xx without a token.
@@ -487,9 +496,11 @@ class AuthSession:
                 # Cookie-based auth: use session cookies as-is
                 hdrs.pop("Authorization", None)
             else:
-                # Token auth: send as both Bearer header and cf_at cookie
+                # Token auth: send as both Bearer header and the auth cookie. The
+                # cookie name is whatever auto_login() observed the server set the JWT
+                # in (default 'cf_at'), so cookie-only apps aren't falsely 401'd.
                 hdrs["Authorization"] = f"Bearer {token}"
-                cookies["cf_at"] = token
+                cookies[self._auth_cookie_name] = token
         if headers:
             hdrs.update(headers)
         try:
@@ -506,7 +517,7 @@ class AuthSession:
                 import requests as _bare_req
                 resp = _bare_req.request(
                     method, url, json=json_body, data=data,
-                    headers=hdrs, cookies={"cf_at": token},
+                    headers=hdrs, cookies={self._auth_cookie_name: token},
                     timeout=timeout, allow_redirects=False,
                     verify=VERIFY_TLS,
                 )

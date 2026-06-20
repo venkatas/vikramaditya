@@ -30,12 +30,18 @@ def test_to_findings_skips_non_fail_status():
     assert to_findings(raw, account_id="111") == []
 
 
+def _rc(returncode=3, stdout="", stderr="", timed_out=False):
+    """run_capture-shaped dict (fork-safe posix_spawn launch replaced subprocess.run)."""
+    return {"stdout": stdout, "stderr": stderr,
+            "returncode": returncode, "timed_out": timed_out}
+
+
 def test_run_invokes_subprocess(tmp_path):
     profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
     fake_binary = "/fake/venvs/prowler/bin/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=3, stderr="", stdout="")
+         patch("whitebox.audit.prowler_runner.procutil.run_capture") as mock_run:
+        mock_run.return_value = _rc()
         ocsf_path = tmp_path / "out.ocsf.json"
         ocsf_path.write_text("[]")
         with patch("whitebox.audit.prowler_runner._find_output_file", return_value=ocsf_path):
@@ -53,8 +59,8 @@ def test_run_treats_exit_code_3_as_success(tmp_path):
     profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
     fake_binary = "/fake/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=3, stdout="", stderr="")
+         patch("whitebox.audit.prowler_runner.procutil.run_capture") as mock_run:
+        mock_run.return_value = _rc(returncode=3)
         ocsf_path = tmp_path / "out.ocsf.json"
         ocsf_path.write_text("[]")
         with patch("whitebox.audit.prowler_runner._find_output_file", return_value=ocsf_path):
@@ -67,8 +73,8 @@ def test_run_treats_exit_code_2_as_failure(tmp_path):
     profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
     fake_binary = "/fake/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=2, stdout="", stderr="boom")
+         patch("whitebox.audit.prowler_runner.procutil.run_capture") as mock_run:
+        mock_run.return_value = _rc(returncode=2, stderr="boom")
         with pytest.raises(RuntimeError, match="prowler exited 2"):
             run(profile, tmp_path)
 
@@ -120,14 +126,13 @@ def test_run_honours_PROWLER_TIMEOUT_env_var(tmp_path, monkeypatch):
     monkeypatch.setenv("PROWLER_TIMEOUT", "120")
     captured = {}
 
-    def fake_subprocess_run(cmd, **kw):
+    def fake_run_capture(cmd, **kw):
         captured["timeout"] = kw.get("timeout")
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return _rc(returncode=0)
 
     fake_binary = "/fake/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run", side_effect=fake_subprocess_run), \
+         patch("whitebox.audit.prowler_runner.procutil.run_capture", side_effect=fake_run_capture), \
          patch("whitebox.audit.prowler_runner._find_output_file", return_value=tmp_path / "x.json"):
         (tmp_path / "x.json").write_text("[]")
         run(profile, tmp_path)
@@ -139,14 +144,13 @@ def test_run_default_timeout_is_5400_seconds(tmp_path, monkeypatch):
     monkeypatch.delenv("PROWLER_TIMEOUT", raising=False)
     captured = {}
 
-    def fake_subprocess_run(cmd, **kw):
+    def fake_run_capture(cmd, **kw):
         captured["timeout"] = kw.get("timeout")
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return _rc(returncode=0)
 
     fake_binary = "/fake/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run", side_effect=fake_subprocess_run), \
+         patch("whitebox.audit.prowler_runner.procutil.run_capture", side_effect=fake_run_capture), \
          patch("whitebox.audit.prowler_runner._find_output_file", return_value=tmp_path / "x.json"):
         (tmp_path / "x.json").write_text("[]")
         run(profile, tmp_path)

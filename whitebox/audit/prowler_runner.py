@@ -2,10 +2,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
+import sys
 import time
 from pathlib import Path
-from whitebox.profiles import CloudProfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import procutil  # noqa: E402  fork-safe launch (macOS Network.framework atfork SIGSEGV fix)
+from whitebox.profiles import CloudProfile  # noqa: E402
 
 # Prowler 4.5.0 hard-pins pydantic==1.10.18, which conflicts with ollama (used by
 # brain.py) and most modern Python packages. Install Prowler in an isolated venv
@@ -68,15 +71,25 @@ def run(profile: CloudProfile, out_dir: Path,
     ]
     if check_groups:
         cmd += ["--checks-folder"] + check_groups
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # Launch via procutil (os.posix_spawn): cloud_hunt does in-process boto3/HTTPS
+    # region discovery before this runner, loading Apple's Network.framework, so a
+    # raw subprocess.run fork()+exec SIGSEGVs (rc=-11) the prowler child on macOS.
+    # Keep stderr separate to preserve the existing error.log layout.
+    res = procutil.run_capture(cmd, timeout=timeout, shell=False, merge_stderr=False)
+    if res["timed_out"]:
+        (out_dir / "error.log").write_text(
+            f"prowler timed out after {timeout}s\nbinary: {binary}\n"
+        )
+        raise RuntimeError(f"prowler timed out after {timeout}s; see {out_dir / 'error.log'}")
+    rc = res["returncode"]
     # Prowler exit codes: 0 = no findings, 3 = completed with findings
     # (normal case for real accounts). Anything else is a true failure.
-    if proc.returncode not in (0, 3):
+    if rc not in (0, 3):
         (out_dir / "error.log").write_text(
-            f"prowler exited {proc.returncode}\nbinary: {binary}\n\n"
-            f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}\n"
+            f"prowler exited {rc}\nbinary: {binary}\n\n"
+            f"stdout:\n{res['stdout']}\n\nstderr:\n{res['stderr']}\n"
         )
-        raise RuntimeError(f"prowler exited {proc.returncode}; see {out_dir / 'error.log'}")
+        raise RuntimeError(f"prowler exited {rc}; see {out_dir / 'error.log'}")
     return _find_output_file(out_dir, min_mtime=start_ts)
 
 
