@@ -72,10 +72,10 @@ def test_coverage_cap_is_explicit_with_marker(tmp_path, monkeypatch):
 
     tested = []
     monkeypatch.setattr(oauth_tester, "check_cors_on_auth_endpoints",
-                        lambda u: tested.append(u) or [])
-    monkeypatch.setattr(oauth_tester, "check_oauth_state_entropy", lambda u: [])
-    monkeypatch.setattr(oauth_tester, "check_redirect_uri_bypass", lambda u: [])
-    monkeypatch.setattr(oauth_tester, "check_password_reset_host_injection", lambda u: [])
+                        lambda u, errors=None: tested.append(u) or [])
+    monkeypatch.setattr(oauth_tester, "check_oauth_state_entropy", lambda u, errors=None: [])
+    monkeypatch.setattr(oauth_tester, "check_redirect_uri_bypass", lambda u, errors=None: [])
+    monkeypatch.setattr(oauth_tester, "check_password_reset_host_injection", lambda u, errors=None: [])
 
     findings = oauth_tester.run_oauth_audit(
         "acme.example.invalid", recon_dir=str(tmp_path), max_hosts=3)
@@ -92,10 +92,10 @@ def test_no_cap_tests_all_hosts(tmp_path, monkeypatch):
 
     tested = []
     monkeypatch.setattr(oauth_tester, "check_cors_on_auth_endpoints",
-                        lambda u: tested.append(u) or [])
-    monkeypatch.setattr(oauth_tester, "check_oauth_state_entropy", lambda u: [])
-    monkeypatch.setattr(oauth_tester, "check_redirect_uri_bypass", lambda u: [])
-    monkeypatch.setattr(oauth_tester, "check_password_reset_host_injection", lambda u: [])
+                        lambda u, errors=None: tested.append(u) or [])
+    monkeypatch.setattr(oauth_tester, "check_oauth_state_entropy", lambda u, errors=None: [])
+    monkeypatch.setattr(oauth_tester, "check_redirect_uri_bypass", lambda u, errors=None: [])
+    monkeypatch.setattr(oauth_tester, "check_password_reset_host_injection", lambda u, errors=None: [])
 
     findings = oauth_tester.run_oauth_audit("acme.example.invalid", recon_dir=str(tmp_path))
     assert len(tested) == 8  # default max_hosts=0 -> unlimited
@@ -140,6 +140,59 @@ def test_non_oauth_404_not_flagged_as_missing_state(monkeypatch):
     monkeypatch.setattr(oauth_tester, "run_cmd", not_found)
     findings = oauth_tester.check_oauth_state_entropy("https://acme.example.invalid")
     assert findings == []
+
+
+def test_probe_errored_classifies_transport_failure():
+    # ok=True is never a degradation, regardless of body.
+    assert oauth_tester._probe_errored(True, "", "") is False
+    # Non-zero exit WITH response bytes -> not lost (check can still inspect).
+    assert oauth_tester._probe_errored(False, "HTTP/1.1 500\r\n", "err") is False
+    # Non-zero exit and NO response bytes (TLS/timeout) -> lost response.
+    assert oauth_tester._probe_errored(False, "", "SSL certificate problem") is True
+    assert oauth_tester._probe_errored(False, "   ", "timeout") is True
+
+
+def test_transport_error_surfaces_degradation_note(monkeypatch):
+    # Every probe fails at the transport layer (e.g. TLS handshake) with NO body.
+    def tls_fail(cmd, timeout=15):
+        return False, "", "curl: (35) SSL connect error"
+
+    monkeypatch.setattr(oauth_tester, "run_cmd", tls_fail)
+    findings = oauth_tester.run_oauth_audit("acme.example.invalid")
+    notes = [f for f in findings if f["type"] == "probe_degraded"]
+    assert notes, "lost-response transport errors must produce a visible note"
+    # One aggregated note per host (not a storm of per-path findings).
+    # base_urls = https://host + http://host -> at most 2 notes.
+    assert 1 <= len(notes) <= 2
+    assert "transport layer" in notes[0]["detail"]
+
+
+def test_clean_skip_no_response_does_not_storm(monkeypatch):
+    # curl exits non-zero (connection refused) with no body across the matrix:
+    # this is the normal "endpoint absent" case and must NOT emit per-path noise,
+    # but the aggregated per-host note still makes the skip visible.
+    def refused(cmd, timeout=15):
+        return False, "", "curl: (7) Failed to connect"
+
+    monkeypatch.setattr(oauth_tester, "run_cmd", refused)
+    findings = oauth_tester.run_oauth_audit("acme.example.invalid")
+    # No per-path vuln findings invented from an unreachable host.
+    assert not any(f["severity"] in ("high", "medium", "critical") for f in findings)
+
+
+def test_headers_inspected_even_on_nonzero_exit(monkeypatch):
+    # curl returns non-zero BUT emitted headers (e.g. partial transfer); a real
+    # CORS misconfig in those headers must still be detected, not skipped.
+    def nonzero_with_cors(cmd, timeout=15):
+        return (False,
+                "HTTP/1.1 200 OK\r\n"
+                "Access-Control-Allow-Origin: https://evil.com\r\n",
+                "curl: (18) transfer closed")
+
+    monkeypatch.setattr(oauth_tester, "run_cmd", nonzero_with_cors)
+    findings = oauth_tester.check_cors_on_auth_endpoints("https://acme.example.invalid")
+    assert any(f["type"] == "cors_on_auth" for f in findings), \
+        "CORS finding must be detected from headers despite non-zero curl exit"
 
 
 if __name__ == "__main__":

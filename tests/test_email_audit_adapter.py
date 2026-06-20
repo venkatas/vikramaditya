@@ -166,6 +166,72 @@ class TestToFindingEntries:
         assert adapter.to_finding_entries("garbage", "x.com") == []
 
 
+class TestBulkModeFanout:
+    """v10.6.0 regression — build_bulk_report() returns a {"mode":
+    "bulk-analysis", "reports": [<per-domain report>, ...]} shape with NO
+    top-level "checks" key. Before the fix, to_finding_entries() read only
+    audit_report["checks"] (empty) and every per-domain SPF/DMARC/DKIM issue
+    under report["reports"][*] was invisible — a multi-target audit produced
+    ZERO findings through the adapter."""
+
+    def _bulk_report(self):
+        # Two synthetic per-domain reports, each a normal build_report() shape.
+        def _domain_report(domain, title, sev):
+            return {
+                "summary": {"target": domain, "target_type": "domain", "domain": domain},
+                "checks": {
+                    "spf": {
+                        "status": "issues",
+                        "issues": [{
+                            "severity": sev,
+                            "title": title,
+                            "detail": "synthetic detail",
+                            "recommendation": "synthetic fix",
+                        }],
+                    },
+                },
+            }
+
+        return {
+            "mode": "bulk-analysis",
+            "summary": {"targets_scanned": 2, "overall_risk": "high"},
+            "domains": [],
+            "top_findings": [],
+            # portfolio_issues carry per-issue area=spf, NOT a cross area
+            "issues": [
+                {"severity": "high", "title": "Missing SPF record", "area": "SPF", "domain": "acme.invalid"},
+                {"severity": "medium", "title": "SPF too permissive", "area": "SPF", "domain": "beta.invalid"},
+            ],
+            "reports": [
+                _domain_report("acme.invalid", "Missing SPF record", "high"),
+                _domain_report("beta.invalid", "SPF too permissive", "medium"),
+            ],
+            "ai_analysis": None,
+        }
+
+    def test_bulk_report_yields_per_domain_findings(self) -> None:
+        findings = adapter.to_finding_entries(self._bulk_report(), "portfolio")
+        # one SPF issue per domain report = 2 findings (was 0 before the fix)
+        assert len(findings) == 2
+
+    def test_bulk_findings_carry_own_target(self) -> None:
+        findings = adapter.to_finding_entries(self._bulk_report(), "portfolio")
+        targets = {f["target"] for f in findings}
+        assert targets == {"acme.invalid", "beta.invalid"}
+
+    def test_bulk_findings_preserve_severity_and_title(self) -> None:
+        findings = adapter.to_finding_entries(self._bulk_report(), "portfolio")
+        by_title = {f["title"]: f for f in findings}
+        assert by_title["Missing SPF record"]["severity"] == "high"
+        assert by_title["SPF too permissive"]["severity"] == "medium"
+
+    def test_reports_key_without_mode_still_fans_out(self) -> None:
+        report = self._bulk_report()
+        report.pop("mode")
+        findings = adapter.to_finding_entries(report, "portfolio")
+        assert len(findings) == 2
+
+
 class TestCrossFindingsFromFlatIssues:
     """v10.6.0 regression — build_report() does NOT emit a top-level
     "cross_findings" key; it folds derive_cross_findings() into the FLAT

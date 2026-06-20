@@ -61,3 +61,35 @@ def test_scopeguard_present_still_blocks_loopback(dispatcher, monkeypatch):
     obs = dispatcher.dispatch("http_request", {"url": "http://127.0.0.1:8080/"})
     assert obs.startswith("[BLOCKED]")
     assert "operator's" in obs
+
+
+def test_scopeguard_scans_nested_dict_arg(dispatcher, monkeypatch):
+    # A loopback target buried inside a dict arg (e.g. http_request headers /
+    # json_body) must be caught by the recursive scopeguard scan, not skipped
+    # because it is not a top-level string.
+    class _SG:
+        @staticmethod
+        def scan_command(v):
+            return "127.0.0.1:9999" if "127.0.0.1" in v else ""
+
+    monkeypatch.setattr(agent, "_scopeguard", _SG)
+    obs = dispatcher.dispatch("http_request", {
+        "url": "http://app.example.invalid/x",
+        "headers": {"X-Forwarded-Host": "127.0.0.1:9999"},
+    })
+    assert obs.startswith("[BLOCKED]"), f"nested dict target must be blocked: {obs!r}"
+    assert "operator's" in obs
+
+
+def test_scopeguard_scans_nested_list_arg(dispatcher, monkeypatch):
+    class _SG:
+        @staticmethod
+        def scan_command(v):
+            return "127.0.0.1:9999" if "127.0.0.1" in v else ""
+
+    monkeypatch.setattr(agent, "_scopeguard", _SG)
+    obs = dispatcher.dispatch("http_request", {
+        "url": "http://app.example.invalid/x",
+        "json_body": {"targets": ["http://app.example.invalid", "http://127.0.0.1:9999"]},
+    })
+    assert obs.startswith("[BLOCKED]"), f"nested list target must be blocked: {obs!r}"

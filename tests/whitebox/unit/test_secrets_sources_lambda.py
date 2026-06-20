@@ -73,3 +73,46 @@ def test_lambda_finding_id_includes_account_and_region(profile):
     # Finding ID must include account + region to avoid cross-region collision
     assert "111" in findings[0].id
     assert "us-east-1" in findings[0].id
+
+
+def test_lambda_pagination_failure_emits_coverage_gap(profile):
+    """A throttling/transient failure mid-enumeration must surface as an INFO
+    coverage-gap Finding, not be silently swallowed (false-negative)."""
+    from whitebox.models import Severity
+
+    class _BoomPaginator:
+        def paginate(self):
+            raise RuntimeError("ThrottlingException: Rate exceeded")
+
+    class _FakeClient:
+        def get_paginator(self, name):
+            return _BoomPaginator()
+
+    class _FakeSession:
+        def client(self, service, region_name=None):
+            return _FakeClient()
+
+    profile._session = _FakeSession()
+    findings = scan_lambda(profile)
+    assert len(findings) == 1, "expected exactly one coverage-gap finding"
+    f = findings[0]
+    assert f.severity == Severity.INFO
+    assert f.rule_id == "secrets.lambda_env.scan_failed"
+    assert "us-east-1" in f.id and "111" in f.id
+    assert "ThrottlingException" in f.description or "Throttling" in f.description
+
+
+def test_lambda_client_creation_failure_emits_coverage_gap(profile):
+    """If the lambda client cannot even be created for a region, that region's
+    coverage gap must be recorded rather than dropped."""
+    from whitebox.models import Severity
+
+    class _FakeSession:
+        def client(self, service, region_name=None):
+            raise RuntimeError("could not connect")
+
+    profile._session = _FakeSession()
+    findings = scan_lambda(profile)
+    assert len(findings) == 1
+    assert findings[0].severity == Severity.INFO
+    assert findings[0].rule_id == "secrets.lambda_env.scan_failed"

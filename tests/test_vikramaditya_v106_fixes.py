@@ -136,3 +136,99 @@ def test_mark_fallback_degraded_dedupes_and_appends(tmp_path):
     data = json.load(open(os.path.join(str(tmp_path), "coverage_degraded.json")))
     tools = sorted(d["tool"] for d in data)
     assert tools == ["nuclei", "sqlmap"]  # sqlmap deduped, nuclei appended
+
+
+# ── 5: whitebox integrated launch plumbs --secrets-mode ────────────────────────
+#
+# Regression for the audit finding: the integrated vikramaditya whitebox launch
+# only ever passed --profile/--session-dir/--allowlist, so cloud_hunt always ran
+# the default "heuristic" secrets name-filter (silently skipping un-hinted
+# buckets/log-groups). Exhaustive selection was unreachable without dropping to
+# the CLI. The launch must now thread --secrets-mode through, gated by an
+# explicit opt-in (config in autonomous mode, prompt interactively).
+
+def _run_whitebox_capture(monkeypatch, tmp_path, *, config_yaml, autonomous,
+                          interactive_answer=None):
+    """Drive _maybe_run_whitebox_for_target with a synthetic config and capture
+    the argv handed to cloud_hunt.main. Returns that argv list."""
+    pytest = __import__("pytest")
+    try:
+        import yaml  # noqa: F401
+    except ImportError:  # pragma: no cover
+        pytest.skip("pyyaml not installed")
+
+    (tmp_path / "whitebox_config.yaml").write_text(config_yaml)
+    monkeypatch.chdir(tmp_path)
+
+    captured = {}
+    import whitebox.cloud_hunt as ch
+    monkeypatch.setattr(ch, "main", lambda argv: captured.setdefault("argv", argv))
+
+    # Interactive prompts: first the "run audit?" gate, then the secrets-mode gate.
+    answers = iter(interactive_answer or [])
+
+    def _fake_input(_prompt=""):
+        try:
+            return next(answers)
+        except StopIteration:
+            return ""
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    vikramaditya._maybe_run_whitebox_for_target(
+        "app.example.invalid", str(tmp_path / "recon"), autonomous=autonomous)
+    return captured.get("argv")
+
+
+_SYNTH_CFG_HEURISTIC = (
+    "profiles:\n"
+    "  acme-prof:\n"
+    "    domains:\n"
+    "      - example.invalid\n"
+    "whitebox:\n"
+    "  autonomous_default: true\n"
+)
+
+_SYNTH_CFG_EXHAUSTIVE = (
+    "profiles:\n"
+    "  acme-prof:\n"
+    "    domains:\n"
+    "      - example.invalid\n"
+    "whitebox:\n"
+    "  autonomous_default: true\n"
+    "  secrets_mode: exhaustive\n"
+)
+
+
+def test_whitebox_launch_passes_secrets_mode_default_heuristic(monkeypatch, tmp_path):
+    argv = _run_whitebox_capture(
+        monkeypatch, tmp_path, config_yaml=_SYNTH_CFG_HEURISTIC, autonomous=True)
+    assert argv is not None, "cloud_hunt.main must be invoked for a matched profile"
+    assert "--secrets-mode" in argv
+    assert argv[argv.index("--secrets-mode") + 1] == "heuristic"
+
+
+def test_whitebox_launch_honours_config_exhaustive_secrets(monkeypatch, tmp_path):
+    argv = _run_whitebox_capture(
+        monkeypatch, tmp_path, config_yaml=_SYNTH_CFG_EXHAUSTIVE, autonomous=True)
+    assert argv is not None
+    assert "--secrets-mode" in argv
+    assert argv[argv.index("--secrets-mode") + 1] == "exhaustive"
+
+
+def test_whitebox_launch_interactive_exhaustive_opt_in(monkeypatch, tmp_path):
+    # answers: "y" -> run the audit; "y" -> exhaustive secret scan
+    argv = _run_whitebox_capture(
+        monkeypatch, tmp_path, config_yaml=_SYNTH_CFG_HEURISTIC,
+        autonomous=False, interactive_answer=["y", "y"])
+    assert argv is not None
+    assert argv[argv.index("--secrets-mode") + 1] == "exhaustive"
+
+
+def test_whitebox_launch_interactive_default_heuristic(monkeypatch, tmp_path):
+    # answers: "y" -> run the audit; "" (default) -> heuristic
+    argv = _run_whitebox_capture(
+        monkeypatch, tmp_path, config_yaml=_SYNTH_CFG_HEURISTIC,
+        autonomous=False, interactive_answer=["y", ""])
+    assert argv is not None
+    assert argv[argv.index("--secrets-mode") + 1] == "heuristic"

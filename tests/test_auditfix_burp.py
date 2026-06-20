@@ -141,3 +141,75 @@ def test_scope_host_preserves_port_and_seed_gets_path(monkeypatch):
     assert body["urls"] == ["https://essl.example.com:8443/"]      # seed normalized w/ path
     rules = [r["rule"] for r in body["scope"]["include"]]
     assert any(r == "https://essl.example.com:8443/" for r in rules)  # port preserved in scope
+
+
+# ── scope_lock must actually constrain scope (was a silent no-op) ─────────────
+def test_scope_lock_true_is_exact_host_only(monkeypatch):
+    captured = {}
+
+    def _post(url, json=None, timeout=None):
+        captured["b"] = json
+        return _FakeResp(201, {"Location": "/v0.1/scan/11"})
+    monkeypatch.setattr(burp_scanner.requests, "post", _post)
+    burp_scanner.BurpClient(api_key="k").start_scan(
+        ["https://acme.invalid/"], scope_host="acme.invalid", scope_lock=True)
+    rules = [r["rule"] for r in captured["b"]["scope"]["include"]]
+    # Exact host only — NO wildcard subdomain rules when locked.
+    assert rules == ["https://acme.invalid/", "http://acme.invalid/"]
+    assert not any("*." in r for r in rules)
+
+
+def test_scope_lock_false_widens_to_subdomains(monkeypatch):
+    captured = {}
+
+    def _post(url, json=None, timeout=None):
+        captured["b"] = json
+        return _FakeResp(201, {"Location": "/v0.1/scan/12"})
+    monkeypatch.setattr(burp_scanner.requests, "post", _post)
+    burp_scanner.BurpClient(api_key="k").start_scan(
+        ["https://acme.invalid/"], scope_host="acme.invalid", scope_lock=False)
+    rules = [r["rule"] for r in captured["b"]["scope"]["include"]]
+    # Full engagement: subdomain wildcard prefixes added so scope_lock has a real
+    # observable effect (the two modes now differ).
+    assert "https://*.acme.invalid/" in rules
+    assert "http://*.acme.invalid/" in rules
+    # Exact host still present too.
+    assert "https://acme.invalid/" in rules
+
+
+def test_scope_lock_false_subdomain_rule_keeps_port(monkeypatch):
+    captured = {}
+
+    def _post(url, json=None, timeout=None):
+        captured["b"] = json
+        return _FakeResp(201, {"Location": "/v0.1/scan/13"})
+    monkeypatch.setattr(burp_scanner.requests, "post", _post)
+    burp_scanner.BurpClient(api_key="k").start_scan(
+        ["https://acme.invalid:8443/"], scope_host="acme.invalid:8443", scope_lock=False)
+    rules = [r["rule"] for r in captured["b"]["scope"]["include"]]
+    assert "https://*.acme.invalid:8443/" in rules
+
+
+def test_scope_lock_without_host_fails_closed():
+    # scope_lock requested but no host derivable -> must REFUSE, not POST a
+    # scope-less scan that runs against Burp's default scope.
+    import pytest
+    with pytest.raises(RuntimeError):
+        burp_scanner.BurpClient(api_key="k").start_scan(
+            ["https://acme.invalid/"], scope_host="", scope_lock=True)
+
+
+def test_run_burp_scan_empty_host_aborts(monkeypatch, tmp_path, capsys):
+    # A path-only / malformed target yielding an empty netloc must abort with an
+    # error rather than silently POST a scope-less scan.
+    monkeypatch.setattr(burp_scanner.BurpClient, "reachable", lambda self: True)
+    posted = {"called": False}
+
+    def _post(url, json=None, timeout=None):
+        posted["called"] = True
+        return _FakeResp(201, {"Location": "/v0.1/scan/9"})
+    monkeypatch.setattr(burp_scanner.requests, "post", _post)
+    out = burp_scanner.run_burp_scan("https:///just-a-path", str(tmp_path / "burp"),
+                                     api_key="k", scope_lock=True)
+    assert out == []
+    assert posted["called"] is False                 # never reached start_scan

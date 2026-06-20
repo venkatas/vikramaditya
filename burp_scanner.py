@@ -162,11 +162,36 @@ class BurpClient:
         # seed URL is normalized to carry a path (see run_burp_scan) so it still
         # satisfies Burp's in-scope check against this bounded prefix. scope_host
         # includes the port when the target has one.
+        #
+        # scope_lock semantics (matches CLAUDE.md "restrict scan to the exact host"):
+        #   • scope_lock=True  → exact host:port only. The host-exact include prefix
+        #     above already does this; we additionally add an EXCLUDE for the bare
+        #     registrable parent so a leftover/broad include in the desktop Burp
+        #     project cannot widen the scan onto sibling subdomains.
+        #   • scope_lock=False → also allow subdomains of the host (add a "*.host/"
+        #     prefix pair) so a full (non-locked) engagement can follow subdomains.
         if scope_host:
-            body["scope"] = {"include": [
+            include = [
                 {"rule": f"https://{scope_host}/"},
                 {"rule": f"http://{scope_host}/"},
-            ]}
+            ]
+            # Host without port, for building subdomain rules.
+            bare_host = scope_host.split(":")[0]
+            port_suffix = scope_host[len(bare_host):]  # ":8443" or ""
+            if not scope_lock:
+                # Full engagement: permit subdomains of the target host too.
+                include += [
+                    {"rule": f"https://*.{bare_host}{port_suffix}/"},
+                    {"rule": f"http://*.{bare_host}{port_suffix}/"},
+                ]
+            body["scope"] = {"include": include}
+        elif scope_lock:
+            # Fail CLOSED: an operator asked for exact-host lock but we could not
+            # derive a host to lock to. Refuse rather than POST a scope-less scan
+            # that Burp would run against its own (possibly broad) default scope.
+            raise RuntimeError(
+                "scope_lock requested but no scope host could be derived from the "
+                "seed URL — refusing to start a scan with Burp's default scope")
         # Named config only when explicitly requested (env or arg) — never a
         # hardcoded default that may not exist on this install.
         cfg = config_name or os.environ.get("BURP_SCAN_CONFIG")
@@ -214,8 +239,16 @@ class BurpClient:
                                 f"(returning {len(issues)} issues collected so far)")
                 return list(issues.values())
             if time.monotonic() >= deadline:
+                # The v0.1 REST API has NO cancel endpoint, so we cannot stop the
+                # task — Burp keeps scanning server-side after we return. Warn the
+                # operator explicitly so they can stop it manually and so they know
+                # back-to-back targets may stack concurrent scans in one Burp.
                 log("warn", f"Burp scan {task_id} hit the {timeout}s budget at "
-                            f"status={st} — returning {len(issues)} partial issues")
+                            f"status={st} — returning {len(issues)} partial issues. "
+                            f"NOTE: the v0.1 REST API cannot cancel a scan; task "
+                            f"{task_id} is STILL RUNNING inside Burp. Stop it "
+                            f"manually (Burp → Dashboard) before the next target "
+                            f"to avoid stacking concurrent scans.")
                 return list(issues.values())
             time.sleep(interval)
 
@@ -313,6 +346,14 @@ def run_burp_scan(target: str, output_dir: str, api_url: str = None,
     # netloc keeps the port (drops any creds) so the scope prefix is host:port-exact.
     netloc = parsed.netloc.split("@")[-1]
     host = netloc.split(":")[0]
+    # Fail CLOSED on an underivable scope host: a malformed / path-only / odd input
+    # can yield an empty netloc, which would otherwise send NO scope object and let
+    # Burp fall back to its own (possibly broad/leftover) project scope — a silent
+    # scope bypass. Require a non-empty host before we start any scan.
+    if not host:
+        log("err", f"Burp scan aborted — could not derive a scope host from "
+                   f"target '{target}'; refusing to scan with Burp's default scope")
+        return []
     # Normalize the seed to carry a path so it satisfies the bounded "https://host/"
     # scope prefix (a bare "https://host" fails Burp's in-scope check against it).
     if not parsed.path:

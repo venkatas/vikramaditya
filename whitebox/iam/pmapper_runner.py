@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -53,6 +54,15 @@ def build_graph(profile: CloudProfile, out_dir: Path, timeout: int | None = None
         )
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Freshness baseline: PMapper writes its graph into a SHARED per-account
+    # storage root (~/.principalmapper/<account_id> or the appdirs location) that
+    # is NOT cleared by the orchestrator's --refresh (which only rmtrees the
+    # per-run pmapper/ artifact dir). If `graph create` partially fails or is a
+    # no-op, an OLD graph from a prior run would otherwise be copied and reported
+    # as current privesc paths. Capture the run start so we can reject any graph
+    # metadata.json that predates this invocation (mirrors prowler_runner's
+    # min_mtime freshness gate).
+    start_ts = time.time()
     cmd = [binary, "--profile", profile.name, "graph", "create"]
     # PMAPPER_REGIONS comma-separated env var narrows graph build to specific
     # regions, avoiding ConnectTimeoutError on slow opt-in regions like me-south-1.
@@ -137,6 +147,28 @@ def build_graph(profile: CloudProfile, out_dir: Path, timeout: int | None = None
                 f"PMapper graph storage not found under {storage_root!s} or fallback paths "
                 f"for account {profile.account_id}. Set PMAPPER_STORAGE env var if non-default."
             )
+    # Staleness gate: the resolved storage graph MUST have been (re)written by
+    # THIS run. PMapper reuses ~/.principalmapper/<account_id> across runs and
+    # --refresh does not clear it, so a metadata.json older than start_ts means
+    # `graph create` produced no fresh graph and we'd be copying last run's
+    # privesc paths. Allow a small clock-skew slack (filesystem mtime can lag the
+    # measured start by sub-second on some platforms).
+    _MTIME_SLACK = 2.0  # seconds
+    meta_mtime = (src_dir / "metadata.json").stat().st_mtime
+    if meta_mtime < (start_ts - _MTIME_SLACK):
+        (out_dir / "error.log").write_text(
+            f"pmapper graph storage is stale\nbinary: {binary}\n"
+            f"storage: {src_dir}\n"
+            f"metadata.json mtime={meta_mtime} < run start={start_ts}\n"
+            "PMapper did not write a fresh graph for this account this run; refusing "
+            "to copy a prior run's graph. Clear the per-account storage "
+            f"({src_dir}) or set PMAPPER_STORAGE to a clean directory and re-run.\n"
+        )
+        raise RuntimeError(
+            f"pmapper graph at {src_dir} predates this run (mtime {meta_mtime} < "
+            f"start {start_ts}); refusing to report a stale IAM graph. "
+            f"See {out_dir / 'error.log'}"
+        )
     dst_dir = out_dir / "pmapper-storage"
     dst_dir.mkdir(parents=True, exist_ok=True)
     (dst_dir / "metadata.json").write_text((src_dir / "metadata.json").read_text())

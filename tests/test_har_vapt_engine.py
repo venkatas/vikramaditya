@@ -289,6 +289,97 @@ def _sqli_engine(latencies):
     return eng
 
 
+# ---------------------------------------------------------------------------
+# IDOR detector — must use the schema-aware success parser + content identity,
+# not a hard-coded '"Success"' substring + size-only delta.
+# ---------------------------------------------------------------------------
+
+
+class _SeqSession:
+    """Session stub returning a queued sequence of response bodies."""
+
+    def __init__(self, bodies):
+        self._bodies = list(bodies)
+
+    def _do(self, *a, **k):
+        body = self._bodies.pop(0) if self._bodies else ""
+        return _StubResponse(body, status_code=200)
+
+    post = _do
+    get = _do
+
+
+def _idor_engine(bodies):
+    eng = HARVAPTEngine.__new__(HARVAPTEngine)
+    eng.vulnerabilities = []
+    eng._emitted_keys = set()
+    eng.test_results = {}
+    eng.allowed_hosts = {"app.acme.invalid"}
+    eng._dropped_hosts = set()
+    eng.session = _SeqSession(bodies)
+    ep = {
+        "url": "https://app.acme.invalid/api/profile", "path": "/api/profile",
+        "method": "GET", "status_code": 200,
+        "query_params": {"userid": ["1"]}, "post_params": {},
+        "_fuzz_params": {"userid": "1"},
+    }
+    eng.endpoints = [ep]
+    return eng
+
+
+class TestIDORDetection:
+    def test_lowercase_success_other_record_is_flagged(self) -> None:
+        # Old code keyed on the literal '"Success"' (capital S) so a lower-case
+        # JSON success body would be a false negative. New code uses the
+        # schema-aware parser → lower-case {"success":true} for a DIFFERENT
+        # record must be flagged.
+        big_other = '{"success":true,"data":{"name":"' + "X" * 400 + '"}}'
+        baseline = '{"success":true,"data":{"name":"self"}}'
+        # baseline GET, then 6 test_vals; first test_val returns the other record.
+        bodies = [baseline, big_other]
+        eng = _idor_engine(bodies)
+        eng.test_idor()
+        idor = [v for v in eng.vulnerabilities if v["type"] == "IDOR"]
+        assert len(idor) == 1
+
+    def test_same_record_refetch_not_flagged(self) -> None:
+        # Re-fetching the operator's OWN record (same content identity) must
+        # NOT be reported even though it is a genuine success — content
+        # identity is equal, so no cross-record disclosure.
+        baseline = '{"success":true,"data":{"name":"self"}}'
+        bodies = [baseline] + [baseline] * 6
+        eng = _idor_engine(bodies)
+        eng.test_idor()
+        idor = [v for v in eng.vulnerabilities if v["type"] == "IDOR"]
+        assert idor == []
+
+    def test_error_response_not_flagged(self) -> None:
+        # A server that correctly denies the cross-user request returns an
+        # error body — even if large/different, it is not a success so no IDOR.
+        baseline = '{"success":true,"data":{"name":"self"}}'
+        denied = '{"success":false,"error":true,"message":"' + "n" * 400 + '"}'
+        bodies = [baseline] + [denied] * 6
+        eng = _idor_engine(bodies)
+        eng.test_idor()
+        idor = [v for v in eng.vulnerabilities if v["type"] == "IDOR"]
+        assert idor == []
+
+
+# ---------------------------------------------------------------------------
+# Brain opt-in — autonomous LLM-executes-code path defaults OFF
+# ---------------------------------------------------------------------------
+
+
+class TestBrainOptIn:
+    def test_brain_disabled_by_default(self) -> None:
+        eng = HARVAPTEngine(_analysis([]))
+        assert eng.enable_brain is False
+
+    def test_brain_enabled_when_requested(self) -> None:
+        eng = HARVAPTEngine(_analysis([]), enable_brain=True)
+        assert eng.enable_brain is True
+
+
 class TestTimeBasedSQLiConfirmation:
     def test_single_jitter_spike_is_not_confirmed(self) -> None:
         # Error-based loop fires first (7 SQLI_ERROR payloads, all fast=0s),

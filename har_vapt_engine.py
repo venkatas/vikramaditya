@@ -87,7 +87,8 @@ class HARVAPTEngine:
     """Replays HAR requests, fuzzes parameters, validates findings."""
 
     def __init__(self, har_analysis: Dict, output_dir: str = None,
-                 allowed_hosts: Optional[List[str]] = None):
+                 allowed_hosts: Optional[List[str]] = None,
+                 enable_brain: bool = False):
         self.analysis = har_analysis
         self.session_data = har_analysis.get('session_data', {})
         self.endpoints = har_analysis.get('endpoints', [])
@@ -107,6 +108,12 @@ class HARVAPTEngine:
         # degradation marker.
         self.allowed_hosts = self._build_allowlist(allowed_hosts)
         self._dropped_hosts: set = set()
+
+        # The brain_scanner path is autonomous LLM-writes-and-EXECUTES-code:
+        # it must be an explicit operator opt-in (default OFF), matching the
+        # `--with-brain` posture used elsewhere in the platform. Even when
+        # enabled it is still hard-gated by the engagement allowlist below.
+        self.enable_brain = bool(enable_brain)
 
         self.session = requests.Session()
         self.session.verify = False
@@ -540,10 +547,15 @@ class HARVAPTEngine:
                                           param=param)
                                 
                                 # Ask the brain to try harder to find it and get RCE by writing a script.
-                                # HARD scope gate: the autonomous LLM-writes-and-executes path must
-                                # never run against a host outside the engagement allowlist.
-                                # brain_scanner's scopeguard only blocks the operator's own machine,
-                                # so we cannot delegate this check to it — assert here and skip.
+                                # GATE 1 — explicit operator opt-in. This path is an autonomous
+                                # LLM that writes and EXECUTES code; it must never fire on a bare
+                                # run. Default OFF; enable with `--with-brain`.
+                                if not self.enable_brain:
+                                    continue
+                                # GATE 2 — HARD scope gate: the autonomous LLM-writes-and-executes
+                                # path must never run against a host outside the engagement
+                                # allowlist. brain_scanner's scopeguard only blocks the operator's
+                                # own machine, so we cannot delegate this check to it — assert here.
                                 if not self._in_scope(url):
                                     host = self._norm_host(urlparse(url).netloc)
                                     print(f"   ⚠️  [SCOPE] Refusing brain scan on out-of-scope "
@@ -641,6 +653,28 @@ class HARVAPTEngine:
         # Body lacks any success flag — treat as ambiguous, not a bypass.
         return False
 
+    @staticmethod
+    def _body_identity(text: str) -> str:
+        """Stable content fingerprint used to decide whether two successful
+        responses represent the SAME record or DIFFERENT records.
+
+        Hashes the response body with volatile tokens (whitespace, digit runs
+        that are usually timestamps/counters, CSRF nonces) normalised out, so a
+        re-fetch of the operator's OWN record collapses to the same identity
+        while another user's record yields a different one. Used by the IDOR
+        detector to distinguish a real cross-record disclosure from a size
+        delta caused by padding / a generic page.
+        """
+        import hashlib
+        if not text:
+            return ''
+        norm = re.sub(r'\s+', ' ', text).strip().lower()
+        # Collapse long digit runs (ids/timestamps) so re-fetching the same
+        # record is identity-stable, but keep short alpha-numeric content that
+        # actually distinguishes one user's record from another's.
+        norm = re.sub(r'\d{4,}', '#', norm)
+        return hashlib.sha256(norm.encode('utf-8', 'replace')).hexdigest()
+
     def test_auth_bypass(self) -> Dict:
         print("\n🧪 Authentication Bypass (dynamic endpoints only)...")
         results = {'tested': 0, 'vulnerable': []}
@@ -718,6 +752,7 @@ class HARVAPTEngine:
                 else:
                     base_r = self.session.get(url, timeout=15)
                 base_size = len(base_r.text)
+                base_ident = self._body_identity(base_r.text)
             except Exception:
                 continue
 
@@ -729,9 +764,19 @@ class HARVAPTEngine:
                         r = self.session.post(url.split('?')[0], data=test_params, timeout=15)
                     else:
                         r = self.session.get(url.split('?')[0], params=test_params, timeout=15)
-                    if '"Success"' in r.text and abs(len(r.text) - base_size) > 100:
+                    # Signal an IDOR only when the server returns a GENUINE success
+                    # (case-insensitive, schema-aware — same parser auth_bypass uses,
+                    # not a hard-coded '"Success"' substring) AND that success body
+                    # is a DIFFERENT record than the operator's own baseline
+                    # (different content identity, not merely a size delta which a
+                    # generic error page or padding can trivially satisfy).
+                    if not self._is_success_response(r):
+                        continue
+                    test_ident = self._body_identity(r.text)
+                    if test_ident != base_ident and abs(len(r.text) - base_size) > 100:
                         self._log('high', 'IDOR', url,
-                                  f"Different data returned for '{param}'={test_val} (delta {len(r.text)-base_size}b)",
+                                  f"Different successful record returned for '{param}'={test_val} "
+                                  f"(delta {len(r.text)-base_size}b, content identity differs)",
                                   evidence=r.text[:200], param=param)
                         results['vulnerable'].append(url)
                         break
@@ -883,11 +928,16 @@ def main():
                         help="authorise an additional in-scope host (repeatable). "
                              "Without this, only the HAR's first-seen target host "
                              "is in scope — third-party hosts are dropped.")
+    parser.add_argument('--with-brain', dest='with_brain', action='store_true',
+                        help="opt in to the autonomous brain_scanner upload->RCE "
+                             "follow-up (LLM writes and EXECUTES code). Default OFF; "
+                             "still hard-gated by the engagement allowlist.")
     args = parser.parse_args()
 
     with open(args.analysis) as f:
         analysis = json.load(f)
-    engine = HARVAPTEngine(analysis, allowed_hosts=args.allowed_hosts or None)
+    engine = HARVAPTEngine(analysis, allowed_hosts=args.allowed_hosts or None,
+                           enable_brain=args.with_brain)
     results = engine.run_comprehensive_scan()
     out = args.output if args.output else f"har_vapt_{int(time.time())}.json"
     with open(out, 'w') as f:

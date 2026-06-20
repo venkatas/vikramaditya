@@ -183,6 +183,34 @@ def _maybe_run_whitebox_for_target(target: str, session_dir, autonomous: bool = 
                 argv += ["--profile", p]
             # Use target-level dir so cloud/ is session-agnostic
             argv += ["--session-dir", str(session_dir), "--allowlist", host]
+            # v10.6.0 — the integrated launch previously NEVER plumbed
+            # --secrets-mode, so cloud_hunt always ran the default "heuristic"
+            # name-filter that silently skips every bucket/log-group whose name
+            # lacks a hint word. Exhaustive secret-value scanning was therefore
+            # unreachable from the orchestrator (operator had to drop to the
+            # CLI). Surface the choice: explicit opt-in like every other
+            # coverage-widening switch in this codebase.
+            #   * autonomous: honour whitebox.secrets_mode in config (default
+            #     "heuristic" — exhaustive is slower/wider, so it stays opt-in);
+            #   * interactive: ask once, defaulting OFF (heuristic).
+            _secrets_mode = "heuristic"
+            if autonomous:
+                _cfg_mode = str(
+                    (cfg.get("whitebox", {}) or {}).get("secrets_mode", "heuristic")
+                ).strip().lower()
+                if _cfg_mode == "exhaustive":
+                    _secrets_mode = "exhaustive"
+            else:
+                try:
+                    _ex = input(
+                        "Exhaustive secret-value scan of ALL buckets/log-groups? "
+                        "(default heuristic name-filter skips un-hinted stores) [y/N]: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    _ex = "n"
+                if _ex in ("y", "yes"):
+                    _secrets_mode = "exhaustive"
+            argv += ["--secrets-mode", _secrets_mode]
             _cloud_main(argv)
             # v9.2.0 (P0-1) — when the same AWS profile maps to multiple
             # targets in one sweep (e.g. clienta.com + clienta-adv.com
@@ -2098,7 +2126,11 @@ def main():
             if want_report:
                 try:
                     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "reporter.py"), result_file]
-                    subprocess.run(cmd, cwd=SCRIPT_DIR)
+                    # Fork-safe launch: HAR VAPT just did in-process requests I/O,
+                    # so a bare subprocess.run() fork() here is the macOS atfork
+                    # SIGSEGV class. Route through procutil like every other
+                    # post-network dispatch (run_hunt / run_report).
+                    _run_streaming(cmd, cwd=SCRIPT_DIR)
                 except Exception as e:
                     log("warn", f"Report generation failed: {e}")
         print(f"\n  {D}Done.{N}\n")

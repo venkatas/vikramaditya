@@ -109,19 +109,29 @@ export HTTPX_BIN
 # short-circuit live-probe + dirsearch when no real subs exist beyond the
 # apex. Cheap (3 dig calls) and saves ~10 min on wildcarded targets.
 _detect_dns_wildcard() {
-    local apex="$1" hits=0 r1 r2 r3
+    local apex="$1" hits=0 a1 a2 a3 all_ips
     [ -z "$apex" ] && return
     [[ "$apex" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]] && return  # skip for IP/CIDR
-    r1=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
-    r2=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
-    r3=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
-    [ -n "$r1" ] && hits=$((hits+1))
-    [ -n "$r2" ] && hits=$((hits+1))
-    [ -n "$r3" ] && hits=$((hits+1))
+    # v10.6.0 — capture the FULL A-record set per random label (no `head -1`).
+    # A wildcard/LB zone round-robins several IPs; recording only the first
+    # (old WILDCARD_DNS_IP=r1) let dead hosts that resolved to a DIFFERENT
+    # wildcard IP slip past the dig-filter (fail-open, wasted probes). Build a
+    # deduped WILDCARD_DNS_IPS set across all three probes.
+    a1=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null)
+    a2=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null)
+    a3=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null)
+    [ -n "$a1" ] && hits=$((hits+1))
+    [ -n "$a2" ] && hits=$((hits+1))
+    [ -n "$a3" ] && hits=$((hits+1))
     if [ "$hits" -ge 2 ]; then
+        # Union all A records seen, keep only IPv4 literals, dedup.
+        all_ips=$(printf '%s\n%s\n%s\n' "$a1" "$a2" "$a3" \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
         export WILDCARD_DNS=1
-        export WILDCARD_DNS_IP="$r1"
-        echo -e "[!] DNS wildcard detected on $apex (random labels resolved to $r1) — brute-forced subs will be filtered post-resolution"
+        export WILDCARD_DNS_IPS="$all_ips"
+        # Keep WILDCARD_DNS_IP (first IP) for back-compat log/diagnostics.
+        export WILDCARD_DNS_IP=$(printf '%s\n' "$all_ips" | head -1)
+        echo -e "[!] DNS wildcard detected on $apex (random labels resolved to: $(printf '%s' "$all_ips" | tr '\n' ' ')) — brute-forced subs will be filtered post-resolution"
     fi
 }
 
@@ -572,12 +582,24 @@ PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
 [ "$(file_lines "$RECON_DIR/subdomains/crtsh.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
 
 # Wayback Machine subdomains
+# v10.6.0 — capture the raw response so a transport failure (timeout / HTTP error)
+# is distinguished from a genuine empty result and folded into the passive-source
+# tally (was previously uncounted, so its silent failures escaped the coverage
+# warning). curl exit 0 = transport OK (possibly-empty body); non-zero = UNKNOWN.
 log_step "Wayback Machine subdomains..."
-curl -s --max-time 30 \
+if _WB_RAW=$(curl -s --max-time 30 \
     "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey" \
-    2>/dev/null \
-    | sed -nE "s|.*://([a-zA-Z0-9._-]+\.$TARGET).*|\1|p" \
-    | sort -u > "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null || true
+    2>/dev/null); then
+    printf '%s' "$_WB_RAW" \
+        | sed -nE "s|.*://([a-zA-Z0-9._-]+\.$TARGET).*|\1|p" \
+        | sort -u > "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null || true
+    PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
+    [ "$(file_lines "$RECON_DIR/subdomains/wayback_subs.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
+else
+    : > "$RECON_DIR/subdomains/wayback_subs.txt"
+    log_warn "Wayback: transport failure / timeout — result is UNKNOWN, not empty"
+fi
+unset _WB_RAW
 log_done "wayback subs: $(file_lines "$RECON_DIR/subdomains/wayback_subs.txt") subdomains"
 
 # AlienVault OTX
@@ -608,19 +630,35 @@ log_done "OTX: $(file_lines "$RECON_DIR/subdomains/otx.txt") subdomains"
 PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
 [ "$(file_lines "$RECON_DIR/subdomains/otx.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
 
+# HackerTarget
+# v10.6.0 — capture the raw body and detect the rate-limit sentinel
+# ("API count exceeded" / "error") BEFORE parsing. HackerTarget rate-limits
+# aggressively and returns that sentinel as the body, which the `grep -v` strips
+# to empty — previously indistinguishable from a genuine empty result and never
+# counted. A sentinel hit is a transport failure (UNKNOWN, not counted as empty);
+# a clean curl is folded into the tally like crt.sh/OTX.
+log_step "HackerTarget API..."
+if _HT_RAW=$(curl -s --max-time 20 \
+    "https://api.hackertarget.com/hostsearch/?q=$TARGET" 2>/dev/null) \
+    && ! printf '%s' "$_HT_RAW" | head -c 256 | grep -qi 'API count exceeded\|^error'; then
+    printf '%s' "$_HT_RAW" | cut -d',' -f1 | grep -v "^error\|^API" \
+        > "$RECON_DIR/subdomains/hackertarget.txt" 2>/dev/null || true
+    PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
+    [ "$(file_lines "$RECON_DIR/subdomains/hackertarget.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
+else
+    : > "$RECON_DIR/subdomains/hackertarget.txt"
+    log_warn "HackerTarget: transport failure / rate-limited (API count exceeded) — result is UNKNOWN, not empty"
+fi
+unset _HT_RAW
+log_done "hackertarget: $(file_lines "$RECON_DIR/subdomains/hackertarget.txt") subdomains"
+
 # v9.23 — surface widespread passive-source failures so 0-result runs aren't
 # silently treated as "the target genuinely has no subdomains".
+# v10.6.0 — moved here so all four counted sources (crt.sh/OTX/Wayback/HackerTarget)
+# are tallied before the warning fires.
 if [ "${PASSIVE_SOURCES_TOTAL:-0}" -gt 0 ] && [ "$PASSIVE_SOURCES_EMPTY" -eq "$PASSIVE_SOURCES_TOTAL" ]; then
-    log_warn "passive returned 0 from $PASSIVE_SOURCES_EMPTY/$PASSIVE_SOURCES_TOTAL CT sources (crt.sh/OTX) — possible rate-limit/outage, results may be incomplete"
+    log_warn "passive returned 0 from $PASSIVE_SOURCES_EMPTY/$PASSIVE_SOURCES_TOTAL sources (crt.sh/OTX/Wayback/HackerTarget) — possible rate-limit/outage, results may be incomplete"
 fi
-
-# HackerTarget
-log_step "HackerTarget API..."
-curl -s --max-time 20 \
-    "https://api.hackertarget.com/hostsearch/?q=$TARGET" \
-    2>/dev/null | cut -d',' -f1 | grep -v "^error\|^API" \
-    > "$RECON_DIR/subdomains/hackertarget.txt" 2>/dev/null || true
-log_done "hackertarget: $(file_lines "$RECON_DIR/subdomains/hackertarget.txt") subdomains"
 
 # asnmap — enumerate IP ranges for the target org (ASN → CIDR → IPs)
 # v9.23 — asnmap (like cvemap) now requires a ProjectDiscovery Cloud (PDCP)
@@ -674,11 +712,20 @@ _PASSIVE_SUB_FILES=()
 for _f in subfinder assetfinder amass crtsh wayback_subs otx hackertarget; do
     [ -f "$RECON_DIR/subdomains/$_f.txt" ] && _PASSIVE_SUB_FILES+=("$RECON_DIR/subdomains/$_f.txt")
 done
-cat "${_PASSIVE_SUB_FILES[@]}" 2>/dev/null \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed 's/^\*\.//' \
-    | grep -E "^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$" \
-    | sort -u > "$RECON_DIR/subdomains/all.txt"
+# v10.6.0 — guard the empty-array case (mirrors the emergency-merge path above).
+# Under `set -u` (line 18), expanding "${arr[@]}" on a ZERO-length array raises
+# "unbound variable" on macOS bash 3.2 — and `2>/dev/null` does NOT suppress it
+# (it is a shell evaluation error, not cat's stderr), aborting Phase 1. Degrade
+# to an empty all.txt (0 subdomains) instead of a hard abort.
+if [ "${#_PASSIVE_SUB_FILES[@]}" -eq 0 ]; then
+    : > "$RECON_DIR/subdomains/all.txt"
+else
+    cat "${_PASSIVE_SUB_FILES[@]}" 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/^\*\.//' \
+        | grep -E "^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$" \
+        | sort -u > "$RECON_DIR/subdomains/all.txt"
+fi
 
 TOTAL_SUBS=$(file_lines "$RECON_DIR/subdomains/all.txt")
 log_ok "Total unique subdomains (pre-permutation): $TOTAL_SUBS"
@@ -779,6 +826,7 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
     DNSX_CAP="${DNSX_MAX:-20000}"          # cap to avoid macOS large-list hang
     ALL_COUNT=$(file_lines "$RECON_DIR/subdomains/all.txt")
     DNS_VALIDATED=0                         # 1 only if dnsx actually resolved >0
+    DNSX_FAILED_CHUNKS=0                    # >0 if any dnsx pass timed out/segfaulted
     # v10.6.0 — treat a non-positive cap as UNCAPPED (route to the single-pass
     # branch) instead of chunking with a bogus `split -l 0/-N` that errors out.
     if [ "${DNSX_CAP:-0}" -le 0 ] 2>/dev/null; then
@@ -788,8 +836,20 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
     if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
         if [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
             log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
-            timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
-                > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+            # v10.6.0 (FIX) — capture the exit status instead of swallowing it with
+            # `|| true`. On timeout/segfault/rc!=0, resolved.txt holds only the partial
+            # set dnsx flushed before dying; mirror the chunked branch: mark the pass
+            # FAILED (so DNS_VALIDATED is NOT set and the wildcard dig-filter still
+            # runs) and UNION the full candidate set back (fail-OPEN — httpx probes them).
+            if timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
+                > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null; then
+                :
+            else
+                DNSX_FAILED_CHUNKS=1
+                cat "$RECON_DIR/subdomains/all.txt" >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+                sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
+                log_warn "dnsx single-pass FAILED (timeout/segfault) — $ALL_COUNT candidates kept UNVALIDATED (httpx will filter); resolution is NOT marked DNS-validated"
+            fi
         else
             # CRITICAL FIX: a candidate list LARGER than the cap must STILL be resolved. The old
             # code skipped resolution entirely (`cp all.txt resolved.txt`), so httpx drowned in
@@ -896,20 +956,29 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
         if [ "$DIG_INPUT" != "$RECON_DIR/subdomains/resolved.txt" ]; then
             tail -n +"$(( DIG_FILTER_CAP + 1 ))" "$RECON_DIR/subdomains/resolved.txt" >> "$FILTERED" 2>/dev/null || true
         fi
+        # v10.6.0 — match against the FULL wildcard IP SET (all round-robin IPs
+        # seen during detection), not just the first. Write the set to a temp file
+        # and drop a host only when EVERY one of its A records is in that set.
+        WC_IP_FILE="$RECON_DIR/subdomains/.wildcard_ips.txt"
+        printf '%s\n' "${WILDCARD_DNS_IPS:-$WILDCARD_DNS_IP}" \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u > "$WC_IP_FILE" 2>/dev/null || true
         # Parallel dig with xargs. Fail-OPEN: drop a host ONLY when it resolves AND
-        # EVERY A record equals the wildcard IP. Empty/timeout dig → keep the host.
+        # EVERY A record is in the wildcard IP set. Empty/timeout dig → keep the host.
         xargs -P 16 -I{} sh -c '
-            host="$1"; wc_ip="$2"
+            host="$1"; wc_file="$2"
             [ "$host" = "$3" ] && exit 0   # apex already added
-            real=$(dig +short +time=2 +tries=1 "$host" A 2>/dev/null)
+            real=$(dig +short +time=2 +tries=1 "$host" A 2>/dev/null \
+                | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
             if [ -z "$real" ]; then
-                echo "$host"; exit 0       # fail-open: empty/timeout → keep
+                echo "$host"; exit 0       # fail-open: empty/timeout/non-A → keep
             fi
-            # keep if ANY A record is not the wildcard IP
-            if printf "%s\n" "$real" | grep -qv "^${wc_ip}\$"; then
+            # keep if ANY A record is NOT in the wildcard IP set (multi-IP LB hosts).
+            # grep -Fxv -f drops the wildcard IPs; a surviving line = a real IP.
+            if printf "%s\n" "$real" | grep -Fxv -f "$wc_file" >/dev/null 2>&1; then
                 echo "$host"
             fi
-        ' _ {} "$WILDCARD_DNS_IP" "$TARGET" < "$DIG_INPUT" >> "$FILTERED" 2>/dev/null || true
+        ' _ {} "$WC_IP_FILE" "$TARGET" < "$DIG_INPUT" >> "$FILTERED" 2>/dev/null || true
+        rm -f "$WC_IP_FILE"
         sort -u "$FILTERED" > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null
         rm -f "$FILTERED"
         [ "$DIG_INPUT" != "$RECON_DIR/subdomains/resolved.txt" ] && rm -f "$DIG_INPUT"
@@ -1016,7 +1085,12 @@ fi
 # ============================================================
 echo ""
 log_info "Phase 3: HTTP Probing in batches of $BATCH_SIZE (probing: $PROBED_COUNT of $RESOLVED_COUNT resolved)"
-if phase_done "$RECON_DIR/live/httpx_full.txt"; then true; else
+# v10.6.0 — resume gates on the .probe.done COMPLETION marker, not the
+# httpx_full.txt data artefact. httpx_full.txt is truncated then appended one
+# batch at a time, so a kill mid-batch-loop previously left a non-empty PARTIAL
+# file that phase_done treated as "done", silently locking in an incomplete
+# live-host set on --resume (same fix already applied to Phases 1 and 2).
+if phase_done "$RECON_DIR/live/.probe.done"; then true; else
 
 if ! tool_ok httpx; then
     log_warn "httpx not installed — skipping HTTP probing"
@@ -1174,6 +1248,11 @@ else
             log_warn "Adaptive throttling: 429 rate ${RATE_429_PCT}% — reducing to $RATE_LIMIT rps / $THREADS threads for later phases"
         fi
     fi
+    # v10.6.0 — authoritative Phase-3 completion marker. Written ONLY after the
+    # full batch loop AND downstream URL/IP/status extraction complete; a kill
+    # mid-loop leaves no marker, so --resume re-runs the probe instead of locking
+    # in a partial live set. MUST stay outside the batch loop.
+    date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/live/.probe.done" 2>/dev/null || true
 fi
 fi  # end Phase 3 resume skip
 
@@ -1311,7 +1390,11 @@ fi  # end Phase 4.5
 # ============================================================
 echo ""
 log_info "Phase 6: URL Collection"
-if phase_done "$RECON_DIR/urls/gau.txt"; then true; else
+# v10.6.0 — resume gates on the .urls.done COMPLETION marker, not gau.txt. gau.txt
+# is written early in the phase while katana crawl, waymore, the all.txt merge and
+# the with_params/js/api subset extraction still follow; a kill after gau but
+# before the merge previously looked "done" to phase_done and skipped the rest.
+if phase_done "$RECON_DIR/urls/.urls.done"; then true; else
 
 # gau — historical URLs from multiple sources
 if tool_ok gau; then
@@ -1506,6 +1589,10 @@ if [ -s "$RECON_DIR/urls/all.txt" ]; then
     grep -iE '/graphql' "$RECON_DIR/urls/all.txt" \
         > "$RECON_DIR/urls/graphql.txt" 2>/dev/null || true
 fi
+# v10.6.0 — authoritative Phase-6 completion marker (resume gates on this). Written
+# only after the full collect+merge+filter pipeline finishes; a kill mid-phase
+# leaves no marker so --resume re-runs URL collection instead of skipping it.
+date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/urls/.urls.done" 2>/dev/null || true
 fi  # end Phase 6 resume skip
 
 # Refresh prioritization once URL and JS artifacts exist.

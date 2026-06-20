@@ -119,12 +119,42 @@ def is_local_or_listener(target: str, cfg: Config = None) -> bool:
         return True
 
     # Resolve host → IPs (literal IPs skip DNS).
+    #
+    # TOCTOU NOTE: this gate resolves the target ONCE at scan time; the executing
+    # client (curl/nc/sqlmap) re-resolves independently. A short-TTL / DNS-rebinding
+    # name that returns a non-loopback A here and 127.0.0.1 at run time can still slip
+    # through — this is inherent to any pre-flight DNS check. Callers MUST treat this
+    # as a best-effort self-target guard, not an authorization boundary.
     try:
         ips = [ipaddress.ip_address(host)]
     except ValueError:
         addrs = LOOKUP_HOST(host)
         if not addrs:
-            return False  # unresolvable → allow; it will fail naturally downstream
+            # Fail-CLOSED only for a token that DECODES to loopback/unspecified when
+            # read as a packed/short-form IPv4 literal — the encoded-loopback
+            # evasion: decimal 2130706433 / hex 0x7f000001 / short-form 127.1, all
+            # == 127.0.0.1. Block those even when the resolver declines the encoding
+            # at check time, so they can't pivot onto our loopback at run time.
+            # A bare port / timeout / count integer (4444, 86400, 3600) is NOT swept
+            # up: it decodes to a NON-loopback address and stays allowed — narrowing
+            # the prior over-broad "any all-digit/0x token" rule that false-positive
+            # blocked legitimate commands whose only numeric token was a port. A
+            # normal DNS name that simply doesn't resolve also stays allowed.
+            _decoded = None
+            try:
+                _n = int(host, 0)
+                if 0 <= _n <= 0xFFFFFFFF:
+                    _decoded = ipaddress.ip_address(_n)
+            except (ValueError, TypeError):
+                pass
+            if _decoded is None:
+                try:
+                    _decoded = ipaddress.ip_address(socket.inet_aton(host))
+                except (OSError, ValueError):
+                    _decoded = None
+            if _decoded is not None and (_decoded.is_loopback or _decoded.is_unspecified):
+                return True
+            return False  # unresolvable name / non-loopback literal → allow
         ips = []
         for a in addrs:
             try:

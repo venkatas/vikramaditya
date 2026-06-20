@@ -23,10 +23,12 @@ def scan(profile: CloudProfile, secrets_dir: Path | None = None) -> list[Finding
         if not secret_arns:
             continue
         denied_count = 0
+        local_get_ok = False  # per-region success; gates the permission-gap marker
         for name, arn in secret_arns:
             try:
                 resp = client.get_secret_value(SecretId=arn)
-                # Lazy probe: first success flips the flag
+                local_get_ok = True
+                # Lazy probe: first success flips the cross-region flag (informational only)
                 profile.permission_probe["secretsmanager_get_value"] = True
             except Exception as e:
                 # Distinguish AccessDenied from other errors
@@ -64,8 +66,11 @@ def scan(profile: CloudProfile, secrets_dir: Path | None = None) -> list[Finding
                         account_id=profile.account_id, region=region, service="secretsmanager", arn=arn,
                     ),
                 ))
-        # Emit permission-gap finding only when GetSecretValue was actually denied
-        if denied_count > 0 and not profile.permission_probe.get("secretsmanager_get_value"):
+        # Emit permission-gap finding when GetSecretValue was denied in THIS region.
+        # Gate on the per-region success flag (local_get_ok), NOT the cross-region
+        # permission_probe flag — otherwise a region where every GetSecretValue is
+        # denied is silently skipped once any other region had a readable secret.
+        if denied_count > 0 and not local_get_ok:
             findings.append(Finding(
                 id=f"secrets-sm-permission-gap-{profile.account_id}-{region}",
                 source="secrets",

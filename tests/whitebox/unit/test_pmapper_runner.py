@@ -202,6 +202,78 @@ def test_build_graph_finds_graph_at_macos_appdirs_path(tmp_path, monkeypatch):
     assert (result / "graph" / "nodes.json").exists()
 
 
+def test_build_graph_rejects_stale_graph(tmp_path, monkeypatch):
+    """If pmapper does not write a fresh graph this run (storage metadata.json
+    predates the run start), build_graph must REFUSE to copy the stale graph
+    rather than silently reporting last-run's privesc paths as current.
+
+    Repro: --refresh clears the per-run pmapper/ dir but NOT the shared
+    ~/.principalmapper/<account_id> storage; a no-op `graph create` leaves an
+    old graph behind."""
+    import os as _os
+    import time as _time
+    profile = CloudProfile(name="t", account_id="555444333222", arn="a", regions=[])
+    monkeypatch.delenv("PMAPPER_TIMEOUT", raising=False)
+    monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    monkeypatch.delenv("PMAPPER_STORAGE", raising=False)
+    fake = "/fake/pmapper"
+
+    fake_home = tmp_path / "home"
+    storage = fake_home / ".principalmapper" / "555444333222"
+    (storage / "graph").mkdir(parents=True)
+    (storage / "metadata.json").write_text('{"account_id":"555444333222"}')
+    (storage / "graph" / "nodes.json").write_text("[]")
+    (storage / "graph" / "edges.json").write_text("[]")
+    # Backdate the storage so it looks like a prior run's graph (1 hour old).
+    old = _time.time() - 3600
+    for p in (storage / "metadata.json", storage / "graph" / "nodes.json",
+              storage / "graph" / "edges.json"):
+        _os.utime(p, (old, old))
+
+    out_dir = tmp_path / "out"
+
+    def fake_subprocess_run(cmd, **kw):
+        # Simulate a no-op graph create that touches nothing in storage.
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
+        with pytest.raises(RuntimeError, match="stale|predates"):
+            build_graph(profile, out_dir)
+    # Must NOT have copied the stale graph into the per-run dir.
+    assert not (out_dir / "pmapper-storage" / "metadata.json").exists()
+    assert (out_dir / "error.log").exists()
+
+
+def test_build_graph_accepts_fresh_graph(tmp_path, monkeypatch):
+    """A graph written DURING this run (mtime >= start) is accepted and copied."""
+    profile = CloudProfile(name="t", account_id="777666555444", arn="a", regions=[])
+    monkeypatch.delenv("PMAPPER_TIMEOUT", raising=False)
+    monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    monkeypatch.delenv("PMAPPER_STORAGE", raising=False)
+    fake = "/fake/pmapper"
+
+    fake_home = tmp_path / "home"
+    storage = fake_home / ".principalmapper" / "777666555444"
+    out_dir = tmp_path / "out"
+
+    def fake_subprocess_run(cmd, **kw):
+        # Simulate pmapper writing a fresh graph during this run.
+        (storage / "graph").mkdir(parents=True, exist_ok=True)
+        (storage / "metadata.json").write_text('{"account_id":"777666555444"}')
+        (storage / "graph" / "nodes.json").write_text("[]")
+        (storage / "graph" / "edges.json").write_text("[]")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
+        result = build_graph(profile, out_dir)
+    assert (result / "metadata.json").exists()
+    assert (result / "graph" / "nodes.json").exists()
+
+
 def test_build_graph_explicit_timeout_overrides_PMAPPER_TIMEOUT_env(tmp_path, monkeypatch):
     """An explicit timeout kwarg wins over the env var (consistent with prowler_runner)."""
     profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])

@@ -47,7 +47,9 @@ def run(profile: CloudProfile, out_dir: Path,
 
     timeout defaults to the PROWLER_TIMEOUT env var (seconds) if set, otherwise 5400 (90 min).
     Real-world full Prowler scans on enterprise AWS accounts typically run 60-90 min.
-    Pass check_groups (a list of check folders) to narrow the scan when timeout is tight.
+    Pass check_groups (a list of Prowler check IDs) to narrow the scan when timeout is
+    tight; they are emitted via Prowler's list-valued ``--checks`` (-c) flag. Note this
+    is NOT ``--checks-folder`` (-x), which takes a single custom-checks DIRECTORY path.
     """
     binary = _resolve_prowler_binary()
     if binary is None:
@@ -70,7 +72,9 @@ def run(profile: CloudProfile, out_dir: Path,
         "--output-directory", str(out_dir),
     ]
     if check_groups:
-        cmd += ["--checks-folder"] + check_groups
+        # Prowler 4.x: --checks/-c takes a list of check IDs to narrow the scan.
+        # (--checks-folder/-x is a SINGLE custom-checks directory, not this.)
+        cmd += ["--checks"] + check_groups
     # Launch via procutil (os.posix_spawn): cloud_hunt does in-process boto3/HTTPS
     # region discovery before this runner, loading Apple's Network.framework, so a
     # raw subprocess.run fork()+exec SIGSEGVs (rc=-11) the prowler child on macOS.
@@ -94,11 +98,18 @@ def run(profile: CloudProfile, out_dir: Path,
 
 
 def _find_output_file(out_dir: Path, min_mtime: float = 0.0) -> Path:
-    candidates = list(out_dir.glob("*.ocsf.json")) + list(out_dir.glob("*ocsf*.json"))
+    # Dedup the two globs (the first pattern is a subset of the second, so a plain
+    # `<prefix>.ocsf.json` matches both) via a set, then choose deterministically.
+    # Path.glob() order is filesystem-dependent, so returning the raw first element
+    # would nondeterministically pick a stale/compliance OCSF file when Prowler 4.5
+    # emits more than one fresh artifact, silently dropping the real findings.
+    candidates = set(out_dir.glob("*.ocsf.json")) | set(out_dir.glob("*ocsf*.json"))
     fresh = [c for c in candidates if c.stat().st_mtime >= min_mtime]
     if not fresh:
         raise FileNotFoundError(f"no fresh OCSF JSON output in {out_dir} (min_mtime={min_mtime})")
-    return fresh[0]
+    # Newest fresh file = the primary findings document for this run. Tie-break by
+    # path string so the result is fully deterministic even when mtimes collide.
+    return max(fresh, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
 def parse(ocsf_path: Path) -> list[dict]:

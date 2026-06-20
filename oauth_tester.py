@@ -52,6 +52,27 @@ def _netloc_is_safe(url: str) -> bool:
     return bool(_SAFE_NETLOC_RE.match(netloc))
 
 
+def _probe_errored(ok: bool, stdout: str, stderr: str) -> bool:
+    """True when curl failed with a TRANSPORT error that lost the response.
+
+    ``ok`` is ``returncode == 0``. With ``curl -s`` (no ``--fail``) a non-zero
+    exit means a transport-level failure — TLS handshake/cert error (35/60),
+    timeout (28), connection refused/no-route (7) — i.e. we never saw an HTTP
+    response. We only treat it as a *degradation worth surfacing* when NO header
+    bytes came back (a clean skip would otherwise be indistinguishable from
+    "endpoint clean"). A plain absent/closed endpoint across a path matrix is
+    normal, so callers aggregate these per-host into one note instead of
+    emitting a storm of per-path findings.
+    """
+    if ok:
+        return False
+    if stdout.strip():
+        # We did receive header/body bytes despite the non-zero exit; the check
+        # can still inspect them, so this is not a lost-response degradation.
+        return False
+    return True
+
+
 def run_cmd(cmd, timeout=15):
     """Run a curl probe as an argv LIST (shell=False) via the fork-safe spawner.
 
@@ -100,7 +121,7 @@ def run_cmd(cmd, timeout=15):
         return False, "", str(e)
 
 
-def check_cors_on_auth_endpoints(base_url: str) -> list[dict]:
+def check_cors_on_auth_endpoints(base_url: str, errors: list | None = None) -> list[dict]:
     """Check CORS headers on authentication-related endpoints."""
     findings = []
     auth_paths = ["/oauth/authorize", "/oauth/token", "/api/v1/auth",
@@ -108,10 +129,16 @@ def check_cors_on_auth_endpoints(base_url: str) -> list[dict]:
 
     for path in auth_paths:
         url = urljoin(base_url, path)
-        ok, stdout, _ = run_cmd(
+        ok, stdout, stderr = run_cmd(
             ["curl", "-sk", "-I", "-H", "Origin: https://evil.com", url, "--max-time", "8"]
         )
-        if not ok:
+        # A transport error (TLS/timeout) that lost the response is recorded so
+        # the skip is visible instead of looking like "endpoint clean".
+        if _probe_errored(ok, stdout, stderr) and errors is not None:
+            errors.append((url, (stderr or "transport error").strip()[:80]))
+        # Inspect whatever headers we DID get, even on a non-zero exit (curl can
+        # emit headers before erroring); only a truly empty response is skipped.
+        if not stdout.strip():
             continue
         headers = stdout.lower()
         if "access-control-allow-origin" in headers:
@@ -126,18 +153,20 @@ def check_cors_on_auth_endpoints(base_url: str) -> list[dict]:
     return findings
 
 
-def check_oauth_state_entropy(base_url: str) -> list[dict]:
+def check_oauth_state_entropy(base_url: str, errors: list | None = None) -> list[dict]:
     """Check OAuth state parameter: missing entirely (CSRF) or insufficient entropy."""
     findings = []
     # Try to find OAuth authorization endpoint
     for path in ["/oauth/authorize", "/authorize", "/auth/authorize", "/connect/authorize"]:
         url = urljoin(base_url, path)
-        ok, stdout, _ = run_cmd([
+        ok, stdout, stderr = run_cmd([
             "curl", "-sk", "-D-", "-o", "/dev/null",
             f"{url}?response_type=code&client_id=test&redirect_uri=http://localhost",
             "--max-time", "8",
         ])
-        if not ok:
+        if _probe_errored(ok, stdout, stderr) and errors is not None:
+            errors.append((url, (stderr or "transport error").strip()[:80]))
+        if not stdout.strip():
             continue
 
         # Did the endpoint actually behave like an OAuth authorization endpoint,
@@ -172,7 +201,7 @@ def check_oauth_state_entropy(base_url: str) -> list[dict]:
     return findings
 
 
-def check_redirect_uri_bypass(base_url: str) -> list[dict]:
+def check_redirect_uri_bypass(base_url: str, errors: list | None = None) -> list[dict]:
     """Test redirect_uri validation bypass vectors.
 
     A genuine bypass is confirmed by the server redirecting to the attacker host
@@ -203,10 +232,12 @@ def check_redirect_uri_bypass(base_url: str) -> list[dict]:
         ]
         for bypass_uri, technique in bypasses:
             test_url = f"{url}?response_type=code&client_id=test&redirect_uri={bypass_uri}"
-            ok, stdout, _ = run_cmd([
+            ok, stdout, stderr = run_cmd([
                 "curl", "-sk", "-D-", "-o", "/dev/null", test_url, "--max-time", "8",
             ])
-            if not ok:
+            if _probe_errored(ok, stdout, stderr) and errors is not None:
+                errors.append((url, (stderr or "transport error").strip()[:80]))
+            if not stdout.strip():
                 continue
             loc = re.search(r'(?im)^location:\s*(\S+)', stdout)
             if not loc:
@@ -229,7 +260,7 @@ def check_redirect_uri_bypass(base_url: str) -> list[dict]:
     return findings
 
 
-def check_password_reset_host_injection(base_url: str) -> list[dict]:
+def check_password_reset_host_injection(base_url: str, errors: list | None = None) -> list[dict]:
     """Test password reset host header injection."""
     findings = []
     for path in ["/password/reset", "/forgot-password", "/api/password/reset",
@@ -240,12 +271,16 @@ def check_password_reset_host_injection(base_url: str) -> list[dict]:
             ("X-Forwarded-Host", "evil.com"),
             ("X-Host", "evil.com"),
         ]:
-            ok, stdout, _ = run_cmd([
+            ok, stdout, stderr = run_cmd([
                 "curl", "-sk", "-X", "POST",
                 "-H", f"{header_name}: {header_value}",
                 "-d", "email=test@test.com", url, "-D-", "--max-time", "8",
             ])
-            if ok and "evil.com" in stdout:
+            if _probe_errored(ok, stdout, stderr) and errors is not None:
+                errors.append((url, (stderr or "transport error").strip()[:80]))
+            # Match on reflected host even if curl exited non-zero, as long as we
+            # captured response bytes (no longer gated on the exit code alone).
+            if "evil.com" in stdout:
                 findings.append({
                     "type": "host_header_injection",
                     "severity": "high",
@@ -308,10 +343,29 @@ def run_oauth_audit(target: str, recon_dir: str | None = None, output_dir: str |
 
     for base_url in base_urls:
         print(f"  [>] Testing {base_url}...")
-        all_findings.extend(check_cors_on_auth_endpoints(base_url))
-        all_findings.extend(check_oauth_state_entropy(base_url))
-        all_findings.extend(check_redirect_uri_bypass(base_url))
-        all_findings.extend(check_password_reset_host_injection(base_url))
+        probe_errors: list = []
+        all_findings.extend(check_cors_on_auth_endpoints(base_url, probe_errors))
+        all_findings.extend(check_oauth_state_entropy(base_url, probe_errors))
+        all_findings.extend(check_redirect_uri_bypass(base_url, probe_errors))
+        all_findings.extend(check_password_reset_host_injection(base_url, probe_errors))
+
+        # Surface lost-response transport errors (TLS handshake/cert/timeout) as a
+        # single per-host degradation note so a silently-skipped probe is visible
+        # rather than indistinguishable from "endpoint clean". A plain connection
+        # refused across the path matrix is normal; only probes that produced NO
+        # response bytes are recorded by the checks, and we de-dup per host here.
+        if probe_errors:
+            uniq = sorted({f"{u} -> {reason}" for u, reason in probe_errors})
+            print(f"  [!] COVERAGE NOTE: {len(uniq)} probe(s) on {base_url} errored "
+                  f"(TLS/timeout); those checks were skipped")
+            all_findings.append({
+                "type": "probe_degraded",
+                "severity": "info",
+                "url": base_url,
+                "detail": (f"{len(uniq)} OAuth probe(s) on this host failed at the "
+                           f"transport layer (TLS/timeout); those checks did not run"),
+                "evidence": uniq[:20],
+            })
 
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)

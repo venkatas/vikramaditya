@@ -36,5 +36,12 @@ def in_scope_domains(profile: CloudProfile, authorized_allowlist: list[str] | No
     candidates = candidate_domains(profile)
     if authorized_allowlist == ["*"]:
         return candidates
-    allow = set(authorized_allowlist)
-    return [d for d in candidates if d in allow or any(d.endswith("." + a) for a in allow)]
+    # DNS names are case-insensitive (RFC 4343). Normalise both sides to lower
+    # case so a case mismatch (e.g. --allowlist Example.com vs an Example.COM
+    # zone) cannot silently drop an authorized zone from scope.
+    allow = {a.lower() for a in authorized_allowlist}
+    return [
+        d
+        for d in candidates
+        if d.lower() in allow or any(d.lower().endswith("." + a) for a in allow)
+    ]
