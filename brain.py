@@ -817,6 +817,10 @@ class Brain:
     """
 
     def __init__(self, model: str = None, provider: str | None = None):
+        # OFF by default — auto_triage_and_exploit's loop issues MODEL-GENERATED --os-shell/
+        # --file-write (webshell) at the LIVE target. Opt in via --sqli-rce (hunt.py) or
+        # --allow-exploit (brain.py CLI). Set BEFORE any early-return so it is always defined.
+        self.allow_exploit = False
         self._llm = LLMClient(provider or os.environ.get("BRAIN_PROVIDER"))
 
         if not self._llm.available:
@@ -2709,6 +2713,17 @@ Based on this:
                 import re
                 url_match = re.search(r"https?://\S+", line)
                 target_url = url_match.group(0) if url_match else target
+                # SECURITY GATE: this loop runs MODEL-GENERATED --os-shell/--file-write against
+                # the LIVE target. Off by default (a normal scan must NOT autonomously attempt
+                # RCE/webshell); opt in with --sqli-rce. The request-file path is gated separately
+                # via run_sqlmap_request_file(escalate=...).
+                if not self.allow_exploit:
+                    _msg = (f"[gated] {cat} {verdict} — autonomous SQLi→RCE exploit loop "
+                            f"(model-driven os-shell/file-write) NOT run; opt in with --sqli-rce. "
+                            f"{target_url}")
+                    print(_msg)
+                    triage_summary.append(_msg)
+                    continue
                 self.exploit_finding(
                     target_url=target_url,
                     vuln_type=cat,
@@ -2925,6 +2940,10 @@ Examples:
     parser.add_argument("--model",        help="Override model (e.g. vapt-qwen25:latest)")
     parser.add_argument("--list-models",  action="store_true", help="List available local models")
     parser.add_argument("--vuln-type",    help="Vulnerability type (for exploit phase, e.g. IDOR, SSRF, XSS)")
+    parser.add_argument("--allow-exploit", action="store_true",
+                        help="Enable the AUTONOMOUS SQLi→RCE exploit loop (model-driven "
+                             "--os-shell/--file-write against the live target) in autopilot / "
+                             "post-scan triage. OFF by default.")
     args = parser.parse_args()
 
     if args.list_models:
@@ -3024,9 +3043,10 @@ Examples:
         )
 
     elif args.phase == "autopilot":
-        # Post-scan: triage all findings, run exploits on confirmed ones
+        # Post-scan: triage all findings, run exploits on confirmed ones (only if opted in)
         if not args.findings_dir:
             parser.error("--findings-dir required")
+        brain.allow_exploit = bool(args.allow_exploit)
         brain.auto_triage_and_exploit(
             args.findings_dir,
             recon_dir=args.recon_dir or "",

@@ -646,8 +646,17 @@ log_ok "Total unique subdomains (pre-permutation): $TOTAL_SUBS"
 # Often finds assets that passive sources miss entirely.
 if tool_ok alterx && [ "$QUICK_MODE" != "--quick" ] && [ "$TOTAL_SUBS" -gt 0 ]; then
     log_step "alterx (subdomain permutation generation)..."
-    alterx -l "$RECON_DIR/subdomains/all.txt" -silent \
-        > "$RECON_DIR/subdomains/alterx.txt" 2>/dev/null || true
+    # BOUND the permutation explosion: a few-thousand passive set otherwise multiplies into tens
+    # of millions (observed 24M on a large estate), ballooning all.txt so Phase-2 resolution takes
+    # hours even chunked. -limit caps the output; operators wanting unlimited set ALTERX_LIMIT=0.
+    ALTERX_LIMIT="${ALTERX_LIMIT:-1000000}"
+    if [ "${ALTERX_LIMIT:-0}" -gt 0 ] 2>/dev/null; then
+        alterx -l "$RECON_DIR/subdomains/all.txt" -limit "$ALTERX_LIMIT" -silent \
+            > "$RECON_DIR/subdomains/alterx.txt" 2>/dev/null || true
+    else
+        alterx -l "$RECON_DIR/subdomains/all.txt" -silent \
+            > "$RECON_DIR/subdomains/alterx.txt" 2>/dev/null || true
+    fi
     ALTERX_COUNT=$(file_lines "$RECON_DIR/subdomains/alterx.txt")
     log_done "alterx: $ALTERX_COUNT permutations generated"
     # Merge permutations back into all.txt and re-resolve in Phase 2
@@ -710,28 +719,55 @@ if phase_done "$RECON_DIR/subdomains/resolved.txt"; then true; else
     DNSX_CAP="${DNSX_MAX:-20000}"          # cap to avoid macOS large-list hang
     ALL_COUNT=$(file_lines "$RECON_DIR/subdomains/all.txt")
     DNS_VALIDATED=0                         # 1 only if dnsx actually resolved >0
-    if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] \
-       && [ -s "$RECON_DIR/subdomains/all.txt" ] && [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
-        log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
-        timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
-            > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+    if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
+        if [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
+            log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
+            timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
+                > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+        else
+            # CRITICAL FIX: a candidate list LARGER than the cap must STILL be resolved. The old
+            # code skipped resolution entirely (`cp all.txt resolved.txt`), so httpx drowned in
+            # 100k+ UNRESOLVED candidates and surfaced only a few apex hosts — a government-scale
+            # wildcard estate (860k unique / 24M raw) collapsed to 9 "live", silently missing every
+            # real application/admin subdomain. DEDUP first (alterx can emit 20M+ duplicate
+            # permutations), then resolve in DNSX_CAP-sized CHUNKS. split -a 4 gives a 456,976-chunk
+            # ceiling; the DEFAULT 2-char suffix caps at 676 and SILENTLY truncates everything past
+            # 13.52M lines (split exits 65 but set -e is off, so the loop just runs on the partial set).
+            DEDUP="$RECON_DIR/subdomains/.all_dedup.txt"
+            sort -u "$RECON_DIR/subdomains/all.txt" > "$DEDUP"
+            UNIQ_COUNT=$(file_lines "$DEDUP")
+            CHUNK_DIR="$RECON_DIR/subdomains/.dnsx_chunks"
+            rm -rf "$CHUNK_DIR"; mkdir -p "$CHUNK_DIR"
+            split -a 4 -l "$DNSX_CAP" "$DEDUP" "$CHUNK_DIR/c_"
+            NCHUNK=$(ls "$CHUNK_DIR"/c_* 2>/dev/null | wc -l | tr -d ' ')
+            log_step "dnsx resolving $UNIQ_COUNT unique candidates (of $ALL_COUNT) in $NCHUNK chunk(s) of $DNSX_CAP..."
+            : > "$RECON_DIR/subdomains/resolved.txt"
+            for _chunk in "$CHUNK_DIR"/c_*; do
+                [ -f "$_chunk" ] || continue          # guard: empty glob if split produced nothing
+                timeout -k 30 300 dnsx -silent -a -l "$_chunk" </dev/null \
+                    >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+            done
+            rm -rf "$CHUNK_DIR" "$DEDUP"
+            sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
+        fi
+        RES_N=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
+        # dnsx now ACTUALLY runs (single-pass or chunked), so non-empty output is real resolution.
+        # (The old "resolved.txt == all.txt unfiltered" failure was a `cp` no-op that can no longer
+        # occur on the dnsx path; the `-lt ALL_COUNT` guard wrongly failed tiny all-resolving lists.)
         if [ -s "$RECON_DIR/subdomains/resolved.txt" ]; then
             DNS_VALIDATED=1
-            RES_N=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
             log_done "dnsx: $RES_N resolved (dropped $(( ALL_COUNT - RES_N )) non-resolving candidates)"
         else
-            # dnsx ran but resolved nothing real — fall back to candidate list
-            # rather than an empty resolved.txt (httpx can still try).
             cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
-            log_warn "dnsx resolved 0 — falling back to $ALL_COUNT unresolved candidates (httpx will filter live)"
+            log_warn "dnsx resolved 0/unfiltered — falling back to $ALL_COUNT unresolved candidates (httpx will filter live)"
         fi
     else
-        # No resolver available (or list too large): do NOT claim resolution.
+        # No resolver available (or explicitly skipped): do NOT claim resolution.
         cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
         if ! tool_ok dnsx; then
             log_warn "dnsx not installed — $ALL_COUNT brute-force candidates UNRESOLVED (httpx will filter live)"
         else
-            log_warn "candidate list ($ALL_COUNT) exceeds dnsx cap ($DNSX_CAP) — skipping resolve, httpx will filter live"
+            log_warn "dnsx skipped (DNSX_SKIP=1) — $ALL_COUNT candidates UNRESOLVED (httpx will filter live)"
         fi
     fi
     # v9.2.0 (P1-7) — when DNS wildcard was detected, every brute-forced

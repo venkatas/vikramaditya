@@ -5540,26 +5540,39 @@ def run_rce_scan(domain: str) -> bool:
                 [interactsh_bin, "-json", "-o", interactsh_log],
                 shell=False, capture=True, merge_stderr=True,
             )
-            # Non-blocking readline with a hard deadline so this phase
-            # never deadlocks waiting on an empty pipe.
+            # Read the RAW fd (os.read), NOT a buffered readline(): interactsh prints its banner
+            # and the OOB URL in a single write, so select() (which polls the fd) + readline()
+            # would return the banner and strand the URL inside the TextIOWrapper buffer — the fd
+            # then reads empty, select says not-ready, and the URL is SILENTLY missed. Accumulate
+            # raw bytes and regex-scan the buffer (handles a URL split across reads). Mirrors the
+            # already-correct pattern at hunt.py ~1218.
             import select as _select
+            import re as _re
+            _fd = None
             if interactsh_proc.stdout:
+                try:
+                    _fd = interactsh_proc.stdout.fileno()
+                except Exception:
+                    _fd = None
+            if _fd is not None:
                 deadline = time.time() + 10
-                while time.time() < deadline:
-                    ready, _, _ = _select.select([interactsh_proc.stdout], [], [], 0.5)
+                _buf = b""
+                while time.time() < deadline and not oob_url:
+                    ready, _, _ = _select.select([_fd], [], [], 0.5)
                     if not ready:
                         continue
-                    line = interactsh_proc.stdout.readline()
-                    if not line:
+                    try:
+                        chunk = os.read(_fd, 65536)
+                    except OSError:
                         break
-                    if ".oast." in line or "interact.sh" in line:
-                        # Parse URL from interactsh stdout (it prints the domain)
-                        import re as _re
-                        m = _re.search(r'([a-z0-9]+\.oast\.[a-z]+|[a-z0-9]+\.interact\.sh)', line)
-                        if m:
-                            oob_url = f"ldap://{m.group(1)}"
-                            log("ok", f"interactsh OOB: {oob_url}")
-                            break
+                    if not chunk:
+                        break                              # EOF
+                    _buf += chunk
+                    m = _re.search(rb'([a-z0-9]+\.oast\.[a-z]+|[a-z0-9]+\.interact\.sh)', _buf)
+                    if m:
+                        oob_url = f"ldap://{m.group(1).decode('utf-8', 'replace')}"
+                        log("ok", f"interactsh OOB: {oob_url}")
+                        break
             if not oob_url:
                 log("warn", "interactsh started but no OOB URL appeared within 10s")
         except Exception as e:
@@ -8078,6 +8091,13 @@ Examples:
                              "OFF by default — opt in deliberately.")
 
     args = parser.parse_args()
+
+    # SECURITY GATE: the brain's AUTONOMOUS exploit loop (auto_triage_and_exploit, reached via
+    # post_scan_hook on every confirmed SQLi) issues model-driven --os-shell/--file-write at the
+    # live target. Gate it behind the same --sqli-rce opt-in as the request-file escalation; OFF
+    # by default so a normal scan never autonomously attempts RCE/webshell against production.
+    if _brain is not None:
+        _brain.allow_exploit = bool(getattr(args, "sqli_rce", False))
     resume_requested = args.resume is not None
     resume_session_id = None if args.resume in (None, "", "latest") else args.resume
     skip_items = parse_skip_items(args.skip)
