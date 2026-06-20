@@ -99,6 +99,9 @@ try:
     _BRAIN_OK = True
 except Exception as _brain_err:
     _BRAIN_OK = False
+    BRAIN_SYSTEM = ""
+    MODEL_PRIORITY = ["qwen3:8b"]
+    OLLAMA_HOST = "http://localhost:11434"
 
 # v10.6.0 — host-gating (scopeguard.py, adapted from xalgorix MIT): block tool args
 # that target the operator's own machine/listener.
@@ -126,9 +129,6 @@ try:
     import coverage_gate as _covgate
 except Exception:
     _covgate = None
-    BRAIN_SYSTEM = ""
-    MODEL_PRIORITY = ["qwen3:8b"]
-    OLLAMA_HOST = "http://localhost:11434"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 GREEN   = "\033[0;32m"
@@ -521,6 +521,18 @@ class HuntMemory:
                 self.observation_buf  = data.get("observation_buf", [])[-10:]
                 self.completed_steps  = data.get("completed_steps", [])
                 self.step_count       = data.get("step_count", 0)
+                # Rehydrate the dedup key space from the restored findings_log so
+                # cross-resume classification stays idempotent. Without this, a
+                # --resume run re-walks byte-identical observation lines and
+                # re-appends already-recorded findings (count inflation). The key
+                # must match the (tool, sev, ln.strip()[:300]) form used in
+                # _classify_obs; add_finding stored text already stripped/sliced.
+                for _f in self.findings_log:
+                    self._classified_keys.add((
+                        _f.get("tool", ""),
+                        _f.get("severity", ""),
+                        (_f.get("text") or "")[:300],
+                    ))
             except Exception as exc:
                 # A corrupt/half-written session file must NOT be silently
                 # reset to defaults — that throws away resume state without a
@@ -638,9 +650,22 @@ class ToolDispatcher:
         # machine/listener (loopback / 0.0.0.0 / our bind:port / a local interface).
         # RFC1918 / cloud-metadata SSRF targets are still allowed.
         if _scopeguard is not None:
+            # Recurse over nested dict/list args (e.g. http_request headers /
+            # json_body) so a host/URL buried inside a structured arg cannot
+            # silently bypass the self-target gate. Top-level strings AND every
+            # nested string value are vetted.
+            def _iter_strs(_val):
+                if isinstance(_val, str):
+                    yield _val
+                elif isinstance(_val, dict):
+                    for _x in _val.values():
+                        yield from _iter_strs(_x)
+                elif isinstance(_val, (list, tuple)):
+                    for _x in _val:
+                        yield from _iter_strs(_x)
             for _v in (args or {}).values():
-                if isinstance(_v, str):
-                    _hit = _scopeguard.scan_command(_v)
+                for _s in _iter_strs(_v):
+                    _hit = _scopeguard.scan_command(_s)
                     if _hit:
                         return (f"[BLOCKED] tool '{name}' arg targets {_hit} — the operator's "
                                 f"own machine/listener (out of scope). Refusing; point at the "
@@ -1816,8 +1841,10 @@ def run_agent_hunt(
     )
     agent.bump_file = bump_path
 
-    result = agent.run()
-    tracer.close()
+    try:
+        result = agent.run()
+    finally:
+        tracer.close()
     result["backend"]    = "builtin-react"
     result["trace_path"] = log_path
     result["bump_path"]  = bump_path

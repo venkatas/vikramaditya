@@ -190,3 +190,26 @@ def test_bind_addr_hostname_resolved_for_listener_match(monkeypatch):
     c = scopeguard.Config(bind_addr="bind.example", port=8080)
     monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: ["10.20.30.40"])
     assert scopeguard.is_local_or_listener("other.example:8080", c) is True
+
+
+# ── REGRESSION: numeric/hex tokens that DON'T resolve must fail CLOSED (Finding 3)
+# An all-numeric (2130706433) or 0x-hex (0x7f000001) token is never a legitimate
+# external FQDN — only a packed/encoded IP-literal attempt. If the check-time
+# resolver declines the encoding (returns empty) but the run-time client accepts
+# it, the old fail-OPEN return allowed a pivot onto loopback. Now it blocks.
+
+@pytest.mark.parametrize("token", [
+    "2130706433",   # decimal-packed 127.0.0.1
+    "0x7f000001",   # hex 127.0.0.1
+    "127.1",        # short-form (all-numeric after dot removal)
+])
+def test_unresolvable_numeric_token_fails_closed(cfg, monkeypatch, token):
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: [])
+    assert scopeguard.is_local_or_listener(token, cfg) is True
+
+
+def test_unresolvable_alpha_name_still_allowed(cfg, monkeypatch):
+    # A normal DNS name that simply doesn't resolve stays ALLOWED (fails downstream).
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: [])
+    assert scopeguard.is_local_or_listener("nope.invalid", cfg) is False
+    assert scopeguard.is_local_or_listener("http://gone.example/x", cfg) is False

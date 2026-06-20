@@ -219,26 +219,79 @@ def test_idor(session: AuthSession, endpoint: dict, token_a: str, token_b: str,
         # plagued earlier runs on `/auth/me`, `/dashboard`, etc.
 
     # Phase 3: ID mutation (if id_field specified in body)
+    #
+    # v9.18.4 — Phase 3 previously fired ``idor_id_mutation`` (HIGH) on the
+    # presence of ANY PII field in a 200/201 response. That is exactly the
+    # "same shape, own data" false positive that Phase 1/2 was hardened
+    # against: an endpoint that ignores the supplied id and returns the
+    # *caller's own* record (e.g. ``GET /auth/me``-style), or that returns a
+    # generic PII-shaped 200 for any id, would fire a HIGH IDOR.
+    #
+    # Real IDOR-via-mutation requires TWO grounded signals:
+    #   1. The server HONORED the swap — the mutated response's id-bearing
+    #      fields actually carry the MUTATED id (not the caller's id). If the
+    #      server ignored the param, the returned identity equals the
+    #      caller's own and this never fires.
+    #   2. The mutated body DIFFERS from token_b's own baseline (the same
+    #      request with the *original* id). If both are byte-equal, the
+    #      server is returning one fixed record regardless of the id → benign.
     if id_field and id_field in body:
         original_id = str(body[id_field])
+
+        # token_b's own baseline for the original id — what the attacker is
+        # *entitled* to see. Used to prove the mutated response is a
+        # *different* resource, not the caller's own record echoed back.
+        baseline = session.request(method, path, token=token_b, json_body=body)
+        baseline_body = baseline["body"] if isinstance(baseline["body"], dict) else {}
+        baseline_norm = normalize_response(baseline_body) if baseline_body else {}
+
         for mutated_id in mutate_id(original_id)[:5]:
             mut_body = dict(body)
             mut_body[id_field] = mutated_id
             resp = session.request(method, path, token=token_b, json_body=mut_body)
-            if resp["status"] in (200, 201) and isinstance(resp["body"], dict):
-                if has_pii(resp["body"]):
-                    finding = {
-                        "type": "idor_id_mutation",
-                        "severity": "high",
-                        "detail": f"IDOR via ID mutation: {id_field}={original_id}→{mutated_id} ({method} {path})",
-                        "url": resp["url"],
-                        "evidence": f"Mutated {id_field}={mutated_id}, got HTTP {resp['status']} with PII",
-                    }
-                    findings.append(finding)
-                    if saver:
-                        saver.save(finding)
-                        saver.save_txt(finding)
-                    break  # One confirmed is enough
+            if resp["status"] not in (200, 201) or not isinstance(resp["body"], dict):
+                continue
+            if not has_pii(resp["body"]):
+                continue
+
+            resp_norm = normalize_response(resp["body"])
+
+            # Signal 1: the server reflected the MUTATED id back. If any
+            # id-bearing field in the response equals the value we injected,
+            # the swap was honored. Coerce both sides to str for cross-type
+            # (numeric body id vs string JSON) comparison.
+            returned_ids = _flat_id_values(resp_norm)
+            server_honored_swap = any(
+                str(v) == str(mutated_id) for v in returned_ids.values()
+            )
+
+            # Signal 2: the mutated response is a DIFFERENT resource than the
+            # caller's own baseline. If they are byte-equal after
+            # normalisation, the endpoint serves one fixed record regardless
+            # of id (or ignores the param) → benign, suppress.
+            differs_from_baseline = bool(baseline_norm) and resp_norm != baseline_norm
+
+            if not (server_honored_swap and differs_from_baseline):
+                # Same-shape / own-data / param-ignored case — not provable
+                # IDOR. Skip to avoid the FP that plagued Phase 1/2 endpoints.
+                continue
+
+            finding = {
+                "type": "idor_id_mutation",
+                "severity": "high",
+                "detail": f"IDOR via ID mutation: {id_field}={original_id}→{mutated_id} ({method} {path})",
+                "url": resp["url"],
+                "evidence": (
+                    f"Mutated {id_field}={mutated_id}, got HTTP {resp['status']}; "
+                    f"response reflects mutated id and differs from caller's own "
+                    f"baseline ({id_field}={original_id}); PII exposed"
+                ),
+            }
+            findings.append(finding)
+            if saver:
+                saver.save(finding)
+                saver.save_txt(finding)
+            break  # One confirmed is enough
 
     return findings
 

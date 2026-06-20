@@ -87,3 +87,69 @@ def test_crtsh_otx_distinguish_transport_failure():
     assert re.search(r"grep -q '\^\[\[:space:\]\]\*\\\['", t), "crt.sh body is not validated as a JSON array"
     assert "transport failure" in t, "no warning distinguishing transport failure from genuine-empty"
     assert "--max-time 45" in t, "passive curl max-time not raised to >=45"
+
+
+# ── fixB group recon.sh: additional confirmed-finding guards ─────────────────
+
+# IDX 0: single-pass dnsx must NOT swallow timeout/SIGKILL and must fail-open
+def test_single_pass_dnsx_captures_exit_and_fails_open():
+    t = _t()
+    # The single-pass branch must initialise DNSX_FAILED_CHUNKS and set it on failure
+    assert "DNSX_FAILED_CHUNKS=0" in t, "DNSX_FAILED_CHUNKS not initialised (single-pass path leaves it unset)"
+    assert "DNSX_FAILED_CHUNKS=1" in t, "single-pass dnsx failure does not mark DNSX_FAILED_CHUNKS"
+    # The single-pass dnsx must be guarded by an if (exit captured), not `|| true`
+    assert re.search(
+        r'if timeout -k 30 300 dnsx -silent -a -l "\$RECON_DIR/subdomains/all\.txt"',
+        t,
+    ), "single-pass dnsx still swallows exit with `|| true` instead of capturing it"
+    # On failure it must union the full candidate set back (fail-open)
+    assert 'cat "$RECON_DIR/subdomains/all.txt" >> "$RECON_DIR/subdomains/resolved.txt"' in t, \
+        "single-pass dnsx failure does not fail-open (union candidates back into resolved.txt)"
+
+
+# IDX 1: Phase 3 / Phase 6 resume gate on completion markers, not partial data
+def test_phase3_phase6_gate_on_completion_markers():
+    t = _t()
+    assert 'phase_done "$RECON_DIR/live/.probe.done"' in t, \
+        "Phase-3 HTTP probe resume not gated on .probe.done completion marker"
+    assert '> "$RECON_DIR/live/.probe.done"' in t, ".probe.done marker is never written"
+    assert 'phase_done "$RECON_DIR/urls/.urls.done"' in t, \
+        "Phase-6 URL collection resume not gated on .urls.done completion marker"
+    assert '> "$RECON_DIR/urls/.urls.done"' in t, ".urls.done marker is never written"
+    # The Phase-3 gate must NOT key on the partial-able httpx_full.txt data artefact
+    assert 'phase_done "$RECON_DIR/live/httpx_full.txt"' not in t, \
+        "Phase-3 still gates resume on the partial-able httpx_full.txt"
+
+
+# IDX 2: Wayback + HackerTarget folded into the passive failure tally
+def test_wayback_hackertarget_in_passive_tally():
+    t = _t()
+    assert "_WB_RAW" in t, "Wayback no longer captures raw body for transport-vs-empty distinction"
+    assert "_HT_RAW" in t, "HackerTarget no longer captures raw body for transport-vs-empty distinction"
+    # HackerTarget rate-limit sentinel must be detected before parsing
+    assert "API count exceeded" in t, "HackerTarget rate-limit sentinel not detected"
+    # All four sources named in the coverage warning
+    assert "crt.sh/OTX/Wayback/HackerTarget" in t, \
+        "passive-failure warning still names only crt.sh/OTX (Wayback/HackerTarget uncounted)"
+
+
+# IDX 3: empty passive-source array must not abort under set -u on bash 3.2
+def test_passive_merge_guards_empty_array():
+    t = _t()
+    # The authoritative merge must guard the zero-length array expansion.
+    assert '[ "${#_PASSIVE_SUB_FILES[@]}" -eq 0 ]' in t, \
+        "authoritative passive merge does not guard empty-array expansion (set -u abort on bash 3.2)"
+
+
+# IDX 4: wildcard detection records the FULL round-robin IP set, not just r1
+def test_wildcard_detection_collects_full_ip_set():
+    t = _t()
+    assert "WILDCARD_DNS_IPS" in t, "wildcard detection still records only the first A record (no WILDCARD_DNS_IPS set)"
+    # The dig-filter must match against the wildcard IP set via grep -Fxv -f
+    assert "grep -Fxv -f" in t, "dig-filter does not match against the full wildcard IP set"
+    # head -1 must no longer truncate the per-label dig output in _detect_dns_wildcard
+    start = t.index("_detect_dns_wildcard()")
+    end = t.index("}", t.index("DNS wildcard detected", start))
+    body = t[start:end]
+    assert 'A 2>/dev/null | head -1' not in body, \
+        "_detect_dns_wildcard still truncates each probe to the first A record with head -1"

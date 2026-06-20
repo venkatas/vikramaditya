@@ -108,6 +108,25 @@ def to_finding_entries(
     findings: list[dict[str, Any]] = []
     if not isinstance(audit_report, dict):
         return findings
+
+    # v10.6.0 — bulk-mode shape. build_bulk_report() returns
+    # {"mode": "bulk-analysis", ..., "reports": [<per-domain report>, ...]}
+    # with NO top-level "checks" key. Without this branch, a multi-target
+    # (--targets / --targets-file) audit JSON loaded via load_and_convert()
+    # yielded ZERO findings — every per-domain SPF/DMARC/DKIM/MX issue under
+    # report["reports"][*] was invisible to the pipeline. Recurse into each
+    # per-domain report with its own domain/target so all findings surface.
+    sub_reports = audit_report.get("reports")
+    if audit_report.get("mode") == "bulk-analysis" or isinstance(sub_reports, list):
+        if isinstance(sub_reports, list):
+            for sub in sub_reports:
+                if not isinstance(sub, dict):
+                    continue
+                sub_summary = sub.get("summary") if isinstance(sub.get("summary"), dict) else {}
+                sub_target = sub_summary.get("target") or sub_summary.get("domain") or target
+                findings.extend(to_finding_entries(sub, sub_target))
+        return findings
+
     checks = audit_report.get("checks") or {}
     if not isinstance(checks, dict):
         return findings

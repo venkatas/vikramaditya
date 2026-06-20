@@ -47,22 +47,39 @@ def _redact(s: str) -> str:
 
 def scan_text(text: str, source: str) -> list[dict]:
     hits: list[dict] = []
-    seen_offsets: set[int] = set()
+    # Dedup on the full matched span (start, end), not the start offset alone:
+    # two distinct named detectors can begin at the SAME offset while matching
+    # different spans (e.g. a keyword-context secret and an overlapping generic
+    # assignment). Keying on offset alone would let whichever detector iterates
+    # first silently suppress the other; keying on the span keeps both while
+    # still collapsing exact-duplicate matches.
+    seen_spans: set[tuple[int, int]] = set()
     for name, regex in DETECTORS.items():
         for m in regex.finditer(text):
-            offset = m.start()
-            if offset in seen_offsets:
+            span = (m.start(), m.end())
+            if span in seen_spans:
                 continue
-            seen_offsets.add(offset)
+            seen_spans.add(span)
             value = m.group(0)
             hits.append({
-                "detector": name, "source": source, "offset": offset,
+                "detector": name, "source": source, "offset": m.start(),
                 "preview": _redact(value),
                 "value": value,  # caller writes only to mode-0600 evidence
             })
-    # Entropy pass: only on tokens >= ENTROPY_MIN_LEN that look like values
+    # Entropy pass: only on tokens >= ENTROPY_MIN_LEN that look like values.
+    # Skip a token only when a named detector already covers its span (i.e. the
+    # entropy token sits inside a span we already emitted), so we don't
+    # double-report the same secret under the generic "high_entropy" label.
+    named_spans = sorted(seen_spans)
+
+    def _covered(s: int, e: int) -> bool:
+        for ns, ne in named_spans:
+            if ns <= s and e <= ne:
+                return True
+        return False
+
     for m in re.finditer(r"[A-Za-z0-9/+_=-]{%d,}" % ENTROPY_MIN_LEN, text):
-        if m.start() in seen_offsets:
+        if _covered(m.start(), m.end()):
             continue
         token = m.group(0)
         if _entropy(token) >= ENTROPY_THRESHOLD:

@@ -97,25 +97,39 @@ def _read_capped(resp, max_body: int) -> bytes:
 
 
 def _finalize(result: dict, resp, final_url: str, max_body: int) -> dict:
-    """Populate result from a terminal response (status/headers/body)."""
-    result["status"] = getattr(resp, "status_code", 0) or 0
-    result["headers"] = dict(getattr(resp, "headers", {}) or {})
-    result["final_url"] = getattr(resp, "url", final_url) or final_url
-    raw = _read_capped(resp, max_body)
-    result["bytes"] = len(raw)
-    ct = result["headers"].get("Content-Type") or result["headers"].get("content-type") or ""
-    result["content_type"] = ct
-    if _is_binary_content_type(ct) or _looks_binary_bytes(raw[:1024]):
-        result["is_binary"] = True
-        result["body"] = f"<binary {result['bytes']} bytes, content-type={ct or 'unknown'}>"
+    """Populate result from a terminal response (status/headers/body).
+
+    Always closes ``resp`` before returning. With ``stream=True`` (see probe())
+    requests/urllib3 does NOT auto-release the connection back to the pool, and
+    ``_read_capped`` deliberately stops short of consuming a large body — so
+    without an explicit close the checked-out connection/socket leaks until GC
+    finalizes the response. This is the single terminal sink for every non-
+    redirect-follow exit path, so closing here covers all of them.
+    """
+    try:
+        result["status"] = getattr(resp, "status_code", 0) or 0
+        result["headers"] = dict(getattr(resp, "headers", {}) or {})
+        result["final_url"] = getattr(resp, "url", final_url) or final_url
+        raw = _read_capped(resp, max_body)
+        result["bytes"] = len(raw)
+        ct = result["headers"].get("Content-Type") or result["headers"].get("content-type") or ""
+        result["content_type"] = ct
+        if _is_binary_content_type(ct) or _looks_binary_bytes(raw[:1024]):
+            result["is_binary"] = True
+            result["body"] = f"<binary {result['bytes']} bytes, content-type={ct or 'unknown'}>"
+            return result
+        text = raw.decode("utf-8", "ignore")
+        if len(text) > max_body:
+            result["truncated"] = True
+            result["body"] = text[:max_body] + f"\n…[truncated {len(text) - max_body}+ chars]"
+        else:
+            result["body"] = text
         return result
-    text = raw.decode("utf-8", "ignore")
-    if len(text) > max_body:
-        result["truncated"] = True
-        result["body"] = text[:max_body] + f"\n…[truncated {len(text) - max_body}+ chars]"
-    else:
-        result["body"] = text
-    return result
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
 
 
 _REDIRECT_CODES = (301, 302, 303, 307, 308)

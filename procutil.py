@@ -229,6 +229,21 @@ class _PosixSpawnProc:
         for t in threads:
             t.join(None if deadline is None else max(0.0, deadline - time.time()))
             if t.is_alive():
+                # Self-clean on timeout so this Popen-like surface is safe for ANY
+                # caller (a caller catching TimeoutExpired the way one does with real
+                # subprocess.Popen.communicate() would otherwise leak the still-running
+                # child + the daemon reader threads' read-pipe fds + the pty master).
+                # Kill the whole session group, then close the pty/read fds — closing the
+                # read fds unblocks the daemon reader threads still parked in s.read().
+                try:
+                    os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        self.kill()
+                    except Exception:
+                        pass
+                self._close_pty()
+                self._close_streams()
                 raise subprocess.TimeoutExpired("posix_spawn", timeout)
         out = bufs.get("out", "") or ""
         err = bufs.get("err", "") or ""
@@ -259,10 +274,23 @@ class _PosixSpawnProc:
 
     def __del__(self):
         # Backstop: reap if a caller path never waited, so we don't leak a zombie.
-        # Non-blocking (WNOHANG) — __del__ must never hang.
+        # A still-running child (e.g. a terminate()-only background child whose SIGTERM
+        # hasn't landed yet) is force-killed then reaped — otherwise the single WNOHANG
+        # would return (0, 0) and the child would linger as a zombie until the long-lived
+        # parent exits. The blocking waitpid after SIGKILL returns essentially immediately,
+        # so __del__ still never hangs.
         try:
             if getattr(self, "returncode", 0) is None:
-                os.waitpid(self.pid, os.WNOHANG)
+                pid, _ = os.waitpid(self.pid, os.WNOHANG)
+                if pid == 0:  # still running
+                    try:
+                        os.kill(self.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                    try:
+                        os.waitpid(self.pid, 0)  # SIGKILLed child reaps promptly
+                    except Exception:
+                        pass
         except Exception:
             pass
         try:

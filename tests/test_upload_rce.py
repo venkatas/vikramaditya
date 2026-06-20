@@ -98,6 +98,115 @@ def test_confirm_rce_unrelated_response_is_nothing():
 def test_rce_poc_line_format_matches_ingestion():
     line = upload_rce.rce_poc_line("https://t/up/shell.php.jpg", technique="double_extension",
                                    command_output="uid=33(www-data)")
-    assert line.startswith("[RCE-POC] "), "must start with [RCE-POC] (reporter.py:724 + hunt.py:7521 parse this)"
+    assert line.startswith("[RCE-POC] "), "must start with [RCE-POC] (reporter.py:741 + hunt.py:8082 parse this)"
     assert "https://t/up/shell.php.jpg" in line
     assert "double_extension" in line and "uid=33" in line
+
+
+# ── rce_poc_line must not crash on whitespace-only command_output (finding 3) ──
+
+def test_rce_poc_line_whitespace_only_command_output_does_not_crash():
+    # A truthy-but-whitespace string used to pass the truthiness guard then raise
+    # IndexError on .splitlines()[0]. It must now degrade to no `cmd id →` segment.
+    for ws in ("   ", "\n", "\t", " \n\t "):
+        line = upload_rce.rce_poc_line("https://t/up/shell.php.jpg",
+                                       technique="double_extension", command_output=ws)
+        assert line.startswith("[RCE-POC] ")
+        assert "cmd id" not in line, "whitespace-only command output must not emit a cmd segment"
+
+
+# ── command_output proof must be anchored `id` output, not a stray substring (finding 2) ──
+
+def test_confirm_rce_reflected_uid_substring_is_not_command_output():
+    # The canary RENDERED (code executes) but the only `uid=` is a reflected query
+    # param / analytics id — NOT real `id` output. Must stay high, not over-escalate.
+    for stray in (
+        "V1KR4M_RCE_49\n<a href='/p?uid=42'>x</a>",
+        'V1KR4M_RCE_49\n<input name="uid=foo">',
+        "V1KR4M_RCE_49\nguid=1a2b3c uuid=9f8e cuid=7766",
+    ):
+        r = upload_rce.confirm_rce(stray)
+        assert r["executed"] is True
+        assert r["command_output"] is False, f"stray substring must not be command output: {stray!r}"
+        assert r["severity"] == "high", "code-render-only must not be escalated to critical"
+
+
+def test_confirm_rce_real_id_output_is_command_output():
+    body = "V1KR4M_RCE_49\nuid=0(root) gid=0(root) groups=0(root)\n"
+    r = upload_rce.confirm_rce(body)
+    assert r["executed"] is True
+    assert r["command_output"] is True
+    assert r["severity"] == "critical"
+
+
+def test_id_output_line_returns_only_anchored_line():
+    body = "noise uid=42 should-not-match\nuid=0(root) gid=0(root) groups=0(root)\ntail"
+    assert upload_rce._id_output_line(body) == "uid=0(root) gid=0(root) groups=0(root)"
+    assert upload_rce._id_output_line("guid=abc uuid=def") == ""
+
+
+# ── stored URL with an existing query string must still append the c=id sink (finding 1) ──
+
+def test_verify_upload_rce_appends_sink_to_existing_query_string():
+    captured = {}
+
+    class _Resp:
+        text = "V1KR4M_RCE_49\nuid=0(root) gid=0(root) groups=0(root)\n"
+
+    def _fake_get(url, timeout=None, verify=None):
+        captured["url"] = url
+        captured["verify"] = verify
+        return _Resp()
+
+    import types
+    fake_requests = types.SimpleNamespace(get=_fake_get)
+    saved = sys.modules.get("requests")
+    sys.modules["requests"] = fake_requests
+    try:
+        # stored URL ALREADY carries a query string (signed CDN/S3-style)
+        def upload_post(_v):
+            return True, "https://t/dl.php?f=shell.php.jpg&token=abc"
+
+        out = upload_rce.verify_upload_rce(upload_post, get_base="https://t",
+                                           basename="shell")
+    finally:
+        if saved is not None:
+            sys.modules["requests"] = saved
+        else:
+            del sys.modules["requests"]
+
+    # the c=id sink must be appended with '&' (not dropped), proving the command-RCE
+    assert "c=id" in captured["url"], "c=id sink must be appended even when ? already present"
+    assert captured["url"] == "https://t/dl.php?f=shell.php.jpg&token=abc&c=id"
+    assert out["confirmed"] is True
+    assert out["severity"] == "critical"
+    # TLS verification must default to fail-closed (finding 4)
+    assert captured["verify"] is True
+
+
+def test_verify_upload_rce_appends_sink_without_query_string():
+    captured = {}
+
+    class _Resp:
+        text = "V1KR4M_RCE_49\nuid=0(root) gid=0(root) groups=0(root)\n"
+
+    def _fake_get(url, timeout=None, verify=None):
+        captured["url"] = url
+        return _Resp()
+
+    import types
+    fake_requests = types.SimpleNamespace(get=_fake_get)
+    saved = sys.modules.get("requests")
+    sys.modules["requests"] = fake_requests
+    try:
+        def upload_post(_v):
+            return True, "https://t/up/shell.php.jpg"
+
+        upload_rce.verify_upload_rce(upload_post, get_base="https://t", basename="shell")
+    finally:
+        if saved is not None:
+            sys.modules["requests"] = saved
+        else:
+            del sys.modules["requests"]
+
+    assert captured["url"] == "https://t/up/shell.php.jpg?c=id"

@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import struct
+import tempfile
 import threading
 import time
 import uuid
@@ -35,13 +36,22 @@ class ReauthRequired(RuntimeError):
     """
 
 
-# Server responses that mean "this grant is permanently dead — re-auth needed",
-# as opposed to an ordinary wrong-password failure we should just report.
+# Unambiguous OAuth/grant phrases that mean "this grant is permanently dead —
+# re-auth needed", as opposed to an ordinary wrong-password failure we should
+# just report. These are specific enough to match prose safely on their own.
 _GRANT_DEAD_SIGNALS = (
     "invalid_grant", "invalid grant", "token expired", "token_expired",
     "refresh token", "refresh_token expired", "grant expired",
-    "expired token", "revoked",
+    "expired token",
 )
+
+# Broad standalone terms ("revoked", "expired", "invalid") that ALSO appear in
+# ordinary account-status prose ("this account has been revoked", "your trial
+# has expired"). To avoid false-positive re-auth aborts on a normal 401/403,
+# these only count as a dead grant when they co-occur with a grant/token
+# context word in the SAME response body.
+_GRANT_CONTEXT_WORDS = ("grant", "token", "refresh", "oauth")
+_GRANT_DEAD_AMBIGUOUS = ("revoked", "expired", "invalid")
 
 
 # ── TOTP (RFC 6238) — stdlib only ─────────────────────────────────────────────
@@ -237,7 +247,12 @@ class AuthSession:
     def __init__(self, base_url: str, rate_limiter: RateLimiter = None):
         import requests as _req
         self._session = _req.Session()
-        self._session.verify = False
+        # Honour the VERIFY_TLS opt-in toggle (strict by default; VAPT_INSECURE_SSL=1
+        # opts out for self-signed staging hosts). Hardcoding False here silently
+        # bypassed the toggle on the default-request path (self._session.request)
+        # and on every auto_login POST, defeating MITM detection on the scanner's
+        # own session even when the operator left the strict default in place.
+        self._session.verify = VERIFY_TLS
         self.base_url = base_url.rstrip("/")
         self._limiter = rate_limiter or RateLimiter(10.0)
         self._creds = None
@@ -316,7 +331,17 @@ class AuthSession:
             text = json.dumps(body, default=str).lower() if isinstance(body, (dict, list)) else str(body).lower()
         except Exception:
             text = str(body).lower()
-        return any(sig in text for sig in _GRANT_DEAD_SIGNALS)
+        # Specific, unambiguous grant/token phrases stand on their own.
+        if any(sig in text for sig in _GRANT_DEAD_SIGNALS):
+            return True
+        # Broad terms (revoked/expired/invalid) only count when a grant/token
+        # context word is present, so ordinary "account revoked"/"trial expired"
+        # 401/403 prose does NOT force a spurious re-auth abort.
+        if any(w in text for w in _GRANT_CONTEXT_WORDS) and any(
+            w in text for w in _GRANT_DEAD_AMBIGUOUS
+        ):
+            return True
+        return False
 
     def auto_login(
         self,
@@ -594,13 +619,38 @@ class FindingSaver:
         sev = finding.get("severity", "medium").upper()
         url = finding.get("url", "N/A")
         detail = finding.get("detail", finding.get("type", ""))
+        # reporter.py parses findings.txt strictly one-finding-per-physical-line
+        # and severity-tags via a `[...]` bracket scan. A newline in `detail`
+        # would split one finding across lines (the tail loses its [SEV] tag);
+        # a stray `]`/`[` could be mis-read as a severity tag. Normalise to a
+        # single line and neutralise brackets so the writer is robust no matter
+        # what a future call site places in `detail`.
+        detail = " ".join(str(detail).split())
+        detail = detail.replace("[", "(").replace("]", ")")
         with open(txt_path, "a") as f:
             f.write(f"[{sev}] {detail} {url}\n")
 
     def save_summary(self):
+        # Atomic write: dump to a temp file in the SAME directory, fsync, then
+        # os.replace() over the target. A truncate-then-dump ("w" mode) leaves
+        # summary.json zero-length / half-written if the process is interrupted
+        # (^C, OOM, the recurring macOS TCC Documents file-lock) and the reporter
+        # then silently under-reports findings. os.replace is atomic on POSIX.
         path = os.path.join(self.dir, "summary.json")
-        with open(path, "w") as f:
-            json.dump({"total": len(self._findings), "findings": self._findings}, f, indent=2, default=str)
+        data = {"total": len(self._findings), "findings": self._findings}
+        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".summary.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @property
     def count(self):

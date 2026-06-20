@@ -481,3 +481,80 @@ class TestIdorRequiresValueEquality:
         assert same is True
         assert "id" in reason
 
+
+# ─── Bug (v9.18.4): Phase-3 ID-mutation requires grounded cross-user proof ─────
+class _ScriptedSession:
+    """Minimal AuthSession stand-in for Phase-3 (ID-mutation) tests.
+
+    ``responder(method, path, body)`` returns the response ``body`` dict
+    (or None for a non-200). Synthetic data only.
+    """
+
+    def __init__(self, responder):
+        self._responder = responder
+
+    def request(self, method, path, token=None, json_body=None):
+        body = self._responder(method, path, json_body or {})
+        if body is None:
+            return {"status": 404, "headers": {}, "body": {}, "url": path, "method": method}
+        return {"status": 200, "headers": {}, "body": body, "url": path, "method": method}
+
+
+class TestIdorMutationRequiresGroundedProof:
+    """Phase 3 used to fire HIGH ``idor_id_mutation`` on PII presence alone,
+    even when the server ignored the id and returned the caller's OWN record
+    (false positive). It must now require (a) the response to reflect the
+    MUTATED id and (b) the body to differ from the caller's own baseline."""
+
+    def _types(self):
+        from api_idor_scanner import test_idor
+        return test_idor
+
+    def test_param_ignored_returns_own_record_is_benign(self):
+        # Server ignores `id` — always returns the caller's own profile.
+        # PII is present, 200 OK — but it is NOT IDOR. Must NOT fire.
+        test_idor = self._types()
+
+        def responder(method, path, body):
+            # Same record regardless of the requested id.
+            return {"id": "self-101", "email": "caller@example.invalid", "name": "Caller"}
+
+        sess = _ScriptedSession(responder)
+        ep = {"path": "/api/profile", "method": "POST",
+              "body": {"id": "101"}, "id_field": "id"}
+        findings = test_idor(sess, ep, "tok-a", "tok-b")
+        assert not any(f["type"] == "idor_id_mutation" for f in findings)
+
+    def test_generic_pii_shape_for_any_id_is_benign(self):
+        # Endpoint returns a generic PII-shaped 200 for any id, but the
+        # returned identity never matches the mutated id and never differs
+        # from the caller's baseline. Must NOT fire.
+        test_idor = self._types()
+
+        def responder(method, path, body):
+            return {"id": "fixed-row", "email": "noreply@example.invalid", "name": "X"}
+
+        sess = _ScriptedSession(responder)
+        ep = {"path": "/api/item", "method": "POST",
+              "body": {"id": "5"}, "id_field": "id"}
+        findings = test_idor(sess, ep, "tok-a", "tok-b")
+        assert not any(f["type"] == "idor_id_mutation" for f in findings)
+
+    def test_honored_swap_with_distinct_record_fires(self):
+        # Server honors the swapped id and returns a DIFFERENT user's record
+        # whose `id` reflects the mutated value → genuine IDOR. MUST fire.
+        test_idor = self._types()
+
+        def responder(method, path, body):
+            rid = str(body.get("id"))
+            # Each id maps to that user's private PII record.
+            return {"id": rid, "email": f"user{rid}@example.invalid", "name": f"User{rid}"}
+
+        sess = _ScriptedSession(responder)
+        ep = {"path": "/api/user", "method": "POST",
+              "body": {"id": "10"}, "id_field": "id"}
+        findings = test_idor(sess, ep, "tok-a", "tok-b")
+        mut = [f for f in findings if f["type"] == "idor_id_mutation"]
+        assert mut, "expected idor_id_mutation when server honors swap to a distinct record"
+        assert mut[0]["severity"] == "high"
+

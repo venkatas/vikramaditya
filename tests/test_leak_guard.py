@@ -217,3 +217,68 @@ def test_clean_commit_message_passes(monkeypatch, tmp_path):
     f.write_text("fix: harden the leak guard against marker-adjacent secrets\n")
     monkeypatch.setattr(sys, "argv", ["leak_guard.py", "--msg-file", str(f)])
     assert leak_guard.main() == 0
+
+
+# ── Fix: SOFT secrets must NOT be suppressed by an unrelated line substring ──────
+# Previously any line containing 'example'/'abcd'/'fake'/… anywhere suppressed EVERY soft
+# secret on that line, so a real basic-auth URL against example.com slipped through.
+
+_JWT = "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 10
+
+
+def test_real_jwt_with_example_annotation_still_blocked():
+    line = f'token = "{_JWT}"  # example token for the prod gateway'
+    assert any("JWT" in w for w, _ in leak_guard._scan([("svc.py", line)], TERMS))
+
+
+def test_real_basic_auth_against_example_host_still_blocked():
+    # the credential is real; the host being example.com must NOT relax the soft check
+    line = 'u = "https://admin:Hunter2Password@db.example.com/api"'
+    assert any(w == "basic-auth URL" for w, _ in leak_guard._scan([("svc.py", line)], TERMS))
+
+
+def test_real_jwt_with_abcd_substring_still_blocked():
+    line = f'auth = "{_JWT}"  abcdefg trailing'
+    assert any("JWT" in w for w, _ in leak_guard._scan([("svc.py", line)], TERMS))
+
+
+def test_in_token_marker_still_suppresses_soft_secret():
+    # the documented in-TOKEN relaxation must remain: your_password_here is a fixture
+    assert leak_guard._scan([("svc.py", 'password = "your_password_here"')], TERMS) == []
+
+
+def test_basic_auth_fixture_credential_still_allowed():
+    # a fixture marker IN THE CREDENTIAL still suppresses (host being example.com is irrelevant)
+    line = 'u = "https://fake_user:fakepass@db.example.com/x"'
+    assert leak_guard._scan([("svc.py", line)], TERMS) == []
+
+
+# ── Fix: non-ASCII client filenames must not be octal-escaped past the guard ─────
+
+def test_unquote_git_path_decodes_octal_utf8():
+    # git core.quotepath ON form: "caf\303\251_dump.sql" -> café_dump.sql
+    quoted = '"caf\\303\\251_dump.sql"'
+    assert leak_guard._unquote_git_path(quoted) == "café_dump.sql"
+
+
+def test_unquote_git_path_passthrough_for_plain_path():
+    assert leak_guard._unquote_git_path("engagements/acmebank_dump.sql") == \
+        "engagements/acmebank_dump.sql"
+
+
+def test_non_ascii_client_filename_blocked():
+    # raw UTF-8 path (as emitted with quotepath=false) normalizes and matches the client term
+    hits = leak_guard._scan([], ["cafebank"], extra_paths=["data/cafébank_export.csv"])
+    assert any(w == "cafebank" for w, _ in hits)
+
+
+# ── Fix: short curated blocklist terms get a one-time verbatim-only warning ──────
+
+def test_short_term_warns_once(monkeypatch, capsys):
+    monkeypatch.setattr(leak_guard, "_WARNED_SHORT_TERMS", False)
+    leak_guard._scan([("app.py", "x = 1")], ["acme", "acmebank"])
+    err = capsys.readouterr().err
+    assert "acme" in err and "VERBATIM" in err
+    # second call is silent (one-time)
+    leak_guard._scan([("app.py", "x = 1")], ["acme"])
+    assert capsys.readouterr().err == ""

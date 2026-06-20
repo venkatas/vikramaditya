@@ -1298,6 +1298,10 @@ def run_cmd(
             except subprocess.TimeoutExpired:
                 timed_out = True
                 log("warn", f"{label}: timeout after {timeout}s — killing PID {proc.pid}")
+                # Coverage-honesty (audit-fix): record the truncation so a
+                # timed-out phase isn't rendered as full coverage.
+                _mark_degraded(watch_phase or "subprocess",
+                               f"wall-clock timeout after {timeout}s — partial coverage")
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
@@ -1309,6 +1313,11 @@ def run_cmd(
                 stdout = b"".join(chunks).decode("utf-8", "replace")
             finally:
                 watchdog.stop()
+                # Surface a watchdog SIGKILL (stuck/no-progress) as degraded —
+                # .killed was previously write-only.
+                if not timed_out and getattr(watchdog, "killed", False):
+                    _mark_degraded(watch_phase or "subprocess",
+                                   "watchdog SIGKILL (stuck/no progress) — partial coverage")
 
             finished_at = datetime.now()
             duration = (finished_at - started_at).total_seconds()
@@ -1323,6 +1332,11 @@ def run_cmd(
         try:
             stdout, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            # Coverage-honesty (audit-fix): record the truncation. This path has
+            # no watch_phase, so attribute it to the phase named by watch_phase
+            # if set, else a generic "subprocess" marker.
+            _mark_degraded(watch_phase or "subprocess",
+                           f"wall-clock timeout after {timeout}s — partial coverage")
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
@@ -1401,6 +1415,12 @@ def run_live(cmd: str, timeout: int = 3600,
         except subprocess.TimeoutExpired:
             timed_out = True
             log("warn", f"{label}: timeout after {timeout}s — killing PID {proc.pid}")
+            # Coverage-honesty (audit-fix): a wall-clock timeout means the phase
+            # was truncated (partial coverage), not a clean run. Record it so the
+            # reporter doesn't render a SIGKILLed/timed-out phase as full coverage.
+            _mark_degraded(phase if watch_file is not None else (watch_phase or "subprocess"),
+                           f"wall-clock timeout after {timeout}s — partial coverage")
+            _mark_truncated_recon(watch_file, watch_phase)
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
@@ -1412,6 +1432,13 @@ def run_live(cmd: str, timeout: int = 3600,
         finally:
             if watchdog:
                 watchdog.stop()
+                # The watchdog SIGKILLs a stuck/no-progress child and sets
+                # .killed; that flag was previously write-only. Surface it as a
+                # degradation so a watchdog-truncated phase isn't silently clean.
+                if not timed_out and getattr(watchdog, "killed", False):
+                    _mark_degraded(watch_phase or "subprocess",
+                                   "watchdog SIGKILL (stuck/no progress) — partial coverage")
+                    _mark_truncated_recon(watch_file, watch_phase)
 
         finished_at = datetime.now()
         duration = (finished_at - started_at).total_seconds()
@@ -1788,6 +1815,24 @@ def _mark_degraded(tool: str, reason: str) -> None:
     if entry not in _DEGRADED_CAPABILITIES:
         _DEGRADED_CAPABILITIES.append(entry)
         log("warn", f"Degraded capability: {tool} — {reason}")
+
+
+def _mark_truncated_recon(watch_file: str | None, watch_phase: str | None) -> None:
+    """Drop a ``.recon_truncated`` sentinel when a RECON subprocess is killed by
+    the watchdog / wall-clock timeout, so ``_collect_completed_steps`` re-runs the
+    truncated recon on resume instead of treating partial httpx output as complete.
+
+    No-op for non-recon phases. ``watch_file`` for the recon phase is the recon
+    directory itself (see run_recon's run_live call)."""
+    try:
+        if not watch_phase or "recon" not in watch_phase.lower():
+            return
+        if not watch_file or not os.path.isdir(watch_file):
+            return
+        with open(os.path.join(watch_file, ".recon_truncated"), "w") as fh:
+            fh.write("recon truncated by watchdog/timeout — re-run on resume\n")
+    except OSError:
+        pass
 
 
 def _reset_degraded() -> None:
@@ -3037,7 +3082,13 @@ def _collect_completed_steps(domain: str, session_id: str | None = None) -> set[
     findings_dir = _resolve_findings_dir(domain, session_id=session_id)
     completed = set()
 
-    if _file_nonempty(os.path.join(recon_dir, "live", "httpx_full.txt")):
+    # audit-fix: live/httpx_full.txt is written incrementally during recon, so a
+    # recon that was SIGKILLed by the watchdog / hit the wall-clock timeout would
+    # otherwise be treated as fully completed and never re-run on resume. The
+    # subprocess timeout path drops a .recon_truncated marker in the recon dir;
+    # gate the completion on its absence so a truncated recon is re-run.
+    if (_file_nonempty(os.path.join(recon_dir, "live", "httpx_full.txt"))
+            and not os.path.exists(os.path.join(recon_dir, ".recon_truncated"))):
         completed.add("recon")
     if any(_file_nonempty(os.path.join(recon_dir, "js", name)) for name in (
         "endpoints.txt", "js_urls.txt", "jsluice_endpoints.txt",
@@ -3604,9 +3655,18 @@ def run_autonomous_hunt(
     executed_steps: list[str] = []
     plan: list[dict] = []
     signals: dict = {}
+    # audit-fix (finding 6): a step that returns falsy lands in `attempted` but
+    # not `completed`; the old `planning_completed = completed | attempted`
+    # excluded it from every later plan, so a single transient blip permanently
+    # zeroed that step's coverage with no marker. Track per-step failure counts
+    # and only exclude a step once it has exhausted MAX_STEP_RETRIES; emit a
+    # degraded marker when it does, so the loss is visible in coverage.json.
+    MAX_STEP_RETRIES = 2
+    failed_counts: dict[str, int] = {}
 
     for _ in range(max(1, max_steps)):
-        planning_completed = completed | attempted
+        _retry_exhausted = {s for s, n in failed_counts.items() if n >= MAX_STEP_RETRIES}
+        planning_completed = completed | _retry_exhausted
         signals, plan = _build_autonomous_plan(
             domain,
             quick=quick,
@@ -3654,17 +3714,36 @@ def run_autonomous_hunt(
         danger = " [destructive]" if next_item.get("destructive") else ""
         log("phase", f"AUTONOMOUS STEP: {step}{danger}")
         log("info", f"Reason: {next_item['reason']}")
-        _run_autonomous_step(
-            domain,
-            step,
-            quick=quick,
-            full=full,
-            batch_size=batch_size,
-            skip_items=skip_items,
-            result=result,
-            completed=completed,
-        )
-        _update_target_state_from_artifacts(domain, session_id=session_id)
+        # audit-fix (finding 7): one raising step must NOT abort the whole plan
+        # and skip report generation. Guard the call so a crashing tool degrades
+        # to a skipped step; the loop continues and the report is still reached.
+        try:
+            _step_ok = _run_autonomous_step(
+                domain,
+                step,
+                quick=quick,
+                full=full,
+                batch_size=batch_size,
+                skip_items=skip_items,
+                result=result,
+                completed=completed,
+            )
+        except Exception as exc:  # noqa: BLE001 — one tool crash must not abort the plan/report
+            log("err", f"Autonomous step '{step}' raised and was skipped: {exc}")
+            result[step] = False
+            result["success"] = False
+            _step_ok = False
+        # audit-fix (finding 6): count failures and, once a step exhausts its
+        # retries without completing, surface the wholesale coverage loss.
+        if not _step_ok and step not in completed:
+            failed_counts[step] = failed_counts.get(step, 0) + 1
+            if failed_counts[step] >= MAX_STEP_RETRIES:
+                _mark_degraded(step, f"autonomous step '{step}' failed "
+                                     f"{failed_counts[step]}x; coverage incomplete")
+        try:
+            _update_target_state_from_artifacts(domain, session_id=session_id)
+        except Exception as exc:  # noqa: BLE001 — artifact propagation must not abort the loop
+            log("warn", f"Artifact-state propagation for '{step}' failed: {exc}")
         if resume:
             session["completed_steps"] = sorted(completed | _collect_completed_steps(domain, session_id=session_id))
         else:
@@ -3880,8 +3959,20 @@ def run_recon(
         scope_lock = True  # IPs/CIDRs never need subdomain enum
         log("info", f"Target type: {_target_type.upper()} — subdomain enum skipped")
         if _target_type == "cidr":
-            _hosts = expand_cidr(domain)
-            log("info", f"CIDR {domain} → {len(_hosts)} host(s) to scan")
+            # recon.sh receives the RAW CIDR string (below) and enumerates the
+            # full range, so the log must report the TRUE host count — not the
+            # 254-cap of expand_cidr(), which would badly understate a /23 or
+            # /16. (expand_cidr's cap only bites a hypothetical future caller
+            # that scopes work off its return value.)
+            try:
+                _net = ipaddress.ip_network(domain, strict=False)
+                if _net.version == 4 and _net.prefixlen < 31:
+                    _total = _net.num_addresses - 2
+                else:
+                    _total = _net.num_addresses
+            except ValueError:
+                _total = len(expand_cidr(domain))
+            log("info", f"CIDR {domain} → {_total} host(s) to scan")
 
     # Always PIN TARGETS_FILE for the child process: empty when unused, so an
     # INHERITED TARGETS_FILE env var can't hijack the normal --target / IP / CIDR
@@ -3905,6 +3996,15 @@ def run_recon(
         log("info", f"Scope-lock ON — subdomain enum skipped, testing {domain} only")
     if max_urls > 0:
         log("info", f"URL cap: {max_urls} URLs max (priority-ordered)")
+    # Clear any stale .recon_truncated sentinel from a PRIOR truncated run before
+    # this fresh recon run. Otherwise it is sticky (only ever written, never
+    # removed) and forces recon to re-run on every resume even after a clean
+    # completion — _collect_completed_steps gates recon-complete on its absence.
+    # If THIS run truncates again, the watchdog re-writes it.
+    try:
+        os.remove(os.path.join(recon_dir, ".recon_truncated"))
+    except OSError:
+        pass
     ok = run_live(
         f'{adaptive_env}{_scope_env}{_type_env}{_maxurl_env}{_targets_env}'
         f'RECON_OUT_DIR="{recon_dir}" RECON_SESSION_ID="{active_session_id or ""}" '
@@ -4526,14 +4626,25 @@ def run_param_discovery(domain: str) -> bool:
     # scales linearly with wordlist size and --stable triples runtime.
     if _which("arjun"):
         top_urls_file = os.path.join(param_dir, "top_urls.txt")
-        ARJUN_MAX_URLS = 5
-        arjun_inputs = _collect_urls_from_file(live_file, limit=ARJUN_MAX_URLS)
-        if len(arjun_inputs) < ARJUN_MAX_URLS:
-            for url in _collect_urls_from_file(with_params_file, strip_query=True, limit=ARJUN_MAX_URLS * 2):
+        # Env-overridable cap (parity with CORS_MAX_URLS). Default 5 mitigates
+        # the observed rc=-9 timeouts at 905s against the 25k wordlist; set
+        # ARJUN_MAX_URLS=0 for unlimited.
+        ARJUN_MAX_URLS = int(os.environ.get("ARJUN_MAX_URLS", "5"))
+        # Count the full live-URL surface BEFORE capping so we can surface the
+        # coverage loss via _mark_degraded (matching the CORS/sqlmap pattern).
+        _arjun_all_live = _collect_urls_from_file(live_file)
+        _arjun_limit = ARJUN_MAX_URLS if ARJUN_MAX_URLS > 0 else None
+        arjun_inputs = _collect_urls_from_file(live_file, limit=_arjun_limit)
+        if ARJUN_MAX_URLS <= 0 or len(arjun_inputs) < ARJUN_MAX_URLS:
+            _topup_limit = (ARJUN_MAX_URLS * 2) if ARJUN_MAX_URLS > 0 else None
+            for url in _collect_urls_from_file(with_params_file, strip_query=True, limit=_topup_limit):
                 if url not in arjun_inputs:
                     arjun_inputs.append(url)
-                if len(arjun_inputs) >= ARJUN_MAX_URLS:
+                if ARJUN_MAX_URLS > 0 and len(arjun_inputs) >= ARJUN_MAX_URLS:
                     break
+        if ARJUN_MAX_URLS > 0 and len(_arjun_all_live) > ARJUN_MAX_URLS:
+            _mark_degraded("arjun", f"URL surface capped: probed {ARJUN_MAX_URLS} of "
+                                    f"{len(_arjun_all_live)} live URLs (set ARJUN_MAX_URLS=0 for unlimited)")
 
         if arjun_inputs:
             with open(top_urls_file, "w") as fh:
@@ -4959,6 +5070,16 @@ def run_msf(rc_path: str, label: str = "", timeout: int = 360) -> bool:
         log("warn", "msfconsole not installed — skipping auto-exploit")
         return False
 
+    # audit-fix: confirmed-RCE branches auto-launch a live `exploit` (meterpreter
+    # reverse_tcp staging) behind only the --rce-scan/--exploit phase flag. Honor
+    # MSF_DRYRUN=1 so an operator can generate/inspect the .rc files without
+    # firing the live exploit. Applies to all run_msf call sites (Tomcat, JBoss,
+    # Drupal, WordPress).
+    if os.environ.get("MSF_DRYRUN", "").strip().lower() in ("1", "true", "yes"):
+        log("warn", f"MSF_DRYRUN set — wrote .rc for '{label or 'msf'}' but NOT "
+                    f"running exploit (meterpreter staging skipped)")
+        return False
+
     lhost   = _get_lhost()
     auto_rc = rc_path.replace(".rc", "_auto.rc")
     log_path = rc_path.replace(".rc", "_output.txt")
@@ -5067,13 +5188,23 @@ def run_cms_exploit(domain: str) -> bool:
         targets = []
         if os.path.isfile(live_urls):
             with open(live_urls, errors="ignore") as fh:
+                # No [:50] cap: live/urls.txt holds one URL per live host, so a
+                # cap would silently drop hosts 51+ from fingerprinting with no
+                # marker. The per-URL 70s timeout already bounds total runtime.
                 targets = [u.strip() for u in fh
-                           if u.strip().startswith(("http://", "https://"))][:50]
+                           if u.strip().startswith(("http://", "https://"))]
         for url in targets:
+            # Shell-injection hardening (audit-fix): `url` is sourced from
+            # gau/wayback/katana archives (recon.sh) and is attacker-
+            # influenceable. Double-quoting does NOT neutralise $(...)/backticks
+            # — the shell still expands command substitution inside "...". The
+            # value is pre-substituted into shell SOURCE here, so shlex.quote it
+            # (the jsluice/secretfinder loops are safe because they read the URL
+            # via shell `read` into "$url", which is never re-parsed).
             run_cmd(
                 f'{whatweb_bin} -a1 --color=never --follow-redirect=always '
                 f'--max-redirects=3 --open-timeout=25 --read-timeout=25 '
-                f'"{url}" >> "{whatweb_out}" 2>> "{whatweb_err}"',
+                f'{shlex.quote(url)} >> {shlex.quote(whatweb_out)} 2>> {shlex.quote(whatweb_err)}',
                 timeout=70,
                 watch_file=exploit_dir,
                 watch_phase="CMS EXPLOIT"
@@ -6309,7 +6440,12 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
 
     # v7.1.4 — thread session cookies into sqlmap so authenticated endpoints
     # don't 302 back to the login page before sqlmap can probe them.
-    cookie_opt = f'--cookie="{cookies}"' if cookies else ""
+    # Shell-injection hardening: this flag is interpolated into a /bin/sh -c
+    # string, so shlex.quote the (operator-supplied) cookie value rather than
+    # hand-wrapping in double quotes — a `"`/`$()`/`;` in --cookie would
+    # otherwise break out of the command (or silently corrupt the cookie and
+    # false-negative the SQLi on auth-gated endpoints).
+    cookie_opt = f"--cookie={shlex.quote(cookies)}" if cookies else ""
 
     sqli_out = os.path.join(sqli_dir, "sqlmap_results.txt")
 
@@ -6320,8 +6456,8 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
             f.write("\n".join(candidates))
 
         ok, out = run_cmd(
-            f'sqlmap -m "{cand_file}" --batch --level=3 --risk=2 '
-            f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
+            f'sqlmap -m {shlex.quote(cand_file)} --batch --level=3 --risk=2 '
+            f'--output-dir={shlex.quote(sqli_dir)} --results-file={shlex.quote(sqli_out)} '
             f'--random-agent --timeout=10 {cookie_opt}',
             timeout=1800,
             watch_file=sqli_dir,
@@ -6369,12 +6505,19 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         is_json_body = body.startswith("{") or body.startswith("[")
         json_header = ' --headers="Content-Type: application/json"' if is_json_body else ''
 
+        # Shell-injection hardening (audit-fix): op["url"] comes from the
+        # target-served OpenAPI/Swagger spec and `body` = json.dumps(...) whose
+        # KEYS are raw spec property names. json.dumps does NOT escape single
+        # quotes, so a property name like  a';id;'  would break out of the old
+        # --data='...' clause and run on the operator host. shlex.quote every
+        # interpolated value, matching the request-file sibling at _build().
+        # json_header is a static literal (Content-Type only) so it stays raw.
         ok_p, out_p = run_cmd(
-            f'sqlmap -u "{op["url"]}" --data=\'{body}\' '
-            f'--method {op["method"]} --batch --level=3 --risk=2 '
+            f'sqlmap -u {shlex.quote(op["url"])} --data={shlex.quote(body)} '
+            f'--method {shlex.quote(op["method"])} --batch --level=3 --risk=2 '
             f'--technique=BEU --smart '
             f'--random-agent --timeout=10 {cookie_opt}{json_header} '
-            f'--output-dir="{sqli_dir}"',
+            f'--output-dir={shlex.quote(sqli_dir)}',
             timeout=600,
         )
         post_attempted = True
@@ -6794,6 +6937,16 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # _sqlmap_targeted_extract already does). extra_flags/extra stay operator-supplied (raw flags).
     import shlex as _shlex
     _q_req, _q_dir, _q_out = _shlex.quote(req_abs), _shlex.quote(sqli_dir), _shlex.quote(sqli_out)
+    # extra_flags is operator-supplied (--sqlmap-extra); `extra` is hard-coded.
+    # Tokenize + re-quote each flag so the latent sink can never become a shell
+    # injection regardless of future callers (e.g. if brain/LLM/scanner output
+    # is ever wired into extra_flags). shlex.split preserves distinct argv
+    # tokens (--dump, -D, --sql-query …); shlex.quote defangs metacharacters.
+    def _quote_flags(*raw: str) -> str:
+        toks = []
+        for r in raw:
+            toks.extend(_shlex.split(r or ""))
+        return " ".join(_shlex.quote(t) for t in toks)
     def _build(tamper_clause: str, extra: str = "") -> str:
         return (
             f'sqlmap -r {_q_req} '
@@ -6801,7 +6954,7 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
             f'{enum_clause}--random-agent {tamper_clause}'
             f'--output-dir={_q_dir} --results-file={_q_out} '
             f'--timeout=15 --retries=2 '
-            f'{extra_flags} {extra}'
+            f'{_quote_flags(extra_flags, extra)}'
         ).strip()
 
     tamper_clause = f'--tamper={_shlex.quote(tamper)} ' if tamper else ''
@@ -7136,11 +7289,14 @@ def run_post_param_discovery(domain: str,
         with open(targets_file, "w") as tf:
             tf.write("\n".join(arjun_targets))
 
-        cookie_flag = f'--headers "Cookie: {cookies}"' if cookies else ""
+        # Shell-injection hardening: shlex.quote the operator-supplied cookie
+        # value (interpolated into a /bin/sh -c string below). A `"`/`$()`/`;`
+        # in --cookie would otherwise break out of the command.
+        cookie_flag = f"--headers {shlex.quote('Cookie: ' + cookies)}" if cookies else ""
         ok_arjun, out_arjun = run_cmd(
-            f'arjun -i "{targets_file}" --method POST --stable '
+            f'arjun -i {shlex.quote(targets_file)} --method POST --stable '
             f'--rate-limit 5 -t 5 {cookie_flag} '
-            f'-oJ "{arjun_post_out}"',
+            f'-oJ {shlex.quote(arjun_post_out)}',
             timeout=600,
         )
         if os.path.isfile(arjun_post_out):
@@ -7202,7 +7358,9 @@ def run_post_param_discovery(domain: str,
         findings_dir  = _resolve_findings_dir(domain, create=True)
         sqli_post_dir = os.path.join(findings_dir, "sqlmap_post")
         os.makedirs(sqli_post_dir, exist_ok=True)
-        cookie_opt = f'--cookie="{cookies}"' if cookies else ""
+        # Shell-injection hardening: shlex.quote the operator-supplied cookie
+        # (interpolated into a /bin/sh -c string below).
+        cookie_opt = f"--cookie={shlex.quote(cookies)}" if cookies else ""
 
         # audit-fix (finding 2): iterate ALL discovered POST endpoints. The
         # per-call ``--timeout=10`` + run_cmd timeout already bound total runtime,
@@ -7227,11 +7385,17 @@ def run_post_param_discovery(domain: str,
             out_file   = os.path.join(sqli_post_dir, f"{safe_name}.txt")
 
             log("info", f"sqlmap POST → {url}  data={params_str[:80]}")
+            # Shell-injection hardening (audit-fix): `url` is a target-served
+            # HTML form action and `params_str` is built from raw <input> name
+            # attributes / arjun-discovered param names — both attacker-
+            # controlled. A param named  x";id #  or an action with $(...) would
+            # break out of the old double-quoted clause. shlex.quote every
+            # interpolated value, matching the request-file sibling.
             ok2, out2 = run_cmd(
-                f'sqlmap -u "{url}" --data="{params_str}" '
+                f'sqlmap -u {shlex.quote(url)} --data={shlex.quote(params_str)} '
                 f'--method POST --batch --level=3 --risk=2 '
                 f'--random-agent --timeout=10 {cookie_opt} '
-                f'--output-dir="{sqli_post_dir}" -o "{out_file}"',
+                f'--output-dir={shlex.quote(sqli_post_dir)} -o {shlex.quote(out_file)}',
                 timeout=600,
             )
             if "injectable" in out2.lower() or "injection" in out2.lower():
@@ -7950,6 +8114,15 @@ def hunt_target(
         # v9.24 audit-fix (finding A): a total browser failure records a
         # "browser" degradation; map it so the phase renders ✗ (ERROR), not ✓/∅.
         "browser_scan":    {"browser"},
+        # audit-fix: a watchdog SIGKILL / wall-clock timeout in run_live/run_cmd
+        # records a degradation under the subprocess watch_phase label (e.g.
+        # "RECON", "SCAN"). Map those so a truncated phase renders ⚠/✗ instead
+        # of silently collapsing to "skipped". Match the uppercase watch_phase
+        # labels used at the subprocess call sites.
+        "recon":           {"RECON", "recon"},
+        # the vuln-scan watch_phase label is "VULN SCAN" (and "VULN SCAN (Batch
+        # X/Y)") — NOT "SCAN" — so the degraded-tool match below is prefix-aware.
+        "scan":            {"VULN SCAN", "SCAN", "scan"},
     }
     _phase_requested = {
         "recon":           should_run_recon,
@@ -7970,7 +8143,15 @@ def hunt_target(
     # (a requested browser phase that produced nothing must not be hidden).
     result["phase_requested"] = {k: bool(v) for k, v in _phase_requested.items()}
     for _phase, _requested in _phase_requested.items():
-        _degraded = bool(_phase_tool_map.get(_phase, set()) & _degraded_tools)
+        # Prefix-aware: a degraded tool matches a phase label exactly OR starts
+        # with it (covers dynamic suffixes like "VULN SCAN (Batch 1/3)" that an
+        # exact set-intersection silently missed → scan coverage-loss collapsed
+        # to "skipped" instead of rendering degraded).
+        _labels = _phase_tool_map.get(_phase, set())
+        _degraded = any(
+            _dt == _lab or _dt.upper().startswith(_lab.upper())
+            for _dt in _degraded_tools for _lab in _labels
+        )
         result["phase_status"][_phase] = derive_phase_status(
             bool(_requested), bool(result.get(_phase)), degraded=_degraded
         )

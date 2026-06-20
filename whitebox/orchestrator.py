@@ -17,7 +17,9 @@ from whitebox.secrets.scanner import run_all as run_secrets
 from whitebox.brain.orchestrator import BrainOrchestrator
 from whitebox.reporting.evidence import dump_findings
 from whitebox.cache.manifest import PhaseCache
-from whitebox.models import Finding, Severity, CloudContext
+from whitebox.models import (
+    Finding, Severity, CloudContext, Asset, BlastRadius, Chain,
+)
 
 
 def _persist_phase_findings(account_dir: Path, phase: str, findings: list[Finding]) -> None:
@@ -26,8 +28,71 @@ def _persist_phase_findings(account_dir: Path, phase: str, findings: list[Findin
     path.write_text(_json.dumps([f.to_dict() for f in findings], indent=2, default=str))
 
 
+def _sev_from_label(value) -> Severity:
+    """Accept either a Title-case label ('Medium') or an enum name ('MEDIUM')."""
+    name = str(value).upper()
+    return Severity[name]
+
+
+def _asset_from_dict(d: dict | None) -> Asset | None:
+    if not d:
+        return None
+    return Asset(
+        arn=d["arn"], service=d["service"], account_id=d["account_id"],
+        region=d["region"], name=d["name"], tags=d.get("tags") or {},
+        public_dns=d.get("public_dns"), public_ip=d.get("public_ip"),
+    )
+
+
+def _blast_radius_from_dict(d: dict | None) -> BlastRadius | None:
+    if not d:
+        return None
+    return BlastRadius(
+        principal_arn=d["principal_arn"],
+        s3_buckets=list(d.get("s3_buckets") or []),
+        kms_keys=list(d.get("kms_keys") or []),
+        lambdas=list(d.get("lambdas") or []),
+        assumable_roles=list(d.get("assumable_roles") or []),
+        assumable_users=list(d.get("assumable_users") or []),
+        regions=list(d.get("regions") or []),
+    )
+
+
+def _cloud_context_from_dict(d: dict | None) -> CloudContext | None:
+    if not d:
+        return None
+    return CloudContext(
+        account_id=d["account_id"], region=d["region"], service=d["service"],
+        arn=d["arn"], iam_role_arn=d.get("iam_role_arn"),
+        blast_radius=_blast_radius_from_dict(d.get("blast_radius")),
+        behind_waf=d.get("behind_waf"),
+        exposed_cidrs=list(d.get("exposed_cidrs") or []),
+        exposed_ports=list(d.get("exposed_ports") or []),
+    )
+
+
+def _chain_from_dict(d: dict | None) -> Chain | None:
+    if not d:
+        return None
+    return Chain(
+        trigger_finding_id=d["trigger_finding_id"],
+        cloud_asset_arn=d["cloud_asset_arn"],
+        iam_path=list(d.get("iam_path") or []),
+        promoted_severity=_sev_from_label(d["promoted_severity"]),
+        promotion_rule=d["promotion_rule"],
+        narrative=d.get("narrative", ""),
+    )
+
+
 def _load_phase_findings(account_dir: Path, phase: str) -> list[Finding]:
-    """Reload findings from a previously-completed phase. Returns [] if missing/malformed."""
+    """Reload findings from a previously-completed phase. Returns [] if missing/malformed.
+
+    Round-trips the FULL Finding (asset, cloud_context incl. blast_radius, chain,
+    brain_narrative) so a cached re-run produces a report with the same fidelity
+    as the original run — _persist_phase_findings() already serialised all of it
+    via Finding.to_dict(); previously this reload silently discarded asset,
+    blast_radius, chain and brain_narrative.
+    """
     path = account_dir / f"phase_{phase}_findings.json"
     if not path.exists():
         return []
@@ -38,14 +103,15 @@ def _load_phase_findings(account_dir: Path, phase: str) -> list[Finding]:
     out: list[Finding] = []
     for d in data:
         try:
-            ctx = d.get("cloud_context")
-            cc = CloudContext(**{k: v for k, v in ctx.items() if k != "blast_radius"}) if ctx else None
             out.append(Finding(
                 id=d["id"], source=d["source"], rule_id=d["rule_id"],
-                severity=Severity[d["severity"].upper()],
+                severity=_sev_from_label(d["severity"]),
                 title=d["title"], description=d["description"],
-                asset=None, evidence_path=Path(d["evidence_path"]),
-                cloud_context=cc,
+                asset=_asset_from_dict(d.get("asset")),
+                evidence_path=Path(d["evidence_path"]),
+                cloud_context=_cloud_context_from_dict(d.get("cloud_context")),
+                chain=_chain_from_dict(d.get("chain")),
+                brain_narrative=d.get("brain_narrative"),
             ))
         except Exception:
             continue

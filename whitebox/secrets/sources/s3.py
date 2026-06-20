@@ -41,18 +41,32 @@ def scan(profile: CloudProfile, target_buckets: list[str],
     findings: list[Finding] = []
     s3 = profile._session.client("s3")
     for bucket in target_buckets:
+        # Per-bucket coverage accounting so a cap / size-skip is recorded as
+        # degraded coverage instead of being indistinguishable from a clean
+        # bucket (a secret in object #201 or in a >1MB dump is otherwise a
+        # silent false-negative).
+        cap_truncated = False         # hit MAX_OBJECTS_PER_BUCKET — more objects left unscanned
+        oversize_skipped = 0          # objects skipped because Size > MAX_OBJECT_SIZE
         try:
             paginator = s3.get_paginator("list_objects_v2")
             count = 0
             stop = False
-            for page in paginator.paginate(Bucket=bucket, PaginationConfig={"MaxItems": MAX_OBJECTS_PER_BUCKET}):
+            # List one item beyond the cap so the cap guard can reliably observe
+            # that more objects exist (MaxItems truncates pagination, so listing
+            # exactly the cap would never reveal an over-cap bucket).
+            for page in paginator.paginate(
+                Bucket=bucket,
+                PaginationConfig={"MaxItems": MAX_OBJECTS_PER_BUCKET + 1},
+            ):
                 if stop:
                     break
                 for obj in page.get("Contents", []):
                     if count >= MAX_OBJECTS_PER_BUCKET:
+                        cap_truncated = True
                         stop = True
                         break
                     if obj.get("Size", 0) > MAX_OBJECT_SIZE:
+                        oversize_skipped += 1
                         continue
                     count += 1
                     try:
@@ -94,4 +108,39 @@ def scan(profile: CloudProfile, target_buckets: list[str],
                         ))
         except Exception:
             continue
+        # Coverage-degradation marker: if we stopped at the object cap or skipped
+        # any oversize object, emit an INFO finding so the report shows degraded
+        # coverage rather than implying the bucket was fully scanned.
+        if cap_truncated or oversize_skipped:
+            reasons = []
+            if cap_truncated:
+                reasons.append(
+                    f"scan capped at MAX_OBJECTS_PER_BUCKET={MAX_OBJECTS_PER_BUCKET} "
+                    f"objects; additional objects were not scanned"
+                )
+            if oversize_skipped:
+                reasons.append(
+                    f"{oversize_skipped} object(s) larger than "
+                    f"MAX_OBJECT_SIZE={MAX_OBJECT_SIZE} bytes were skipped"
+                )
+            detail = "; ".join(reasons)
+            fid = f"secrets-s3-scan-truncated-{profile.account_id}-{bucket}"
+            findings.append(Finding(
+                id=fid,
+                source="secrets",
+                rule_id="secrets.s3.scan_truncated",
+                severity=Severity.INFO,
+                title=f"S3 secret scan coverage limited ({bucket})",
+                description=(
+                    f"Secret scan of s3://{bucket} (account {profile.account_id}) "
+                    f"was not exhaustive: {detail}. A secret in an unscanned object "
+                    f"is a false-negative this scan cannot rule out."
+                ),
+                asset=None,
+                evidence_path=Path("secrets") / f"{fid}.json",
+                cloud_context=CloudContext(
+                    account_id=profile.account_id, region="global",
+                    service="s3", arn=f"arn:aws:s3:::{bucket}",
+                ),
+            ))
     return findings
