@@ -6613,7 +6613,9 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                 path_from_file   = parts[1]
         for ln in lines[1:]:
             if ln.lower().startswith("host:"):
-                host_from_file = host_from_file or ln.split(":", 1)[1].strip().split(":")[0]
+                _h = ln.split(":", 1)[1].strip().split(":")[0]
+                _h = _re.sub(r'[^A-Za-z0-9.-]', '', _h)   # hostname charset only — a poisoned
+                host_from_file = host_from_file or _h     # Host header must not traverse the output path
             if not ln.strip() and not has_post_body:
                 # blank line = end of headers; body may follow
                 has_post_body = (method_from_file in ("POST", "PUT", "PATCH"))
@@ -6644,17 +6646,23 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # requests it needs (heavy re-enumeration every call is what trips edge rate-limiting /
     # 421 Misdirected Request storms on protected targets).
     enum_clause = '' if lean else '--dbs --tables '
+    # Shell-injection hardening: this string runs via /bin/sh -c, and req_abs / sqli_dir / sqli_out
+    # derive from the request-file path and its (attacker-controllable) Host header, while `tamper`
+    # comes from --sqlmap-tamper. shlex.quote every interpolated value (the sibling
+    # _sqlmap_targeted_extract already does). extra_flags/extra stay operator-supplied (raw flags).
+    import shlex as _shlex
+    _q_req, _q_dir, _q_out = _shlex.quote(req_abs), _shlex.quote(sqli_dir), _shlex.quote(sqli_out)
     def _build(tamper_clause: str, extra: str = "") -> str:
         return (
-            f'sqlmap -r "{req_abs}" '
+            f'sqlmap -r {_q_req} '
             f'--batch --level={level} --risk={risk} '
             f'{enum_clause}--random-agent {tamper_clause}'
-            f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
+            f'--output-dir={_q_dir} --results-file={_q_out} '
             f'--timeout=15 --retries=2 '
             f'{extra_flags} {extra}'
         ).strip()
 
-    tamper_clause = f'--tamper={tamper} ' if tamper else ''
+    tamper_clause = f'--tamper={_shlex.quote(tamper)} ' if tamper else ''
     cmd = _build(tamper_clause)
 
     log("info", f"Running: {cmd}")
