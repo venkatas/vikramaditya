@@ -173,6 +173,14 @@ AMASS_TIMEOUT="${AMASS_TIMEOUT:-180}"  # v10.1.2: 3 min (passive amass is low-yi
 # ~4 min producing 0 output on a live engagement run. Hard-kill like amass/dnsx.
 GAU_TIMEOUT="${GAU_TIMEOUT:-120}"      # 2 min — historical-URL pull
 WAYMORE_TIMEOUT="${WAYMORE_TIMEOUT:-180}"  # 3 min — multi-source archive pull
+# waybackurls also queries the (slow/rate-limiting) Wayback Machine and can hang
+# indefinitely with NO timeout — same failure mode as gau/waymore. Bound it.
+WAYBACK_TIMEOUT="${WAYBACK_TIMEOUT:-120}"  # 2 min — wayback historical-URL pull
+# Visual recon (gowitness) screenshots EVERY live URL at 12s/URL — disproportionate
+# on large estates (1700+ hosts ≈ 40 min, zero finding-value). Cap to the top-N
+# priority-ordered URLs; SCREENSHOT_MAX=0 = unlimited; SKIP_SCREENSHOTS=1 = skip phase.
+SCREENSHOT_MAX="${SCREENSHOT_MAX:-200}"
+SKIP_SCREENSHOTS="${SKIP_SCREENSHOTS:-}"
 CURL_TIMEOUT=10        # per request
 HTTP_PROBE_TIMEOUT=5   # reduced: 5s per-host timeout (was 10) — avoids macOS TCP hang
 
@@ -1368,11 +1376,23 @@ start_async_phase "Phase 11: Subdomain Takeover Pre-Check" "$ASYNC_LOG_DIR/phase
 echo ""
 log_info "Phase 4.5: Visual Recon"
 mkdir -p "$RECON_DIR/screenshots"
-if phase_done "$RECON_DIR/screenshots/.gowitness.done"; then true; else
+if [ -n "$SKIP_SCREENSHOTS" ]; then
+    log_warn "Phase 4.5 skipped — SKIP_SCREENSHOTS set (visual recon disabled)"
+    touch "$RECON_DIR/screenshots/.gowitness.done"
+elif phase_done "$RECON_DIR/screenshots/.gowitness.done"; then true; else
 if tool_ok gowitness && [ -s "$RECON_DIR/live/urls.txt" ]; then
     URL_COUNT=$(file_lines "$RECON_DIR/live/urls.txt")
-    log_step "gowitness ($URL_COUNT URLs, 6 threads, 12s/URL timeout)..."
-    gowitness scan file -f "$RECON_DIR/live/urls.txt" -t 6 -T 12 \
+    # Cap the full pass on large estates: screenshot only the top-N priority-ordered
+    # URLs (live/urls.txt is written priority-ordered). At 12s/URL the uncapped pass
+    # is ~40min on 1700+ hosts for zero finding-value; SCREENSHOT_MAX=0 = all.
+    SHOT_SRC="$RECON_DIR/live/urls.txt"
+    if [ "${SCREENSHOT_MAX:-0}" -gt 0 ] 2>/dev/null && [ "$URL_COUNT" -gt "$SCREENSHOT_MAX" ]; then
+        head -n "$SCREENSHOT_MAX" "$RECON_DIR/live/urls.txt" > "$RECON_DIR/screenshots/.shot_targets.txt"
+        SHOT_SRC="$RECON_DIR/screenshots/.shot_targets.txt"
+        log_warn "gowitness: capped to $SCREENSHOT_MAX/$URL_COUNT priority URLs (set SCREENSHOT_MAX=0 for all, SKIP_SCREENSHOTS=1 to skip)"
+    fi
+    log_step "gowitness ($(file_lines "$SHOT_SRC") URLs, 6 threads, 12s/URL timeout)..."
+    gowitness scan file -f "$SHOT_SRC" -t 6 -T 12 \
         -s "$RECON_DIR/screenshots" \
         --write-jsonl --write-jsonl-file "$RECON_DIR/screenshots/gowitness.jsonl" \
         -q 2>/dev/null || true
@@ -1411,10 +1431,10 @@ else
     log_done "wayback: $(file_lines "$RECON_DIR/urls/wayback.txt") URLs"
 fi
 
-# waybackurls — extra coverage
+# waybackurls — extra coverage (timeout-bounded; the Wayback API can hang forever)
 if tool_ok waybackurls; then
     log_step "waybackurls..."
-    echo "$TARGET" | waybackurls \
+    echo "$TARGET" | timeout -k 15 "$WAYBACK_TIMEOUT" waybackurls \
         > "$RECON_DIR/urls/waybackurls.txt" 2>/dev/null || true
     log_done "waybackurls: $(file_lines "$RECON_DIR/urls/waybackurls.txt") URLs"
 fi
@@ -1994,7 +2014,14 @@ while IFS= read -r base_url; do
                 if [ "$DIFF" -le 2 ]; then continue; fi
             fi
 
-            echo "[EXPOSED] ${base_url}${path}"
+            # Persist GROUNDED proof (status + content-type + size + a content
+            # snippet) so a confirmed exposure is reportable evidence, not a bare
+            # URL the reporter/operator can't verify. Snippet capped at 180 chars,
+            # control chars stripped; full body NOT stored (size-bounded + may hold
+            # secrets — config_files.txt lives under gitignored recon/).
+            _SNIP=$(printf '%s' "$BODY" | head -c 180 | tr '\r\n\t' '   ' | tr -cd '[:print:]')
+            _CTV=$(printf '%s' "$CT" | sed -E 's/^[Cc]ontent-[Tt]ype:[[:space:]]*//; s/[\r\n]//g' | cut -d';' -f1)
+            echo "[EXPOSED] ${base_url}${path} :: status=${STATUS} type=${_CTV:-?} bytes=${BODY_SIZE} snippet=${_SNIP}"
         done < "$CONFIG_PATHS_FILE"
     ) >> "$RECON_DIR/exposure/config_files.txt" &
     CONFIG_PIDS+=("$!")
