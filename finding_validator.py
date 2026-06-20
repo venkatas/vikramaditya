@@ -74,22 +74,34 @@ VTYPE_DEFAULT_SEVERITY = {
 }
 
 # Explicit severity tokens that may appear in a finding line, e.g.
-# "[CRITICAL]", "severity: high", "(low)". Ordered most→least severe so the
-# first match wins when several appear.
-_SEVERITY_TOKEN_RE = re.compile(r"\b(critical|high|medium|low|info)\b", re.IGNORECASE)
+# "[CRITICAL]", "[HIGH - SQLi]", "(low)", "severity: high".
+#
+# IMPORTANT: only ANCHORED forms count. A bare severity word elsewhere on the
+# line (e.g. "info" inside "http://h/info.php", or "low" inside "low
+# false-positive rate") is NOT a severity declaration — honoring it would
+# silently DOWNGRADE a confirmed finding (a real SQLi line routinely contains
+# such words in its URL/description) and, under --strict, KILL it. So we match
+# only bracketed / parenthesized / "severity:"-labelled tokens; everything
+# else falls through to the per-vtype default.
+_SEVERITY_TOKEN_RE = re.compile(
+    r"\[\s*(critical|high|medium|low|info)\b"                    # [CRITICAL]  /  [HIGH - SQLi]
+    r"|\(\s*(critical|high|medium|low|info)\s*\)"                # (low)
+    r"|\bseverity\s*[:=]\s*(critical|high|medium|low|info)\b"    # severity: high  /  severity=high
+    r"|^\s*(critical|high|medium|low|info)\s*:",                 # leading label: "low: verbose ..."
+    re.IGNORECASE)
 
 
 def parse_severity(line: str, vtype: str = "") -> str:
     """Derive a finding's severity.
 
     Precedence:
-      1. An explicit severity token in the line text (critical/high/medium/low/info).
+      1. An EXPLICIT, anchored severity token in the line (see _SEVERITY_TOKEN_RE).
       2. The per-vtype default from VTYPE_DEFAULT_SEVERITY.
       3. "medium" as a last-resort fallback.
     """
     m = _SEVERITY_TOKEN_RE.search(line or "")
     if m:
-        return m.group(1).lower()
+        return next(g for g in m.groups() if g).lower()
     return VTYPE_DEFAULT_SEVERITY.get(vtype, "medium")
 
 

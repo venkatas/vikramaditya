@@ -7458,6 +7458,22 @@ def run_browser_scan(
                 artifacts={"findings": findings_dir},
             )
             return False
+        # v10.6 audit-fix: a PARTIAL phase (some tasks completed, some errored)
+        # returns findings but must NOT render as a clean ✓ — consume the
+        # producer's agent.partial flag and mark the phase degraded so coverage
+        # honestly reflects that some browser tasks failed.
+        if getattr(agent, "partial", False):
+            reason = (f"browser phase partial — {tasks_completed} task(s) completed, "
+                      f"{tasks_errored} errored; findings may be incomplete")
+            _mark_degraded("browser", reason)
+            log("warn", f"Browser scan partial: {reason}")
+            _brain_phase_complete(
+                phase_name, bool(results),
+                detail=(f"target={domain} headed={headed} PARTIAL "
+                        f"completed={tasks_completed} errored={tasks_errored} findings={total}"),
+                artifacts={"findings": findings_dir},
+            )
+            return bool(results)
         log("ok" if total else "info", f"Browser scan complete: {total} finding(s)")
         _brain_phase_complete(
             phase_name,

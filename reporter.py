@@ -1329,19 +1329,22 @@ def load_findings(findings_dir: str) -> list:
                 from brain_scanner import _ACCESS_CLAIM_RE, _USAGE_BANNER_RE
             except Exception:
                 _ACCESS_CLAIM_RE = _USAGE_BANNER_RE = None
+            try:
+                from brain_scanner import _grounded_read_unproven as _shared_grounded_gate
+            except Exception:
+                _shared_grounded_gate = None
 
             def _claim_unproven(_line, _out):
-                """Reporter-side proof gate. Keeps brain_scanner's signature
-                whitelist as a fast-accept, but does NOT treat the narrow
-                _FILE_PROOF_RE signature as the SOLE proof: a grounded read of a
-                non-whitelisted file (source code, YAML/JSON config, /etc/hosts,
-                a log file, /proc/self/environ) prints substantive retrieved
-                content that the signature regex cannot represent — dropping it
-                is a silent false-negative on a real file-disclosure finding.
-                So when the imported gate flags a claim as unproven, re-check
-                whether the output carries multiple substantive content lines
-                beyond the claim/banner itself. A bare `echo "[CRITICAL]
-                accessible"` prints zero such lines and stays demoted."""
+                """Reporter-side proof gate. Prefer the SHARED generalized gate in
+                brain_scanner (_grounded_read_unproven): it keeps grounded reads
+                of non-whitelisted files (source code, YAML/JSON config,
+                /etc/hosts, /proc/self/environ) — substantive content the narrow
+                _FILE_PROOF_RE signature cannot represent — while filtering tool
+                progress-noise so a bare/padded `echo "[CRITICAL] accessible"`
+                stays demoted. Falls back to the inline content check below when
+                the import is unavailable (keeps this path self-contained)."""
+                if _shared_grounded_gate is not None:
+                    return _shared_grounded_gate(_line, _out)
                 if not _access_claim_unproven:
                     return False
                 if not _access_claim_unproven(_line, _out):
