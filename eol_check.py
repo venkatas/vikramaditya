@@ -332,6 +332,8 @@ def lookup(tech_term: str, version: str | None = None,
           "slug": endoflife.date slug or None,
           "version": version or None,
           "matched_cycle": cycle dict or None,
+          "cycle_inferred": bool,   # True = cycle was a guess (no version),
+                                    #        not matched to the supplied version
           "status": "supported" | "soon" | "expired" | "unknown" | "no_data",
           "days_to_eol": int or None,
           "latest": str or None,    # latest patch in matched cycle
@@ -368,9 +370,22 @@ def lookup(tech_term: str, version: str | None = None,
         return out  # 404 / empty product
 
     matched = _match_cycle(cycles, version) if version else None
+    if version and matched is None:
+        # A version was supplied but no cycle's label is a numeric prefix of it
+        # (e.g. php=5 against cycles 5.6/7.x/8.x). Do NOT fall back to the newest
+        # cycle and classify against it — that fabricates a "supported" verdict
+        # for software that may be long EOL. Surface the unmatched state instead.
+        out["status"] = "unknown"
+        out["matched_cycle"] = None
+        out["cycle_inferred"] = False
+        return out
     if matched is None:
-        # Use the most recent cycle as a hint
+        # No version supplied: use the most recent cycle as a hint only, and
+        # flag that the cycle was inferred rather than matched to a version.
         matched = cycles[0]
+        out["cycle_inferred"] = True
+    else:
+        out["cycle_inferred"] = False
     out["matched_cycle"] = matched
     out["latest"] = matched.get("latest")
     out["eol_date"] = matched.get("eol")

@@ -86,13 +86,27 @@ def _skip_params():
 class HARVAPTEngine:
     """Replays HAR requests, fuzzes parameters, validates findings."""
 
-    def __init__(self, har_analysis: Dict, output_dir: str = None):
+    def __init__(self, har_analysis: Dict, output_dir: str = None,
+                 allowed_hosts: Optional[List[str]] = None):
         self.analysis = har_analysis
         self.session_data = har_analysis.get('session_data', {})
         self.endpoints = har_analysis.get('endpoints', [])
         self.attack_surface = har_analysis.get('attack_surface', {})
         self.config = har_analysis.get('config', {})
         self.output_dir = output_dir
+
+        # ── Engagement scope allowlist ────────────────────────────────────
+        # A real HAR routinely mixes third-party hosts (analytics, CDN, SSO/
+        # IdP, ad networks). Firing active payloads — or the autonomous brain
+        # scanner — at those is an out-of-scope attack the operator never
+        # authorised. brain_scanner's scopeguard only blocks the operator's
+        # OWN machine, NOT third-party hosts, so it cannot stand in for an
+        # engagement allowlist. We fail CLOSED: if no explicit allowlist is
+        # supplied, the in-scope set is the single first-seen target host
+        # (config['target_domain']). Any other host is dropped with a logged
+        # degradation marker.
+        self.allowed_hosts = self._build_allowlist(allowed_hosts)
+        self._dropped_hosts: set = set()
 
         self.session = requests.Session()
         self.session.verify = False
@@ -102,6 +116,67 @@ class HARVAPTEngine:
         self.vulnerabilities: List[Dict] = []
         self.test_results: Dict = {}
         self._tested = 0
+
+    # ── Engagement-scope filtering ────────────────────────────────────────
+
+    @staticmethod
+    def _norm_host(host: str) -> str:
+        """Lowercase, strip an explicit port and trailing dot for comparison."""
+        if not host:
+            return ''
+        host = host.strip().lower().rstrip('.')
+        # Drop credentials / port (urlparse already strips creds for .hostname,
+        # but a bare netloc like 'host:8443' still carries the port).
+        if '@' in host:
+            host = host.rsplit('@', 1)[1]
+        if host.startswith('['):  # IPv6 literal [::1]:8443
+            host = host[1:].split(']', 1)[0]
+        elif ':' in host:
+            host = host.split(':', 1)[0]
+        return host
+
+    def _build_allowlist(self, allowed_hosts: Optional[List[str]]) -> set:
+        scope = set()
+        for h in (allowed_hosts or []):
+            n = self._norm_host(h)
+            if n:
+                scope.add(n)
+        if not scope:
+            # Fail closed: only the first-seen target host is authorised.
+            target = self.config.get('target_domain', '')
+            n = self._norm_host(target)
+            if n:
+                scope.add(n)
+        return scope
+
+    def _in_scope(self, url: str) -> bool:
+        """True iff ``url``'s host is in the engagement allowlist.
+
+        Fail CLOSED: an empty allowlist (no target_domain, no explicit hosts)
+        means NOTHING is in scope rather than everything.
+        """
+        if not self.allowed_hosts:
+            return False
+        host = self._norm_host(urlparse(url).netloc)
+        if not host:
+            return False
+        return host in self.allowed_hosts
+
+    def _scope_filter(self, endpoints: List[Dict]) -> List[Dict]:
+        """Drop endpoints whose host is out of scope, recording each dropped
+        host once so coverage loss is never silent."""
+        kept = []
+        for ep in endpoints:
+            url = ep.get('url', '')
+            if self._in_scope(url):
+                kept.append(ep)
+            else:
+                host = self._norm_host(urlparse(url).netloc)
+                if host and host not in self._dropped_hosts:
+                    self._dropped_hosts.add(host)
+                    print(f"   ⚠️  [SCOPE] Dropping out-of-scope host '{host}' "
+                          f"(not in engagement allowlist {sorted(self.allowed_hosts)})")
+        return kept
 
     # ── Session setup ─────────────────────────────────────────────────────
 
@@ -168,12 +243,13 @@ class HARVAPTEngine:
                     fuzz_params[p] = v[0] if isinstance(v, list) and v else str(v)
             if fuzz_params:
                 targets.append({**ep, '_fuzz_params': fuzz_params})
-        return targets
+        return self._scope_filter(targets)
 
     def _real_upload_endpoints(self) -> List[Dict]:
         """Return only endpoints that actually had multipart file uploads in the HAR."""
-        return [ep for ep in self.endpoints
-                if ep.get('has_file_upload') and ep.get('method') in ('POST', 'PUT')]
+        return self._scope_filter([
+            ep for ep in self.endpoints
+            if ep.get('has_file_upload') and ep.get('method') in ('POST', 'PUT')])
 
     def _auth_endpoints(self) -> List[Dict]:
         """Return endpoints that serve dynamic content and should require auth."""
@@ -188,7 +264,7 @@ class HARVAPTEngine:
             ct = ep.get('content_type', '')
             if 'json' in ct or 'html' in ct:
                 out.append(ep)
-        return out
+        return self._scope_filter(out)
 
     # ── SQL Injection ─────────────────────────────────────────────────────
 
@@ -241,7 +317,21 @@ class HARVAPTEngine:
                             self.session.get(url.split('?')[0], params=test_params, timeout=delay + 10)
                         elapsed = time.time() - t0
                         if elapsed >= delay - 0.5:
-                            # Confirm with a shorter delay
+                            # The first 5s-payload hit was slow, but a single
+                            # slow sample is indistinguishable from network
+                            # jitter / a GC pause / a cold cache. CONFIRM
+                            # differentially: (a) re-run the SAME long payload
+                            # and require the delay to REPRODUCE (defeats a
+                            # one-off spike), and (b) run the short (1s) payload
+                            # as a fast baseline. Only when long reproduces AND
+                            # short is fast is this a genuine time-based SQLi.
+                            t_long = time.time()
+                            if method == 'POST':
+                                self.session.post(url.split('?')[0], data=test_params, timeout=delay + 10)
+                            else:
+                                self.session.get(url.split('?')[0], params=test_params, timeout=delay + 10)
+                            elapsed_long2 = time.time() - t_long
+
                             payload2 = tpl.format(delay=1)
                             test_params2 = {**base_params, param: payload2}
                             t1 = time.time()
@@ -250,9 +340,13 @@ class HARVAPTEngine:
                             else:
                                 self.session.get(url.split('?')[0], params=test_params2, timeout=12)
                             elapsed2 = time.time() - t1
-                            if elapsed >= delay - 0.5 and elapsed2 < delay - 0.5:
+
+                            if (elapsed >= delay - 0.5
+                                    and elapsed_long2 >= delay - 0.5
+                                    and elapsed2 < delay - 0.5):
                                 self._log('critical', 'SQL Injection (Time-Based)', url,
-                                          f"Delay {elapsed:.1f}s with {delay}s, {elapsed2:.1f}s with 1s in param '{param}'",
+                                          f"Delay reproduced ({elapsed:.1f}s, {elapsed_long2:.1f}s with {delay}s) "
+                                          f"vs {elapsed2:.1f}s with 1s in param '{param}'",
                                           param=param, payload=payload)
                                 results['vulnerable'].append(url)
                     except Exception:
@@ -445,7 +539,16 @@ class HARVAPTEngine:
                                           f"Server accepted '{fname}' via '{param}' — cannot verify storage",
                                           param=param)
                                 
-                                # Ask the brain to try harder to find it and get RCE by writing a script
+                                # Ask the brain to try harder to find it and get RCE by writing a script.
+                                # HARD scope gate: the autonomous LLM-writes-and-executes path must
+                                # never run against a host outside the engagement allowlist.
+                                # brain_scanner's scopeguard only blocks the operator's own machine,
+                                # so we cannot delegate this check to it — assert here and skip.
+                                if not self._in_scope(url):
+                                    host = self._norm_host(urlparse(url).netloc)
+                                    print(f"   ⚠️  [SCOPE] Refusing brain scan on out-of-scope "
+                                          f"host '{host}' (not in allowlist {sorted(self.allowed_hosts)})")
+                                    continue
                                 try:
                                     import os
                                     from brain_scanner import run_brain_scanner
@@ -653,6 +756,15 @@ class HARVAPTEngine:
         }
 
         for domain in domains:
+            # Only probe in-scope hosts — `domains` is harvested verbatim from
+            # the HAR and may include third-party (analytics/CDN/SSO) hosts.
+            if not self._in_scope(f"https://{domain}/"):
+                host = self._norm_host(domain)
+                if host and host not in self._dropped_hosts:
+                    self._dropped_hosts.add(host)
+                    print(f"   ⚠️  [SCOPE] Skipping out-of-scope host '{host}' "
+                          f"in header audit")
+                continue
             results['tested'] += 1
             try:
                 r = self.session.get(f"https://{domain}/", timeout=10)
@@ -697,6 +809,7 @@ class HARVAPTEngine:
 
         print(f"🚀 Starting comprehensive VAPT scan...")
         print(f"📊 Target: {target}")
+        print(f"🔒 In-scope hosts (allowlist): {sorted(self.allowed_hosts) or '(none — fail-closed)'}")
         print(f"🎯 Total endpoints: {len(self.endpoints)}")
         print(f"🔧 Fuzzable endpoints: {len(fuzzable)} (with {sum(len(e['_fuzz_params']) for e in fuzzable)} params)")
         print(f"📁 Real upload endpoints: {len(uploads)}")
@@ -723,6 +836,8 @@ class HARVAPTEngine:
                 'endpoints_total': len(self.endpoints),
                 'endpoints_fuzzed': len(fuzzable),
                 'upload_endpoints': len(uploads),
+                'in_scope_hosts': sorted(self.allowed_hosts),
+                'dropped_out_of_scope_hosts': sorted(self._dropped_hosts),
             },
             'vulnerability_summary': {
                 'total_vulnerabilities': len(self.vulnerabilities),
@@ -758,15 +873,23 @@ class HARVAPTEngine:
 
 
 def main():
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python har_vapt_engine.py <har_analysis.json> [output.json]")
-        return
-    with open(sys.argv[1]) as f:
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="HAR-based authenticated VAPT engine")
+    parser.add_argument('analysis', help="HAR analysis JSON (from har_analyzer.py)")
+    parser.add_argument('output', nargs='?', help="output results JSON path")
+    parser.add_argument('--allow-host', dest='allowed_hosts', action='append',
+                        default=[], metavar='HOST',
+                        help="authorise an additional in-scope host (repeatable). "
+                             "Without this, only the HAR's first-seen target host "
+                             "is in scope — third-party hosts are dropped.")
+    args = parser.parse_args()
+
+    with open(args.analysis) as f:
         analysis = json.load(f)
-    engine = HARVAPTEngine(analysis)
+    engine = HARVAPTEngine(analysis, allowed_hosts=args.allowed_hosts or None)
     results = engine.run_comprehensive_scan()
-    out = sys.argv[2] if len(sys.argv) > 2 else f"har_vapt_{int(time.time())}.json"
+    out = args.output if args.output else f"har_vapt_{int(time.time())}.json"
     with open(out, 'w') as f:
         json.dump(results, f, indent=2, default=str)
     print(f"\n💾 Results: {out}")

@@ -179,10 +179,16 @@ class Cvss40Vector:
             m["VC"] == "H" or m["VI"] == "H" or m["VA"] == "H"
             or m["SC"] == "H" or m["SI"] == "H" or m["SA"] == "H"
         )
-        all_full_vuln = m["VC"] == "H" and m["VI"] == "H" and m["VA"] == "H"
+        # FIRST CVSS 4.0 EQ3=0 puts a vector in the top severity band when
+        # confidentiality AND integrity of the vulnerable system are both
+        # High — availability is irrelevant to that top-band C/I loss. So a
+        # pre-auth network data-dump (VC:H/VI:H/VA:N) is Critical, matching
+        # the EQ-table score (9.3) produced by validate.py.
+        high_vuln_ci = m["VC"] == "H" and m["VI"] == "H"
 
-        # Critical: easy exploit + full impact on the vulnerable system.
-        if easy_exploit and all_full_vuln:
+        # Critical: easy exploit + full confidentiality+integrity loss on the
+        # vulnerable system.
+        if easy_exploit and high_vuln_ci:
             return "Critical"
 
         # High: easy-ish exploit OR at least one full-impact component, but

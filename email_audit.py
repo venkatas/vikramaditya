@@ -1465,7 +1465,15 @@ def _read_der_tlv(data: bytes, offset: int) -> Tuple[int, bytes, int]:
     return tag, data[value_offset:end], end
 
 
-def estimate_dkim_rsa_bits(public_key_b64: str) -> Optional[int]:
+def estimate_dkim_rsa_bits(public_key_b64: str, _depth: int = 0) -> Optional[int]:
+    # The DKIM p= value is fully controlled by the audited domain's DNS. A
+    # valid SubjectPublicKeyInfo needs only one level of SPKI unwrapping, but a
+    # crafted, deeply-nested DER (~7 bytes per level) could otherwise recurse
+    # past Python's recursion limit and raise an uncaught RecursionError that
+    # aborts build_report and, in portfolio mode, every later target. Bound the
+    # depth so an abusive record degrades to bits=None instead of crashing.
+    if _depth > 4:
+        return None
     try:
         der = base64.b64decode(public_key_b64 + "==", validate=False)
     except Exception:
@@ -1488,8 +1496,10 @@ def estimate_dkim_rsa_bits(public_key_b64: str) -> Optional[int]:
                 return None
             if second_value[0] != 0:
                 return None
-            return estimate_dkim_rsa_bits(base64.b64encode(second_value[1:]).decode("ascii"))
-    except ValueError:
+            return estimate_dkim_rsa_bits(
+                base64.b64encode(second_value[1:]).decode("ascii"), _depth + 1
+            )
+    except (ValueError, RecursionError):
         return None
 
     return None
@@ -1831,7 +1841,11 @@ def audit_mx(
         mx_host_details.append(detail)
 
     if smtp_probe:
-        for mx_record in mx_records[:5]:
+        # v10.6.0 — probe every MX host. The old [:5] cap silently dropped
+        # SMTP transport-security coverage (STARTTLS / legacy-TLS findings)
+        # for the 6th+ MX host with no degradation marker, since the summary
+        # still reported the full MX count.
+        for mx_record in mx_records:
             host = mx_record["host"]
             if not host:
                 continue
@@ -1865,14 +1879,46 @@ def audit_mx(
     return result
 
 
+# MTA-STS policy bodies are tiny (RFC 8461 caps them well under a KB). Bound
+# the read so a hostile/misconfigured policy host can't exhaust scanner memory
+# with an unbounded response body.
+MTA_STS_MAX_BODY_BYTES = 256 * 1024
+
+
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow HTTP redirects.
+
+    The MTA-STS policy host (mta-sts.<domain>) is target-controlled and may be
+    dangling/takeover-able; following an arbitrary 3xx would let it redirect
+    the audit fetch off-host (request-redirection / minor SSRF). The policy
+    MUST be served directly at the well-known URL, so a redirect is invalid.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802,D401
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirect not permitted for policy fetch", headers, fp
+        )
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=HTTP_SSL_CTX),
+    _RejectRedirectHandler(),
+)
+
+
 def fetch_url_text(url: str, timeout: float) -> Tuple[Optional[str], Optional[str]]:
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "claude-bug-bounty-email-auth-audit/1.0"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=HTTP_SSL_CTX) as response:
-            body = response.read().decode("utf-8", errors="replace")
+        with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+            # Bounded read: pull at most the cap + 1 byte so we can detect an
+            # over-limit body without buffering the whole (possibly huge) one.
+            raw = response.read(MTA_STS_MAX_BODY_BYTES + 1)
+            if len(raw) > MTA_STS_MAX_BODY_BYTES:
+                return None, "policy body exceeds size limit"
+            body = raw.decode("utf-8", errors="replace")
             return body, None
     except Exception as exc:
         return None, str(exc)

@@ -298,7 +298,13 @@ def extract_operations(spec: dict[str, Any], source_url: str) -> tuple[dict[str,
     }, operations
 
 
-def collect_candidate_hosts(recon_dir: Path, max_hosts: int) -> list[str]:
+def collect_candidate_hosts(recon_dir: Path, max_hosts: int) -> tuple[list[str], int]:
+    """Return (probed_hosts, total_candidate_count).
+
+    ``total_candidate_count`` is the de-duplicated host count BEFORE the
+    ``max_hosts`` cap is applied, so callers can emit an honest coverage
+    marker when the cap truncates the surface (see write_outputs).
+    """
     hosts = []
     for rel in (
         "priority/critical_hosts.txt",
@@ -306,20 +312,26 @@ def collect_candidate_hosts(recon_dir: Path, max_hosts: int) -> list[str]:
         "live/urls.txt",
     ):
         hosts.extend(read_lines(recon_dir / rel))
-    return dedupe(hosts)[:max_hosts]
+    deduped = dedupe(hosts)
+    return deduped[:max_hosts], len(deduped)
 
 
 def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
         list[dict[str, Any]], list[dict[str, Any]], list[str],
-        list[tuple[str, dict[str, Any]]]]:
+        list[tuple[str, dict[str, Any]]], int]:
     """Discover OpenAPI/Swagger specs from recon candidate hosts.
 
     v7.1.9 — also returns ``raw_specs`` so callers can persist parsed specs
     to disk. sqlmap's OpenAPI→POST feed needs the schema ``$ref`` expansion
     (username, password, etc.) which gets erased in ``operations.json`` —
     keeping the raw JSON around lets hunt.py resolve body shapes per op.
+
+    Also returns ``total_candidates`` (the pre-cap de-duplicated host count)
+    so the caller can record an explicit coverage marker when ``max_hosts``
+    truncated the host surface — silently dropping hosts 21+ would hide whole
+    specs (and all their operations) from the audit.
     """
-    candidates = collect_candidate_hosts(recon_dir, max_hosts)
+    candidates, total_candidates = collect_candidate_hosts(recon_dir, max_hosts)
     discovered_specs = []
     operations = []
     raw_specs: list[tuple[str, dict[str, Any]]] = []
@@ -373,10 +385,30 @@ def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
     for extra in dedupe(queued_links):
         probe(extra)
 
-    return discovered_specs, operations, candidates, raw_specs
+    return discovered_specs, operations, candidates, raw_specs, total_candidates
 
 
-def audit_public_operations(operations: list[dict[str, Any]], max_ops: int) -> list[dict[str, Any]]:
+def count_probeable_public_ops(operations: list[dict[str, Any]]) -> int:
+    """How many operations the public-op audit loop WOULD probe absent any cap.
+
+    Mirrors the skip logic in audit_public_operations (public + safe method)
+    so the coverage marker's denominator is honest.
+    """
+    return sum(
+        1 for op in operations
+        if not op["requires_auth"] and op["method"].lower() in SAFE_PROBE_METHODS
+    )
+
+
+def audit_public_operations(
+    operations: list[dict[str, Any]], max_ops: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Probe public, safe-method operations.
+
+    Returns (findings, tested) where ``tested`` is the number of public ops
+    actually fetched — compare against count_probeable_public_ops() to detect
+    when ``max_ops`` left part of the public surface unprobed.
+    """
     findings = []
     tested = 0
     for op in operations:
@@ -408,7 +440,7 @@ def audit_public_operations(operations: list[dict[str, Any]], max_ops: int) -> l
                     "summary": op.get("summary", ""),
                     "title": op.get("title", ""),
                 })
-    return findings
+    return findings, tested
 
 
 def write_outputs(
@@ -417,8 +449,10 @@ def write_outputs(
     operations: list[dict[str, Any]],
     findings: list[dict[str, Any]],
     raw_specs: list[tuple[str, dict[str, Any]]] | None = None,
+    coverage: dict[str, Any] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    coverage = coverage or {}
 
     spec_urls = [item["source_url"] for item in discovered_specs]
     public_operations = [op for op in operations if not op["requires_auth"]]
@@ -464,6 +498,70 @@ def write_outputs(
         f"{(item.get('title') or item['source_url'])} ({item['operations']} ops)"
         for item in discovered_specs[:6]
     ) or "none"
+
+    # --- Coverage / degradation markers ---------------------------------
+    # Never silently drop coverage: when either the --max-hosts or --max-ops
+    # cap actually truncated the surface, record an explicit "X of Y (CAPPED)"
+    # line so the operator knows to re-run with a higher limit. (Mirrors the
+    # --max-urls / _mark_degraded convention elsewhere in the codebase.)
+    probed_hosts = coverage.get("probed_hosts")
+    total_hosts = coverage.get("total_hosts")
+    max_hosts = coverage.get("max_hosts")
+    tested_ops = coverage.get("tested_ops")
+    total_probeable_ops = coverage.get("total_probeable_ops")
+    max_ops = coverage.get("max_ops")
+    discover_only = coverage.get("discover_only", False)
+
+    coverage_lines: list[str] = []
+    degraded = False
+
+    if total_hosts is not None and probed_hosts is not None:
+        if total_hosts > probed_hosts:
+            degraded = True
+            coverage_lines.append(
+                f"- Candidate hosts: {probed_hosts} of {total_hosts} probed "
+                f"(CAPPED by --max-hosts={max_hosts}, {total_hosts - probed_hosts} untested) "
+                f"— re-run with a higher --max-hosts to cover them"
+            )
+        else:
+            coverage_lines.append(
+                f"- Candidate hosts: {probed_hosts} of {total_hosts} probed (full)"
+            )
+
+    if not discover_only and total_probeable_ops is not None and tested_ops is not None:
+        if total_probeable_ops > tested_ops:
+            degraded = True
+            coverage_lines.append(
+                f"- Public operations probed: {tested_ops} of {total_probeable_ops} "
+                f"(CAPPED by --max-ops={max_ops}, "
+                f"{total_probeable_ops - tested_ops} untested) "
+                f"— re-run with a higher --max-ops to cover them"
+            )
+        else:
+            coverage_lines.append(
+                f"- Public operations probed: {tested_ops} of {total_probeable_ops} (full)"
+            )
+
+    # Persist a machine-readable coverage record + a degradation marker file
+    # so downstream tooling (and the operator) can detect the truncation.
+    (output_dir / "coverage.json").write_text(
+        json.dumps(
+            {
+                "probed_hosts": probed_hosts,
+                "total_hosts": total_hosts,
+                "max_hosts": max_hosts,
+                "tested_public_operations": tested_ops,
+                "total_probeable_public_operations": total_probeable_ops,
+                "max_ops": max_ops,
+                "discover_only": discover_only,
+                "degraded": degraded,
+            },
+            indent=2,
+        )
+    )
+    if degraded:
+        (output_dir / "COVERAGE_CAPPED.marker").write_text("\n".join(coverage_lines) + "\n")
+
     lines = [
         "# OpenAPI Audit Summary",
         "",
@@ -473,6 +571,12 @@ def write_outputs(
         f"- Sensitive public operations: {len(sensitive_public_ops)}",
         f"- Unauthenticated findings: {len(findings)}",
         f"- Top specs: {top_specs}",
+    ]
+    if coverage_lines:
+        lines.append("")
+        lines.append("## Coverage")
+        lines.extend(coverage_lines)
+    lines += [
         "",
         "## Unauthenticated Findings",
     ]
@@ -501,10 +605,49 @@ def main() -> int:
         return 1
 
     output_dir = recon_dir / "api_specs"
-    discovered_specs, operations, _, raw_specs = discover_specs(
-        recon_dir, max_hosts=max(1, args.max_hosts))
-    findings = [] if args.discover_only else audit_public_operations(operations, max_ops=max(1, args.max_ops))
-    write_outputs(output_dir, discovered_specs, operations, findings, raw_specs=raw_specs)
+    max_hosts = max(1, args.max_hosts)
+    max_ops = max(1, args.max_ops)
+    discovered_specs, operations, candidates, raw_specs, total_candidates = discover_specs(
+        recon_dir, max_hosts=max_hosts)
+
+    total_probeable_ops = count_probeable_public_ops(operations)
+    if args.discover_only:
+        findings, tested_ops = [], 0
+    else:
+        findings, tested_ops = audit_public_operations(operations, max_ops=max_ops)
+
+    coverage = {
+        "probed_hosts": len(candidates),
+        "total_hosts": total_candidates,
+        "max_hosts": max_hosts,
+        "tested_ops": tested_ops,
+        "total_probeable_ops": total_probeable_ops,
+        "max_ops": max_ops,
+        "discover_only": args.discover_only,
+    }
+    write_outputs(
+        output_dir, discovered_specs, operations, findings,
+        raw_specs=raw_specs, coverage=coverage,
+    )
+
+    # Surface truncation on stderr so an operator running non-interactively
+    # still sees that coverage was capped (never silently drop coverage).
+    if total_candidates > len(candidates):
+        print(
+            f"[!] COVERAGE CAPPED: probed {len(candidates)} of {total_candidates} "
+            f"candidate hosts (--max-hosts={max_hosts}); "
+            f"{total_candidates - len(candidates)} host(s) untested. "
+            f"Re-run with a higher --max-hosts to cover them.",
+            file=sys.stderr,
+        )
+    if not args.discover_only and total_probeable_ops > tested_ops:
+        print(
+            f"[!] COVERAGE CAPPED: probed {tested_ops} of {total_probeable_ops} "
+            f"public operations (--max-ops={max_ops}); "
+            f"{total_probeable_ops - tested_ops} operation(s) untested. "
+            f"Re-run with a higher --max-ops to cover them.",
+            file=sys.stderr,
+        )
 
     print(f"[*] OpenAPI specs discovered: {len(discovered_specs)}")
     print(f"[*] Parsed operations:        {len(operations)}")

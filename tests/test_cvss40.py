@@ -57,12 +57,23 @@ class TestSeverityBuckets:
     """Spec-aligned severity buckets — bucket boundary tests."""
 
     HEADLINE_CRITICAL = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+    # Pre-auth network data-dump (full C+I loss, no availability impact).
+    # FIRST EQ3=0 → 9.3 = Critical even though VA:N. Regression guard for the
+    # old all-three-High Critical condition that wrongly bucketed this as High.
+    HEADLINE_CRITICAL_NO_AVAIL = (
+        "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
+    )
     HEADLINE_HIGH    = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:N/SC:N/SI:N/SA:N"
     HEADLINE_MEDIUM  = "CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N"
     HEADLINE_NONE    = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:N/SC:N/SI:N/SA:N"
 
     def test_full_impact_no_auth_no_ui_network_is_critical(self):
         assert severity(self.HEADLINE_CRITICAL) == "Critical"
+
+    def test_full_ci_loss_no_availability_is_critical(self):
+        # Availability must not gate the top band: VC:H+VI:H is Critical even
+        # when VA:N (matches the 9.3 EQ-table score in validate.py).
+        assert severity(self.HEADLINE_CRITICAL_NO_AVAIL) == "Critical"
 
     def test_partial_impact_is_high(self):
         assert severity(self.HEADLINE_HIGH) == "High"

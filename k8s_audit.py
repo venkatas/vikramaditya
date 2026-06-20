@@ -127,19 +127,24 @@ def falco_runtime(context: str, seconds: int, out_dir: Path) -> None:
         return
     log_path = out_dir / "falco_runtime.log"
     print(f"[*] Falco capture for {seconds}s — Ctrl-C to stop early")
-    proc = subprocess.Popen(["falco", "--json"],
-                            stdout=open(log_path, "w"),
-                            stderr=subprocess.STDOUT)
-    try:
-        time.sleep(seconds)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        proc.terminate()
+    # Open the log via a context manager so the parent-side write-fd is closed
+    # deterministically once the child has inherited its own dup. Leaving the
+    # open() object anonymous on the Popen call leaks the parent's copy of the
+    # fd until garbage collection and leaves the parent handle un-flushed.
+    with open(log_path, "w") as fh:
+        proc = subprocess.Popen(["falco", "--json"],
+                                stdout=fh,
+                                stderr=subprocess.STDOUT)
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            time.sleep(seconds)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
     print(f"[+] Falco events → {log_path}")
 
 

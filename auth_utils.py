@@ -13,7 +13,9 @@ import hmac
 import json
 import os
 import struct
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,14 +111,24 @@ class RateLimiter:
     def __init__(self, max_rps: float = 10.0):
         self._interval = 1.0 / max_rps if max_rps > 0 else 0
         self._last = 0.0
+        # Guards the read-compute-write of self._last so the limiter stays
+        # correct if a single instance is ever shared across threads
+        # (e.g. driven from a ThreadPoolExecutor). Without it, concurrent
+        # callers could read the same stale _last and fire simultaneously,
+        # briefly exceeding the configured per-second cap.
+        self._lock = threading.Lock()
 
     def wait(self) -> float:
-        now = time.monotonic()
-        elapsed = now - self._last
-        wait_time = max(0.0, self._interval - elapsed)
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last
+            wait_time = max(0.0, self._interval - elapsed)
+            # Reserve this caller's slot before releasing the lock so a
+            # concurrent caller computes its wait relative to ours, instead
+            # of racing on a stale timestamp. Sleep happens outside the lock.
+            self._last = now + wait_time
         if wait_time > 0:
             time.sleep(wait_time)
-        self._last = time.monotonic()
         return wait_time
 
 
@@ -552,11 +564,29 @@ class FindingSaver:
 
     def save(self, finding: dict):
         self._findings.append(finding)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        # Microsecond resolution + pid + uuid removes the realistic collision
+        # window between two same-category savers writing within one UTC second.
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         idx = len(self._findings)
-        path = os.path.join(self.dir, f"finding_{ts}_{idx:04d}.json")
-        with open(path, "w") as f:
-            json.dump(finding, f, indent=2, default=str)
+        suffix = uuid.uuid4().hex[:6]
+        # "x" (exclusive create) converts any residual collision into a loud
+        # FileExistsError instead of silently truncating/clobbering a finding.
+        for _ in range(5):
+            path = os.path.join(
+                self.dir,
+                f"finding_{ts}_{os.getpid()}_{idx:04d}_{suffix}.json",
+            )
+            try:
+                with open(path, "x") as f:
+                    json.dump(finding, f, indent=2, default=str)
+                return
+            except FileExistsError:
+                # Astronomically unlikely; regenerate the random suffix rather
+                # than overwrite an existing finding file.
+                suffix = uuid.uuid4().hex[:6]
+        raise FileExistsError(
+            f"FindingSaver.save: could not allocate a unique path in {self.dir}"
+        )
 
     def save_txt(self, finding: dict):
         """Also append one-liner to a summary text file for reporter.py."""
