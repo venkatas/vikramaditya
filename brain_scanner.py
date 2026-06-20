@@ -119,6 +119,52 @@ def _access_claim_unproven(line: str, stdout: str) -> bool:
     return not _FILE_PROOF_RE.search(stdout)
 
 
+# Tool STATUS / progress chatter — NOT retrieved file content. Used to stop a
+# fabricated access claim padded with noise (`echo "[*] scanning..."`) from
+# being mistaken for a grounded read.
+_STATUS_NOISE_RE = re.compile(
+    r"^\s*(?:\[[*+\-!#]\]"                                  # [*] [+] [-] [!] [#]
+    r"|\[(?:watchdog|info|warn|error|debug|brain|phase|status)\b"   # [Watchdog/..]
+    r"|[>$#]\s"                                             # '> ' '$ ' '# '
+    r"|\.{3,}"                                              # '...'
+    r"|\d{1,3}%(?:\s|$))"                                   # '50%'
+    r"|\b(?:scanning|connecting|downloading|fetching|elapsed|payload|"
+    r"injecting|trying|progress|requesting|resolving)\b",
+    re.IGNORECASE)
+
+
+def _grounded_read_unproven(line: str, stdout: str) -> bool:
+    """Generalized file-access proof gate (superset of _access_claim_unproven).
+
+    An access CLAIM is treated as PROVEN when the output carries EITHER the
+    narrow _FILE_PROOF_RE signature OR >=2 substantive lines that plausibly
+    carry retrieved file content — i.e. >=8 chars, not the claim/usage banner,
+    and not tool-status/progress chatter. This recovers grounded reads of
+    NON-whitelisted files (source, YAML/JSON config, /etc/hosts, /proc/self/
+    environ) that the narrow signature regex cannot represent, while a bare
+    `echo "accessible"` or a claim padded only with progress noise stays
+    unproven. Returns True == still unproven (reject as a finding)."""
+    if not _ACCESS_CLAIM_RE.search(line):
+        return False                       # not an access claim → unaffected
+    if _FILE_PROOF_RE.search(stdout):
+        return False                       # narrow signature already proves it
+    substantive = []
+    for ln in (stdout or "").splitlines():
+        s = ln.strip()
+        if len(s) < 8:
+            continue
+        if _ACCESS_CLAIM_RE.search(ln):
+            continue
+        if _USAGE_BANNER_RE is not None and _USAGE_BANNER_RE.search(ln):
+            continue
+        if _STATUS_NOISE_RE.search(ln):
+            continue
+        substantive.append(s)
+        if len(substantive) >= 2:
+            return False                   # enough real content → proven
+    return True
+
+
 def log(level: str, msg: str):
     colors = {"ok": G, "err": R, "warn": Y, "info": C, "brain": M, "phase": "\033[0;34m"}
     sym = {"ok": "+", "err": "-", "warn": "!", "info": "*", "brain": "🧠", "phase": "»"}
@@ -954,7 +1000,10 @@ Then test the most promising attack vectors."""
                         # script output does not actually PROVE (no file content) — a
                         # buggy PoC (`echo "...accessible" || echo`) prints it whether
                         # or not the read succeeded. Don't record it as a finding.
-                        if _access_claim_unproven(line, result["stdout"]):
+                        # Use the GENERALIZED gate so a grounded read of a non-passwd
+                        # file (source/YAML/hosts) is KEPT at this primary path, not
+                        # dropped before it reaches findings (it printed real content).
+                        if _grounded_read_unproven(line, result["stdout"]):
                             _unproven_access = True
                             log("warn", f"Rejected unproven access claim (no file "
                                         f"content in output): {line.strip()[:80]}")

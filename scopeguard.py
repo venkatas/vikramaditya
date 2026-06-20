@@ -179,8 +179,20 @@ _URL_RE = _re.compile(r"""https?://[^\s'"|;)>]+""", _re.IGNORECASE)
 # such as 2130706433), or is a 0x-hex literal (0x7f000001). Plain alpha flags / option
 # words / small port-like ints are skipped so we don't fire getaddrinfo on every word.
 _HOSTISH_RE = _re.compile(
-    r"""^(?:\[?[0-9A-Fa-f:.]+\]?|0x[0-9A-Fa-f]+|[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+|localhost)$""",
+    r"""^(?:
+        \[[0-9A-Fa-f:.]+\]                  # [::1] bracketed IPv6
+      | [0-9A-Fa-f]*:[0-9A-Fa-f:.]+         # ::1 / fe80::1 — IPv6 (MUST contain a colon)
+      | 0x[0-9A-Fa-f]+                       # 0x7f000001 hex-packed IPv4
+      | [A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+      # dotted: FQDN / IPv4 / short-form 127.1
+      | localhost
+    )$""",
+    _re.VERBOSE,
 )
+# NOTE: a bare hex-only word (dd, beef, cafe) is deliberately NOT host-ish — the
+# old `[0-9A-Fa-f:.]+` alternation matched it and fired getaddrinfo on benign
+# command args (`dd bs=...`). Encoded loopback stays covered: decimal-packed
+# (2130706433) via _hostish's isdigit branch, 0x-hex (0x7f000001) via the 0x
+# alternation, and short-form (127.1) via the dotted alternation.
 
 
 def _hostish(s: str) -> bool:
