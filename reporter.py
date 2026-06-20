@@ -822,8 +822,12 @@ def load_findings(findings_dir: str) -> list:
         # File Upload" HIGHs from auth_required.txt during the 03-May clienta run).
         NON_FINDING_FILES = {
             "auth_required.txt",          # upload/ — paths protected by auth, not vulnerable
-            "timebased_candidates.txt",   # sqli/ — unverified timing candidates
             "auth-required.txt",
+            # NOTE: timebased_candidates.txt is deliberately NOT blacklisted — it can carry a
+            # [SQLI-POC-VERIFIED] line (an EMPIRICALLY-CONFIRMED time-based SQLi PoC) alongside
+            # the unverified [SQLI-CANDIDATE]/[SQLI-TIMEOUT-CANDIDATE] lines. File-level
+            # blacklisting silently dropped the CONFIRMED CRITICAL; the per-line
+            # NON_FINDING_PREFIXES below still suppress the unverified candidate lines.
             # cves/ — cvemap writes global "high-EPSS CVEs worth testing" (CVE IDs,
             # one per line via -lsi); they are NOT host/version-confirmed, so the
             # generic loader must not promote each ID to a CRITICAL cves finding.
