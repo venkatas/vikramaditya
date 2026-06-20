@@ -93,13 +93,19 @@ _ACCESS_CLAIM_RE = re.compile(
     r'arbitrary[\s_-]*file|file (?:read|disclos|retriev|leak)|local file|'
     r'/etc/passwd|/etc/shadow|win\.ini|boot\.ini|web\.config', re.I)
 _FILE_PROOF_RE = re.compile(
-    # A real /etc/passwd or /etc/shadow read prints account LINES at line-start —
-    # user:x:UID:GID:... (passwd) or user:$hash:lastchg:min:... (shadow). Anchored
-    # to line-start (MULTILINE) so a passwd-shaped string embedded in a shell ERROR
-    # ("bash: line 3: root:x:0:0:...: No such file") is NOT miscounted as proof.
-    r'^[a-z_][a-z0-9_-]*:[^:\n]*:\d+:\d+:'
+    # A real /etc/passwd or /etc/shadow read prints account LINES — user:x:UID:GID:...
+    # (passwd) or user:$hash:... (shadow). Anchored near line-start (MULTILINE) but we
+    # allow a few leading NON-content characters (quotes, list bullets, an HTTP body
+    # offset, leading whitespace) before the passwd shape, since real responses often
+    # prefix it (e.g. JSON "data":"root:x:0:0:...", or a leading "> "). We still anchor
+    # to a line boundary so a passwd-shaped string mid-error ("No such file") is excluded.
+    r'^[\s"\'>\]\)\.,:|*-]{0,8}[a-z_][a-z0-9_-]*:[^:\n]*:\d+:\d+:'
     r'|\[boot loader\]|\[fonts\]|\[mci extensions\]'              # win.ini / boot.ini
-    r'|<\?xml\b|<configuration\b|<connectionStrings|<appSettings',  # web.config
+    r'|<\?xml\b|<configuration\b|<connectionStrings|<appSettings'   # web.config
+    r'|<\?php\b|<\?=\s'                                            # PHP source disclosure
+    r'|-----BEGIN [A-Z ]*PRIVATE KEY-----'                        # private keys (covers RSA/OPENSSH/EC/DSA)
+    r'|ssh-rsa AAAA|ssh-ed25519 AAAA'                             # public-key material in keyfiles
+    r'|\bDB_PASSWORD\s*=|\bAWS_SECRET_ACCESS_KEY\b',              # .env / config leaks
     re.I | re.M)
 
 
@@ -265,7 +271,18 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
     operator's own machine/listener (loopback / 0.0.0.0 / our bind:port / a local
     interface). RFC1918 / cloud-metadata SSRF targets are still allowed.
     """
-    if _scopeguard is not None:
+    if _scopeguard is None:
+        # FAIL CLOSED: without scopeguard we cannot prove the LLM-authored command is
+        # not aimed at the operator's own machine/listener, so refuse to execute it.
+        # Escape hatch for environments that knowingly run without it.
+        if os.environ.get("BRAIN_SCANNER_NO_SCOPEGUARD") != "1":
+            return {"stdout": "",
+                    "stderr": "SCOPE BLOCKED (not executed): scopeguard module is "
+                              "unavailable, so host-scope cannot be enforced. Refusing "
+                              "to run LLM-authored code (fail-closed). Set "
+                              "BRAIN_SCANNER_NO_SCOPEGUARD=1 to override.",
+                    "returncode": 3, "scope_blocked": True}
+    else:
         _hit = _scopeguard.scan_command(code)
         if _hit:
             return {"stdout": "",
@@ -345,7 +362,37 @@ def _is_grounded_run(result: dict) -> bool:
     )
     if any(m in err for m in _FAILED_TO_RUN):
         return False
-    return bool((result.get("stdout") or "").strip())
+    out = (result.get("stdout") or "").strip()
+    if not out:
+        return False
+    # A tool printed only its USAGE/HELP banner (e.g. `curl` with no URL, `sqlmap -h`,
+    # `ffuf` with bad args) — that is the tool describing ITSELF, not target evidence.
+    # Counting it as grounding let a verdict rest on a help screen.
+    if _is_usage_banner(out):
+        return False
+    return True
+
+
+_USAGE_BANNER_RE = re.compile(
+    r"^\s*(usage:|usage\s|try '.*--help'|"
+    r".*--help.*for (more )?(usage|information)|"
+    r"options:\s*$|examples:\s*$)", re.I | re.M)
+
+
+def _is_usage_banner(stdout: str) -> bool:
+    """True when stdout looks like a tool's own usage/help banner rather than target
+    evidence. Conservative: requires a usage/help cue AND no obvious target signal."""
+    s = stdout.strip()
+    if not s:
+        return False
+    if not _USAGE_BANNER_RE.search(s):
+        return False
+    # If real target signal is present (HTTP status, a URL, an IP, file-content
+    # proof), do NOT classify as a mere banner.
+    if re.search(r"https?://|HTTP/\d|\b\d{1,3}(?:\.\d{1,3}){3}\b|"
+                 r"<html|root:x:0:0:|set-cookie", s, re.I):
+        return False
+    return True
 
 
 def _verdict_findings(response: str, grounded: bool) -> list:

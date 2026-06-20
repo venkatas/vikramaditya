@@ -39,11 +39,10 @@ def test_build_graph_skips_pythonnousersite_for_path_install(tmp_path, monkeypat
 
     def fake_subprocess_run(cmd, **kw):
         captured["env"] = kw.get("env", {})
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
 
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
-         patch("subprocess.run", side_effect=fake_subprocess_run):
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
         # Will fail when looking for graph storage but we only care that
         # subprocess was called with the right env
         try:
@@ -65,11 +64,10 @@ def test_build_graph_sets_pythonnousersite_for_isolated_venv(tmp_path, monkeypat
 
     def fake_subprocess_run(cmd, **kw):
         captured["env"] = kw.get("env", {})
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
 
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=isolated), \
-         patch("subprocess.run", side_effect=fake_subprocess_run):
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
         try:
             build_graph(profile, tmp_path)
         except Exception:
@@ -86,11 +84,10 @@ def test_build_graph_passes_PMAPPER_REGIONS(tmp_path, monkeypatch):
 
     def fake_subprocess_run(cmd, **kw):
         captured["cmd"] = cmd
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
 
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
-         patch("subprocess.run", side_effect=fake_subprocess_run):
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
         try:
             from whitebox.iam.pmapper_runner import build_graph
             build_graph(profile, tmp_path)
@@ -120,11 +117,10 @@ def test_build_graph_no_region_flags_when_env_unset(tmp_path, monkeypatch):
 
     def fake_subprocess_run(cmd, **kw):
         captured["cmd"] = cmd
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
 
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
-         patch("subprocess.run", side_effect=fake_subprocess_run):
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
         try:
             from whitebox.iam.pmapper_runner import build_graph
             build_graph(profile, tmp_path)
@@ -143,11 +139,10 @@ def test_build_graph_honours_PMAPPER_TIMEOUT_env_var(tmp_path, monkeypatch):
 
     def fake_subprocess_run(cmd, **kw):
         captured["timeout"] = kw.get("timeout")
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
 
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
-         patch("subprocess.run", side_effect=fake_subprocess_run):
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
         try:
             build_graph(profile, tmp_path)
         except Exception:
@@ -165,11 +160,10 @@ def test_build_graph_default_timeout_is_1800_when_env_unset(tmp_path, monkeypatc
 
     def fake_subprocess_run(cmd, **kw):
         captured["timeout"] = kw.get("timeout")
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
 
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
-         patch("subprocess.run", side_effect=fake_subprocess_run):
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
         try:
             build_graph(profile, tmp_path)
         except Exception:
@@ -198,12 +192,11 @@ def test_build_graph_finds_graph_at_macos_appdirs_path(tmp_path, monkeypatch):
     out_dir = tmp_path / "out"
 
     def fake_subprocess_run(cmd, **kw):
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
 
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
-         patch("subprocess.run", side_effect=fake_subprocess_run):
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
         result = build_graph(profile, out_dir)
     assert (result / "metadata.json").exists()
     assert (result / "graph" / "nodes.json").exists()
@@ -219,11 +212,10 @@ def test_build_graph_explicit_timeout_overrides_PMAPPER_TIMEOUT_env(tmp_path, mo
 
     def fake_subprocess_run(cmd, **kw):
         captured["timeout"] = kw.get("timeout")
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
 
     with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
-         patch("subprocess.run", side_effect=fake_subprocess_run):
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
         try:
             build_graph(profile, tmp_path, timeout=42)
         except Exception:

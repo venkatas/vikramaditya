@@ -43,3 +43,35 @@ def test_alterx_permutation_explosion_bounded():
     t = _t()
     assert "ALTERX_LIMIT" in t and re.search(r'alterx .*-limit "\$ALTERX_LIMIT"', t), \
         "alterx permutation output is not bounded (-limit)"
+
+
+def test_chunked_dnsx_tracks_failed_chunks():
+    """v10.6.0 — a failed dnsx chunk must NOT be swallowed by `|| true`; it must
+    be counted and its candidates kept (fail-open) instead of mislabelled validated."""
+    t = _t()
+    assert "DNSX_FAILED_CHUNKS" in t, "failed-chunk counter missing"
+    assert ".dnsx_failed" in t, "failed chunk candidates are not accumulated for fail-open re-union"
+    # a chunked run with any failed chunk must NOT be marked DNS_VALIDATED=1
+    assert '${DNSX_FAILED_CHUNKS:-0}" -eq 0' in t, \
+        "DNS_VALIDATED gate does not require zero failed chunks"
+
+
+def test_alterx_merge_capped():
+    """v10.6.0 — default limit lowered and merge skipped when count exceeds the cap."""
+    t = _t()
+    assert 'ALTERX_LIMIT="${ALTERX_LIMIT:-100000}"' in t, "ALTERX_LIMIT default not lowered to 100000"
+    assert "ALTERX_MERGE_CAP" in t, "no independent merge cap for alterx permutations"
+
+
+def test_dnsx_cap_nonpositive_routes_single_pass():
+    """v10.6.0 — DNSX_CAP<=0 must be treated as uncapped (single pass), not fed to split -l 0."""
+    assert '${DNSX_CAP:-0}" -le 0' in _t(), "non-positive DNSX_CAP not normalised to uncapped"
+
+
+def test_passive_merge_is_source_restricted():
+    """v10.6.0 — all.txt merge must NOT re-glob derived files (alterx/resolved/...)."""
+    t = _t()
+    assert "_PASSIVE_SUB_FILES" in t, "passive merge still uses a blind *.txt glob"
+    # the blind glob form must be gone from the authoritative merge
+    assert 'cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null \\\n    | tr' not in t, \
+        "authoritative merge still globs all *.txt (re-ingests derived artefacts)"

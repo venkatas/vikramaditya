@@ -618,7 +618,11 @@ class AuthBypassScanner:
                     # Use subprocess curl for COMPLETE process-level isolation.
                     # requests.Session() leaks cookies via urllib3 connection pool
                     # after other phases have used the same session.
-                    import subprocess
+                    # Launch via procutil (os.posix_spawn): this phase runs AFTER
+                    # in-process `requests` I/O loaded Apple's Network.framework, so a
+                    # raw subprocess.run fork()+exec SIGSEGVs (rc=-11) the curl child on
+                    # macOS and silently zeroes this phase.
+                    import procutil
                     curl_args = [
                         "/usr/bin/curl", "-sk", "-X", "POST", url,
                         "-H", "Content-Type: application/json",
@@ -630,8 +634,12 @@ class AuthBypassScanner:
                         curl_args += ["--cookie", f"cf_at={test_token}"]
                     # No --cookie flag = no auth at all
 
-                    result = subprocess.run(curl_args, capture_output=True, text=True, timeout=15)
-                    status_code = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+                    result = procutil.run_capture(curl_args, timeout=15, shell=False)
+                    if result["returncode"] not in (0, None) and not result.get("timed_out"):
+                        log("warn", f"  curl exited rc={result['returncode']} for {test_name} "
+                                    f"({path}) — possible crashed child")
+                    out = (result["stdout"] or "").strip()
+                    status_code = int(out) if out.isdigit() else 0
 
                     if status_code in (200, 201, 204):
                         f = {"type": f"auth_bypass_{test_name}", "severity": severity,
@@ -1230,19 +1238,26 @@ class InjectionTester:
             log("info", f"  Running sqlmap on {len(sqli_urls)} confirmed SQLi candidate(s)...")
             for sqli_url in sqli_urls[:3]:  # Max 3 to avoid long waits
                 try:
-                    import subprocess as _sp
+                    import procutil
                     sqlmap_out = os.path.join(
                         os.path.dirname(saver.dir) if saver else "/tmp",
                         "sqlmap_verify")
                     os.makedirs(sqlmap_out, exist_ok=True)
-                    result = _sp.run([
+                    # posix_spawn launch: this runs after in-process requests I/O loaded
+                    # Apple's Network.framework — a raw fork()+exec would SIGSEGV (rc=-11).
+                    result = procutil.run_capture([
                         "sqlmap", "-u", sqli_url,
                         "--batch", "--level=3", "--risk=2",
                         "--random-agent", "--timeout=15",
                         "--current-db", "--current-user",
                         "--output-dir", sqlmap_out,
-                    ], capture_output=True, text=True, timeout=120)
-                    output = result.stdout
+                    ], timeout=120, shell=False)
+                    if result["timed_out"]:
+                        log("warn", f"  sqlmap timed out on {sqli_url}")
+                        continue
+                    if result["returncode"] not in (0, None):
+                        log("warn", f"  sqlmap exited rc={result['returncode']} on {sqli_url}")
+                    output = result["stdout"]
                     # Check if sqlmap confirmed injection
                     if "is vulnerable" in output or "Type:" in output:
                         # Extract DB info
@@ -1266,8 +1281,6 @@ class InjectionTester:
                 except FileNotFoundError:
                     log("warn", "  sqlmap not installed — skipping verification")
                     break
-                except _sp.TimeoutExpired:
-                    log("warn", f"  sqlmap timed out on {sqli_url}")
                 except Exception as e:
                     log("warn", f"  sqlmap error: {e}")
 
@@ -1279,14 +1292,17 @@ class InjectionTester:
             log("info", f"  Running dalfox XSS on {len(param_urls)} endpoint(s)...")
             for ep in param_urls[:5]:
                 try:
-                    import subprocess as _sp
+                    import procutil
                     target_url = f"{session.base_url}/{ep['path'].lstrip('/')}?search=test"
-                    result = _sp.run(
+                    # posix_spawn launch — runs after in-process requests I/O.
+                    result = procutil.run_capture(
                         ["dalfox", "url", target_url, "--silence", "--skip-bav",
                          "--timeout", "10", "--worker", "5"],
-                        capture_output=True, text=True, timeout=60)
-                    if result.stdout.strip():
-                        for line in result.stdout.strip().split("\n")[:3]:
+                        timeout=60, shell=False)
+                    if result["returncode"] not in (0, None) and not result["timed_out"]:
+                        log("warn", f"  dalfox exited rc={result['returncode']} on {ep['path']}")
+                    if result["stdout"].strip():
+                        for line in result["stdout"].strip().split("\n")[:3]:
                             f = {"type": "xss_dalfox_confirmed", "severity": HIGH,
                                  "detail": f"dalfox confirmed XSS on {ep['path']}: {line[:100]}",
                                  "url": target_url,
@@ -1306,7 +1322,7 @@ class InjectionTester:
         if endpoints:
             log("info", f"  Running nuclei on {min(len(endpoints), 20)} endpoint(s)...")
             try:
-                import subprocess as _sp
+                import procutil
                 import tempfile
                 urls_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
                 for ep in endpoints[:20]:
@@ -1319,11 +1335,14 @@ class InjectionTester:
                 # (Python httpx pip pkg shadows PD httpx; same risk for nuclei).
                 _gobin_nuclei = os.path.expanduser("~/go/bin/nuclei")
                 _nuclei_bin = _gobin_nuclei if os.path.isfile(_gobin_nuclei) and os.access(_gobin_nuclei, os.X_OK) else "nuclei"
-                result = _sp.run(
+                # posix_spawn launch — runs after in-process requests I/O.
+                result = procutil.run_capture(
                     [_nuclei_bin, "-l", urls_file.name,
                      "-severity", "critical,high,medium", "-silent",
                      "-o", nuclei_out],
-                    capture_output=True, text=True, timeout=120)
+                    timeout=120, shell=False)
+                if result["returncode"] not in (0, None) and not result["timed_out"]:
+                    log("warn", f"  nuclei exited rc={result['returncode']}")
                 if os.path.isfile(nuclei_out) and os.path.getsize(nuclei_out) > 0:
                     with open(nuclei_out) as nf:
                         for line in nf:
@@ -2114,7 +2133,7 @@ def _report_js_credentials(output_dir, fetched_js, all_findings, saver, base_url
     try:
         import hashlib
         import shutil
-        import subprocess as _sp
+        import procutil
         import cred_blast_radius
         dl = os.path.join(output_dir, "js", "downloaded")
         os.makedirs(dl, exist_ok=True)
@@ -2129,9 +2148,16 @@ def _report_js_credentials(output_dir, fetched_js, all_findings, saver, base_url
                     continue
         th = shutil.which("trufflehog")
         if th:
+            # posix_spawn launch — this helper runs after in-process JS fetches loaded
+            # Apple's Network.framework; a raw fork()+exec would SIGSEGV (rc=-11).
+            # run_capture merges/keeps streams separate; stderr is discarded here to
+            # mirror the prior stderr=DEVNULL, and stdout is written to the report file.
+            res = procutil.run_capture([th, "filesystem", dl, "--json", "--no-update"],
+                                       timeout=180, shell=False, merge_stderr=False)
+            if res["returncode"] not in (0, None) and not res["timed_out"]:
+                log("warn", f"  trufflehog exited rc={res['returncode']}")
             with open(os.path.join(output_dir, "js", "trufflehog.json"), "w", encoding="utf-8") as fh:
-                _sp.run([th, "filesystem", dl, "--json", "--no-update"],
-                        stdout=fh, stderr=_sp.DEVNULL, timeout=180)
+                fh.write(res["stdout"] or "")
         findings_dir = os.path.join(output_dir, "findings")
         summary = cred_blast_radius.run(output_dir, findings_dir, active=False)
         if summary:

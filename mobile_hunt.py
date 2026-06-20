@@ -117,8 +117,6 @@ def frida_pinning_bypass(app_id: str, out_dir: Path) -> str | None:
         print("[!] frida CLI not found — pip install frida-tools")
         return None
     out_log = out_dir / "frida_pinning.log"
-    cmd = ["frida", "-U", "-l", "-",  # script via stdin
-           "-f", app_id, "--no-pause"]
     # Universal Android SSL pinning bypass (compact form)
     script = """
     Java.perform(function() {
@@ -142,14 +140,21 @@ def frida_pinning_bypass(app_id: str, out_dir: Path) -> str | None:
                     .currentApplication().getPackageName());
     });
     """
+    # Launch via procutil (os.posix_spawn): the MobSF phase runs urllib.urlopen
+    # (in-process HTTPS) before this, loading Apple's Network.framework whose
+    # non-fork-safe pthread_atfork child handler SIGSEGVs (rc=-11) any fork()+exec
+    # child on macOS. posix_spawn skips atfork handlers. procutil has no stdin-input
+    # channel, so the JS script is written to a temp file and passed via `frida -l`.
+    import procutil
+    script_path = out_dir / "frida_pinning_bypass.js"
     try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=open(out_log, "w"), stderr=subprocess.STDOUT)
-        proc.communicate(input=script.encode(), timeout=30)
+        script_path.write_text(script)
+        cmd = ["frida", "-U", "-l", str(script_path), "-f", app_id, "--no-pause"]
+        res = procutil.run_capture(cmd, timeout=30, shell=False, merge_stderr=True)
+        out_log.write_text(res["stdout"] or "")
+        if res["returncode"] not in (0, None) and not res["timed_out"]:
+            print(f"[!] frida exited rc={res['returncode']} — possible crashed child")
         print(f"[+] Frida pinning-bypass attempted → {out_log}")
-        return str(out_log)
-    except subprocess.TimeoutExpired:
-        proc.kill()
         return str(out_log)
     except Exception as e:
         print(f"[!] frida failed: {e}")
@@ -165,9 +170,14 @@ def objection_keychain(app_id: str, out_dir: Path) -> str | None:
     cmd = ["objection", "-g", app_id, "explore",
            "-c", "ios keychain dump",
            "-q"]
+    # posix_spawn launch — runs after the MobSF urllib HTTPS phase loaded Apple's
+    # Network.framework; a raw fork()+exec would SIGSEGV (rc=-11) on macOS.
+    import procutil
     try:
-        with open(out_log, "w") as fh:
-            subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, timeout=60)
+        res = procutil.run_capture(cmd, timeout=60, shell=False, merge_stderr=True)
+        out_log.write_text(res["stdout"] or "")
+        if res["returncode"] not in (0, None) and not res["timed_out"]:
+            print(f"[!] objection exited rc={res['returncode']} — possible crashed child")
         print(f"[+] Objection keychain dump → {out_log}")
         return str(out_log)
     except Exception as e:
@@ -188,12 +198,18 @@ def drozer_ipc(app_id: str, out_dir: Path) -> str | None:
         f"run app.broadcast.info -a {app_id}",
         f"run app.service.info -a {app_id}",
     ]
+    # posix_spawn launch — runs after the MobSF urllib HTTPS phase loaded Apple's
+    # Network.framework; a raw fork()+exec would SIGSEGV (rc=-11) on macOS.
+    import procutil
     try:
         with open(out_log, "w") as fh:
             for c in commands:
                 fh.write(f"\n## {c}\n")
-                subprocess.run(["drozer", "console", "connect", "-c", c],
-                               stdout=fh, stderr=subprocess.STDOUT, timeout=60)
+                res = procutil.run_capture(["drozer", "console", "connect", "-c", c],
+                                           timeout=60, shell=False, merge_stderr=True)
+                fh.write(res["stdout"] or "")
+                if res["returncode"] not in (0, None) and not res["timed_out"]:
+                    print(f"[!] drozer exited rc={res['returncode']} on '{c}' — possible crashed child")
         print(f"[+] Drozer IPC → {out_log}")
         return str(out_log)
     except Exception as e:
