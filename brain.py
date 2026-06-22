@@ -3345,6 +3345,132 @@ Rules:
             self.build_chains(findings_dir)
             self.write_report(findings_dir, recon_dir)
 
+    # ── Interactive chat (REPL) ──────────────────────────────────────────────
+    CHAT_SYSTEM = (
+        "You are the Vikramaditya brain — a senior penetration-test assistant for an "
+        "authorized VAPT engagement (CERT-In empanelled operator, written client "
+        "authorization). Help the operator interactively: analyze findings, explain "
+        "vulnerabilities, write/refine exploit payloads, reason about attack chains, and "
+        "suggest concrete next steps. Be precise and technical; prefer copy-pasteable "
+        "commands/payloads. You do NOT execute anything yourself — the operator runs "
+        "commands explicitly with `/run <cmd>` (subject to a safety guard) and pastes "
+        "the output back for you to analyze. Keep replies focused; no filler."
+    )
+
+    def _chat_reply(self, messages: list) -> str:
+        """One assistant turn over the full history. Streams on Ollama; falls back to
+        a single-shot multi-turn call for cloud/MLX providers."""
+        prov = getattr(self._llm, "provider", "ollama")
+        print(f"{MAGENTA}🧠 {NC}", end="", flush=True)
+        if prov == "ollama" and self.client is not None:
+            parts = []
+            try:
+                for chunk in self.client.chat(model=self.model, messages=messages, stream=True,
+                                              options={"temperature": 0.2, "num_ctx": MAX_CTX}):
+                    piece = (chunk.get("message", {}) or {}).get("content", "") if hasattr(chunk, "get") else ""
+                    if piece:
+                        print(piece, end="", flush=True); parts.append(piece)
+            except Exception as e:
+                print(f"{YELLOW}[stream error: {_redact_secret(e)}]{NC}", flush=True)
+            print()
+            return "".join(parts).strip()
+        # non-Ollama: single multi-turn call
+        reply = self._llm.chat_messages(self.model, messages, max_tokens=4000, temperature=0.2)
+        print(reply)
+        return (reply or "").strip()
+
+    def interactive_chat(self, findings_dir: str = None, recon_dir: str = None,
+                         allow_run: bool = False):
+        """Conversational REPL with the local brain. Maintains history, streams replies,
+        and runs operator-issued `/run` commands through the same guard_command gate as
+        the autonomous loop. Fully offline (local Ollama model)."""
+        if not self.enabled:
+            print(f"{YELLOW}[-] Brain not enabled (no model / Ollama down).{NC}"); return
+        self.allow_exploit = bool(allow_run)   # /run destructive-denylist lift mirrors --allow-exploit
+        messages = [{"role": "system", "content": self.CHAT_SYSTEM}]
+
+        # Seed context from a findings/recon dir so "analyze my scan" works out of the box.
+        seeded = []
+        for label, d in (("findings", findings_dir), ("recon", recon_dir)):
+            if d and Path(d).exists():
+                try:
+                    listing = "\n".join(sorted(str(p.relative_to(d)) for p in Path(d).rglob("*")
+                                               if p.is_file())[:120])
+                except Exception:
+                    listing = ""
+                seeded.append(f"[{label} dir: {d}]\n{listing}")
+        if seeded:
+            messages.append({"role": "user",
+                             "content": "Engagement artifacts available (ask me to /load any file "
+                                        "for full content):\n\n" + "\n\n".join(seeded)})
+            messages.append({"role": "assistant",
+                             "content": "Got the artifact list. Ask me anything — or `/load <file>` "
+                                        "to pull a file into context."})
+
+        print(f"\n{BOLD}{MAGENTA}╔══ Vikramaditya Brain — interactive chat ══╗{NC}")
+        print(f"  model: {BOLD}{self.model}{NC} | provider: {getattr(self._llm,'provider','?')}"
+              f" | /run guard: {'destructive-OK' if allow_run else 'allowlist-only'}")
+        print(f"  commands: {CYAN}/run <cmd>{NC} exec+analyze · {CYAN}/load <file>{NC} · {CYAN}/reset{NC} ·"
+              f" {CYAN}/model <name>{NC} · {CYAN}/save <file>{NC} · {CYAN}/help{NC} · {CYAN}/exit{NC}\n")
+
+        while True:
+            try:
+                user = input(f"{BOLD}{GREEN}you ›{NC} ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(f"\n{CYAN}[brain chat ended]{NC}"); break
+            if not user:
+                continue
+            low = user.lower()
+            if low in ("/exit", "/quit", ":q"):
+                print(f"{CYAN}[brain chat ended]{NC}"); break
+            if low == "/help":
+                print(f"  /run <cmd>   run a shell command (guard-gated) and feed output back\n"
+                      f"  /load <file> load a file's content into the conversation\n"
+                      f"  /reset       clear the conversation (keep system prompt)\n"
+                      f"  /model <m>   switch local model\n"
+                      f"  /save <file> save the transcript\n"
+                      f"  /exit        quit"); continue
+            if low == "/reset":
+                messages = [{"role": "system", "content": self.CHAT_SYSTEM}]
+                print(f"{CYAN}[context reset]{NC}"); continue
+            if low.startswith("/model "):
+                self.model = user[7:].strip(); print(f"{CYAN}[model → {self.model}]{NC}"); continue
+            if low.startswith("/load "):
+                fp = user[6:].strip()
+                try:
+                    body = Path(fp).read_text(errors="replace")[:16000]
+                    messages.append({"role": "user", "content": f"Contents of `{fp}`:\n```\n{body}\n```"})
+                    print(f"{CYAN}[loaded {fp} ({len(body)} chars) into context]{NC}")
+                except Exception as e:
+                    print(f"{YELLOW}[load failed: {e}]{NC}")
+                continue
+            if low.startswith("/save "):
+                fp = user[6:].strip()
+                try:
+                    Path(fp).write_text("\n\n".join(f"## {m['role']}\n{m['content']}" for m in messages))
+                    print(f"{CYAN}[transcript saved → {fp}]{NC}")
+                except Exception as e:
+                    print(f"{YELLOW}[save failed: {e}]{NC}")
+                continue
+            if low.startswith("/run "):
+                cmd = user[5:].strip()
+                rc, out, err = self.run_command(cmd, timeout=120)
+                combined = (out or "") + (("\n[stderr]\n" + err) if err else "")
+                print(f"{CYAN}[exit={rc}]{NC}\n{combined[:4000]}")
+                messages.append({"role": "user",
+                                 "content": f"I ran `{cmd}` (exit={rc}). Output:\n```\n{combined[:6000]}\n```\n"
+                                            "Analyze this."})
+                reply = self._chat_reply(messages)
+                if reply:
+                    messages.append({"role": "assistant", "content": reply})
+                continue
+
+            # normal conversational turn
+            messages.append({"role": "user", "content": user})
+            reply = self._chat_reply(messages)
+            if reply:
+                messages.append({"role": "assistant", "content": reply})
+
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def main():
@@ -3379,6 +3505,7 @@ Examples:
         "exploit",    # run autonomous exploit loop on a single finding
         "autopilot",  # post-scan: triage all findings + exploit confirmed ones
         "plan",       # post-recon: analyze + generate targeted scan plan
+        "chat",       # interactive REPL — converse with the local brain
     ])
     parser.add_argument("--recon-dir",    help="Recon directory")
     parser.add_argument("--findings-dir", help="Findings directory")
@@ -3508,6 +3635,15 @@ Examples:
         brain.auto_triage_and_exploit(
             args.findings_dir,
             recon_dir=args.recon_dir or "",
+        )
+
+    elif args.phase == "chat":
+        # Interactive REPL — converse with the local brain. Optional findings/recon dir
+        # seeds context; --allow-exploit lifts the /run destructive denylist.
+        brain.interactive_chat(
+            findings_dir=args.findings_dir,
+            recon_dir=args.recon_dir,
+            allow_run=bool(args.allow_exploit),
         )
 
 
