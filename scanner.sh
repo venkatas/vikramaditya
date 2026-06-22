@@ -563,9 +563,21 @@ if ! skip_has sqli; then
                             log_vuln "SQLi Candidate (confirmed delay but not linear): $url"
                             echo "[SQLI-CANDIDATE] dialect=$dialect param=$i url=$url" >> "$FINDINGS_DIR/sqli/timebased_candidates.txt"
                         fi
-                    elif [ "$RC" -eq 28 ] && [ "$TE" -gt 18000 ]; then
-                        log_warn "Potential SQLi (Timeout Multiplier): $url"
-                        echo "[SQLI-TIMEOUT-CANDIDATE] timeout=${TE}ms param=$i url=$url" >> "$FINDINGS_DIR/sqli/timebased_candidates.txt"
+                    elif [ "$RC" -eq 28 ]; then
+                        # Curl TIMED OUT. A bare timeout is NOT SQLi evidence: a WAF /
+                        # gateway commonly returns a FIXED ~18-20s timeout (HTTP 502) for
+                        # ANY request carrying SQL metacharacters — indistinguishable from
+                        # a real sleep by duration alone (max-time truncates both). Confirm
+                        # via the 1s/2s LINEAR-SCALING check; a fixed block fails it (its
+                        # D2≈0). Only a delay that SCALES with the injected sleep is real.
+                        # (Was: blindly flagged any RC=28 >18s as [SQLI-TIMEOUT-CANDIDATE]
+                        #  — the dominant false-positive source on WAF-fronted targets.)
+                        if verify_sqli_poc "$url" "$i" "$dialect"; then
+                            log_crit "EMPIRICAL SQLI POC (timeout path, scaling-confirmed): $url"
+                            echo "[SQLI-POC-VERIFIED] dialect=$dialect param=$i url=$url" >> "$FINDINGS_DIR/sqli/timebased_candidates.txt"
+                            break 2
+                        fi
+                        # else: fixed timeout / WAF block — NOT flagged (false positive).
                     fi
                 done
             done

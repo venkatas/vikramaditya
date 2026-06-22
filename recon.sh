@@ -2014,6 +2014,28 @@ while IFS= read -r base_url; do
                 if [ "$DIFF" -le 2 ]; then continue; fi
             fi
 
+            # Soft-404 false-positive suppression (the dominant FP class). A framework
+            # custom-404 served as HTTP 200 (e.g. ASP.NET) ECHOES the requested path
+            # back into the body — <form action="./.env?404;http://host/..."> — so each
+            # path's body differs from the fingerprint baseline and slips past the
+            # md5/size checks above, producing a bogus [EXPOSED] /.env, /.git/config,
+            # /actuator/heapdump, … all of identical size. Two grounded suppressors:
+            LOWER_BODY=$(printf '%s' "$BODY" | tr 'A-Z' 'a-z')
+            # (a) the path-echo / framework-404 redirect signature (covers .php/.aspx too)
+            case "$LOWER_BODY" in
+                *'?404;'*|*'action="./'*|*"action='./"*|*'?404%3b'*) continue ;;
+            esac
+            # (b) a TEXT config path that returns an HTML document is a soft-404/SPA, not
+            #     the real file (.env/.git/.json/.yml/.ini/.conf/.properties/actuator are
+            #     never HTML when genuinely exposed). .php/.aspx render HTML legitimately,
+            #     so they are left to (a).
+            case "$path" in
+                *.env*|*.git/*|*.json|*.yml|*.yaml|*.ini|*.conf|*.config|*.properties|*.bak|*.sql|*actuator*)
+                    case "$LOWER_BODY" in
+                        *'<!doctype html'*|*'<html'*|*'<head>'*|*'<head '*|*'<form'*) continue ;;
+                    esac ;;
+            esac
+
             # Persist GROUNDED proof (status + content-type + size + a content
             # snippet) so a confirmed exposure is reportable evidence, not a bare
             # URL the reporter/operator can't verify. Snippet capped at 180 chars,
