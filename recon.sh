@@ -1246,9 +1246,16 @@ else
     if [ -s "$RECON_DIR/live/cdn_map.json" ] \
        && grep -q '"cdn"\|"waf"' "$RECON_DIR/live/cdn_map.json" 2>/dev/null \
        && [ -f "$_CFH" ] && command -v python3 >/dev/null 2>&1; then
-        _SUBS="$RECON_DIR/subdomains/all.txt"; [ -s "$_SUBS" ] || _SUBS="$RECON_DIR/subdomains/resolved.txt"
+        # Feed the DNS-RESOLVED hosts (dozens), NOT all.txt — which carries thousands of
+        # alterx permutations that mostly NXDOMAIN. Resolving those sequentially in
+        # classify() was the real budget-killer (thousands of lookups on a real estate). Prefer
+        # resolved.txt; fall back to all.txt only if it is absent.
+        _SUBS="$RECON_DIR/subdomains/resolved.txt"; [ -s "$_SUBS" ] || _SUBS="$RECON_DIR/subdomains/all.txt"
         log_step "cf_origin_hunt (Cloudflare/CDN origin discovery — WAF bypass)..."
-        if timeout 240 python3 "$_CFH" --target "$TARGET" \
+        # --deadline 180 < the 220s wrapper: the module self-bounds its concurrent
+        # probe phase and ALWAYS writes cf_origin.json before the hard kill (sequential
+        # probes previously overran the wrapper and the module died with no output).
+        if timeout 220 python3 "$_CFH" --target "$TARGET" --deadline 180 \
                --subdomains-file "$_SUBS" --out "$RECON_DIR/live/cf_origin.json" 2>/dev/null \
            && grep -q '"bypass": true' "$RECON_DIR/live/cf_origin.json" 2>/dev/null; then
             _ORIG=$(grep -oE '"ip": "[^"]+"' "$RECON_DIR/live/cf_origin.json" 2>/dev/null | head -1 | cut -d'"' -f4)
