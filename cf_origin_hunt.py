@@ -132,7 +132,7 @@ def _is_cf_error(body: str) -> bool:
     """True ONLY for a genuine Cloudflare CHALLENGE / ERROR interstitial — NOT a
     legitimate page that merely references cloudflare (CF assets/analytics/scripts
     appear in the HTML of plenty of real origin pages; matching the bare word
-    'cloudflare' false-rejected the verified KIMS origin)."""
+    'cloudflare' false-rejected a verified real origin)."""
     low = (body or "").lower()
     return any(s in low for s in (
         "attention required! | cloudflare", "error 1015", "error 1020",
@@ -280,7 +280,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="cf_origin_hunt",
         description="Cloudflare/CDN origin discovery — find + verify the real server behind the WAF.")
-    ap.add_argument("--target", required=True, help="The CF-fronted host (e.g. kims.example.edu)")
+    ap.add_argument("--target", required=True, help="The CF-fronted host (e.g. app.example.edu)")
     ap.add_argument("--subdomains-file", help="File of enumerated subdomains (one per line) to mine for origin leaks")
     ap.add_argument("--out", help="Write result JSON here (e.g. live/cf_origin.json)")
     ap.add_argument("--timeout", type=int, default=_PROBE_TIMEOUT,
