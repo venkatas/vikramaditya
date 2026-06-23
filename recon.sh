@@ -1237,6 +1237,27 @@ else
         fi
     fi
 
+    # v10.6 — DETECTING a CDN/WAF isn't enough: the edge then stonewalls the scan
+    # (the public host 403s/challenges). HUNT THE ORIGIN so downstream phases can
+    # test it DIRECTLY. Mine the enumerated estate for a non-proxied sibling that
+    # leaks the origin IP, then verify each candidate with a Host-header probe.
+    # Output: live/cf_origin.json {target:{verified:[{ip,status,title}], bypass}}.
+    _CFH="$(dirname "$0")/cf_origin_hunt.py"
+    if [ -s "$RECON_DIR/live/cdn_map.json" ] \
+       && grep -q '"cdn"\|"waf"' "$RECON_DIR/live/cdn_map.json" 2>/dev/null \
+       && [ -f "$_CFH" ] && command -v python3 >/dev/null 2>&1; then
+        _SUBS="$RECON_DIR/subdomains/all.txt"; [ -s "$_SUBS" ] || _SUBS="$RECON_DIR/subdomains/resolved.txt"
+        log_step "cf_origin_hunt (Cloudflare/CDN origin discovery — WAF bypass)..."
+        if timeout 240 python3 "$_CFH" --target "$TARGET" \
+               --subdomains-file "$_SUBS" --out "$RECON_DIR/live/cf_origin.json" 2>/dev/null \
+           && grep -q '"bypass": true' "$RECON_DIR/live/cf_origin.json" 2>/dev/null; then
+            _ORIG=$(grep -oE '"ip": "[^"]+"' "$RECON_DIR/live/cf_origin.json" 2>/dev/null | head -1 | cut -d'"' -f4)
+            log_done "CF BYPASS — origin reachable: ${_ORIG:-found} (Host-header) → live/cf_origin.json"
+        else
+            log_warn "cf_origin_hunt: no verified origin (target not CDN-fronted, or origin not exposed)"
+        fi
+    fi
+
     log_done "200 OK:         $(file_lines "$RECON_DIR/live/status_200.txt")"
     log_done "3xx Redirect:   $(file_lines "$RECON_DIR/live/status_3xx.txt")"
     log_done "403 Forbidden:  $(file_lines "$RECON_DIR/live/status_403.txt")"
