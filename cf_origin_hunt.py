@@ -26,6 +26,7 @@ Output: live/cf_origin.json
 Stdlib only — no third-party deps. Safe/read-only (GET requests only).
 """
 import argparse
+import concurrent.futures
 import ipaddress
 import json
 import os
@@ -33,6 +34,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 from http.client import HTTPSConnection, HTTPConnection
 
 # ── Published Cloudflare ranges (https://www.cloudflare.com/ips/) ──────────────
@@ -51,6 +53,13 @@ _CF_NETS = [ipaddress.ip_network(c) for c in _CF_V4 + _CF_V6]
 # origin candidates so we don't waste a Host-header probe on Google's MX, etc.
 _NON_ORIGIN_PREFIXES = ("142.250.", "142.251.", "172.217.", "216.58.", "64.233.",
                         "74.125.", "108.177.")  # Google/Workspace mail ranges
+# Per-probe network timeout — deliberately SHORT. cf_origin_hunt runs under
+# recon.sh's `timeout` wrapper; sequential 2×10s probes across a dozen candidates
+# blew past it and the module was KILLED before it could write cf_origin.json (a real
+# recon run produced ZERO output exactly this way). Short per-probe timeout
+# + concurrent fan-out + a hard internal deadline (see hunt()) keep it inside the
+# wrapper and guarantee a written result.
+_PROBE_TIMEOUT = 6
 
 
 def is_cloudflare(ip: str) -> bool:
@@ -82,19 +91,35 @@ def resolve(host: str) -> list:
         return []
 
 
-def classify(hosts) -> dict:
-    """Resolve each host and split into proxied (all-CF) vs direct (has a non-CF
-    IP). Returns {host: {"ips": [...], "proxied": bool, "origin_ips": [...]}}."""
-    out = {}
+_MAX_CLASSIFY_HOSTS = 1500   # safety cap — don't sequentially DNS a permutation list
+
+
+def classify(hosts, max_workers: int = 32) -> dict:
+    """Resolve each host CONCURRENTLY and split into proxied (all-CF) vs direct (has a
+    non-CF IP). Returns {host: {"ips": [...], "proxied": bool, "origin_ips": [...]}}.
+
+    Resolution is fanned out: classify() previously walked the host list serially, so
+    when recon handed it a 5k-entry alterx permutation list the thousands of NXDOMAIN
+    getaddrinfo() calls overran recon.sh's timeout wrapper. We dedup, cap, and resolve
+    in a thread pool (getaddrinfo releases the GIL)."""
+    clean, seen = [], set()
     for h in hosts:
         h = (h or "").strip().lower().lstrip("*.")
-        if not h:
-            continue
-        ips = resolve(h)
-        if not ips:
-            continue
-        origin = [ip for ip in ips if _is_origin_candidate(ip)]
-        out[h] = {"ips": ips, "proxied": len(origin) == 0, "origin_ips": origin}
+        if h and h not in seen:
+            seen.add(h)
+            clean.append(h)
+    if len(clean) > _MAX_CLASSIFY_HOSTS:
+        clean = clean[:_MAX_CLASSIFY_HOSTS]
+    out = {}
+    if not clean:
+        return out
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max_workers, len(clean))) as ex:
+        for h, ips in zip(clean, ex.map(resolve, clean)):
+            if not ips:
+                continue
+            origin = [ip for ip in ips if _is_origin_candidate(ip)]
+            out[h] = {"ips": ips, "proxied": len(origin) == 0, "origin_ips": origin}
     return out
 
 
@@ -116,7 +141,7 @@ def _is_cf_error(body: str) -> bool:
         "enable javascript and cookies to continue", "ray id:"))
 
 
-def _fetch(ip: str, host: str, scheme: str = "https", timeout: int = 10):
+def _fetch(ip: str, host: str, scheme: str = "https", timeout: int = _PROBE_TIMEOUT):
     """GET ``scheme://ip/`` with an explicit Host header. Returns (status, body)."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -140,12 +165,13 @@ def _fetch(ip: str, host: str, scheme: str = "https", timeout: int = 10):
             pass
 
 
-def verify_origin(ip: str, host: str, expected_title=None) -> dict:
+def verify_origin(ip: str, host: str, expected_title=None,
+                  timeout: int = _PROBE_TIMEOUT) -> dict:
     """Probe ``ip`` with ``Host: host``. Confirmed bypass when it returns a real
     200 page (real <title>, not a Cloudflare challenge), optionally matching the
     expected title of the fronted site. Tries HTTPS then HTTP."""
     for scheme in ("https", "http"):
-        status, body = _fetch(ip, host, scheme)
+        status, body = _fetch(ip, host, scheme, timeout)
         if status is None:
             continue
         title = _title(body)
@@ -173,13 +199,13 @@ def _host_token_in(title: str, host: str) -> bool:
     return len(label) >= 3 and label in re.sub(r"[^a-z0-9]+", "", (title or "").lower())
 
 
-def _fronted_baseline(host: str):
+def _fronted_baseline(host: str, timeout: int = _PROBE_TIMEOUT):
     """Fetch the public (CF-fronted) host to learn (status, title) for matching."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
-        conn = HTTPSConnection(host, timeout=10, context=ctx)
+        conn = HTTPSConnection(host, timeout=timeout, context=ctx)
         conn.request("GET", "/", headers={"User-Agent": "Mozilla/5.0", "Connection": "close"})
         r = conn.getresponse()
         body = r.read(4000).decode("utf-8", "replace")
@@ -189,12 +215,21 @@ def _fronted_baseline(host: str):
         return None, None
 
 
-def hunt(target: str, hosts, verbose=False) -> dict:
+def hunt(target: str, hosts, verbose=False, timeout=None, deadline=None) -> dict:
     """Full origin hunt for ``target`` given the enumerated ``hosts`` (the estate).
-    Returns the result dict written to cf_origin.json."""
-    cls = classify(set(hosts) | {target})
-    tinfo = cls.get(target.lower().lstrip("*."), {})
-    fronted_status, fronted_title = _fronted_baseline(target)
+    Returns the result dict written to cf_origin.json. Candidate probes fan out
+    concurrently under ``deadline`` seconds (None = no cap) so the module finishes
+    and writes a result inside recon.sh's `timeout` wrapper instead of being killed
+    mid-probe with zero output."""
+    t = timeout or _PROBE_TIMEOUT
+    # Target FIRST so the classify host cap can never drop it (set() ordering could,
+    # which made a CF-fronted apex look un-proxied and skipped the whole hunt).
+    cls = classify([target] + list(hosts))
+    tnorm = target.lower().lstrip("*.")
+    if tnorm not in cls:                       # transient resolve miss — classify it alone
+        cls.update(classify([target]))
+    tinfo = cls.get(tnorm, {})
+    fronted_status, fronted_title = _fronted_baseline(target, t)
     # Candidate origin IPs = every direct IP across the estate (siblings leak the
     # origin subnet), de-duplicated, with same-subnet-as-a-sibling ranked first.
     cand = []
@@ -205,13 +240,28 @@ def hunt(target: str, hosts, verbose=False) -> dict:
                 seen.add(ip)
                 cand.append(ip)
     verified = []
-    for ip in cand:
-        v = verify_origin(ip, target, expected_title=fronted_title)
-        if v.get("matched"):
-            verified.append(v)
-            if verbose:
-                print(f"  [BYPASS] {ip} serves {target} "
-                      f"({v['scheme']} {v['status']} '{v.get('title')}')", file=sys.stderr)
+    timed_out = False
+    if cand:
+        workers = min(16, max(1, len(cand)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(verify_origin, ip, target, fronted_title, t): ip
+                    for ip in cand}
+            try:
+                for fut in concurrent.futures.as_completed(
+                        futs, timeout=(deadline or None)):
+                    v = fut.result()
+                    if v.get("matched"):
+                        verified.append(v)
+                        if verbose:
+                            print(f"  [BYPASS] {v.get('ip')} serves {target} "
+                                  f"({v.get('scheme')} {v.get('status')} "
+                                  f"'{v.get('title')}')", file=sys.stderr)
+            except concurrent.futures.TimeoutError:
+                timed_out = True
+                if verbose:
+                    print(f"  [cf_origin_hunt] deadline {deadline}s hit; "
+                          f"{len(verified)} verified from partial probes",
+                          file=sys.stderr)
     return {
         "target": target,
         "fronted_status": fronted_status,
@@ -220,6 +270,7 @@ def hunt(target: str, hosts, verbose=False) -> dict:
         "origin_candidates": cand,
         "verified": verified,
         "bypass": bool(verified),
+        "deadline_hit": timed_out,
         "direct_siblings": sorted(h for h, i in cls.items()
                                   if not i.get("proxied") and h != target),
     }
@@ -232,13 +283,20 @@ def main(argv=None) -> int:
     ap.add_argument("--target", required=True, help="The CF-fronted host (e.g. kims.example.edu)")
     ap.add_argument("--subdomains-file", help="File of enumerated subdomains (one per line) to mine for origin leaks")
     ap.add_argument("--out", help="Write result JSON here (e.g. live/cf_origin.json)")
+    ap.add_argument("--timeout", type=int, default=_PROBE_TIMEOUT,
+                    help="Per-probe network timeout in seconds (default: %(default)s)")
+    ap.add_argument("--deadline", type=float, default=180.0,
+                    help="Hard cap (s) on the concurrent candidate-probe phase so the "
+                         "module always writes its result inside recon.sh's timeout "
+                         "wrapper (default: %(default)s; 0 = no cap)")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
 
     hosts = []
     if a.subdomains_file and os.path.isfile(a.subdomains_file):
         hosts = [l.strip() for l in open(a.subdomains_file, encoding="utf-8", errors="replace") if l.strip()]
-    res = hunt(a.target, hosts, verbose=a.verbose)
+    res = hunt(a.target, hosts, verbose=a.verbose, timeout=a.timeout,
+               deadline=(a.deadline or None))
 
     if a.out:
         try:
@@ -251,9 +309,10 @@ def main(argv=None) -> int:
         print(f"[+] Cloudflare BYPASS for {a.target}: origin = "
               + ", ".join(f"{v['ip']} (Host-header {v['scheme']} {v['status']})" for v in res["verified"]))
     elif res["is_cloudflare"]:
+        partial = " [deadline hit — partial probe]" if res.get("deadline_hit") else ""
         print(f"[-] {a.target} is Cloudflare-fronted; {len(res['origin_candidates'])} "
               f"candidate(s) probed, none served the site directly "
-              f"({len(res['direct_siblings'])} non-proxied siblings found)")
+              f"({len(res['direct_siblings'])} non-proxied siblings found){partial}")
     else:
         print(f"[*] {a.target} does not appear Cloudflare-proxied — no origin hunt needed")
     return 0
