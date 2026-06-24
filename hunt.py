@@ -202,6 +202,13 @@ WATCHDOG_INTERVAL  = 60
 WATCHDOG_MAX_IDLE  = 5
 WATCHDOG_DIAG_AT   = 3
 WATCHDOG_MSF_IDLE  = 10
+# Consecutive watchdog ticks of SYN_SENT-with-zero-ESTABLISHED (output also stalled)
+# before declaring the target has BLOCKED us. A WAF/firewall that null-routes the source
+# IP on a malicious-payload hit (e.g. Palo Alto threat-prevention block, typically a
+# FIXED-duration block) leaves the scanner sending SYNs that get no SYN-ACK — the retry
+# churn otherwise reads as "busy" forever, so the run banks false-negative "0 findings"
+# against an unreachable host. 3 ticks (~3 min) avoids tripping on brief slowness.
+WATCHDOG_BLOCK_TICKS = 3
 
 # Per-call sqlmap timeouts already bound total runtime, so these caps exist only
 # to keep a single phase from ballooning. When a cap actually drops candidates we
@@ -376,8 +383,12 @@ class ProcessWatchdog:
         self._last_cpu_times: dict = {}
         self._last_socket_signature = ""
         self._last_socket_summary = "(not sampled yet)"
+        self._last_syn_sent = 0          # block-detection: SYN_SENT count last tick
+        self._last_established = 0        # block-detection: ESTABLISHED count last tick
+        self._block_count = 0             # consecutive ticks of SYN_SENT-with-no-ESTABLISHED
         self.diag_at    = diag_at   # stale_count at which brain diagnoses (default 3 min)
         self.killed     = False
+        self.blocked    = False     # set True if the target null-routed us (WAF/firewall IP-block)
         self._stop_evt  = threading.Event()
         self._thread    = threading.Thread(target=self._run, daemon=True,
                                            name=f"watchdog-{phase}")
@@ -544,6 +555,11 @@ class ProcessWatchdog:
         signature = "\n".join(entries)
         changed = bool(signature) and signature != self._last_socket_signature
         self._last_socket_signature = signature
+
+        # Block-detection signals: a healthy scan ESTABLISHES connections; a target that
+        # has null-routed us leaves only SYN_SENT (SYNs with no SYN-ACK).
+        self._last_syn_sent = counts.get("SYN_SENT", 0)
+        self._last_established = counts.get("ESTABLISHED", 0)
 
         if counts:
             summary = ", ".join(f"{state}={counts[state]}" for state in sorted(counts))
@@ -718,6 +734,41 @@ class ProcessWatchdog:
                     f"idle={stale_count}/{self.max_stale} | bytes={current_size:,} | {detail}{NC}",
                     flush=True,
                 )
+
+            # ── Target-block detection ──────────────────────────────────────────
+            # Sustained SYN_SENT with ZERO ESTABLISHED (output also stalled) means the
+            # target stopped answering our SYNs — a WAF/firewall IP-block (e.g. Palo Alto
+            # threat-prevention null-routes the source IP for a FIXED window when it sees a
+            # malicious payload). The retry churn reads as "busy" to the heuristics above, so
+            # without this the run grinds for hours and banks a FALSE-NEGATIVE "0 findings"
+            # against an unreachable host. Abort the phase and mark coverage UNRELIABLE.
+            if (not grew) and self._last_syn_sent > 0 and self._last_established == 0:
+                self._block_count += 1
+            else:
+                self._block_count = 0
+            if self._block_count >= WATCHDOG_BLOCK_TICKS:
+                if self._stop_evt.is_set() or self.proc.poll() is not None:
+                    break
+                blocked_secs = self._block_count * self.interval
+                print(
+                    f"\033[0;31m\033[1m[Watchdog/{self.phase}] TARGET BLOCKED — "
+                    f"{self._last_syn_sent} SYN_SENT / 0 ESTABLISHED for ~{blocked_secs}s "
+                    f"(WAF/firewall null-route, e.g. Palo Alto fixed-time block). Aborting "
+                    f"phase; remaining coverage is UNRELIABLE — a blocked host returns "
+                    f"false-negative 0-findings, NOT a clean target.\033[0m",
+                    flush=True,
+                )
+                _mark_degraded(
+                    self.phase,
+                    f"TARGET BLOCKED US — {self._last_syn_sent} SYN_SENT with 0 ESTABLISHED for "
+                    f"~{blocked_secs}s (firewall/WAF IP-block, likely a fixed-duration threat-"
+                    f"prevention null-route triggered by a payload). This phase and any later "
+                    f"phases are UNRELIABLE; re-run after the block window at a slower / non-"
+                    f"destructive rate. Do NOT read '0 findings' here as a clean target.")
+                self._kill_proc()
+                self.killed = True
+                self.blocked = True
+                break
 
             # Early-warning diagnosis only when the process looks truly idle.
             if stale_count == self.diag_at and _brain and _brain.enabled:
