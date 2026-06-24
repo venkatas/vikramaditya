@@ -524,7 +524,14 @@ def run_nuclei_cve_scan(domain, recon_dir=None, out_file=None):
     else:
         cmd = f'echo "https://{domain}" | {nuclei_opts} {stderr_redirect}'
 
-    success, output = run_cmd(cmd, timeout=300)
+    # Timeout is env-overridable: the 300s default DEGRADED on multi-host estates
+    # (an 8-host IIS estate timed out before CVE coverage completed). Raise it via
+    # NUCLEI_CVE_TIMEOUT=<seconds> for a complete pass; default stays 300 for compat.
+    try:
+        cve_timeout = max(60, int(os.environ.get("NUCLEI_CVE_TIMEOUT", "300")))
+    except (TypeError, ValueError):
+        cve_timeout = 300
+    success, output = run_cmd(cmd, timeout=cve_timeout)
     timed_out = (
         not success and isinstance(output, str) and output.startswith("timeout after")
     )
