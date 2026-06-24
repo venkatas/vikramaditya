@@ -852,7 +852,14 @@ def load_findings(findings_dir: str) -> list:
         }
         # Line-prefix markers used by scanner.sh to record state, not findings.
         NON_FINDING_PREFIXES = (
-            "[UPLOAD-CANDIDATE-AUTH]",   # path returned 403 to GET+POST = auth-protected
+            "[UPLOAD-CANDIDATE",         # open-ended — covers [UPLOAD-CANDIDATE], -POST, -VALIDATION,
+                                         # -AUTH. A readable file or probed endpoint in an upload dir is a
+                                         # discovery LEAD, not a verified unrestricted-upload vuln. Only a
+                                         # confirmed write/exec ([UPLOAD-ONLY-POC], [POC-RCE-CONFIRMED],
+                                         # [VULN] — none of which match this prefix) is a finding.
+                                         # (Real run: 16 PUBLIC report .html files in an /upload/ dir were
+                                         # promoted to HIGH "Unrestricted File Upload" CVSS 8.8 despite the
+                                         # scan's own summary.txt saying "Verified Upload Only: 0".)
             "[SQLI-CANDIDATE]",          # unverified time-based candidate, needs follow-up
             "[SQLI-TIMEOUT-CANDIDATE]",  # timeout was server-side slow, not necessarily SQLi
             "[GIT-FLAG-INJECTION-CANDIDATE]",  # candidate, not confirmed
