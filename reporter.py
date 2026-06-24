@@ -849,6 +849,19 @@ def load_findings(findings_dir: str) -> list:
             # one per line via -lsi); they are NOT host/version-confirmed, so the
             # generic loader must not promote each ID to a CRITICAL cves finding.
             "cvemap_results.txt",
+            # cves/ — check_exposed_configs() (cve.py) writes accessible config-file URLs here, one
+            # per line. The generic cves/ loader rendered each as a CRITICAL "Known CVE Vulnerability"
+            # CVSS 9.0 — a readable config URL is NOT a CVE (wrong category + inflated severity). The
+            # exposed-config signal is better surfaced as a dedicated MEDIUM info-disclosure finding.
+            "exposed_configs.txt",
+            # supply_chain/ — raw `head -5` of cred-file response BODIES (incl. benign lines like
+            # "always-auth=true"). The actual finding is the [CRED-FILE] line in findings.txt; each
+            # snippet body line otherwise became a separate HIGH "Supply-Chain Exposure".
+            "snippets.txt",
+            # xss/ — raw `grep -iE "xss|payload|vulnerable"` of XSStrike PROGRESS output (payload-
+            # generation chatter, not a confirmed reflection). Verified XSS comes from dalfox; these
+            # raw lines were promoted to MEDIUM XSS findings.
+            "xsstrike_results.txt",
         }
         # Line-prefix markers used by scanner.sh to record state, not findings.
         NON_FINDING_PREFIXES = (
@@ -860,11 +873,22 @@ def load_findings(findings_dir: str) -> list:
                                          # (Real run: 16 PUBLIC report .html files in an /upload/ dir were
                                          # promoted to HIGH "Unrestricted File Upload" CVSS 8.8 despite the
                                          # scan's own summary.txt saying "Verified Upload Only: 0".)
+            "[UPLOAD-ACCEPTED-UNVERIFIED]",  # upload/ — POST accepted (canary path echoed) but the stored
+                                         # file was NEVER retrieved at any probed path: no write/exec confirm.
+                                         # scanner.sh keeps it ONLY as a manual-review signal in a SEPARATE
+                                         # file; without this it shipped as HIGH 8.8 "Unrestricted File Upload".
+            "[IMPORT-ENDPOINT",          # import_export/ — endpoint DISCOVERY (fires on 403/405 too), not an
+                                         # exploited business-logic flaw; was promoted to HIGH 8.1.
+            "[CONVERTER-ENDPOINT",       # import_export/ — converter endpoint guess (bare 200/405), not exploited.
+            "[JAVA-DESER]",              # deserialize/ — Content-Type fingerprint only (no gadget sent).
+            "[PHP-DESER]",               # deserialize/ — unserialize-error reflection heuristic, not exploited.
             "[SQLI-CANDIDATE]",          # unverified time-based candidate, needs follow-up
             "[SQLI-TIMEOUT-CANDIDATE]",  # timeout was server-side slow, not necessarily SQLi
             "[GIT-FLAG-INJECTION-CANDIDATE]",  # candidate, not confirmed
-            "[JAVA-RMI-CANDIDATE]",      # deserialize/ — manual ysoserial follow-up lead,
-                                         # NOT a confirmed HIGH deserialization finding
+            "[JAVA-RMI",                 # deserialize/ — open-ended: covers [JAVA-RMI] (path+banner
+                                         # fingerprint, no gadget executed) and [JAVA-RMI-CANDIDATE]. A manual
+                                         # ysoserial follow-up LEAD, NOT a confirmed HIGH deserialization vuln.
+                                         # Confirmed exec uses [POC-RCE-CONFIRMED]/[VULN] (different prefix).
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
