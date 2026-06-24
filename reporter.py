@@ -733,27 +733,33 @@ def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
     tmpl = VULN_TEMPLATES.get(default_vtype, {})
     sev = tmpl.get("severity", "medium")
 
-    # Override with explicit severity keywords in the raw finding text.
-    # Use word-boundary regex so severity tokens are not matched inside
-    # payload/evidence text — e.g. INFORMATION_SCHEMA must not match "INFO",
-    # HIGHCHARTS must not match "HIGH", SLOWLORIS/yellow must not match "LOW".
-    # Hyphen counts as a \b boundary, so RCE-POC / SSTI-CONFIRMED still match.
-    if re.search(r'\b(SQLI-POC-VERIFIED|RCE-POC|CRITICAL|CONFIRMED)\b', line):
-        sev = "critical"
-    elif re.search(r'\bHIGH\b', line):
-        sev = "high"
-    elif re.search(r'\bINFO\b', line):
-        # Explicit INFO is context, not a low-severity vuln. Mapping it to "low"
-        # turned benign informational lines (e.g. "CORS-INFO" for a wildcard
-        # ACAO without credentials) into LOW findings in the report.
-        sev = "info"
-    elif re.search(r'\bLOW\b', line):
-        sev = "low"
     url = "N/A"
     m = re.search(r'https?://\S+', line)
     if m:
         url = m.group(0).rstrip(".,;)")
-    tags = [tag.strip().lower() for tag in re.findall(r'\[([^\]]+)\]', line)]
+    # v10.6.1 ANTI-FABRICATION: strip ALL URLs before the severity-keyword scan so a
+    # benign URL PATH segment can never promote severity — e.g. a misconfig line for
+    # `https://h/api/CONFIRMED/status` was scored CRITICAL, and `/HIGH-availability/`
+    # was scored HIGH, purely because the path text contained the keyword.
+    text = re.sub(r'https?://\S+', ' ', line)
+
+    # Override with explicit severity keywords in the NON-URL finding text.
+    # Use word-boundary regex so severity tokens are not matched inside
+    # payload/evidence text — e.g. INFORMATION_SCHEMA must not match "INFO",
+    # HIGHCHARTS must not match "HIGH", SLOWLORIS/yellow must not match "LOW".
+    # Hyphen counts as a \b boundary, so RCE-POC / SSTI-CONFIRMED still match.
+    if re.search(r'\b(SQLI-POC-VERIFIED|RCE-POC|CRITICAL|CONFIRMED)\b', text):
+        sev = "critical"
+    elif re.search(r'\bHIGH\b', text):
+        sev = "high"
+    elif re.search(r'\bINFO\b', text):
+        # Explicit INFO is context, not a low-severity vuln. Mapping it to "low"
+        # turned benign informational lines (e.g. "CORS-INFO" for a wildcard
+        # ACAO without credentials) into LOW findings in the report.
+        sev = "info"
+    elif re.search(r'\bLOW\b', text):
+        sev = "low"
+    tags = [tag.strip().lower() for tag in re.findall(r'\[([^\]]+)\]', text)]
     if len(tags) > 1 and tags[1] in SEVERITY_ORDER:
         sev = tags[1]
     elif tags and tags[0] in SEVERITY_ORDER:
@@ -822,6 +828,20 @@ def load_findings(findings_dir: str) -> list:
                       f"Add to reporter.py::SUBDIR_VTYPE + VULN_TEMPLATES.")
     except OSError:
         pass
+
+    # Collected here so Method 1's cves/ loader can divert bare/unverified CVE-ID
+    # lines into the SAME "unconfirmed keyword match" collapse that Method 1b uses,
+    # instead of promoting each one to a CRITICAL cves finding (see below).
+    unconfirmed_cves = []
+
+    # A line is a confirmed CVE finding only if it carries active-confirmation
+    # context: a target URL (nuclei output) or an explicit confirmation marker.
+    # A *bare* CVE ID on its own (e.g. "CVE-2021-44228") is an unverified, unversioned
+    # match — exactly the class Method 1b collapses to INFO. The generic .txt loader
+    # must NOT promote it to a CRITICAL "Known CVE Vulnerability" (CVSS 9.0).
+    _BARE_CVE_RE = re.compile(r'^CVE-\d{4}-\d{4,}$', re.IGNORECASE)
+    # cves/*.txt files that ARE confirmed findings (allowlist; fail-closed for the rest).
+    _CVES_CONFIRMED_TXT = {"nuclei_cve_confirmed.txt"}
 
     # Method 1: Subdirectory-based findings (scanner.sh output)
     for subdir, vtype in SUBDIR_VTYPE.items():
@@ -902,6 +922,14 @@ def load_findings(findings_dir: str) -> list:
                         continue
                     if any(line.startswith(p) for p in NON_FINDING_PREFIXES):
                         continue
+                    # cves/ fail-closed guard: only nuclei_cve_confirmed.txt holds
+                    # confirmed (URL-bearing) findings. Any other cves/*.txt that is a
+                    # bare CVE ID is an unverified, unversioned keyword/ID match — divert
+                    # it into the Method-1b INFO collapse instead of emitting a CRITICAL.
+                    if vtype == "cves" and fn not in _CVES_CONFIRMED_TXT \
+                            and _BARE_CVE_RE.match(line):
+                        unconfirmed_cves.append((line.upper(), "", ""))
+                        continue
                     finding = parse_custom_line(line, vtype)
                     for poc_key, poc_text in all_pocs.items():
                         if poc_key in line or line[:60] in poc_key:
@@ -922,7 +950,8 @@ def load_findings(findings_dir: str) -> list:
     # remaining unverified keyword matches are collapsed into ONE clearly-labelled
     # INFORMATIONAL context item so the findings table stays trustworthy.
     cve_path = os.path.join(findings_dir, "cves")
-    unconfirmed_cves = []
+    # NOTE: unconfirmed_cves is initialised before Method 1 (above) and may already
+    # hold bare-CVE-ID lines diverted from cves/*.txt — do NOT re-initialise it here.
     if os.path.isdir(cve_path):
         for fn in sorted(os.listdir(cve_path)):
             if not fn.endswith(".json"):
@@ -1259,6 +1288,20 @@ def load_findings(findings_dir: str) -> list:
                     sev = "high"   # Burp has no Critical severity — clamp per contract
                 if sev not in SEVERITY_ORDER:
                     sev = "info"
+                # v10.6.1 — ANTI-FABRICATION: Burp's "Tentative" is its LOWEST
+                # confidence tier (Tentative < Firm < Certain). A Tentative issue is
+                # an UNVERIFIED heuristic guess (frequently a false positive), not a
+                # confirmed vuln. Method 1g previously copied the raw Burp severity
+                # verbatim, so a Tentative-confidence "High" SQLi / "Medium" XSS — and
+                # even issues Burp itself flags as likely false-positive — shipped to
+                # the client report as verified high/medium findings. Downgrade any
+                # Tentative issue to INFO so it is preserved for manual review but
+                # never presented as a confirmed medium+ finding. Firm/Certain (and
+                # any unlabelled confidence) keep their reported severity.
+                confidence = str(item.get("confidence", "")).strip().lower()
+                if (confidence == "tentative"
+                        and SEVERITY_ORDER.get(sev, 4) < SEVERITY_ORDER["info"]):
+                    sev = "info"
                 vtype = (item.get("type") or item.get("vtype") or "misconfig")
                 if vtype not in VULN_TEMPLATES:
                     vtype = "misconfig"
@@ -1357,9 +1400,9 @@ def load_findings(findings_dir: str) -> list:
             except Exception:
                 _access_claim_unproven = None
             try:
-                from brain_scanner import _ACCESS_CLAIM_RE, _USAGE_BANNER_RE
+                from brain_scanner import _ACCESS_CLAIM_RE, _USAGE_BANNER_RE, _STATUS_NOISE_RE
             except Exception:
-                _ACCESS_CLAIM_RE = _USAGE_BANNER_RE = None
+                _ACCESS_CLAIM_RE = _USAGE_BANNER_RE = _STATUS_NOISE_RE = None
             try:
                 from brain_scanner import _grounded_read_unproven as _shared_grounded_gate
             except Exception:
@@ -1390,6 +1433,20 @@ def load_findings(findings_dir: str) -> list:
                 substantive = [ln for ln in content if len(ln.strip()) >= 8]
                 return len(substantive) < 2  # <2 real content lines ⇒ still unproven
 
+            # v10.6.1 ANTI-FABRICATION: a brain finding counts as "script-confirmed" ONLY
+            # if the active scan's iteration output carries SUBSTANTIVE tool content. The
+            # _claim_unproven gate above only validates file-READ claims; a [CRITICAL]
+            # "SQL injection confirmed" / "RCE confirmed" line whose results were pure
+            # progress chatter ([*] testing ...) otherwise reached a CRITICAL finding
+            # (fail-open _apply_verification_gating treats an unmarked brain line as
+            # EXPLOITED). Require real grounding for ALL claim types, not just file reads.
+            _grounding = [ln for ln in (all_iter_output or "").splitlines()
+                          if ln.strip() and len(ln.strip()) >= 8
+                          and not (_ACCESS_CLAIM_RE and _ACCESS_CLAIM_RE.search(ln))
+                          and not (_USAGE_BANNER_RE and _USAGE_BANNER_RE.search(ln))
+                          and not (_STATUS_NOISE_RE and _STATUS_NOISE_RE.search(ln))]
+            _iter_grounded = len(_grounding) >= 2
+
             model_claims = []
             for line in brain_findings:
                 line = (line or "").strip()
@@ -1405,6 +1462,12 @@ def load_findings(findings_dir: str) -> list:
                 # unconditionally. Demote to unverified context, never a finding.
                 if _claim_unproven(line, all_iter_output):
                     model_claims.append("UNVERIFIED (no file content as proof): " + line)
+                    continue
+                # Any brain claim (SQLi/XSS/RCE/auth-bypass — not just file-access) whose
+                # iteration produced no substantive script output is a MODEL CLAIM, not a
+                # confirmed finding; collapse it to context instead of a medium+ row.
+                if not _iter_grounded:
+                    model_claims.append("UNGROUNDED (no script output as proof): " + line)
                     continue
                 # Script-output-grounded line → real finding. Reuse the custom-line
                 # parser so its vtype/severity are derived from any [tag]/keywords.
