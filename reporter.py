@@ -928,8 +928,11 @@ def load_findings(findings_dir: str) -> list:
                     # findings. Any other cves/*.txt line that REFERENCES a CVE ID (bare or
                     # with trailing CVSS/name text) is an unverified, unversioned keyword/ID
                     # match — divert it into the Method-1b INFO collapse, never a CRITICAL.
+                    # EXEMPT lines carrying a URL: a CVE ref WITH a target URL is nuclei
+                    # active-confirmation format (e.g. "[CVE-..] [http] [critical] https://h/x"),
+                    # a real hit — diverting it would be NEW over-suppression (friends 2nd pass).
                     if vtype == "cves" and fn not in _CVES_CONFIRMED_TXT \
-                            and _CVE_REF_RE.search(line):
+                            and _CVE_REF_RE.search(line) and "http" not in line.lower():
                         unconfirmed_cves.append((line.upper(), "", ""))
                         continue
                     finding = parse_custom_line(line, vtype)
@@ -1032,23 +1035,27 @@ def load_findings(findings_dir: str) -> list:
     _exposed_cfg = os.path.join(findings_dir, "cves", "exposed_configs.txt")
     if os.path.isfile(_exposed_cfg):
         try:
+            _seen_cfg = set()
             with open(_exposed_cfg, errors="replace") as f:
                 for _ln in f:
                     _u = _ln.strip()
-                    if not _u or _u.startswith("#"):
+                    if not _u or _u.startswith("#") or _u in _seen_cfg:
                         continue
-                    results.append({
-                        "severity": "medium",
-                        "cvss": CVSS_DEFAULT.get("medium", "5.3"),
-                        "vtype": "misconfig",
+                    _seen_cfg.add(_u)                    # de-dup repeated URLs (friends 2nd pass)
+                    # Build via parse_custom_line so it inherits the misconfig template's
+                    # cwe/impact/remediation/cvss (a bare dict left those empty); force MEDIUM.
+                    _f = parse_custom_line(f"Exposed Configuration File {_u}", "misconfig")
+                    _f["severity"] = "medium"
+                    _f.update({
                         "title": "Exposed Configuration File",
+                        "url": _u,
                         "detail": (f"A configuration file is directly accessible without "
                                    f"authentication: {_u} . Config files frequently disclose "
                                    f"credentials, connection strings, framework versions, or "
                                    f"internal paths (CWE-538). Review the content and restrict access."),
-                        "url": _u,
                         "poc": f"GET {_u}  ->  HTTP 200 (config file served directly, unauthenticated).",
                     })
+                    results.append(_f)
         except OSError:
             pass
 
