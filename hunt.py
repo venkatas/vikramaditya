@@ -556,8 +556,10 @@ class ProcessWatchdog:
                 # local proxies, interactsh/OOB helpers): a localhost ESTABLISHED must not
                 # MASK a real target block, and loopback churn must not fake target activity.
                 _addr = next((p for p in line.split() if "->" in p), "")
-                _remote = _addr.split("->", 1)[1] if _addr else ""
-                if _remote and not _remote.startswith(("127.", "[::1]", "localhost", "[fe80")):
+                _remote = _addr.split("->", 1)[1].lower() if _addr else ""
+                _loopback = ("127.", "[::1]", "::1", "localhost", "[fe80", "fe80",
+                             "[::ffff:127.", "::ffff:127.")   # incl. IPv4-mapped localhost
+                if _remote and not _remote.startswith(_loopback):
                     nl_counts[state] = nl_counts.get(state, 0) + 1
 
         signature = "\n".join(entries)
