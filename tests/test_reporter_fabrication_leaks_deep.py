@@ -69,3 +69,31 @@ def test_burp_tentative_is_downgraded_to_info(tmp_path):
     certain = [{"severity": "High", "confidence": "Certain", "type": "sqli",
                 "title": "SQLi", "url": "https://t.example.invalid/x", "source": "burp"}]
     assert _worst(tmp_path, "burp/findings.json", certain) == "high"
+
+
+# ── friends-review follow-ups (codex + grok + agy) ──────────────────────────────
+
+def test_cve_id_with_trailing_text_does_not_ship_critical(tmp_path):
+    # prefix-only guard let "CVE-... CVSS:10 Log4Shell" through; must divert any CVE ref
+    assert _worst(tmp_path, "cves/other.txt", "CVE-2021-44228 CVSS:10.0 Log4Shell RCE") not in _MEDPLUS
+
+
+def test_saml_endpoint_discovery_is_not_a_finding(tmp_path):
+    assert _worst(tmp_path, "saml/endpoints.txt",
+                  "[SAML-ENDPOINT] https://t.example.invalid/saml | HTTP 200") not in _MEDPLUS
+
+
+def test_brain_single_line_real_proof_is_not_over_suppressed(tmp_path):
+    # a REAL exploit often proves itself in ONE line — must NOT be demoted (>=2 was too strict)
+    grounded = {"findings_so_far": ["[CRITICAL] RCE confirmed uid=0"],
+                "results": "uid=0(root) gid=0(root) groups=0(root)\n[*] done"}
+    assert _worst(tmp_path, "brain_active/iteration_1.json", grounded) == "critical"
+    # but pure-chatter (0 substantive lines) still collapses to a model claim
+    ungrounded = {"findings_so_far": ["[CRITICAL] SQL injection confirmed"],
+                  "results": "[*] running\n[*] testing\n[*] no output"}
+    assert _worst(tmp_path, "brain_active/iteration_1.json", ungrounded) not in _MEDPLUS
+
+
+def test_exposed_config_is_surfaced_not_dropped(tmp_path):
+    # over-suppression: exposed_configs.txt was blacklisted with no loader -> real exposures lost
+    assert _worst(tmp_path, "cves/exposed_configs.txt", "https://t.example.invalid/.git/config") == "medium"

@@ -539,6 +539,7 @@ class ProcessWatchdog:
 
         entries = []
         counts = {}
+        nl_counts = {}   # non-loopback only — used for TARGET-BLOCK detection
         active = False
         for idx, line in enumerate(lsof_out.splitlines()):
             if idx == 0 or not line.strip():
@@ -551,15 +552,22 @@ class ProcessWatchdog:
                 entries.append(line.strip())
                 if state in ("ESTABLISHED", "SYN_SENT", "SYN_RECV"):
                     active = True
+                # Block-detection counts EXCLUDE loopback/control sockets (the Ollama brain,
+                # local proxies, interactsh/OOB helpers): a localhost ESTABLISHED must not
+                # MASK a real target block, and loopback churn must not fake target activity.
+                _addr = next((p for p in line.split() if "->" in p), "")
+                _remote = _addr.split("->", 1)[1] if _addr else ""
+                if _remote and not _remote.startswith(("127.", "[::1]", "localhost", "[fe80")):
+                    nl_counts[state] = nl_counts.get(state, 0) + 1
 
         signature = "\n".join(entries)
         changed = bool(signature) and signature != self._last_socket_signature
         self._last_socket_signature = signature
 
-        # Block-detection signals: a healthy scan ESTABLISHES connections; a target that
-        # has null-routed us leaves only SYN_SENT (SYNs with no SYN-ACK).
-        self._last_syn_sent = counts.get("SYN_SENT", 0)
-        self._last_established = counts.get("ESTABLISHED", 0)
+        # Block-detection signals (NON-LOOPBACK only): a healthy scan ESTABLISHES
+        # connections to the target; a null-route leaves only SYN_SENT (no SYN-ACK).
+        self._last_syn_sent = nl_counts.get("SYN_SENT", 0)
+        self._last_established = nl_counts.get("ESTABLISHED", 0)
 
         if counts:
             summary = ", ".join(f"{state}={counts[state]}" for state in sorted(counts))
@@ -1366,7 +1374,10 @@ def run_cmd(
                 watchdog.stop()
                 # Surface a watchdog SIGKILL (stuck/no-progress) as degraded —
                 # .killed was previously write-only.
-                if not timed_out and getattr(watchdog, "killed", False):
+                if (not timed_out and getattr(watchdog, "killed", False)
+                        and not getattr(watchdog, "blocked", False)):
+                    # (a block-kill already recorded a distinct "TARGET BLOCKED" degradation;
+                    # don't double-mark it as a generic stuck/no-progress kill.)
                     _mark_degraded(watch_phase or "subprocess",
                                    "watchdog SIGKILL (stuck/no progress) — partial coverage")
 
@@ -1486,7 +1497,10 @@ def run_live(cmd: str, timeout: int = 3600,
                 # The watchdog SIGKILLs a stuck/no-progress child and sets
                 # .killed; that flag was previously write-only. Surface it as a
                 # degradation so a watchdog-truncated phase isn't silently clean.
-                if not timed_out and getattr(watchdog, "killed", False):
+                if (not timed_out and getattr(watchdog, "killed", False)
+                        and not getattr(watchdog, "blocked", False)):
+                    # (a block-kill already recorded a distinct "TARGET BLOCKED" degradation;
+                    # don't double-mark it as a generic stuck/no-progress kill.)
                     _mark_degraded(watch_phase or "subprocess",
                                    "watchdog SIGKILL (stuck/no progress) — partial coverage")
                     _mark_truncated_recon(watch_file, watch_phase)
