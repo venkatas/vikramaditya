@@ -8450,6 +8450,79 @@ def print_dashboard(results: list) -> None:
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
+def _verify_authenticated(target: str, cookie: str) -> tuple[bool, str, str]:
+    """Pre-flight a --cookie session BEFORE the scan: confirm it is actually authenticated,
+    and capture any load-balancer stickiness cookie.
+
+    A bad / expired / wrong cookie otherwise scans the UNAUTHENTICATED surface and reports a
+    false-negative "0 findings" for the whole protected app — and behind an AWS ALB without
+    session stickiness, even a valid login round-robins to a backend that doesn't know the
+    session. Returns (authenticated, reason, extra_cookies_to_append).
+    CONSERVATIVE: declares NOT-authenticated only on STRONG signals (401/403, a login FORM, or
+    a redirect to a login URL) so it never blocks a legitimate authenticated scan.
+    """
+    if not cookie:
+        return True, "no --cookie (unauthenticated scan)", ""
+    t = str(target).strip()
+    url = t if "://" in t else f"https://{t}"           # 'httpbin.org' is NOT pre-schemed
+    try:
+        import requests as _rq
+        try:
+            _rq.packages.urllib3.disable_warnings()
+        except Exception:
+            pass
+        r = _rq.get(url, headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie},
+                    verify=False, timeout=15, allow_redirects=True)
+        # ── Stickiness: harvest from the WHOLE redirect chain (ALB sets it on the 302),
+        # upsert by name (no AWSALB=old; AWSALB=new dupes), reject header-splitting bytes.
+        _STICK = ("AWSALB", "AWSALBCORS", "AWSELB", "ARRAffinity", "ARRAffinitySameSite")
+        _seen: dict = {}
+        for _resp in list(getattr(r, "history", []) or []) + [r]:
+            for _c in _resp.cookies:
+                if _c.name in _STICK and _c.value and not any(b in _c.value for b in "\r\n;"):
+                    _seen[_c.name] = _c.value
+        extra = "; ".join(f"{k}={v}" for k, v in _seen.items())
+        low = (r.text or "")[:300000].lower()
+        ctype = (r.headers.get("Content-Type", "") or "").lower()
+        chain = " ".join([(_h.url or "") for _h in (getattr(r, "history", []) or [])]
+                         + [getattr(r, "url", "") or ""]).lower()
+        # ── Unauthenticated signals (any ONE = not logged in) ──
+        if r.status_code in (401, 403):
+            return False, f"protected page returned HTTP {r.status_code}", extra
+        if r.headers.get("WWW-Authenticate"):
+            return False, "WWW-Authenticate challenge (not authenticated)", extra
+        if "json" in ctype and any(s in low for s in (
+                '"unauthorized"', '"authenticated":false', '"loggedin":false',
+                '"isauthenticated":false', '"error":"unauth', '"code":401', '"status":401')):
+            return False, "API returned an unauthenticated JSON response", extra
+        # redirected THROUGH a login / IdP / SSO URL anywhere in the chain
+        _IDP = ("/login", "/signin", "/sign-in", "/account/login", "/oauth", "/authorize",
+                "/connect/authorize", "/sso", "/adfs", "/saml", "/cas/login",
+                "login.microsoftonline.com", "accounts.google.com", ".okta.com", ".auth0.com")
+        if getattr(r, "history", None) and any(k in chain for k in _IDP):
+            return False, "redirected through a login/IdP URL", extra
+        _mr = re.search(r'http-equiv=["\']refresh["\'][^>]*url=([^"\'>\s]+)', low)
+        if _mr and any(k in _mr.group(1) for k in ("login", "signin", "sso", "authorize")):
+            return False, "meta-refresh to a login page", extra
+        if "your session has expired" in low or "session expired" in low or "please log in" in low:
+            return False, "page indicates the session expired", extra
+        # A LOGIN FORM = password input + login context — UNLESS the page also shows
+        # AUTHENTICATED markers (logout / sign-out), i.e. an authed page that merely contains a
+        # password widget (change-password) — those must NOT be flagged as a login page.
+        has_pw = ('type="password"' in low) or ("type='password'" in low)
+        login_ctx = any(s in low for s in (
+            'name="txtusername"', 'name="username"', 'name="userid"', 'name="loginfmt"',
+            'id="loginform"', 'id="login"', "sign in to", ">login<"))
+        authed_markers = any(s in low for s in (
+            ">logout<", ">log out<", ">sign out<", ">signout<", "/logout", "logoutbutton"))
+        if has_pw and login_ctx and not authed_markers:
+            return False, "session resolves to a LOGIN page (cookie not authenticated)", extra
+        return True, "session authenticated", extra
+    except Exception as e:
+        # Never block on a network/parse hiccup — proceed, but say we couldn't verify.
+        return True, f"pre-flight could not verify ({str(e)[:50]}) — proceeding unverified", ""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="VAPT Orchestrator v4",
@@ -8597,6 +8670,28 @@ Examples:
                              "OFF by default — opt in deliberately.")
 
     args = parser.parse_args()
+
+    # ── Authenticated-session pre-flight (gap fix #2/#3) ──────────────────────
+    # Placed BEFORE any mode dispatch (--post-params etc. early-return below) so an
+    # authenticated run never silently scans the UNAUTHENTICATED surface. A --cookie that
+    # isn't actually logged in (expired/wrong, or lost behind a stickiness-less load
+    # balancer) otherwise reports false-negative "0 findings" for the protected app. Verify
+    # up-front, pin any LB stickiness cookie, FLAG (not abort) so a heuristic miss never
+    # blocks a legitimate scan while the report records the coverage as unreliable.
+    if getattr(args, "cookie", "") and getattr(args, "target", ""):
+        _authed, _why, _stick = _verify_authenticated(args.target, args.cookie)
+        if _stick:
+            args.cookie = args.cookie.rstrip("; ") + "; " + _stick
+            log("info", "Captured load-balancer stickiness cookie — session pinned to one backend")
+        if _authed:
+            log("ok", f"Auth pre-flight: {_why}")
+        else:
+            log("warn", f"AUTH PRE-FLIGHT FAILED — {_why}. The --cookie session is NOT "
+                        "authenticated; this run would test the UNAUTHENTICATED surface and "
+                        "report false-negative '0 findings' for protected pages. Re-capture a "
+                        "valid session cookie and re-run.")
+            _mark_degraded("auth", f"--cookie session not authenticated ({_why}); authenticated "
+                           "coverage is UNRELIABLE — do NOT read '0 findings' as a clean result")
 
     # SECURITY GATE: the brain's AUTONOMOUS exploit loop (auto_triage_and_exploit, reached via
     # post_scan_hook on every confirmed SQLi) issues model-driven --os-shell/--file-write at the
