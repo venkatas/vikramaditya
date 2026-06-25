@@ -40,7 +40,9 @@ def _worst(tmp_path, relpath, line):
 
 
 SUPPRESS = [
-    ("cves/exposed_configs.txt", "https://t.example.invalid/web.config"),
+    # NB: cves/exposed_configs.txt is NO LONGER suppressed — it is re-surfaced as a dedicated
+    # MEDIUM "Exposed Configuration File" finding (friends-review). See the deep-leak test
+    # test_exposed_config_is_surfaced_not_dropped. It must just never be a CRITICAL "Known CVE".
     ("upload/accepted_unverified.txt", "[UPLOAD-ACCEPTED-UNVERIFIED] https://t.example.invalid/up | canary=abc stored but not located"),
     ("import_export/endpoints.txt", "[IMPORT-ENDPOINT] https://t.example.invalid/import (GET=403)"),
     ("import_export/converters.txt", "[CONVERTER-ENDPOINT] https://t.example.invalid/convert (POST=405)"),

@@ -834,12 +834,12 @@ def load_findings(findings_dir: str) -> list:
     # instead of promoting each one to a CRITICAL cves finding (see below).
     unconfirmed_cves = []
 
-    # A line is a confirmed CVE finding only if it carries active-confirmation
-    # context: a target URL (nuclei output) or an explicit confirmation marker.
-    # A *bare* CVE ID on its own (e.g. "CVE-2021-44228") is an unverified, unversioned
-    # match — exactly the class Method 1b collapses to INFO. The generic .txt loader
-    # must NOT promote it to a CRITICAL "Known CVE Vulnerability" (CVSS 9.0).
-    _BARE_CVE_RE = re.compile(r'^CVE-\d{4}-\d{4,}$', re.IGNORECASE)
+    # ANY line that merely REFERENCES a CVE ID — bare ("CVE-2021-44228") OR with trailing
+    # text ("CVE-2021-44228 CVSS:10.0 Log4Shell") — in a non-allowlisted cves/*.txt is an
+    # unverified, unversioned keyword/ID match: the class Method 1b collapses to INFO. The
+    # generic .txt loader must NOT promote it to a CRITICAL "Known CVE Vulnerability" 9.0.
+    # (friends-review: a prefix-only `^CVE-..$` guard let "CVE-.. CVSS:10 Log4Shell" through.)
+    _CVE_REF_RE = re.compile(r'\bCVE-\d{4}-\d{4,}\b', re.IGNORECASE)
     # cves/*.txt files that ARE confirmed findings (allowlist; fail-closed for the rest).
     _CVES_CONFIRMED_TXT = {"nuclei_cve_confirmed.txt"}
 
@@ -900,6 +900,8 @@ def load_findings(findings_dir: str) -> list:
             "[IMPORT-ENDPOINT",          # import_export/ — endpoint DISCOVERY (fires on 403/405 too), not an
                                          # exploited business-logic flaw; was promoted to HIGH 8.1.
             "[CONVERTER-ENDPOINT",       # import_export/ — converter endpoint guess (bare 200/405), not exploited.
+            "[SAML-ENDPOINT",            # saml/ — endpoint DISCOVERY (HTTP 200/302), NOT an exploited auth
+                                         # bypass; shipped CRITICAL via the auth_bypass template default.
             "[JAVA-DESER]",              # deserialize/ — Content-Type fingerprint only (no gadget sent).
             "[PHP-DESER]",               # deserialize/ — unserialize-error reflection heuristic, not exploited.
             "[SQLI-CANDIDATE]",          # unverified time-based candidate, needs follow-up
@@ -922,12 +924,12 @@ def load_findings(findings_dir: str) -> list:
                         continue
                     if any(line.startswith(p) for p in NON_FINDING_PREFIXES):
                         continue
-                    # cves/ fail-closed guard: only nuclei_cve_confirmed.txt holds
-                    # confirmed (URL-bearing) findings. Any other cves/*.txt that is a
-                    # bare CVE ID is an unverified, unversioned keyword/ID match — divert
-                    # it into the Method-1b INFO collapse instead of emitting a CRITICAL.
+                    # cves/ fail-closed guard: only nuclei_cve_confirmed.txt holds confirmed
+                    # findings. Any other cves/*.txt line that REFERENCES a CVE ID (bare or
+                    # with trailing CVSS/name text) is an unverified, unversioned keyword/ID
+                    # match — divert it into the Method-1b INFO collapse, never a CRITICAL.
                     if vtype == "cves" and fn not in _CVES_CONFIRMED_TXT \
-                            and _BARE_CVE_RE.match(line):
+                            and _CVE_REF_RE.search(line):
                         unconfirmed_cves.append((line.upper(), "", ""))
                         continue
                     finding = parse_custom_line(line, vtype)
@@ -1020,6 +1022,35 @@ def load_findings(findings_dir: str) -> list:
             "poc": (f"{_collapsed_detail}\n\n"
                     "Source: cves/cve_database_matches.json (keyword matches; not version-verified)."),
         })
+
+    # Method 1b-x: Exposed configuration files (cves/exposed_configs.txt).
+    # cve.py::check_exposed_configs writes URLs of ACTIVELY-ACCESSIBLE (HTTP 200, non-HTML)
+    # config files (.env, .git/config, web.config, appsettings.json, ...). The file is in
+    # NON_FINDING_FILES so the generic cves/ loader can't mis-render each as a CRITICAL
+    # "Known CVE" — but it IS a real exposure, so emit it here as a dedicated MEDIUM
+    # info-disclosure finding instead of dropping it (friends-review: it was silently lost).
+    _exposed_cfg = os.path.join(findings_dir, "cves", "exposed_configs.txt")
+    if os.path.isfile(_exposed_cfg):
+        try:
+            with open(_exposed_cfg, errors="replace") as f:
+                for _ln in f:
+                    _u = _ln.strip()
+                    if not _u or _u.startswith("#"):
+                        continue
+                    results.append({
+                        "severity": "medium",
+                        "cvss": CVSS_DEFAULT.get("medium", "5.3"),
+                        "vtype": "misconfig",
+                        "title": "Exposed Configuration File",
+                        "detail": (f"A configuration file is directly accessible without "
+                                   f"authentication: {_u} . Config files frequently disclose "
+                                   f"credentials, connection strings, framework versions, or "
+                                   f"internal paths (CWE-538). Review the content and restrict access."),
+                        "url": _u,
+                        "poc": f"GET {_u}  ->  HTTP 200 (config file served directly, unauthenticated).",
+                    })
+        except OSError:
+            pass
 
     # Method 1c: cves_custom/ — output of scanner.sh Check 1.5 (nuclei custom templates)
     # v9.1.2 — added to surface findings from /Users/venkatasatish/Documents/GitHub/obsidian/nuclei-templates/
@@ -1445,7 +1476,12 @@ def load_findings(findings_dir: str) -> list:
                           and not (_ACCESS_CLAIM_RE and _ACCESS_CLAIM_RE.search(ln))
                           and not (_USAGE_BANNER_RE and _USAGE_BANNER_RE.search(ln))
                           and not (_STATUS_NOISE_RE and _STATUS_NOISE_RE.search(ln))]
-            _iter_grounded = len(_grounding) >= 2
+            # >=1 (not >=2): a REAL exploit often proves itself in a SINGLE line of tool
+            # output (`uid=0(root) gid=0(root)`, one sqlmap dump row, one dalfox hit) — the
+            # >=2 bar demoted those genuine findings (friends-review). The original leak
+            # (a [CRITICAL] claim whose output is PURE progress chatter = 0 substantive
+            # lines) still collapses to a model claim.
+            _iter_grounded = len(_grounding) >= 1
 
             model_claims = []
             for line in brain_findings:

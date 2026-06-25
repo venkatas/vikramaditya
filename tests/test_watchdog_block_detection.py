@@ -57,6 +57,20 @@ def test_socket_status_healthy_is_not_a_block(monkeypatch):
     assert wd._last_established == 1 and wd._last_syn_sent == 0
 
 
+def test_loopback_established_does_not_mask_a_real_block(monkeypatch):
+    # friends-review: a localhost ESTABLISHED (Ollama brain / local proxy / interactsh)
+    # must NOT count toward block-detection ESTABLISHED, or it masks a real target block.
+    lsof = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+            "ffuf 1234 u 7u IPv4 0 TCP 127.0.0.1:5000->127.0.0.1:11434 (ESTABLISHED)\n"
+            "ffuf 1234 u 8u IPv4 0 TCP 10.0.0.1:54321->1.2.3.4:443 (SYN_SENT)\n"
+            "ffuf 1234 u 9u IPv4 0 TCP 10.0.0.1:54322->1.2.3.4:443 (SYN_SENT)\n")
+    monkeypatch.setattr(hunt, "run_capture",
+                        lambda *a, **k: {"stdout": lsof, "stderr": "", "returncode": 0, "timed_out": False})
+    wd = _bare_watchdog()
+    wd._socket_status({1234})
+    assert wd._last_syn_sent == 2 and wd._last_established == 0  # loopback ESTABLISHED excluded
+
+
 def test_watchdog_aborts_and_flags_when_target_blocks(monkeypatch, tmp_path):
     """End-to-end: a stalled phase with sustained SYN_SENT/0-ESTABLISHED is killed and
     recorded as TARGET BLOCKED (degraded), instead of grinding forever."""
