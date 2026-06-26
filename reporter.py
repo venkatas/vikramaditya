@@ -810,7 +810,8 @@ def load_findings(findings_dir: str) -> list:
                       "sqlmap",        # sqlmap/ is handled by Method 1f below
                       "email_auth",    # email_auth/findings.json handled by Method 1d below
                       "exposed_credentials",  # handled by Method 1h below
-                      "burp"}          # burp/findings.json handled by Method 1g below
+                      "burp",          # burp/findings.json handled by Method 1g below
+                      "authz"}         # authz/findings.json handled by Method 1i below
         for entry in sorted(os.listdir(findings_dir)):
             full = os.path.join(findings_dir, entry)
             if not os.path.isdir(full):
@@ -1360,6 +1361,48 @@ def load_findings(findings_dir: str) -> list:
             print(f"[reporter] WARNING: failed to load "
                   f"{os.path.relpath(burp_path, findings_dir)}: {e!r} — "
                   "Burp findings may be MISSING from this report")
+
+    # Method 1i: Authz / disclosure detectors (authz/findings.json)
+    # authz_audit_run writes a JSON LIST of normalized findings
+    # {severity, type, title, url, detail, evidence, poc, confidence, source:"authz_audit"}
+    # from bfla_scanner (BFLA), idor_scanner (IDOR/BOLA) and pii_detector (bulk PII /
+    # directory disclosure). Mirrors the burp loader (Method 1g): the dir is in meta_dirs
+    # so the generic .txt walk ignores it; this is the sole ingestion path. Unlike Burp,
+    # these CAN be Critical (IDOR enumeration of a large record set), so severity is NOT
+    # clamped — BUT an UNCONFIRMED (candidate) finding is never shipped as Critical
+    # (anti-fabrication: a heuristic candidate is at most High).
+    authz_path = os.path.join(findings_dir, "authz", "findings.json")
+    if os.path.isfile(authz_path):
+        try:
+            with open(authz_path, errors="replace") as f:
+                authz_data = _json.load(f)
+            for item in (authz_data if isinstance(authz_data, list) else []):
+                sev = str(item.get("severity", "info")).lower()
+                if sev in ("informational", "information"):
+                    sev = "info"
+                if sev not in SEVERITY_ORDER:
+                    sev = "info"
+                confidence = str(item.get("confidence", "")).strip().lower()
+                if confidence == "candidate" and sev == "critical":
+                    sev = "high"   # an unconfirmed candidate is never presented as Critical
+                vtype = (item.get("type") or item.get("vtype") or "misconfig")
+                if vtype not in VULN_TEMPLATES:
+                    vtype = "misconfig"
+                finding = {
+                    "severity": sev,
+                    "vtype": vtype,
+                    "title": item.get("title", "Authorization / disclosure finding"),
+                    "detail": item.get("detail", ""),
+                    "url": item.get("url", "N/A"),
+                    "poc": item.get("poc", ""),
+                }
+                if item.get("cvss"):
+                    finding["cvss"] = str(item["cvss"])
+                results.append(finding)
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load "
+                  f"{os.path.relpath(authz_path, findings_dir)}: {e!r} — "
+                  "authz/IDOR/PII findings may be MISSING from this report")
 
     # Method 1e: Brain active scanner output (brain_active/iteration_*.json)
     # brain_scanner.run_brain_scanner writes iteration_NN.json files whose
