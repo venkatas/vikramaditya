@@ -53,3 +53,25 @@ def test_dbms_fingerprint_guess_alone_does_not_confirm():
     # "it looks like the back-end DBMS is X" with no Parameter block + a negative verdict
     out = "it looks like the back-end DBMS is 'MySQL'.\n[WARNING] does not seem to be injectable\n"
     assert hunt._parse_sqlmap_confirmation(out)["confirmed"] is False
+
+
+# ── --eval crash must be reported INCONCLUSIVE, not a clean negative (tool bug #2) ──
+EVAL_CRASH = ("[12:35:44] [INFO] testing connection to the target URL\n"
+              "[12:35:44] [CRITICAL] an error occurred while evaluating provided code "
+              "('SyntaxError: invalid decimal literal')\n[*] ending @ 12:35:44")
+
+
+def test_eval_crash_detected_as_inconclusive():
+    assert hunt._sqlmap_eval_crashed(EVAL_CRASH) is True
+    assert "invalid decimal literal" in hunt._sqlmap_eval_crash_reason(EVAL_CRASH)
+
+
+def test_real_negative_is_not_an_eval_crash():
+    out = ("[INFO] testing '...'\n[WARNING] POST parameter '#1*' does not seem to be injectable\n"
+           "[CRITICAL] all tested parameters do not appear to be injectable.")
+    assert hunt._sqlmap_eval_crashed(out) is False
+
+
+def test_real_injection_is_not_an_eval_crash():
+    out = "sqlmap identified the following injection point(s):\nParameter: id (GET)\n"
+    assert hunt._sqlmap_eval_crashed(out) is False

@@ -7008,6 +7008,23 @@ def _sqlmap_targeted_extract(req_abs: str, sqli_dir: str, schema: str, table: st
 
 
 # ── NEW: sqlmap via raw request file (--request-file) ───────────────────────────
+def _sqlmap_eval_crashed(out: str) -> bool:
+    """True if sqlmap's --eval (the WebForms VIEWSTATE/EventValidation refresh) crashed, so
+    the run NEVER actually tested the parameter — it must NOT be reported as a clean negative.
+
+    Seen live: a form param value that is a Python-invalid literal (e.g. a leading-zero date
+    like 01/01/2020) makes sqlmap's --eval raise 'SyntaxError: invalid decimal literal', sqlmap
+    aborts after ~1s, and the wrapper would otherwise log 'complete — no injection confirmed'
+    (a silent false-negative). Anti-fabrication: an aborted run is INCONCLUSIVE, not negative.
+    """
+    return "evaluating provided code" in (out or "").lower()
+
+
+def _sqlmap_eval_crash_reason(out: str) -> str:
+    m = re.search(r"evaluating provided code \('([^']+)'\)", out or "")
+    return m.group(1) if m else "eval error"
+
+
 def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                              level: int = 5, risk: int = 3,
                              extra_flags: str = "",
@@ -7300,6 +7317,18 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                 sf.write(f"ENUMERATED TABLES ({len(conf['tables'])}):\n"
                          + "\n".join(conf["tables"]) + "\n")
         log("crit", f"Summary → {summary_f}")
+    elif _sqlmap_eval_crashed(out):
+        # The --eval (WebForms token refresh) crashed → the parameter was NEVER tested.
+        # Report INCONCLUSIVE, not a clean negative (anti-fabrication / false-negative guard).
+        log("warn", f"sqlmap (request-file) INCONCLUSIVE — the WebForms --eval token refresh "
+                    f"CRASHED ({_sqlmap_eval_crash_reason(out)}); the scan did NOT actually test "
+                    f"the parameter, so this is NOT a clean negative. Re-test (e.g. avoid a "
+                    f"Python-invalid param value such as a leading-zero date like 01/01/2020). → {sqli_dir}")
+        try:
+            _mark_degraded("sqlmap_rf", "WebForms --eval crashed; request-file SQLi coverage is "
+                           "UNRELIABLE for this target — do NOT read 'no injection' as a clean result")
+        except Exception:
+            pass
     else:
         log("ok", f"sqlmap (request-file) complete — no injection confirmed → {sqli_dir}")
 
