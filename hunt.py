@@ -183,6 +183,9 @@ REPORTS_DIR  = os.path.join(BASE_DIR, "reports")
 # authenticated authz/IDOR/PII audit (authz_audit) without threading the cookie through
 # the whole pipeline. Empty => unauthenticated run => the audit is skipped.
 _AUTHED_COOKIE = ""
+# --seed-urls: operator-supplied parameterized URLs forced into the sqli/param test set —
+# the fix for WebForms (__doPostBack) / SPA apps whose GET endpoints the link-crawl can't find.
+_SEED_URLS: list = []
 WORDLIST_DIR = os.path.join(BASE_DIR, "wordlists")
 HOME         = os.path.expanduser("~")
 GOBIN        = os.path.join(HOME, "go", "bin")
@@ -1590,6 +1593,32 @@ def _install_lightpanda() -> bool:
         return False
 
 
+_LP_HEADER_OK: bool | None = None
+
+
+def _lightpanda_supports_header() -> bool:
+    """Cached probe: does this lightpanda build's ``fetch`` accept ``--header``?
+
+    Some builds reject it ('unknown argument arg=--header'), which silently broke
+    authenticated POST-parameter discovery (the fetch errored → 0 forms found). When it is
+    unsupported we fall back to the cookie-capable HTTP path instead of passing a flag the
+    binary rejects (which fetched 0 forms / an unauthenticated page).
+    """
+    global _LP_HEADER_OK
+    if _LP_HEADER_OK is not None:
+        return _LP_HEADER_OK
+    lp = _lightpanda_bin()
+    if not lp:
+        _LP_HEADER_OK = False
+        return False
+    try:
+        res = run_capture([lp, "fetch", "--help"], shell=False, merge_stderr=True, timeout=10)
+        _LP_HEADER_OK = "--header" in (res.get("stdout", "") or "")
+    except Exception:
+        _LP_HEADER_OK = False
+    return _LP_HEADER_OK
+
+
 def _lightpanda_fetch_forms(url: str, cookies: str = "",
                              headers: dict | None = None,
                              timeout: int = 20) -> list[dict]:
@@ -1626,11 +1655,13 @@ def _lightpanda_fetch_forms(url: str, cookies: str = "",
                 self._cur = None
 
     lp = _lightpanda_bin()
+    # When cookies/headers are required for an AUTHENTICATED fetch but this lightpanda build
+    # rejects --header, use the cookie-capable HTTP fallback instead of a flag it errors on.
+    if lp and (cookies or headers) and not _lightpanda_supports_header():
+        lp = None
     html_content = ""
 
     if lp:
-        # Build env for cookies/headers
-        env_extra: dict = {}
         cmd_parts = [lp, "fetch", "--log_level", "warn"]
         if cookies:
             cmd_parts += ["--header", f"Cookie: {cookies}"]
@@ -6361,6 +6392,45 @@ def run_email_audit(domain: str, *, smtp_probe: bool = False) -> bool:
     return True
 
 
+def _parse_seed_urls(spec: str) -> list:
+    """--seed-urls accepts a FILE (one URL per line) OR a comma-separated list. Returns the
+    distinct http(s) URLs in order."""
+    if not spec:
+        return []
+    if os.path.isfile(spec):
+        with open(spec, errors="ignore") as fh:
+            raw = [ln.strip() for ln in fh]
+    else:
+        raw = [p.strip() for p in spec.split(",")]
+    out, seen = [], set()
+    for u in raw:
+        if u.startswith(("http://", "https://")) and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _seed_urls_into_recon(recon_dir: str, seeds: list) -> int:
+    """Append seed URLs into <recon_dir>/urls/with_params.txt so the sqlmap/param phases (and
+    the authz IDOR enumeration) test them — the fix for WebForms (__doPostBack) apps whose GET
+    endpoints the link-crawl never discovers. Dedups; returns the count newly written."""
+    if not seeds:
+        return 0
+    urls_dir = os.path.join(recon_dir, "urls")
+    os.makedirs(urls_dir, exist_ok=True)
+    wp = os.path.join(urls_dir, "with_params.txt")
+    existing = set()
+    if os.path.isfile(wp):
+        with open(wp, errors="ignore") as fh:
+            existing = {ln.strip() for ln in fh if ln.strip()}
+    new = [u for u in seeds if u not in existing]
+    if new:
+        with open(wp, "a") as fh:
+            for u in new:
+                fh.write(u + "\n")
+    return len(new)
+
+
 # ── NEW: sqlmap targeted scan ───────────────────────────────────────────────────
 def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     """
@@ -6368,6 +6438,9 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     """
     log("phase", f"SQLMAP: {domain}")
     recon_dir    = _resolve_recon_dir(domain)
+    _n_seeded = _seed_urls_into_recon(recon_dir, _SEED_URLS)
+    if _n_seeded:
+        log("ok", f"--seed-urls: {_n_seeded} URL(s) seeded into the sqli candidate set")
     findings_dir = _resolve_findings_dir(domain, create=True)
     sqli_dir     = os.path.join(findings_dir, "sqlmap")
     os.makedirs(sqli_dir, exist_ok=True)
@@ -8777,6 +8850,10 @@ Examples:
                         help="Use real LangGraph backend for agent mode (requires pip install langgraph langchain-ollama)")
     parser.add_argument("--request-file",     type=str, metavar="PATH",
                         help="Raw HTTP request file (Burp export) — runs sqlmap -r directly")
+    parser.add_argument("--seed-urls",        type=str, default="", metavar="PATH_OR_LIST",
+                        help="Seed specific parameterized URLs (file with one URL/line, or a "
+                             "comma-separated list) into the sqli/param test set — for WebForms "
+                             "(__doPostBack) / SPA apps whose GET endpoints the crawl can't find")
     parser.add_argument("--post-params",      action="store_true",
                         help="Run POST parameter discovery (katana forms + arjun POST) on target")
     parser.add_argument("--cookie",           type=str, default="",
@@ -8820,6 +8897,11 @@ Examples:
         # authenticated authz/IDOR/PII audit without threading the cookie through the pipeline.
         global _AUTHED_COOKIE
         _AUTHED_COOKIE = args.cookie
+    # --seed-urls: parse once; run_sqlmap_targeted seeds them into the session's candidate set.
+    global _SEED_URLS
+    _SEED_URLS = _parse_seed_urls(getattr(args, "seed_urls", ""))
+    if _SEED_URLS:
+        log("info", f"--seed-urls: {len(_SEED_URLS)} URL(s) will be added to the sqli/param test set")
         if _authed:
             log("ok", f"Auth pre-flight: {_why}")
         else:
