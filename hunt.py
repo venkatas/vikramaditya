@@ -179,6 +179,10 @@ TARGETS_DIR  = os.path.join(BASE_DIR, "targets")
 RECON_DIR    = os.path.join(BASE_DIR, "recon")
 FINDINGS_DIR = os.path.join(BASE_DIR, "findings")
 REPORTS_DIR  = os.path.join(BASE_DIR, "reports")
+# Set once, after the --cookie auth pre-flight, so generate_reports() can run the
+# authenticated authz/IDOR/PII audit (authz_audit) without threading the cookie through
+# the whole pipeline. Empty => unauthenticated run => the audit is skipped.
+_AUTHED_COOKIE = ""
 WORDLIST_DIR = os.path.join(BASE_DIR, "wordlists")
 HOME         = os.path.expanduser("~")
 GOBIN        = os.path.join(HOME, "go", "bin")
@@ -7678,8 +7682,44 @@ def run_jwt_audit(domain: str) -> bool:
 
 
 # ── Existing pipeline ──────────────────────────────────────────────────────────
+def _run_authz_audit(domain: str, findings_dir: str, cookie: str) -> int:
+    """Best-effort authenticated authz/disclosure audit → <findings_dir>/authz/findings.json.
+
+    Runs bfla_scanner (forced-browsing BFLA, differential-confirmed against an
+    unauthenticated baseline) + the IDOR/PII detectors over the authenticated session and
+    writes the reporter Method-1f shape that reporter.py Method 1i ingests. This is the
+    authenticated authorization coverage Vikramaditya previously lacked.
+
+    NEVER raises into the pipeline (a network/parse hiccup must not abort report
+    generation). Opt out with VIK_NO_AUTHZ_AUDIT=1. Returns the finding count.
+    """
+    if not cookie or os.environ.get("VIK_NO_AUTHZ_AUDIT"):
+        return 0
+    try:
+        import authz_audit
+        import authz_audit_run
+        base = domain if "://" in str(domain) else f"https://{domain}"
+        get = authz_audit_run.cookie_fetcher(base, cookie)
+        unauth = authz_audit_run.cookie_fetcher(base, "")   # unauthenticated baseline (BFLA confirm)
+        # v1: forced-browsing BFLA over the built-in admin wordlist (highest-yield authenticated
+        # check). object_refs (IDOR) + page_urls (PII) are wired from the crawl in iteration-2.
+        findings = authz_audit.audit(get, unauth_get=unauth)
+        authz_audit.write_findings_json(findings, os.path.join(findings_dir, "authz"))
+        if findings:
+            log("ok", f"Authz audit: {len(findings)} authorization/disclosure finding(s) "
+                      "→ authz/findings.json")
+        return len(findings)
+    except Exception as e:
+        log("warn", f"Authz audit skipped ({str(e)[:80]})")
+        return 0
+
+
 def generate_reports(domain: str) -> int:
     findings_dir = _resolve_findings_dir(domain)
+    # Authenticated authz/IDOR/PII audit — runs BEFORE the reporter reads findings_dir so the
+    # findings fold into the report (Method 1i). Only when a --cookie session was verified.
+    if _AUTHED_COOKIE:
+        _run_authz_audit(domain, findings_dir, _AUTHED_COOKIE)
     if not os.path.isdir(findings_dir):
         log("warn", f"No findings for {domain}")
         return 0
@@ -8683,6 +8723,10 @@ Examples:
         if _stick:
             args.cookie = args.cookie.rstrip("; ") + "; " + _stick
             log("info", "Captured load-balancer stickiness cookie — session pinned to one backend")
+        # Hand the verified session (incl. stickiness) to generate_reports so it can run the
+        # authenticated authz/IDOR/PII audit without threading the cookie through the pipeline.
+        global _AUTHED_COOKIE
+        _AUTHED_COOKIE = args.cookie
         if _authed:
             log("ok", f"Auth pre-flight: {_why}")
         else:
