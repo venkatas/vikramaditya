@@ -6714,6 +6714,18 @@ def _parse_sqlmap_confirmation(out: str) -> dict:
             if m and m.group(1).lower() not in ("table", "tables"):
                 res["tables"].append(m.group(1))
 
+    # ANTI-FABRICATION veto: sqlmap's explicit not-injectable / false-positive verdict
+    # overrides any heuristic confirmation. The "the back-end dbms is X" line (and a transient
+    # "appears to be ... injectable") is printed DURING false-positive fingerprinting, so it
+    # must not stand once sqlmap rejects the point. A REAL confirmation always carries a
+    # structured "Parameter:"/"Type:" block; absent that, honour the rejection.
+    _NEG = ("false positive or unexploitable injection point",
+            "does not seem to be injectable",
+            "do not appear to be injectable",
+            "all tested parameters do not appear")
+    if any(n in low for n in _NEG) and not res["params"] and not res["types"]:
+        res["confirmed"] = False
+
     for k in ("params", "types", "payloads", "tables"):
         res[k] = list(dict.fromkeys(res[k]))
     return res
@@ -7175,7 +7187,14 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
         # audit-fix (finding 10): context-managed read (was a leaked fd).
         with open(sqli_out) as _sf:
             for ln in _sf:
-                if "injectable" in ln.lower() or "injection point" in ln.lower():
+                low_ln = ln.lower()
+                # ANTI-FABRICATION: "injection point" also matches "false positive or
+                # unexploitable injection point detected"; "injectable" matches "not
+                # injectable". Only a POSITIVE row may confirm — exclude the rejections.
+                if (("injectable" in low_ln or "injection point" in low_ln)
+                        and "false positive" not in low_ln and "unexploitable" not in low_ln
+                        and "not injectable" not in low_ln and "does not seem" not in low_ln
+                        and "do not appear" not in low_ln):
                     conf["confirmed"] = True
 
     target_url = path_from_file if path_from_file.lower().startswith("http") \
