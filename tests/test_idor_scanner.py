@@ -70,3 +70,33 @@ def test_differential_owner_ref_invalid_skipped():
     other = lambda r: _g(200, "PAN ABCDE9999Z")
     fs = idor_scanner.scan_differential(owner, other, ["/x?id=999"])
     assert fs == []
+
+
+def test_differential_soft_deny_200_shared_shell_not_flagged():
+    # WebForms soft-deny: the non-owner gets HTTP 200 "not authorized" sharing the app
+    # header/footer/nav SHELL with the owner page but receives NO sensitive data. Whole-page
+    # similarity would false-confirm on the shared shell -> must NOT be flagged.
+    # large shared shell so the differing sensitive tail is <1% of the body — on the OLD
+    # whole-page _similar() comparison this scored ~1.0 and false-confirmed a high IDOR.
+    SHELL = "<html><head>App</head><body><nav>Home About Logout</nav>" + \
+            ("<div class='card'>menu row filler content</div>" * 200) + "<div id=main>"
+    owner = lambda r: _g(200, SHELL + "PAN ABCDE1234F</div></body></html>")
+    other = lambda r: _g(200, SHELL + "You are not authorized to view this record.</div></body></html>")
+    fs = idor_scanner.scan_differential(owner, other, ["/RecordDetails?recordId=82"])
+    assert fs == []
+
+
+def test_differential_other_gets_owner_govt_id_flagged():
+    # the non-owner response carries the OWNER's exact PAN -> genuine cross-user exposure
+    owner = lambda r: _g(200, "<div>client PAN ABCDE9999Z</div>")
+    other = lambda r: _g(200, "<div>client PAN ABCDE9999Z</div>")
+    fs = idor_scanner.scan_differential(owner, other, ["/x?id=1"])
+    assert fs and fs[0]["severity"] in ("high", "critical")
+
+
+def test_differential_other_gets_own_different_record_not_flagged():
+    # the non-owner gets a DIFFERENT (their own) PAN at the ref -> properly scoped, not IDOR
+    owner = lambda r: _g(200, "PAN ABCDE9999Z")
+    other = lambda r: _g(200, "PAN ABCDE1111A")
+    fs = idor_scanner.scan_differential(owner, other, ["/x?id=1"])
+    assert fs == []

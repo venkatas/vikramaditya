@@ -74,3 +74,16 @@ def test_accessible_without_baseline_is_candidate():
 def test_default_admin_wordlist_present():
     assert len(bfla_scanner.DEFAULT_ADMIN_PATHS) >= 10
     assert any("admin" in p.lower() for p in bfla_scanner.DEFAULT_ADMIN_PATHS)
+
+
+def test_soft_deny_200_not_authorized_classified_gated():
+    # an ASP.NET soft-deny page returns HTTP 200 with a "not authorized" body — that is a
+    # DENY, not access; classify must not call it 'accessible'.
+    assert bfla_scanner.classify(200, "<h1>You are not authorized to access this page.</h1>") == "gated"
+    assert bfla_scanner.classify(200, "<div>Access Denied</div>") == "gated"
+
+
+def test_soft_deny_200_page_not_flagged_as_bfla():
+    low = lambda p: _r(200, "<nav>Home Logout</nav><h2>Access Denied</h2> you do not have permission")
+    fs = bfla_scanner.scan(low, ["/AdminQueue"], unauth_get=lambda p: _r(302, "", "/login"))
+    assert fs == []

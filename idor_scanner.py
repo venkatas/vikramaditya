@@ -16,7 +16,6 @@ recall-oriented; severity scales with the number of objects exposed.
 Iteration-2 backlog: learn object-ref params + id ranges from the crawl/site-map; opaque
 vs sequential id heuristics; subject-id ≠ authenticated-user correlation; pagination-aware.
 """
-import difflib
 import hashlib
 import html
 
@@ -40,23 +39,22 @@ def _has_sensitive(body):
     return any(rx.search(d) for rx in _GOVT_RES)
 
 
+def _sensitive_values(body):
+    """Set of government-identifier values (PAN/GSTIN/Aadhaar) present in a body."""
+    d = html.unescape(body or "")
+    vals = set()
+    for rx in _GOVT_RES:
+        vals.update(rx.findall(d))
+    return vals
+
+
 def _signature(body):
     """Stable hash of the sensitive values in a body (to measure record distinctness).
 
     Raw values are hashed, never stored/emitted — so distinctness is measured without
     retaining PII.
     """
-    d = html.unescape(body or "")
-    vals = []
-    for rx in _GOVT_RES:
-        vals += rx.findall(d)
-    return hashlib.sha1("|".join(sorted(set(vals))).encode()).hexdigest()[:12]
-
-
-def _similar(a, b, threshold=0.9):
-    if not a or not b:
-        return False
-    return difflib.SequenceMatcher(None, a[:4000], b[:4000]).ratio() >= threshold
+    return hashlib.sha1("|".join(sorted(_sensitive_values(body))).encode()).hexdigest()[:12]
 
 
 def scan_enumeration(get_fn, refs):
@@ -87,24 +85,33 @@ def scan_enumeration(get_fn, refs):
 
 
 def scan_differential(owner_get, other_get, refs):
-    """Flag IDOR where a non-owner session receives the owner's sensitive object data."""
+    """Flag IDOR where a non-owner session receives the OWNER's sensitive object data.
+
+    Confirmation requires the non-owner response to carry at least one of the OWNER's exact
+    government identifiers (PAN/GSTIN/Aadhaar). Whole-page similarity is intentionally NOT
+    used: a 200 soft-deny page that shares the app's header/footer/nav shell would otherwise
+    score ~1.0 and false-confirm a high-severity IDOR that does not exist (the dominant
+    ASP.NET WebForms pattern these modules target). A non-owner receiving a DIFFERENT record
+    (their own data) is proper scoping, not IDOR, and is correctly not flagged.
+    """
     findings = []
     for ref in refs:
         os_, ob, ol = _norm(owner_get(ref))
         if not (os_ == 200 and _has_sensitive(ob)):
             continue  # ref must be a valid sensitive object for the owner to compare against
+        owner_vals = _sensitive_values(ob)
         ts, tb, tl = _norm(other_get(ref))
         if bfla_scanner.classify(ts, tb, tl) in ("gated", "absent"):
-            continue  # other session properly denied
-        if ts == 200 and (_has_sensitive(tb) or _similar(ob, tb)):
+            continue  # other session properly denied (incl. 200 soft-deny "not authorized" pages)
+        if ts == 200 and (owner_vals & _sensitive_values(tb)):
             findings.append({
                 "type": "idor_bola_differential",
                 "vuln_class": "IDOR/BOLA",
                 "severity": "high",
                 "confidence": "confirmed",
                 "ref": ref,
-                "evidence": (f"a second (non-owner) session received sensitive object data at "
-                             f"{ref} that the owning session also receives — cross-user object "
-                             f"access (IDOR), object-level authorization absent"),
+                "evidence": (f"a second (non-owner) session received the owning session's exact "
+                             f"sensitive identifier(s) at {ref} — cross-user object access "
+                             f"(IDOR), object-level authorization absent"),
             })
     return findings
