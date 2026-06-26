@@ -7682,6 +7682,73 @@ def run_jwt_audit(domain: str) -> bool:
 
 
 # ── Existing pipeline ──────────────────────────────────────────────────────────
+# Query-param name suffixes that look like an object identifier worth enumerating for IDOR
+# (the value must also be a positive integer). Matches id, recordId, ClientID, feeRecordId,
+# pageNo, refCode, etc.
+_AUTHZ_ID_SUFFIX = ("id", "key", "no", "num", "ref", "code")
+
+
+def _authz_recon_dir(domain: str, findings_dir: str) -> str:
+    """Map a findings dir back to its sibling recon session dir (separate trees:
+    findings/<domain>/sessions/<id> vs recon/<domain>/sessions/<id>)."""
+    sid = os.path.basename(os.path.normpath(findings_dir))
+    if sid and sid != domain and sid != "findings":
+        return _recon_session_dir(domain, sid)
+    return _recon_domain_root(domain)
+
+
+def _authz_select_pages(all_urls_file: str, base_host: str, limit: int = 40) -> list[str]:
+    """Distinct same-host PATHS from the crawl (urls/all.txt) to PII-scan. Pure file read."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in _collect_urls_from_file(all_urls_file, strip_query=True, limit=4000,
+                                     filter_payloads=True):
+        parsed = urlsplit(u)
+        if base_host and parsed.netloc != base_host:
+            continue
+        path = parsed.path or "/"
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _authz_select_object_refs(params_file: str, base_host: str, per_param: int = 12,
+                              max_groups: int = 6) -> list[str]:
+    """Object-ref PATHS to enumerate for IDOR from urls/with_params.txt.
+
+    Selects query params whose NAME looks like an object id and whose observed VALUE is a
+    positive integer; for each distinct (path, param) emits path?param=1..per_param. The
+    enumeration itself is gated downstream — idor_scanner only flags when >=2 refs return
+    DISTINCT sensitive records — so over-selection here is conservative, not noisy. Pure file read.
+    """
+    from urllib.parse import parse_qsl
+    groups: list[tuple[str, str]] = []
+    seen_groups: set[tuple[str, str]] = set()
+    for u in _collect_urls_from_file(params_file, require_query=True, limit=4000,
+                                     filter_payloads=True):
+        parsed = urlsplit(u)
+        if base_host and parsed.netloc != base_host:
+            continue
+        for k, v in parse_qsl(parsed.query):
+            if not v.isdigit():
+                continue
+            kl = k.lower()
+            if (kl == "id" or kl.endswith(_AUTHZ_ID_SUFFIX)) and (parsed.path, k) not in seen_groups:
+                seen_groups.add((parsed.path, k))
+                groups.append((parsed.path, k))
+        if len(groups) >= max_groups:
+            break
+    refs: list[str] = []
+    for path, param in groups[:max_groups]:
+        for i in range(1, per_param + 1):
+            refs.append(f"{path}?{param}={i}")
+    return refs
+
+
 def _run_authz_audit(domain: str, findings_dir: str, cookie: str) -> int:
     """Best-effort authenticated authz/disclosure audit → <findings_dir>/authz/findings.json.
 
@@ -7699,11 +7766,18 @@ def _run_authz_audit(domain: str, findings_dir: str, cookie: str) -> int:
         import authz_audit
         import authz_audit_run
         base = domain if "://" in str(domain) else f"https://{domain}"
+        base_host = urlsplit(base).netloc
         get = authz_audit_run.cookie_fetcher(base, cookie)
         unauth = authz_audit_run.cookie_fetcher(base, "")   # unauthenticated baseline (BFLA confirm)
-        # v1: forced-browsing BFLA over the built-in admin wordlist (highest-yield authenticated
-        # check). object_refs (IDOR) + page_urls (PII) are wired from the crawl in iteration-2.
-        findings = authz_audit.audit(get, unauth_get=unauth)
+        # Feed the audit from the crawl: forced-browsing BFLA over the admin wordlist, PII over
+        # crawled authenticated pages (urls/all.txt), and IDOR enumeration over id-like params
+        # (urls/with_params.txt). All three degrade gracefully when the crawl files are absent.
+        urls_dir = os.path.join(_authz_recon_dir(domain, findings_dir), "urls")
+        page_urls = _authz_select_pages(os.path.join(urls_dir, "all.txt"), base_host)
+        object_refs = _authz_select_object_refs(os.path.join(urls_dir, "with_params.txt"), base_host)
+        findings = authz_audit.audit(get, unauth_get=unauth,
+                                     object_refs=object_refs or None,
+                                     page_urls=page_urls or None)
         authz_audit.write_findings_json(findings, os.path.join(findings_dir, "authz"))
         if findings:
             log("ok", f"Authz audit: {len(findings)} authorization/disclosure finding(s) "
