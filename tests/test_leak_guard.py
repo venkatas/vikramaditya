@@ -55,7 +55,7 @@ def test_is_test_path():
 # ── DO-NOW hardening: filename matching + fail-closed ────────────────────────
 
 def test_client_name_in_filename_blocked():
-    # content is clean, but the client identifier is in the FILE NAME (the colleqbt_*.sql vector)
+    # content is clean, but the client identifier is in the FILE NAME (the real-client *.sql dump vector)
     changes = [("engagements/acmebank_dump.sql", "id,name")]
     hits = leak_guard._scan(changes, TERMS)
     assert any(w == "acmebank" and "filename" in line for w, line in hits)

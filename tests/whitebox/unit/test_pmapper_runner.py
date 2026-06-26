@@ -108,10 +108,36 @@ def test_build_graph_passes_PMAPPER_REGIONS(tmp_path, monkeypatch):
     assert cmd[inc_idx + 3] == "eu-west-1"
 
 
-def test_build_graph_no_region_flags_when_env_unset(tmp_path, monkeypatch):
-    """No PMAPPER_REGIONS → no --region flags (preserves current default behaviour)."""
+def test_build_graph_defaults_to_region_narrowing_when_env_unset(tmp_path, monkeypatch):
+    """No PMAPPER_REGIONS → default region narrowing IS applied. The audit-passB hardening
+    (commit e00a8e2) deliberately made narrowing ON by default to avoid boto3 hanging in
+    SYN_SENT against unenabled opt-in regions; PMAPPER_REGIONS_OVERRIDE_NONE=1 opts out."""
     profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
     monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    monkeypatch.delenv("PMAPPER_REGIONS_OVERRIDE_NONE", raising=False)
+    fake = "/fake/pmapper"
+    captured = {}
+
+    def fake_subprocess_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
+
+    with patch("whitebox.iam.pmapper_runner._resolve_pmapper_binary", return_value=fake), \
+         patch("whitebox.iam.pmapper_runner.procutil.run_capture", side_effect=fake_subprocess_run):
+        try:
+            from whitebox.iam.pmapper_runner import build_graph
+            build_graph(profile, tmp_path)
+        except Exception:
+            pass
+    assert "--include-regions" in captured["cmd"]
+    assert "us-east-1" in captured["cmd"] and "ap-south-1" in captured["cmd"]
+
+
+def test_build_graph_override_none_disables_region_narrowing(tmp_path, monkeypatch):
+    """PMAPPER_REGIONS_OVERRIDE_NONE=1 → narrowing disabled, no --include-regions flag."""
+    profile = CloudProfile(name="t", account_id="111", arn="a", regions=[])
+    monkeypatch.delenv("PMAPPER_REGIONS", raising=False)
+    monkeypatch.setenv("PMAPPER_REGIONS_OVERRIDE_NONE", "1")
     fake = "/fake/pmapper"
     captured = {}
 

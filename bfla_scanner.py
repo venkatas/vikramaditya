@@ -37,6 +37,14 @@ _AUTH_REDIRECT = (
     "login", "signin", "sso", "oauth", "authorize", "microsoftonline",
     "adfs", "okta", "/home", "/default", "/account",
 )
+# tokens in a 200 BODY that mean "soft-deny" — the app returns HTTP 200 but the page is an
+# access-denied notice, not the protected content (the dominant ASP.NET WebForms pattern).
+# Treated as gated so a soft-deny is never scored as 'accessible' (BFLA / IDOR false-positive).
+_DENY_BODY = (
+    "not authorized", "unauthorized access", "access denied", "access is denied",
+    "you do not have permission", "you don't have permission", "permission denied",
+    "do not have access", "you are not allowed",
+)
 
 
 def _norm(r):
@@ -57,6 +65,8 @@ def classify(status, body="", location=""):
     if status == 200:
         if any(m in b for m in _LOGIN_BODY):
             return "gated"
+        if any(m in b for m in _DENY_BODY):
+            return "gated"   # soft-deny page ("not authorized") — denied, not real access
         return "accessible"
     if status >= 500:
         return "error"
