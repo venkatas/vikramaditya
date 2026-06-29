@@ -85,3 +85,15 @@ def test_reporter_attack_chain_helper_integrates_kb():
     # variant vtype resolves via the KB alias, and unknown is empty (safe to append)
     assert reporter._attack_chain_str("sqli_sqlmap_confirmed")
     assert reporter._attack_chain_str("totally_unknown") == ""
+
+
+# ── AD techniques (feed ad_hunt) + chain integrity holds ──
+def test_ad_techniques_present_and_chained():
+    for v in ("kerberoasting", "asrep_roast", "ntlm_relay", "adcs_esc", "dcsync"):
+        t = kb.get(v)
+        assert t is not None and t.mitre_id.startswith("T")
+    # the classic AD escalation chain resolves through the graph
+    assert "dcsync" in kb.get("adcs_esc").chains_to
+    assert "dcsync" in kb.get("ntlm_relay").chains_to
+    path = kb.chain_path("adcs_esc")
+    assert path[0] == "adcs_esc" and "dcsync" in path

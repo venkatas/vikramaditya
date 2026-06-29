@@ -320,6 +320,72 @@ _t(vtype="misconfig", title="Security Misconfiguration", mitre_id="T1562",
                "https://cwe.mitre.org/data/definitions/16.html"))
 
 
+# ── Active Directory / identity techniques (feed ad_hunt.py findings) ────────────
+_t(vtype="kerberoasting", title="Kerberoasting", mitre_id="T1558.003",
+   mitre_tactic="Credential Access", cwe="CWE-522",
+   summary="Any domain user can request Kerberos service tickets (TGS) for accounts with an SPN; "
+           "the ticket is encrypted with the service account's NTLM hash and can be cracked "
+           "offline to recover the plaintext password.",
+   chains_to=("exposure", "auth_bypass"),
+   detection="Alert on anomalous TGS-REQ volume and RC4 (etype 23) ticket requests; honeypot SPN "
+             "accounts; Event ID 4769 monitoring.",
+   remediation="Use long (25+ char) random passwords or gMSAs for service accounts; enforce "
+               "AES-only Kerberos; remove unnecessary SPNs; least-privilege service accounts.",
+   references=("https://attack.mitre.org/techniques/T1558/003/",
+               "https://cwe.mitre.org/data/definitions/522.html"))
+
+_t(vtype="asrep_roast", title="AS-REP Roasting", mitre_id="T1558.004",
+   mitre_tactic="Credential Access", cwe="CWE-522",
+   summary="Accounts with Kerberos pre-authentication disabled return an AS-REP encrypted with "
+           "the user's hash to any requester, enabling offline password cracking without prior "
+           "authentication.",
+   chains_to=("exposure", "auth_bypass"),
+   detection="Inventory accounts with 'Do not require Kerberos preauthentication'; alert on "
+             "AS-REQ without pre-auth (Event ID 4768 with preauth not required).",
+   remediation="Require Kerberos pre-authentication on all accounts; strong passwords; review "
+               "legacy accounts that disabled it.",
+   references=("https://attack.mitre.org/techniques/T1558/004/",
+               "https://cwe.mitre.org/data/definitions/522.html"))
+
+_t(vtype="ntlm_relay", title="NTLM Relay / Coercion", mitre_id="T1557.001",
+   mitre_tactic="Credential Access", cwe="CWE-294",
+   summary="Coerced or poisoned NTLM authentication is relayed to a service that lacks signing, "
+           "letting an attacker authenticate as the victim — often a path to AD CS or DC takeover.",
+   chains_to=("auth_bypass", "dcsync"),
+   detection="Monitor LLMNR/NBT-NS/mDNS poisoning, coercion RPC calls (PetitPotam, PrinterBug), "
+             "and unexpected machine-account auth to HTTP/LDAP endpoints.",
+   remediation="Enforce SMB and LDAP signing + channel binding (EPA); disable LLMNR/NBT-NS; "
+               "patch coercion vectors; restrict who can authenticate to AD CS web enrollment.",
+   references=("https://attack.mitre.org/techniques/T1557/001/",
+               "https://cwe.mitre.org/data/definitions/294.html"))
+
+_t(vtype="adcs_esc", title="AD CS Misconfiguration (ESC)", mitre_id="T1649",
+   mitre_tactic="Privilege Escalation", cwe="CWE-269",
+   summary="Misconfigured Active Directory Certificate Services templates (ESC1–ESC8) let a "
+           "low-privileged user enrol a certificate that authenticates as a privileged account, "
+           "yielding domain escalation.",
+   chains_to=("dcsync", "auth_bypass"),
+   detection="Audit certificate templates for dangerous flags (ENROLLEE_SUPPLIES_SUBJECT, "
+             "client-auth EKU, weak enrol rights); monitor abnormal certificate enrolment.",
+   remediation="Remediate vulnerable templates (remove SUPPLIES_SUBJECT, restrict enrol/EKU); "
+               "enable CA enforcement of strong mapping; restrict web enrolment; audit with Certipy.",
+   references=("https://attack.mitre.org/techniques/T1649/",
+               "https://cwe.mitre.org/data/definitions/269.html"))
+
+_t(vtype="dcsync", title="DCSync — Domain Credential Replication", mitre_id="T1003.006",
+   mitre_tactic="Credential Access", cwe="CWE-269",
+   summary="An account with directory-replication rights can ask a DC to replicate password "
+           "hashes for any principal (including krbtgt), giving full domain credential access "
+           "and effective domain dominance (golden-ticket capable).",
+   chains_to=("rce",),
+   detection="Alert on DRSUAPI replication (GetNCChanges) from non-DC hosts/accounts; monitor "
+             "Replicating Directory Changes rights assignments.",
+   remediation="Restrict replication rights to DCs only; tier-0 isolation; rotate krbtgt twice on "
+               "suspected compromise; monitor and alert on DCSync primitives.",
+   references=("https://attack.mitre.org/techniques/T1003/006/",
+               "https://cwe.mitre.org/data/definitions/269.html"))
+
+
 def get(vtype: str) -> Technique | None:
     """Return the Technique for a reporter vtype (resolving variants), or None if unknown."""
     if not vtype:
