@@ -1004,6 +1004,63 @@ def _pick_model(preferred: str = None) -> str | None:
     return available[0]
 
 
+# ── technique_kb lazy-load ───────────────────────────────────────────────────
+# Ground the triage/chaining LLM in the structured technique knowledge (MITRE/CWE/attack-
+# chain/remediation) for ONLY the finding type at hand — the "load one technique, not the
+# whole knowledge base" idea. Best-effort: the brain runs fine without the KB.
+_VTYPE_KEYWORDS = {
+    "sqli": ("sql injection", "sqli", "sqlmap"),
+    "idor": ("idor", "bola", "object-level", "object reference", "object level authoriz"),
+    "auth_bypass": ("bfla", "function-level", "forced brows", "auth bypass",
+                    "privilege escalat", "broken access", "broken function"),
+    "rce": ("remote code execution", "rce", "code execution", "command injection",
+            "webshell", "os command"),
+    "xss": ("xss", "cross-site scripting", "cross site scripting"),
+    "ssrf": ("ssrf", "server-side request", "server side request"),
+    "lfi": ("lfi", "path traversal", "file inclusion", "directory traversal"),
+    "ssti": ("ssti", "template injection"),
+    "exposure": ("credential", "secret", "sensitive data", "data exposure",
+                 "information disclosure", "clear text", "clear-text"),
+    "upload": ("file upload", "unrestricted upload", "arbitrary file write"),
+    "deserialization": ("deserial", "viewstate", "gadget chain"),
+    "cors": ("cors", "cross-origin"),
+    "jwt": ("jwt", "json web token", "alg=none"),
+    "oauth": ("oauth", "oidc", "openid"),
+    "csrf": ("csrf", "cross-site request forgery"),
+    "open_redirect": ("open redirect",),
+    "takeover": ("subdomain takeover", "dangling dns", "subdomain hijack"),
+    "graphql": ("graphql",),
+    "smuggling": ("request smuggling", "http desync"),
+    "business_logic": ("business logic", "race condition", "workflow abuse"),
+    "kerberoasting": ("kerberoast",),
+    "asrep_roast": ("as-rep", "asrep", "as rep roast"),
+    "dcsync": ("dcsync",),
+    "adcs_esc": ("adcs", "esc1", "esc8", "certipy", "certificate template"),
+    "ntlm_relay": ("ntlm relay", "ntlmrelay", "coerce"),
+}
+
+
+def _resolve_vtype(text: str):
+    """Best-effort map a free-text finding description to a technique_kb vtype, or None."""
+    low = (text or "").lower()
+    for v, kws in _VTYPE_KEYWORDS.items():
+        if any(k in low for k in kws):
+            return v
+    return None
+
+
+def _technique_hint(finding_description: str) -> str:
+    """Structured technique context (MITRE/CWE/attack-chain/remediation) for the ONE technique
+    matching a finding — to ground the triage/chaining prompt. '' if no match or KB absent.
+    Lazy: resolves and loads a single technique, never the whole KB."""
+    try:
+        import technique_kb
+        v = _resolve_vtype(finding_description)
+        return technique_kb.markdown_block(v) if v else ""
+    except Exception:
+        return ""
+
+
 def _pick_triage_model(preferred: str = None) -> str | None:
     """Return the best fast triage model — prefers BaronLLM when installed.
 
@@ -2305,12 +2362,15 @@ Be concise. Flag only what's actually interesting."""
         if not self.enabled:
             return "UNKNOWN", ""
 
+        _hint = _technique_hint(finding_description)
+        _hint_block = (f"\nKNOWN TECHNIQUE CONTEXT (ground your answer in this — MITRE/CWE/attack-"
+                       f"chain/remediation for this finding type):\n{_hint}\n") if _hint else ""
         prompt = f"""Validate this finding against VAPT quality criteria:
 
 ---
 {finding_description}
 ---
-
+{_hint_block}
 THE 7 QUESTIONS:
 Q1: Can I exploit this RIGHT NOW with a real PoC HTTP request?
 Q2: Does it affect a real user who took NO unusual actions?
