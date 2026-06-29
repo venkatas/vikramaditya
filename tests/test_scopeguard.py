@@ -133,3 +133,83 @@ def test_scan_command_allows_external_and_ssrf(cfg, monkeypatch):
 def test_scan_command_returns_the_offending_target(cfg):
     hit = scopeguard.scan_command("echo hi && curl http://localhost/x", cfg)
     assert hit and "localhost" in hit
+
+
+# ── REGRESSION: encoded loopback literals must NOT fail open (Finding 1) ───────
+# Decimal / hex / short-form loopback tokens were never extracted by the old regex,
+# so scan_command returned None (clean) and the LLM-authored command executed.
+
+@pytest.mark.parametrize("command", [
+    "nc 2130706433 4444",            # decimal-packed 127.0.0.1
+    "nc 0x7f000001 9000",            # hex 127.0.0.1
+    "socat - TCP:2130706433:9000",   # connector form, decimal loopback
+    "nc 127.1 4444",                 # short-form loopback
+])
+def test_scan_command_blocks_encoded_loopback(cfg, monkeypatch, command):
+    # All of these resolve to 127.0.0.1 via getaddrinfo; stub the resolver so the
+    # test is hermetic and does not depend on the host's libc resolver behavior.
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: ["127.0.0.1"])
+    assert scopeguard.scan_command(command, cfg) is not None
+
+
+def test_scan_command_encoded_loopback_url_form_still_blocked(cfg, monkeypatch):
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: ["127.0.0.1"])
+    assert scopeguard.scan_command("curl http://0x7f000001/", cfg) is not None
+
+
+def test_scan_command_bare_external_int_not_flagged(cfg, monkeypatch):
+    # A non-loopback packed integer (resolves elsewhere) and small ints/ports must
+    # stay allowed — we only block when the resolver says it's a self-target.
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: ["93.184.216.34"])
+    assert scopeguard.scan_command("nc 16843009 4444", cfg) is None   # 1.1.1.1
+    assert scopeguard.scan_command("sleep 4444", cfg) is None
+
+
+# ── REGRESSION: hostname resolving to operator bind IP on listener port (Finding 2)
+# Old guard only matched the literal bind-addr STRING; a name resolving to the bind
+# IP (when that IP is not one of this host's interfaces) slipped through.
+
+def test_hostname_resolving_to_bind_ip_blocked(monkeypatch):
+    c = scopeguard.Config(bind_addr="10.20.30.40", port=8080)
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: ["10.20.30.40"])
+    # bind IP is deliberately NOT a local interface IP (autouse fixture stubs it empty)
+    assert scopeguard.is_local_or_listener("listener.example:8080", c) is True
+    # literal form remains blocked via the textual fast-path
+    assert scopeguard.is_local_or_listener("10.20.30.40:8080", c) is True
+
+
+def test_hostname_to_bind_ip_wrong_port_allowed(monkeypatch):
+    c = scopeguard.Config(bind_addr="10.20.30.40", port=8080)
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: ["10.20.30.40"])
+    # different port than the operator listener → not a self-listener → allowed
+    assert scopeguard.is_local_or_listener("listener.example:9999", c) is False
+
+
+def test_bind_addr_hostname_resolved_for_listener_match(monkeypatch):
+    # bind_addr given as a name; a different name resolving to the same IP is blocked.
+    c = scopeguard.Config(bind_addr="bind.example", port=8080)
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: ["10.20.30.40"])
+    assert scopeguard.is_local_or_listener("other.example:8080", c) is True
+
+
+# ── REGRESSION: numeric/hex tokens that DON'T resolve must fail CLOSED (Finding 3)
+# An all-numeric (2130706433) or 0x-hex (0x7f000001) token is never a legitimate
+# external FQDN — only a packed/encoded IP-literal attempt. If the check-time
+# resolver declines the encoding (returns empty) but the run-time client accepts
+# it, the old fail-OPEN return allowed a pivot onto loopback. Now it blocks.
+
+@pytest.mark.parametrize("token", [
+    "2130706433",   # decimal-packed 127.0.0.1
+    "0x7f000001",   # hex 127.0.0.1
+    "127.1",        # short-form (all-numeric after dot removal)
+])
+def test_unresolvable_numeric_token_fails_closed(cfg, monkeypatch, token):
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: [])
+    assert scopeguard.is_local_or_listener(token, cfg) is True
+
+
+def test_unresolvable_alpha_name_still_allowed(cfg, monkeypatch):
+    # A normal DNS name that simply doesn't resolve stays ALLOWED (fails downstream).
+    monkeypatch.setattr(scopeguard, "LOOKUP_HOST", lambda h: [])
+    assert scopeguard.is_local_or_listener("nope.invalid", cfg) is False
+    assert scopeguard.is_local_or_listener("http://gone.example/x", cfg) is False

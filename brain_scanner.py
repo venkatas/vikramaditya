@@ -93,13 +93,19 @@ _ACCESS_CLAIM_RE = re.compile(
     r'arbitrary[\s_-]*file|file (?:read|disclos|retriev|leak)|local file|'
     r'/etc/passwd|/etc/shadow|win\.ini|boot\.ini|web\.config', re.I)
 _FILE_PROOF_RE = re.compile(
-    # A real /etc/passwd or /etc/shadow read prints account LINES at line-start —
-    # user:x:UID:GID:... (passwd) or user:$hash:lastchg:min:... (shadow). Anchored
-    # to line-start (MULTILINE) so a passwd-shaped string embedded in a shell ERROR
-    # ("bash: line 3: root:x:0:0:...: No such file") is NOT miscounted as proof.
-    r'^[a-z_][a-z0-9_-]*:[^:\n]*:\d+:\d+:'
+    # A real /etc/passwd or /etc/shadow read prints account LINES — user:x:UID:GID:...
+    # (passwd) or user:$hash:... (shadow). Anchored near line-start (MULTILINE) but we
+    # allow a few leading NON-content characters (quotes, list bullets, an HTTP body
+    # offset, leading whitespace) before the passwd shape, since real responses often
+    # prefix it (e.g. JSON "data":"root:x:0:0:...", or a leading "> "). We still anchor
+    # to a line boundary so a passwd-shaped string mid-error ("No such file") is excluded.
+    r'^[\s"\'>\]\)\.,:|*-]{0,8}[a-z_][a-z0-9_-]*:[^:\n]*:\d+:\d+:'
     r'|\[boot loader\]|\[fonts\]|\[mci extensions\]'              # win.ini / boot.ini
-    r'|<\?xml\b|<configuration\b|<connectionStrings|<appSettings',  # web.config
+    r'|<\?xml\b|<configuration\b|<connectionStrings|<appSettings'   # web.config
+    r'|<\?php\b|<\?=\s'                                            # PHP source disclosure
+    r'|-----BEGIN [A-Z ]*PRIVATE KEY-----'                        # private keys (covers RSA/OPENSSH/EC/DSA)
+    r'|ssh-rsa AAAA|ssh-ed25519 AAAA'                             # public-key material in keyfiles
+    r'|\bDB_PASSWORD\s*=|\bAWS_SECRET_ACCESS_KEY\b',              # .env / config leaks
     re.I | re.M)
 
 
@@ -111,6 +117,52 @@ def _access_claim_unproven(line: str, stdout: str) -> bool:
     if not _ACCESS_CLAIM_RE.search(line):
         return False                       # not an access claim → unaffected
     return not _FILE_PROOF_RE.search(stdout)
+
+
+# Tool STATUS / progress chatter — NOT retrieved file content. Used to stop a
+# fabricated access claim padded with noise (`echo "[*] scanning..."`) from
+# being mistaken for a grounded read.
+_STATUS_NOISE_RE = re.compile(
+    r"^\s*(?:\[[*+\-!#]\]"                                  # [*] [+] [-] [!] [#]
+    r"|\[(?:watchdog|info|warn|error|debug|brain|phase|status)\b"   # [Watchdog/..]
+    r"|[>$#]\s"                                             # '> ' '$ ' '# '
+    r"|\.{3,}"                                              # '...'
+    r"|\d{1,3}%(?:\s|$))"                                   # '50%'
+    r"|\b(?:scanning|connecting|downloading|fetching|elapsed|payload|"
+    r"injecting|trying|progress|requesting|resolving)\b",
+    re.IGNORECASE)
+
+
+def _grounded_read_unproven(line: str, stdout: str) -> bool:
+    """Generalized file-access proof gate (superset of _access_claim_unproven).
+
+    An access CLAIM is treated as PROVEN when the output carries EITHER the
+    narrow _FILE_PROOF_RE signature OR >=2 substantive lines that plausibly
+    carry retrieved file content — i.e. >=8 chars, not the claim/usage banner,
+    and not tool-status/progress chatter. This recovers grounded reads of
+    NON-whitelisted files (source, YAML/JSON config, /etc/hosts, /proc/self/
+    environ) that the narrow signature regex cannot represent, while a bare
+    `echo "accessible"` or a claim padded only with progress noise stays
+    unproven. Returns True == still unproven (reject as a finding)."""
+    if not _ACCESS_CLAIM_RE.search(line):
+        return False                       # not an access claim → unaffected
+    if _FILE_PROOF_RE.search(stdout):
+        return False                       # narrow signature already proves it
+    substantive = []
+    for ln in (stdout or "").splitlines():
+        s = ln.strip()
+        if len(s) < 8:
+            continue
+        if _ACCESS_CLAIM_RE.search(ln):
+            continue
+        if _USAGE_BANNER_RE is not None and _USAGE_BANNER_RE.search(ln):
+            continue
+        if _STATUS_NOISE_RE.search(ln):
+            continue
+        substantive.append(s)
+        if len(substantive) >= 2:
+            return False                   # enough real content → proven
+    return True
 
 
 def log(level: str, msg: str):
@@ -265,7 +317,18 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
     operator's own machine/listener (loopback / 0.0.0.0 / our bind:port / a local
     interface). RFC1918 / cloud-metadata SSRF targets are still allowed.
     """
-    if _scopeguard is not None:
+    if _scopeguard is None:
+        # FAIL CLOSED: without scopeguard we cannot prove the LLM-authored command is
+        # not aimed at the operator's own machine/listener, so refuse to execute it.
+        # Escape hatch for environments that knowingly run without it.
+        if os.environ.get("BRAIN_SCANNER_NO_SCOPEGUARD") != "1":
+            return {"stdout": "",
+                    "stderr": "SCOPE BLOCKED (not executed): scopeguard module is "
+                              "unavailable, so host-scope cannot be enforced. Refusing "
+                              "to run LLM-authored code (fail-closed). Set "
+                              "BRAIN_SCANNER_NO_SCOPEGUARD=1 to override.",
+                    "returncode": 3, "scope_blocked": True}
+    else:
         _hit = _scopeguard.scan_command(code)
         if _hit:
             return {"stdout": "",
@@ -345,7 +408,37 @@ def _is_grounded_run(result: dict) -> bool:
     )
     if any(m in err for m in _FAILED_TO_RUN):
         return False
-    return bool((result.get("stdout") or "").strip())
+    out = (result.get("stdout") or "").strip()
+    if not out:
+        return False
+    # A tool printed only its USAGE/HELP banner (e.g. `curl` with no URL, `sqlmap -h`,
+    # `ffuf` with bad args) — that is the tool describing ITSELF, not target evidence.
+    # Counting it as grounding let a verdict rest on a help screen.
+    if _is_usage_banner(out):
+        return False
+    return True
+
+
+_USAGE_BANNER_RE = re.compile(
+    r"^\s*(usage:|usage\s|try '.*--help'|"
+    r".*--help.*for (more )?(usage|information)|"
+    r"options:\s*$|examples:\s*$)", re.I | re.M)
+
+
+def _is_usage_banner(stdout: str) -> bool:
+    """True when stdout looks like a tool's own usage/help banner rather than target
+    evidence. Conservative: requires a usage/help cue AND no obvious target signal."""
+    s = stdout.strip()
+    if not s:
+        return False
+    if not _USAGE_BANNER_RE.search(s):
+        return False
+    # If real target signal is present (HTTP status, a URL, an IP, file-content
+    # proof), do NOT classify as a mere banner.
+    if re.search(r"https?://|HTTP/\d|\b\d{1,3}(?:\.\d{1,3}){3}\b|"
+                 r"<html|root:x:0:0:|set-cookie", s, re.I):
+        return False
+    return True
 
 
 def _verdict_findings(response: str, grounded: bool) -> list:
@@ -907,7 +1000,10 @@ Then test the most promising attack vectors."""
                         # script output does not actually PROVE (no file content) — a
                         # buggy PoC (`echo "...accessible" || echo`) prints it whether
                         # or not the read succeeded. Don't record it as a finding.
-                        if _access_claim_unproven(line, result["stdout"]):
+                        # Use the GENERALIZED gate so a grounded read of a non-passwd
+                        # file (source/YAML/hosts) is KEPT at this primary path, not
+                        # dropped before it reaches findings (it printed real content).
+                        if _grounded_read_unproven(line, result["stdout"]):
                             _unproven_access = True
                             log("warn", f"Rejected unproven access claim (no file "
                                         f"content in output): {line.strip()[:80]}")

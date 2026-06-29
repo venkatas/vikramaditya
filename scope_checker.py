@@ -56,7 +56,11 @@ class ScopeChecker:
         if not hostname:
             return False
 
-        hostname = hostname.lower()
+        # Normalize: lowercase and strip the trailing dot of an absolute
+        # (rooted) FQDN — "sub.target.com." resolves identically to
+        # "sub.target.com" and must match the same patterns. Doing it here
+        # keeps the exclusion and allowlist matchers consistent.
+        hostname = hostname.lower().rstrip(".")
 
         # IP address check — not supported, return False with warning
         if _is_ip(hostname):
@@ -69,9 +73,12 @@ class ScopeChecker:
         # Strip port if present (urlparse handles this, but be safe)
         # hostname from urlparse should already exclude port
 
-        # Check exclusion list first
+        # Check exclusion list first. Exclusions use SUBTREE semantics: a
+        # bare excluded host ("internal.target.com") excludes itself AND every
+        # subdomain beneath it ("deep.internal.target.com"). Bug bounty
+        # programs that list a bare host as out-of-scope mean the whole tree.
         for excluded in self.excluded_domains:
-            if _domain_matches(hostname, excluded):
+            if _excludes(hostname, excluded):
                 return False
 
         # Check allowlist
@@ -132,6 +139,7 @@ def _domain_matches(hostname: str, pattern: str) -> bool:
                   → does NOT match target.com, evil-target.com
     target.com    → matches target.com exactly
     """
+    pattern = pattern.rstrip(".")
     if pattern.startswith("*."):
         # Wildcard: must be a proper subdomain
         suffix = pattern[1:]  # ".target.com"
@@ -139,6 +147,24 @@ def _domain_matches(hostname: str, pattern: str) -> bool:
     else:
         # Exact match
         return hostname == pattern
+
+
+def _excludes(hostname: str, pattern: str) -> bool:
+    """Subtree-aware exclusion matching.
+
+    Unlike the allowlist (which is exact-match for a bare host), an exclusion
+    for a bare host blocks that host AND its entire subtree:
+
+    *.target.com         → blocks sub.target.com, a.b.target.com (proper subs)
+    internal.target.com  → blocks internal.target.com AND deep.internal.target.com
+    """
+    pattern = pattern.rstrip(".")
+    if pattern.startswith("*."):
+        # Wildcard exclusion: proper subdomains of the suffix.
+        suffix = pattern[1:]  # ".target.com"
+        return hostname.endswith(suffix) and hostname != suffix[1:]
+    # Bare host excludes itself and its whole subtree.
+    return hostname == pattern or hostname.endswith("." + pattern)
 
 
 def _is_ip(hostname: str) -> bool:

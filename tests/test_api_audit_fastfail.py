@@ -15,7 +15,7 @@ import api_audit  # noqa: E402
 
 def test_discover_specs_fast_fails_on_black_hole(monkeypatch, tmp_path):
     monkeypatch.setattr(api_audit, "collect_candidate_hosts",
-                        lambda *a, **k: ["https://deadhost.example"])
+                        lambda *a, **k: (["https://deadhost.example"], 1))
     calls = {"n": 0}
 
     def _dead_fetch(url, timeout=6):
@@ -23,7 +23,7 @@ def test_discover_specs_fast_fails_on_black_hole(monkeypatch, tmp_path):
         return {"status": 0, "content_type": "", "body": "", "final_url": url}
 
     monkeypatch.setattr(api_audit, "fetch", _dead_fetch)
-    specs, ops, cands, raw = api_audit.discover_specs(tmp_path, max_hosts=5)
+    specs, ops, cands, raw, total = api_audit.discover_specs(tmp_path, max_hosts=5)
     assert specs == [] and ops == []
     assert calls["n"] <= 3, (
         f"a SYN-dropping host must fast-fail after 3 probes, got {calls['n']} "
@@ -32,7 +32,7 @@ def test_discover_specs_fast_fails_on_black_hole(monkeypatch, tmp_path):
 
 def test_discover_specs_probes_all_paths_when_host_responds(monkeypatch, tmp_path):
     monkeypatch.setattr(api_audit, "collect_candidate_hosts",
-                        lambda *a, **k: ["https://live.example"])
+                        lambda *a, **k: (["https://live.example"], 1))
     calls = {"n": 0}
 
     def _live_fetch(url, timeout=6):

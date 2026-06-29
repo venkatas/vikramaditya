@@ -119,12 +119,42 @@ def is_local_or_listener(target: str, cfg: Config = None) -> bool:
         return True
 
     # Resolve host → IPs (literal IPs skip DNS).
+    #
+    # TOCTOU NOTE: this gate resolves the target ONCE at scan time; the executing
+    # client (curl/nc/sqlmap) re-resolves independently. A short-TTL / DNS-rebinding
+    # name that returns a non-loopback A here and 127.0.0.1 at run time can still slip
+    # through — this is inherent to any pre-flight DNS check. Callers MUST treat this
+    # as a best-effort self-target guard, not an authorization boundary.
     try:
         ips = [ipaddress.ip_address(host)]
     except ValueError:
         addrs = LOOKUP_HOST(host)
         if not addrs:
-            return False  # unresolvable → allow; it will fail naturally downstream
+            # Fail-CLOSED only for a token that DECODES to loopback/unspecified when
+            # read as a packed/short-form IPv4 literal — the encoded-loopback
+            # evasion: decimal 2130706433 / hex 0x7f000001 / short-form 127.1, all
+            # == 127.0.0.1. Block those even when the resolver declines the encoding
+            # at check time, so they can't pivot onto our loopback at run time.
+            # A bare port / timeout / count integer (4444, 86400, 3600) is NOT swept
+            # up: it decodes to a NON-loopback address and stays allowed — narrowing
+            # the prior over-broad "any all-digit/0x token" rule that false-positive
+            # blocked legitimate commands whose only numeric token was a port. A
+            # normal DNS name that simply doesn't resolve also stays allowed.
+            _decoded = None
+            try:
+                _n = int(host, 0)
+                if 0 <= _n <= 0xFFFFFFFF:
+                    _decoded = ipaddress.ip_address(_n)
+            except (ValueError, TypeError):
+                pass
+            if _decoded is None:
+                try:
+                    _decoded = ipaddress.ip_address(socket.inet_aton(host))
+                except (OSError, ValueError):
+                    _decoded = None
+            if _decoded is not None and (_decoded.is_loopback or _decoded.is_unspecified):
+                return True
+            return False  # unresolvable name / non-loopback literal → allow
         ips = []
         for a in addrs:
             try:
@@ -139,6 +169,25 @@ def is_local_or_listener(target: str, cfg: Config = None) -> bool:
         if ip.is_loopback or ip.is_unspecified:
             return True
 
+    # Self-listener by RESOLVED IP: a hostname that resolves to our bind IP on our
+    # listener port must be blocked too (the textual fast-path above only catches the
+    # literal bind-addr string). Honors the documented "bind addr + port" contract
+    # regardless of whether the target was given as an IP literal or a name.
+    if port and port.isdigit() and cfg.port and int(port) == cfg.port:
+        bind = (cfg.bind_addr or "").strip()
+        if bind:
+            bind_ips = set()
+            try:
+                bind_ips.add(str(ipaddress.ip_address(bind)))
+            except ValueError:
+                for a in LOOKUP_HOST(bind):
+                    try:
+                        bind_ips.add(str(ipaddress.ip_address(a)))
+                    except ValueError:
+                        pass
+            if bind_ips and any(str(ip) in bind_ips for ip in ips):
+                return True
+
     # Block any IP that is one of THIS machine's interfaces (operator's own services),
     # even when it's an otherwise-allowed RFC1918 address.
     local = _local_interface_ips()
@@ -149,14 +198,76 @@ def is_local_or_listener(target: str, cfg: Config = None) -> bool:
 
 
 import re as _re
+import shlex as _shlex
 
-# URLs, and bare IPv4 / localhost tokens an LLM-written command might target.
-_TARGET_RE = _re.compile(
-    r"""(?:https?://[^\s'"|;)>]+)"""          # http(s) URLs
-    r"""|(?:\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b)"""  # bare IPv4[:port]
-    r"""|(?:\blocalhost(?::\d+)?\b)""",        # localhost[:port]
-    _re.IGNORECASE,
+# URLs an LLM-written command might target (used as a fallback for tokens that glue a
+# URL to surrounding shell syntax so shlex keeps them in one word).
+_URL_RE = _re.compile(r"""https?://[^\s'"|;)>]+""", _re.IGNORECASE)
+
+# A token (or colon-field) plausibly references a host/IP if it contains a dot
+# (dotted-quad / FQDN / short-form), looks like a decimal integer >=256 (packed IPv4
+# such as 2130706433), or is a 0x-hex literal (0x7f000001). Plain alpha flags / option
+# words / small port-like ints are skipped so we don't fire getaddrinfo on every word.
+_HOSTISH_RE = _re.compile(
+    r"""^(?:
+        \[[0-9A-Fa-f:.]+\]                  # [::1] bracketed IPv6
+      | [0-9A-Fa-f]*:[0-9A-Fa-f:.]+         # ::1 / fe80::1 — IPv6 (MUST contain a colon)
+      | 0x[0-9A-Fa-f]+                       # 0x7f000001 hex-packed IPv4
+      | [A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+      # dotted: FQDN / IPv4 / short-form 127.1
+      | localhost
+    )$""",
+    _re.VERBOSE,
 )
+# NOTE: a bare hex-only word (dd, beef, cafe) is deliberately NOT host-ish — the
+# old `[0-9A-Fa-f:.]+` alternation matched it and fired getaddrinfo on benign
+# command args (`dd bs=...`). Encoded loopback stays covered: decimal-packed
+# (2130706433) via _hostish's isdigit branch, 0x-hex (0x7f000001) via the 0x
+# alternation, and short-form (127.1) via the dotted alternation.
+
+
+def _hostish(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    if s.lower() == "localhost":
+        return True
+    if s.startswith("0x") and len(s) > 2:
+        return True
+    if s.isdigit():
+        # packed-integer IPv4 candidate; bare small ints (ports/counts) are not hosts.
+        return int(s) >= 256
+    return bool(_HOSTISH_RE.match(s))
+
+
+def _candidate_hosts(token: str):
+    """Yield host-ish substrings of a single shell token to feed is_local_or_listener.
+
+    Covers bare hosts/IPs, host:port, scheme://host, and connector forms like
+    socat's `TCP:host:port` / `UDP4:host:port` / `OPENSSL:host:port`. Encoded IP
+    literals (decimal `2130706433`, hex `0x7f000001`, short-form `127.1`) are passed
+    through verbatim — is_local_or_listener resolves them via getaddrinfo.
+    """
+    if not token:
+        return
+    # URL glued to other shell text → pull the URL out and hand it over whole.
+    has_url = False
+    for m in _URL_RE.finditer(token):
+        has_url = True
+        yield m.group(0)
+    # Whole token if it already looks host-ish (bare host[:port] or dotted/encoded IP).
+    bare = token
+    if bare.count(":") == 1 and bare.rsplit(":", 1)[1].isdigit():
+        bare = bare.rsplit(":", 1)[0]
+    if _hostish(bare):
+        yield token
+    # connector / prefixed forms: socat TCP:host:port, foo=host:port, etc.
+    # Peel a leading PROTO: / key= prefix and a trailing :port so the host literal
+    # (decimal/hex/short-form included) is tested on its own.
+    if not has_url and (":" in token or "=" in token):
+        parts = [p for p in token.replace("=", ":").split(":") if p]
+        for p in parts:
+            if _hostish(p):
+                yield p
 
 
 def scan_command(command: str, cfg: Config = None) -> str:
@@ -165,12 +276,25 @@ def scan_command(command: str, cfg: Config = None) -> str:
     Returns the first offending target token, or None if the command is clean. Used to
     gate brain_scanner.execute_script and agent tool dispatch so the agent cannot curl /
     sqlmap / nc the operator's own box or listener.
+
+    Tokenizes the command with shlex and feeds every word (and its host substrings) to
+    is_local_or_listener, which already resolves dotted-quad, decimal, hex, short-form,
+    and DNS hosts via getaddrinfo. This closes the prior fail-OPEN gap where encoded
+    loopback literals (e.g. `nc 2130706433 4444`, `nc 0x7f000001 9000`,
+    `socat - TCP:2130706433:9000`, `nc 127.1 4444`) were never extracted and so ran.
     """
     cfg = cfg or Config.from_env()
-    for m in _TARGET_RE.finditer(command or ""):
-        tok = m.group(0)
-        if is_local_or_listener(tok, cfg):
-            return tok
+    cmd = command or ""
+    try:
+        tokens = _shlex.split(cmd, posix=True)
+    except ValueError:
+        # Unbalanced quotes etc. — fall back to whitespace splitting so we still scan.
+        tokens = cmd.split()
+    for tok in tokens:
+        for cand in _candidate_hosts(tok):
+            if is_local_or_listener(cand, cfg):
+                # Return the offending whole token for a readable block message.
+                return tok
     return None
 
 

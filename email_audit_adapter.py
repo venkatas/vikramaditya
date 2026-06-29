@@ -51,7 +51,12 @@ from email_audit import (  # noqa: F401 — re-exports
 # info-severity email_audit findings per run were not reaching the
 # hunt journal. Spelling fixed so /pickup surfaces the full picture.
 _SEVERITY_MAP = {
-    "critical": "high",       # subspace "critical" = config gap, not RCE
+    # v10.6.0 — do NOT downgrade "critical". It is a valid journal severity
+    # (memory/schemas.py::VALID_SEVERITIES) and reporter.py renders it
+    # natively (SEVERITY_ORDER/color/CVSS_DEFAULT). The old "config gap, not
+    # RCE" remap silently understated real spoofability (SPF +all, SPF /0) in
+    # the journal and the client-facing report with no degradation marker.
+    "critical": "critical",
     "high": "high",
     "medium": "medium",
     "low": "low",
@@ -103,6 +108,25 @@ def to_finding_entries(
     findings: list[dict[str, Any]] = []
     if not isinstance(audit_report, dict):
         return findings
+
+    # v10.6.0 — bulk-mode shape. build_bulk_report() returns
+    # {"mode": "bulk-analysis", ..., "reports": [<per-domain report>, ...]}
+    # with NO top-level "checks" key. Without this branch, a multi-target
+    # (--targets / --targets-file) audit JSON loaded via load_and_convert()
+    # yielded ZERO findings — every per-domain SPF/DMARC/DKIM/MX issue under
+    # report["reports"][*] was invisible to the pipeline. Recurse into each
+    # per-domain report with its own domain/target so all findings surface.
+    sub_reports = audit_report.get("reports")
+    if audit_report.get("mode") == "bulk-analysis" or isinstance(sub_reports, list):
+        if isinstance(sub_reports, list):
+            for sub in sub_reports:
+                if not isinstance(sub, dict):
+                    continue
+                sub_summary = sub.get("summary") if isinstance(sub.get("summary"), dict) else {}
+                sub_target = sub_summary.get("target") or sub_summary.get("domain") or target
+                findings.extend(to_finding_entries(sub, sub_target))
+        return findings
+
     checks = audit_report.get("checks") or {}
     if not isinstance(checks, dict):
         return findings
@@ -136,8 +160,23 @@ def to_finding_entries(
                 "area": area,
             })
 
-    # Cross-findings (e.g. "SPF+DMARC+DKIM all permissive → spoofable")
-    for cross in audit_report.get("cross_findings", []) or []:
+    # Cross-findings (e.g. "SPF+DMARC+DKIM all permissive → spoofable").
+    #
+    # v10.6.0 — build_report() folds derive_cross_findings() into the FLAT
+    # top-level report["issues"] list tagged area="Cross-check"; it does NOT
+    # emit a "cross_findings" key. The old line-140 loop only read
+    # "cross_findings", so it was always empty and the HIGH "High spoofing
+    # and impersonation exposure" verdict (plus the LOW transport-security
+    # gap) were silently dropped before reaching the reporter/journal.
+    # Read the flat issues list and select cross-check entries, keeping the
+    # "cross_findings" key as a forward-compatible fallback.
+    cross_items = audit_report.get("cross_findings") or [
+        issue
+        for issue in (audit_report.get("issues") or [])
+        if isinstance(issue, dict)
+        and str(issue.get("area", "")).lower().replace("-", "_") in ("cross", "cross_check")
+    ]
+    for cross in cross_items:
         if not isinstance(cross, dict):
             continue
         findings.append({

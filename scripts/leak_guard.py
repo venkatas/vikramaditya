@@ -86,14 +86,38 @@ def _load_blocklist():
         return []
 
 
+# Force raw UTF-8 paths from git. Without this, git escapes non-ASCII path bytes as octal
+# (core.quotepath defaults ON) — e.g. "caf\303\251.sql" — so a client identifier with any
+# non-ASCII character (accented name, CJK) never matches the verbatim/normalized blocklist and
+# the FILENAME leak-guard is silently bypassed. quotepath=false emits the raw bytes; git still
+# C-quotes paths containing a literal quote/tab/newline, which _unquote_git_path decodes back.
+def _git(*args):
+    return subprocess.run(["git", "-c", "core.quotepath=false", *args],
+                          capture_output=True, text=True).stdout
+
+
+def _unquote_git_path(p):
+    """Decode git's C-style quoting. Even with quotepath=false, git wraps a path in double quotes
+    and backslash-escapes it when it contains a quote/tab/newline. Return the literal path."""
+    if len(p) >= 2 and p.startswith('"') and p.endswith('"'):
+        try:
+            # git uses C escapes (\", \\, \t, \n, octal \NNN); codecs unicode_escape decodes them,
+            # then re-encode latin-1 / decode utf-8 to recover multibyte chars from octal bytes.
+            inner = p[1:-1]
+            return inner.encode("latin-1", "backslashreplace").decode("unicode_escape") \
+                        .encode("latin-1", "backslashreplace").decode("utf-8", "replace")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return p[1:-1]
+    return p
+
+
 def _added_changes(diff_args):
     """Yield (path, added_line) for every added line, tracking the current file from the diff."""
-    out = subprocess.run(["git", "diff", "--no-color", *diff_args],
-                         capture_output=True, text=True).stdout
+    out = _git("diff", "--no-color", *diff_args)
     path = ""
     for ln in out.splitlines():
         if ln.startswith("+++ b/"):
-            path = ln[6:]
+            path = _unquote_git_path(ln[6:])
         elif ln.startswith("+") and not ln.startswith("+++"):
             yield path, ln[1:]
 
@@ -109,9 +133,8 @@ def _is_test_path(path):
 def _changed_paths(diff_args):
     """All changed file PATHS — incl. files with no added text lines (binaries/renames)
     that ``_added_changes`` would never yield."""
-    out = subprocess.run(["git", "diff", "--no-color", "--name-only", *diff_args],
-                         capture_output=True, text=True).stdout
-    return [p for p in out.splitlines() if p.strip()]
+    out = _git("diff", "--no-color", "--name-only", *diff_args)
+    return [_unquote_git_path(p) for p in out.splitlines() if p.strip()]
 
 
 def _msg_changes(text):
@@ -123,11 +146,10 @@ def _msg_changes(text):
 def _range_messages(rng):
     """Every commit MESSAGE in a range — closes the message-only leak the diff scan can't see
     (a prior incident was remediated by scrubbing commit messages specifically)."""
-    shas = subprocess.run(["git", "rev-list", rng], capture_output=True, text=True).stdout.split()
+    shas = _git("rev-list", rng).split()
     out = []
     for sha in shas:
-        body = subprocess.run(["git", "show", "-s", "--format=%B", sha],
-                              capture_output=True, text=True).stdout
+        body = _git("show", "-s", "--format=%B", sha)
         out += _msg_changes(body)
     return out
 
@@ -152,17 +174,49 @@ def _secret_hits(path, ln):
                 continue                                          # one-line placeholder PEM literal
             hits.append((label, ln.strip()[:120]))
 
-    if not _is_test_path(path) and not any(mk in low for mk in _LINE_MARKERS):
-        for rx, label in _SOFT_SECRETS:                          # lenient: non-test, marker-free only
+    # SOFT secrets are relaxed ONLY on test paths (which legitimately carry fixture tokens) and
+    # only suppressed by an in-TOKEN marker via _allowed(). The previous broad line-level
+    # _LINE_MARKERS substring check is NOT applied here: it suppressed every SOFT secret on any
+    # line that merely contained 'example'/'abcd'/'fake'/… anywhere — so a real basic-auth URL
+    # against example.com, or a real JWT on a line annotated "# example", silently passed.
+    if not _is_test_path(path):
+        for rx, label in _SOFT_SECRETS:                          # marker-IN-TOKEN suppression only
             for m in rx.findall(ln):
                 tok = m if isinstance(m, str) else next((g for g in m if g), "")
-                if _allowed(tok):
+                # For a basic-auth URL the SECRET is the user:pass credential, not the host —
+                # scope the marker check to the credential so a real cred against example.com
+                # (host carries the marker word) is NOT suppressed.
+                marker_tok = tok
+                if label == "basic-auth URL":
+                    cred = re.search(r"://([^@]+)@", tok)
+                    marker_tok = cred.group(1) if cred else tok
+                if _allowed(marker_tok):
                     continue
                 hits.append((label, ln.strip()[:120]))
     return hits
 
 
+_WARNED_SHORT_TERMS = False
+
+
+def _warn_short_terms(terms):
+    """One-time stderr notice: curated blocklist terms below the normalization floor are still
+    matched VERBATIM everywhere, but NOT separator-normalized (so 'ac me'/'ac-me' variants of a
+    4-char term are not caught). The floor exists to bound fuzzy false positives; surface it so the
+    operator knows these terms are verbatim-only rather than assuming silent full coverage."""
+    global _WARNED_SHORT_TERMS
+    if _WARNED_SHORT_TERMS:
+        return
+    short = sorted({t for t in terms if 0 < len(t) < _NORM_MIN_LEN})
+    if short:
+        print(f"⚠️  leak-guard: blocklist terms shorter than {_NORM_MIN_LEN} chars are matched "
+              f"VERBATIM only (no separator-normalized/fuzzy match): {', '.join(short)}",
+              file=sys.stderr)
+    _WARNED_SHORT_TERMS = True
+
+
 def _scan(changes, terms, extra_paths=()):
+    _warn_short_terms(terms)
     changes = list(changes)
     norm_terms = [(_norm(t), t) for t in terms if len(t) >= _NORM_MIN_LEN]
     allow_dumps = _allow_dumps()

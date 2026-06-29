@@ -113,13 +113,19 @@ def check(test_name: str, resp_a: dict, resp_b: dict, severity: str = "HIGH"):
     b_data = resp_b.get("data", {})
     has_error = bool(resp_b.get("errors")) or "_http_error" in resp_b
 
-    # B got non-null data and no errors = IDOR
-    if b_data and not has_error:
-        for v in b_data.values():
-            if v is not None:
-                flag(test_name, resp_b, severity)
-                return
-    status = "BLOCKED" if has_error else "NULL (ok)"
+    # Real IDOR = B got the SAME data A got (cross-user leak), no errors.
+    if same and not has_error:
+        flag(test_name, resp_b, severity)
+        return
+
+    # B got *some* non-null data but it differs from A's — could be public/
+    # shared data, or a partial leak. Do NOT auto-confirm; surface for manual
+    # review instead of emitting a false-positive HIGH finding.
+    b_has_data = bool(b_data) and any(v is not None for v in b_data.values())
+    if b_has_data and not has_error:
+        status = "B-DATA-NO-MATCH (manual review)"
+    else:
+        status = "BLOCKED" if has_error else "NULL (ok)"
     print(f"  [{status}] {test_name}")
 
 
@@ -307,17 +313,20 @@ def test_identity_idor(token_a: str, token_b: str, user_id: str):
 def test_collaboration_idor(token_a: str, token_b: str, report_id: str):
     print("\n[8] REPORT COLLABORATION / DRAFT IDOR")
 
-    # Draft reports
-    for draft_offset in range(0, 5):
-        draft_id = str(int(report_id) - draft_offset)
-        gid = make_gid("ReportDraft", draft_id)
-        q = '{ node(id: "%s") { ... on ReportDraft { title body } } }' % gid
-        r_b = gql(token_b, q)
-        sleep()
-        data = r_b.get("data", {}).get("node")
-        if data and data.get("title"):
-            flag(f"ReportDraft IDOR (id={draft_id})", r_b, "HIGH")
-            break
+    # Draft reports — enumeration only makes sense for numeric DB IDs.
+    if report_id.isdigit():
+        for draft_offset in range(0, 5):
+            draft_id = str(int(report_id) - draft_offset)
+            gid = make_gid("ReportDraft", draft_id)
+            q = '{ node(id: "%s") { ... on ReportDraft { title body } } }' % gid
+            r_b = gql(token_b, q)
+            sleep()
+            data = r_b.get("data", {}).get("node")
+            if data and data.get("title"):
+                flag(f"ReportDraft IDOR (id={draft_id})", r_b, "HIGH")
+                break
+    else:
+        print("  [SKIP] ReportDraft enumeration — report_id is non-numeric")
 
     # ReportIntent (submitted but unprocessed)
     gid_intent = make_gid("ReportIntent", report_id)
@@ -560,29 +569,38 @@ def main():
         print("ERROR: Provide at least one of --report-id, --user-id, or --program")
         sys.exit(1)
 
-    if args.report_id:
-        if should_run("1"): test_report_idor(args.token_a, args.token_b, args.report_id)
-        if should_run("2"): test_report_node_idor(args.token_a, args.token_b, args.report_id)
-        if should_run("3"): test_rest_report_idor(args.token_a, args.token_b, args.report_id)
-        if should_run("8"): test_collaboration_idor(args.token_a, args.token_b, args.report_id)
-        if should_run("9"): test_hai_idor(args.token_a, args.token_b, args.report_id)
-        if args.program and should_run("10"):
-            test_manager_mutations(args.token_a, args.token_b, args.report_id, args.program)
+    def run(name: str, fn, *fn_args):
+        """Run a single test; never let one test abort the whole suite or
+        suppress the final summary. Logs and continues on any failure."""
+        try:
+            fn(*fn_args)
+        except Exception as e:
+            print(f"  [TEST ERROR] {name} raised {type(e).__name__}: {e} — continuing")
 
-    if args.program:
-        if should_run("4"): test_duplicate_detector_idor(args.token_a, args.token_b, args.program)
-        if should_run("5"): test_program_idor(args.token_a, args.token_b, args.program)
+    try:
+        if args.report_id:
+            if should_run("1"): run("test_report_idor", test_report_idor, args.token_a, args.token_b, args.report_id)
+            if should_run("2"): run("test_report_node_idor", test_report_node_idor, args.token_a, args.token_b, args.report_id)
+            if should_run("3"): run("test_rest_report_idor", test_rest_report_idor, args.token_a, args.token_b, args.report_id)
+            if should_run("8"): run("test_collaboration_idor", test_collaboration_idor, args.token_a, args.token_b, args.report_id)
+            if should_run("9"): run("test_hai_idor", test_hai_idor, args.token_a, args.token_b, args.report_id)
+            if args.program and should_run("10"):
+                run("test_manager_mutations", test_manager_mutations, args.token_a, args.token_b, args.report_id, args.program)
 
-    if args.user_id:
-        if should_run("6"): test_user_idor(args.token_a, args.token_b, args.user_id)
-        if should_run("7"): test_identity_idor(args.token_a, args.token_b, args.user_id)
+        if args.program:
+            if should_run("4"): run("test_duplicate_detector_idor", test_duplicate_detector_idor, args.token_a, args.token_b, args.program)
+            if should_run("5"): run("test_program_idor", test_program_idor, args.token_a, args.token_b, args.program)
 
-    if should_run("11"): test_graphql_csrf(args.token_a)
-    if should_run("12"): test_2fa_rate_limit(args.token_b)
-    if args.attachment_url and should_run("13"):
-        test_s3_url(args.attachment_url, args.token_b)
+        if args.user_id:
+            if should_run("6"): run("test_user_idor", test_user_idor, args.token_a, args.token_b, args.user_id)
+            if should_run("7"): run("test_identity_idor", test_identity_idor, args.token_a, args.token_b, args.user_id)
 
-    print_summary()
+        if should_run("11"): run("test_graphql_csrf", test_graphql_csrf, args.token_a)
+        if should_run("12"): run("test_2fa_rate_limit", test_2fa_rate_limit, args.token_b)
+        if args.attachment_url and should_run("13"):
+            run("test_s3_url", test_s3_url, args.attachment_url, args.token_b)
+    finally:
+        print_summary()
 
 
 if __name__ == "__main__":

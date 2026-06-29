@@ -2,10 +2,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
+import sys
 import time
 from pathlib import Path
-from whitebox.profiles import CloudProfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import procutil  # noqa: E402  fork-safe launch (macOS Network.framework atfork SIGSEGV fix)
+from whitebox.profiles import CloudProfile  # noqa: E402
 
 # Prowler 4.5.0 hard-pins pydantic==1.10.18, which conflicts with ollama (used by
 # brain.py) and most modern Python packages. Install Prowler in an isolated venv
@@ -44,7 +47,9 @@ def run(profile: CloudProfile, out_dir: Path,
 
     timeout defaults to the PROWLER_TIMEOUT env var (seconds) if set, otherwise 5400 (90 min).
     Real-world full Prowler scans on enterprise AWS accounts typically run 60-90 min.
-    Pass check_groups (a list of check folders) to narrow the scan when timeout is tight.
+    Pass check_groups (a list of Prowler check IDs) to narrow the scan when timeout is
+    tight; they are emitted via Prowler's list-valued ``--checks`` (-c) flag. Note this
+    is NOT ``--checks-folder`` (-x), which takes a single custom-checks DIRECTORY path.
     """
     binary = _resolve_prowler_binary()
     if binary is None:
@@ -67,25 +72,44 @@ def run(profile: CloudProfile, out_dir: Path,
         "--output-directory", str(out_dir),
     ]
     if check_groups:
-        cmd += ["--checks-folder"] + check_groups
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # Prowler 4.x: --checks/-c takes a list of check IDs to narrow the scan.
+        # (--checks-folder/-x is a SINGLE custom-checks directory, not this.)
+        cmd += ["--checks"] + check_groups
+    # Launch via procutil (os.posix_spawn): cloud_hunt does in-process boto3/HTTPS
+    # region discovery before this runner, loading Apple's Network.framework, so a
+    # raw subprocess.run fork()+exec SIGSEGVs (rc=-11) the prowler child on macOS.
+    # Keep stderr separate to preserve the existing error.log layout.
+    res = procutil.run_capture(cmd, timeout=timeout, shell=False, merge_stderr=False)
+    if res["timed_out"]:
+        (out_dir / "error.log").write_text(
+            f"prowler timed out after {timeout}s\nbinary: {binary}\n"
+        )
+        raise RuntimeError(f"prowler timed out after {timeout}s; see {out_dir / 'error.log'}")
+    rc = res["returncode"]
     # Prowler exit codes: 0 = no findings, 3 = completed with findings
     # (normal case for real accounts). Anything else is a true failure.
-    if proc.returncode not in (0, 3):
+    if rc not in (0, 3):
         (out_dir / "error.log").write_text(
-            f"prowler exited {proc.returncode}\nbinary: {binary}\n\n"
-            f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}\n"
+            f"prowler exited {rc}\nbinary: {binary}\n\n"
+            f"stdout:\n{res['stdout']}\n\nstderr:\n{res['stderr']}\n"
         )
-        raise RuntimeError(f"prowler exited {proc.returncode}; see {out_dir / 'error.log'}")
+        raise RuntimeError(f"prowler exited {rc}; see {out_dir / 'error.log'}")
     return _find_output_file(out_dir, min_mtime=start_ts)
 
 
 def _find_output_file(out_dir: Path, min_mtime: float = 0.0) -> Path:
-    candidates = list(out_dir.glob("*.ocsf.json")) + list(out_dir.glob("*ocsf*.json"))
+    # Dedup the two globs (the first pattern is a subset of the second, so a plain
+    # `<prefix>.ocsf.json` matches both) via a set, then choose deterministically.
+    # Path.glob() order is filesystem-dependent, so returning the raw first element
+    # would nondeterministically pick a stale/compliance OCSF file when Prowler 4.5
+    # emits more than one fresh artifact, silently dropping the real findings.
+    candidates = set(out_dir.glob("*.ocsf.json")) | set(out_dir.glob("*ocsf*.json"))
     fresh = [c for c in candidates if c.stat().st_mtime >= min_mtime]
     if not fresh:
         raise FileNotFoundError(f"no fresh OCSF JSON output in {out_dir} (min_mtime={min_mtime})")
-    return fresh[0]
+    # Newest fresh file = the primary findings document for this run. Tie-break by
+    # path string so the result is fully deterministic even when mtimes collide.
+    return max(fresh, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
 def parse(ocsf_path: Path) -> list[dict]:

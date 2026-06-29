@@ -43,10 +43,36 @@ def _arn_tail(arn: str) -> str:
     return tail.rsplit("/", 1)[-1]
 
 
+def _looks_like_prowler_check_id(check_id: str) -> bool:
+    """A Prowler check_id is a service-prefixed snake_case slug (e.g. 's3_bucket_...').
+
+    We use this to decide whether check_id is authoritative for routing. When it
+    is, the title_hint must NEVER override it — title-based routing is only a
+    fallback for findings whose rule_id was not populated with a real check id.
+    """
+    cid = (check_id or "").strip().lower()
+    if not cid:
+        return False
+    # Real check ids are slug-like: alnum + underscores, no spaces, has an '_'.
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9_]*", cid)) and "_" in cid
+
+
 def _matches(check_id: str, title: str, ids: Iterable[str], title_hint: str) -> bool:
+    """Route a finding to a verifier.
+
+    Routing is STRICT on check_id: if check_id matches one of ``ids`` we route
+    here; if check_id is a real-but-different Prowler slug we do NOT route here
+    (return False) even when the free-text title happens to contain title_hint —
+    this prevents a re-worded/localised title from sending, e.g., an S3 finding
+    into the Lambda verifier and dropping a genuine finding. The title_hint is
+    only consulted as a fallback when check_id is absent/non-slug.
+    """
     cid = (check_id or "").lower()
     if any(needle in cid for needle in ids):
         return True
+    # check_id is authoritative; don't let title substring cross service lines.
+    if _looks_like_prowler_check_id(check_id):
+        return False
     return title_hint in (title or "").lower()
 
 
@@ -95,11 +121,17 @@ def _verify_s3_write_public(boto3_session, bucket_name: str) -> bool:
         if is_public:
             public_stmts.append(st)
     if not public_stmts:
-        return False  # no public stmt → FP
-    # Real exposure if at least one public stmt has NO Condition
+        # The live bucket *policy* shows no public-Principal statement, yet
+        # Prowler FAILed. We cannot reproduce its reasoning — e.g. it may have
+        # flagged a bucket-ACL grant, or a Principal shape this verifier does
+        # not model (CanonicalUser / NotPrincipal). "I can't explain the FAIL"
+        # is NOT proof of a false positive, so KEEP the finding (fail-open).
+        return True
+    # Real exposure if at least one public stmt has NO Condition.
     for st in public_stmts:
         if not st.get("Condition"):
             return True
+    # Every public statement is Condition-gated → positively confirmed FP.
     return False
 
 

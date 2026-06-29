@@ -2,6 +2,7 @@ import boto3
 import pytest
 from moto import mock_aws
 from whitebox.profiles import CloudProfile
+import whitebox.secrets.sources.s3 as s3mod
 from whitebox.secrets.sources.s3 import scan as scan_s3
 
 
@@ -74,3 +75,50 @@ def test_scan_s3_still_finds_named_detectors(profile):
     profile._session = boto3.Session(region_name="us-east-1")
     findings = scan_s3(profile, target_buckets=["cred-bucket"])
     assert any(f.rule_id == "secrets.s3.aws_access_key_id" for f in findings)
+
+
+@mock_aws
+def test_scan_s3_emits_truncation_marker_when_oversize_skipped(profile):
+    """An object larger than MAX_OBJECT_SIZE is skipped, but the skip must be
+    recorded as a coverage-limited INFO finding (not a silent false-negative)."""
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="big-bucket")
+    # Body bigger than MAX_OBJECT_SIZE; padding is benign synthetic data.
+    big_body = b"x" * (s3mod.MAX_OBJECT_SIZE + 10)
+    s3.put_object(Bucket="big-bucket", Key="dump.sql", Body=big_body)
+    profile._session = boto3.Session(region_name="us-east-1")
+    findings = scan_s3(profile, target_buckets=["big-bucket"])
+    trunc = [f for f in findings if f.rule_id == "secrets.s3.scan_truncated"]
+    assert len(trunc) == 1, f"expected one truncation marker, got {[f.rule_id for f in findings]}"
+    assert trunc[0].severity.label() == "Info"
+    assert "big-bucket" in trunc[0].title
+    assert "skipped" in trunc[0].description.lower()
+
+
+@mock_aws
+def test_scan_s3_emits_truncation_marker_when_object_cap_hit(profile, monkeypatch):
+    """When the bucket has more scannable objects than MAX_OBJECTS_PER_BUCKET,
+    the scan stops early and must emit a coverage-limited INFO finding."""
+    # Lower the cap so the test stays fast and deterministic.
+    monkeypatch.setattr(s3mod, "MAX_OBJECTS_PER_BUCKET", 3)
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="many-bucket")
+    for i in range(5):  # more than the (patched) cap of 3
+        s3.put_object(Bucket="many-bucket", Key=f"file-{i}.txt", Body=b"nothing-secret-here")
+    profile._session = boto3.Session(region_name="us-east-1")
+    findings = scan_s3(profile, target_buckets=["many-bucket"])
+    trunc = [f for f in findings if f.rule_id == "secrets.s3.scan_truncated"]
+    assert len(trunc) == 1, f"expected one truncation marker, got {[f.rule_id for f in findings]}"
+    assert trunc[0].severity.label() == "Info"
+    assert "capped" in trunc[0].description.lower()
+
+
+@mock_aws
+def test_scan_s3_no_truncation_marker_when_fully_scanned(profile):
+    """A small, fully-scanned bucket must NOT emit a truncation marker."""
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="small-bucket")
+    s3.put_object(Bucket="small-bucket", Key="readme.txt", Body=b"hello world")
+    profile._session = boto3.Session(region_name="us-east-1")
+    findings = scan_s3(profile, target_buckets=["small-bucket"])
+    assert not any(f.rule_id == "secrets.s3.scan_truncated" for f in findings)

@@ -44,8 +44,11 @@ def test_endpoint(session: AuthSession, endpoint: dict, valid_token: str) -> dic
 
     # 2. No token / no cookies
     resp = session.request(method, path, token="", json_body=body)
-    result["tests"]["no_auth"] = resp["status"]
-    if resp["status"] in (200, 201, 204) and baseline in (200, 201, 204):
+    no_auth_status = resp["status"]
+    result["tests"]["no_auth"] = no_auth_status
+    OK = (200, 201, 204)
+    public_endpoint = no_auth_status in OK
+    if public_endpoint and baseline in OK:
         result["findings"].append({
             "type": "broken_authentication",
             "severity": "critical",
@@ -54,44 +57,60 @@ def test_endpoint(session: AuthSession, endpoint: dict, valid_token: str) -> dic
             "evidence": f"No-auth: HTTP {resp['status']}, Valid-auth: HTTP {baseline}",
         })
 
+    # JWT mutation checks (expired / tampered / alg=none) only make sense when:
+    #   (a) the supplied token is actually a JWT — opaque bearers cannot be
+    #       mutated (JWTHelper.* return the token UNCHANGED for non-JWTs, which
+    #       would otherwise re-send the still-valid token and emit fabricated
+    #       critical/high "bypass" findings against a server that has no JWT);
+    #   (b) the endpoint is NOT already fully public — on a public endpoint
+    #       every token (mutated or not) trivially yields 200, so a 200 here is
+    #       not evidence the server skipped JWT validation.
+    # Additionally, each mutation must have actually changed the token (the
+    # mutation helper succeeded) before the result is meaningful.
+    token_is_jwt = JWTHelper.is_jwt(valid_token)
+    run_jwt_checks = token_is_jwt and not public_endpoint
+
     # 3. Expired token
     expired = JWTHelper.expire_token(valid_token)
-    resp = session.request(method, path, token=expired, json_body=body)
-    result["tests"]["expired"] = resp["status"]
-    if resp["status"] in (200, 201, 204):
-        result["findings"].append({
-            "type": "no_expiry_validation",
-            "severity": "high",
-            "detail": f"Expired JWT accepted ({method} {path})",
-            "url": resp["url"],
-            "evidence": f"Expired token: HTTP {resp['status']}",
-        })
+    if run_jwt_checks and expired != valid_token:
+        resp = session.request(method, path, token=expired, json_body=body)
+        result["tests"]["expired"] = resp["status"]
+        if resp["status"] in OK:
+            result["findings"].append({
+                "type": "no_expiry_validation",
+                "severity": "high",
+                "detail": f"Expired JWT accepted ({method} {path})",
+                "url": resp["url"],
+                "evidence": f"Expired token: HTTP {resp['status']}, No-auth: HTTP {no_auth_status}",
+            })
 
     # 4. Tampered signature
     tampered = JWTHelper.tamper_signature(valid_token)
-    resp = session.request(method, path, token=tampered, json_body=body)
-    result["tests"]["tampered"] = resp["status"]
-    if resp["status"] in (200, 201, 204):
-        result["findings"].append({
-            "type": "no_signature_validation",
-            "severity": "high",
-            "detail": f"Tampered JWT signature accepted ({method} {path})",
-            "url": resp["url"],
-            "evidence": f"Tampered token: HTTP {resp['status']}",
-        })
+    if run_jwt_checks and tampered != valid_token:
+        resp = session.request(method, path, token=tampered, json_body=body)
+        result["tests"]["tampered"] = resp["status"]
+        if resp["status"] in OK:
+            result["findings"].append({
+                "type": "no_signature_validation",
+                "severity": "high",
+                "detail": f"Tampered JWT signature accepted ({method} {path})",
+                "url": resp["url"],
+                "evidence": f"Tampered token: HTTP {resp['status']}, No-auth: HTTP {no_auth_status}",
+            })
 
     # 5. alg=none
     alg_none = JWTHelper.set_alg_none(valid_token)
-    resp = session.request(method, path, token=alg_none, json_body=body)
-    result["tests"]["alg_none"] = resp["status"]
-    if resp["status"] in (200, 201, 204):
-        result["findings"].append({
-            "type": "jwt_alg_none_bypass",
-            "severity": "critical",
-            "detail": f"JWT alg=none accepted ({method} {path})",
-            "url": resp["url"],
-            "evidence": f"alg=none token: HTTP {resp['status']}",
-        })
+    if run_jwt_checks and alg_none != valid_token:
+        resp = session.request(method, path, token=alg_none, json_body=body)
+        result["tests"]["alg_none"] = resp["status"]
+        if resp["status"] in OK:
+            result["findings"].append({
+                "type": "jwt_alg_none_bypass",
+                "severity": "critical",
+                "detail": f"JWT alg=none accepted ({method} {path})",
+                "url": resp["url"],
+                "evidence": f"alg=none token: HTTP {resp['status']}, No-auth: HTTP {no_auth_status}",
+            })
 
     # 6. 500 errors = poor error handling
     for test_name, status in result["tests"].items():

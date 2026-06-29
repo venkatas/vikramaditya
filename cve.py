@@ -17,10 +17,17 @@ import signal
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FINDINGS_DIR = os.path.join(BASE_DIR, "findings")
+
+# Exposed-config check: 0 = probe ALL live hosts (the uncapped CLAUDE.md contract).
+# Set CVE_CONFIG_MAX_HOSTS=N to cap for runtime reasons; when a cap truncates the
+# host list, a degradation marker is printed so a "clean" result is never mistaken
+# for a complete one. (audit-fix: was a silent hardcoded [:20])
+CVE_CONFIG_MAX_HOSTS = int(os.environ.get("CVE_CONFIG_MAX_HOSTS", "0") or "0")
 
 
 def resolve_domain_from_recon_dir(recon_dir):
@@ -50,10 +57,15 @@ TECH_ALIASES = {
 
 
 def run_cmd(cmd, timeout=30):
+    # ``cmd`` may be a shell string (legacy callers) OR an argv list. When a list
+    # is passed we run with shell=False so no value is ever re-parsed by /bin/sh
+    # — this is the injection-safe path used by search_cves(), where the keyword
+    # is derived from attacker-controlled HTTP response headers.
+    use_shell = isinstance(cmd, str)
     proc = None
     try:
         proc = subprocess.Popen(
-            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cmd, shell=use_shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True,
         )
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -303,18 +315,40 @@ def _is_searchable_tech(tech_name: str) -> bool:
     return True
 
 
+def _coerce_cvss(value):
+    """Best-effort float coercion for a CVSS score that may be a str/None.
+
+    Some CVE sources (e.g. circl.lu) return cvss as a JSON string; comparing
+    that against a float raises TypeError. This keeps the numeric filters total.
+    """
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def search_cves(tech_name, max_results=10):
     """Search for CVEs related to a technology using public APIs."""
     cves = []
 
-    # Clean up tech name for search
+    # Clean up tech name for search. The token originates from attacker-controlled
+    # HTTP response headers (Server / X-Powered-By), so it MUST NOT be interpolated
+    # into a shell string. Build curl as an argv list (shell=False) and percent-encode
+    # the keyword so it cannot break out of the URL or the command.
     search_term = re.sub(r'[/.]', ' ', tech_name).strip()
+    nvd_kw = urllib.parse.quote(search_term, safe='')
+    circl_kw = urllib.parse.quote(search_term, safe='')
 
     # Method 1: NVD API (NIST)
     print(f"    [>] Searching CVEs for: {tech_name}...")
     try:
         success, output = run_cmd(
-            f'curl -s "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={search_term}&resultsPerPage={max_results}" --max-time 15',
+            [
+                "curl", "-s",
+                f"https://services.nvd.nist.gov/rest/json/cves/2.0"
+                f"?keywordSearch={nvd_kw}&resultsPerPage={max_results}",
+                "--max-time", "15",
+            ],
             timeout=20
         )
         if success and output:
@@ -360,7 +394,11 @@ def search_cves(tech_name, max_results=10):
     if not cves:
         try:
             success, output = run_cmd(
-                f'curl -s "https://cve.circl.lu/api/search/{search_term}" --max-time 15',
+                [
+                    "curl", "-s",
+                    f"https://cve.circl.lu/api/search/{circl_kw}",
+                    "--max-time", "15",
+                ],
                 timeout=20
             )
             if success and output:
@@ -377,8 +415,13 @@ def search_cves(tech_name, max_results=10):
                                 cvss_val = 0.0
                             cves.append({
                                 "id": cve_id,
+                                # Store the float-parsed score, not the raw value.
+                                # circl.lu often returns cvss as a JSON STRING
+                                # (e.g. "7.5"); storing it raw made the downstream
+                                # numeric filter (cvss_score >= 7.0) raise TypeError
+                                # and discard the entire CVE result set.
                                 "description": item.get("summary", "")[:200],
-                                "cvss_score": item.get("cvss", 0),
+                                "cvss_score": cvss_val,
                                 "severity": "high" if cvss_val >= 7 else "medium",
                                 "technology": tech_name
                             })
@@ -481,7 +524,14 @@ def run_nuclei_cve_scan(domain, recon_dir=None, out_file=None):
     else:
         cmd = f'echo "https://{domain}" | {nuclei_opts} {stderr_redirect}'
 
-    success, output = run_cmd(cmd, timeout=300)
+    # Timeout is env-overridable: the 300s default DEGRADED on multi-host estates
+    # (an 8-host IIS estate timed out before CVE coverage completed). Raise it via
+    # NUCLEI_CVE_TIMEOUT=<seconds> for a complete pass; default stays 300 for compat.
+    try:
+        cve_timeout = max(60, int(os.environ.get("NUCLEI_CVE_TIMEOUT", "300")))
+    except (TypeError, ValueError):
+        cve_timeout = 300
+    success, output = run_cmd(cmd, timeout=cve_timeout)
     timed_out = (
         not success and isinstance(output, str) and output.startswith("timeout after")
     )
@@ -605,10 +655,26 @@ def check_exposed_configs(domain, recon_dir=None):
 
     hosts = [f"https://{domain}"]
     if recon_dir:
+        # Prefer priority-ranked order (highest-risk first) so that if a cap is
+        # ever applied, the most important hosts survive the truncation. The
+        # live/urls.txt file is `sort -u` (alphabetical), so capping it would
+        # silently drop hosts by name rather than by risk.
+        ranked_file = os.path.join(recon_dir, "priority", "prioritized_hosts.txt")
         live_file = os.path.join(recon_dir, "live", "urls.txt")
-        if os.path.exists(live_file):
-            with open(live_file) as f:
-                hosts = [line.strip() for line in f if line.strip()][:20]
+        src_file = ranked_file if os.path.exists(ranked_file) else live_file
+        if os.path.exists(src_file):
+            with open(src_file) as f:
+                all_hosts = [line.strip() for line in f if line.strip()]
+            if all_hosts:
+                hosts = all_hosts
+                # Honor the uncapped contract unless an explicit cap is set.
+                if CVE_CONFIG_MAX_HOSTS > 0 and len(all_hosts) > CVE_CONFIG_MAX_HOSTS:
+                    hosts = all_hosts[:CVE_CONFIG_MAX_HOSTS]
+                    print(
+                        f"    [!] Coverage degraded: probing {CVE_CONFIG_MAX_HOSTS} "
+                        f"of {len(all_hosts)} live hosts for exposed configs "
+                        f"(capped via CVE_CONFIG_MAX_HOSTS)"
+                    )
 
     for host in hosts:
         for path in config_paths:
@@ -718,7 +784,7 @@ def hunt_cves(domain, recon_dir=None, findings_root=None):
             f"(nuclei {nuclei_status.get('status', 'degraded').upper()} — coverage INCOMPLETE)"
         )
 
-    high_cves = [c for c in all_cves if c.get("cvss_score", 0) >= 7.0]
+    high_cves = [c for c in all_cves if _coerce_cvss(c.get("cvss_score", 0)) >= 7.0]
     if high_cves:
         print(f"\n  HIGH/CRITICAL CVEs ({len(high_cves)}):")
         for cve in sorted(high_cves, key=lambda x: -x.get("cvss_score", 0)):

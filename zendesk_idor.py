@@ -202,18 +202,26 @@ def test_graphql():
             if r.status_code == 200:
                 try:
                     data = r.json()
-                    if "data" in data and "__schema" in data.get("data", {}):
-                        types = data["data"]["__schema"]["types"]
-                        print(f"  [GraphQL {path}] INTROSPECTION ENABLED! {len(types)} types found!")
-                        print(f"    Types: {[t['name'] for t in types[:10]]}...")
-                        # Save full schema
-                        with open("recon/zendesk/graphql_schema.json", "w") as f:
-                            json.dump(data, f, indent=2)
-                        print(f"    Schema saved to recon/zendesk/graphql_schema.json")
-                    else:
-                        print(f"  [GraphQL {path}] Status 200 but no schema: {json.dumps(data)[:200]}")
-                except Exception:
+                except ValueError:
                     print(f"  [GraphQL {path}] Status 200 but not JSON: {r.text[:200]}")
+                    continue
+                if "data" in data and "__schema" in data.get("data", {}):
+                    types = data["data"]["__schema"]["types"]
+                    print(f"  [GraphQL {path}] INTROSPECTION ENABLED! {len(types)} types found!")
+                    print(f"    Types: {[t['name'] for t in types[:10]]}...")
+                    # Save full schema. Do this OUTSIDE the JSON-parse guard so a
+                    # filesystem error never masquerades as 'not JSON' and discards
+                    # the confirmed introspection finding (recon/zendesk/ may not exist).
+                    schema_path = "recon/zendesk/graphql_schema.json"
+                    try:
+                        os.makedirs(os.path.dirname(schema_path), exist_ok=True)
+                        with open(schema_path, "w") as f:
+                            json.dump(data, f, indent=2)
+                        print(f"    Schema saved to {schema_path}")
+                    except OSError as e:
+                        print(f"    [WARN] introspection ENABLED but could not save schema to {schema_path}: {e}")
+                else:
+                    print(f"  [GraphQL {path}] Status 200 but no schema: {json.dumps(data)[:200]}")
             elif r.status_code in [404, 405]:
                 print(f"  [GraphQL {path}] Not found ({r.status_code})")
             else:

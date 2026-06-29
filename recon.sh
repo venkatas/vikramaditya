@@ -109,19 +109,29 @@ export HTTPX_BIN
 # short-circuit live-probe + dirsearch when no real subs exist beyond the
 # apex. Cheap (3 dig calls) and saves ~10 min on wildcarded targets.
 _detect_dns_wildcard() {
-    local apex="$1" hits=0 r1 r2 r3
+    local apex="$1" hits=0 a1 a2 a3 all_ips
     [ -z "$apex" ] && return
     [[ "$apex" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]] && return  # skip for IP/CIDR
-    r1=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
-    r2=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
-    r3=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null | head -1)
-    [ -n "$r1" ] && hits=$((hits+1))
-    [ -n "$r2" ] && hits=$((hits+1))
-    [ -n "$r3" ] && hits=$((hits+1))
+    # v10.6.0 — capture the FULL A-record set per random label (no `head -1`).
+    # A wildcard/LB zone round-robins several IPs; recording only the first
+    # (old WILDCARD_DNS_IP=r1) let dead hosts that resolved to a DIFFERENT
+    # wildcard IP slip past the dig-filter (fail-open, wasted probes). Build a
+    # deduped WILDCARD_DNS_IPS set across all three probes.
+    a1=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null)
+    a2=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null)
+    a3=$(dig +short +time=2 +tries=1 "vk-no-such-$RANDOM-$RANDOM.$apex" A 2>/dev/null)
+    [ -n "$a1" ] && hits=$((hits+1))
+    [ -n "$a2" ] && hits=$((hits+1))
+    [ -n "$a3" ] && hits=$((hits+1))
     if [ "$hits" -ge 2 ]; then
+        # Union all A records seen, keep only IPv4 literals, dedup.
+        all_ips=$(printf '%s\n%s\n%s\n' "$a1" "$a2" "$a3" \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
         export WILDCARD_DNS=1
-        export WILDCARD_DNS_IP="$r1"
-        echo -e "[!] DNS wildcard detected on $apex (random labels resolved to $r1) — brute-forced subs will be filtered post-resolution"
+        export WILDCARD_DNS_IPS="$all_ips"
+        # Keep WILDCARD_DNS_IP (first IP) for back-compat log/diagnostics.
+        export WILDCARD_DNS_IP=$(printf '%s\n' "$all_ips" | head -1)
+        echo -e "[!] DNS wildcard detected on $apex (random labels resolved to: $(printf '%s' "$all_ips" | tr '\n' ' ')) — brute-forced subs will be filtered post-resolution"
     fi
 }
 
@@ -163,6 +173,14 @@ AMASS_TIMEOUT="${AMASS_TIMEOUT:-180}"  # v10.1.2: 3 min (passive amass is low-yi
 # ~4 min producing 0 output on a live engagement run. Hard-kill like amass/dnsx.
 GAU_TIMEOUT="${GAU_TIMEOUT:-120}"      # 2 min — historical-URL pull
 WAYMORE_TIMEOUT="${WAYMORE_TIMEOUT:-180}"  # 3 min — multi-source archive pull
+# waybackurls also queries the (slow/rate-limiting) Wayback Machine and can hang
+# indefinitely with NO timeout — same failure mode as gau/waymore. Bound it.
+WAYBACK_TIMEOUT="${WAYBACK_TIMEOUT:-120}"  # 2 min — wayback historical-URL pull
+# Visual recon (gowitness) screenshots EVERY live URL at 12s/URL — disproportionate
+# on large estates (1700+ hosts ≈ 40 min, zero finding-value). Cap to the top-N
+# priority-ordered URLs; SCREENSHOT_MAX=0 = unlimited; SKIP_SCREENSHOTS=1 = skip phase.
+SCREENSHOT_MAX="${SCREENSHOT_MAX:-200}"
+SKIP_SCREENSHOTS="${SKIP_SCREENSHOTS:-}"
 CURL_TIMEOUT=10        # per request
 HTTP_PROBE_TIMEOUT=5   # reduced: 5s per-host timeout (was 10) — avoids macOS TCP hang
 
@@ -175,7 +193,15 @@ mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params,priority,exposu
 _emergency_merge_subs() {
     if [ ! -s "$RECON_DIR/subdomains/all.txt" ] && \
        ls "$RECON_DIR/subdomains/"*.txt &>/dev/null; then
-        cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null \
+        # v10.6.0 — passive-source files ONLY (mirror the authoritative merge); a
+        # blind *.txt glob re-ingested derived artefacts on a partial-exit re-run.
+        local _emf
+        local -a _em_files=()
+        for _emf in subfinder assetfinder amass crtsh wayback_subs otx hackertarget; do
+            [ -f "$RECON_DIR/subdomains/$_emf.txt" ] && _em_files+=("$RECON_DIR/subdomains/$_emf.txt")
+        done
+        [ "${#_em_files[@]}" -eq 0 ] && return 0
+        cat "${_em_files[@]}" 2>/dev/null \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/^\*\.//' \
             | grep -E "^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$" \
@@ -184,6 +210,8 @@ _emergency_merge_subs() {
         if [ "${_count:-0}" -gt 0 ]; then
             echo -e "${YELLOW}[$(ts)] [!]${NC} Emergency merge: ${_count} subdomains saved to all.txt"
         fi
+        # NOTE: this safety-net path deliberately does NOT write the Phase-1
+        # completion marker — it is a partial/early-exit merge, not authoritative.
     fi
 }
 trap _emergency_merge_subs EXIT
@@ -420,7 +448,12 @@ EOF
     fi
 fi
 
-if phase_done "$RECON_DIR/subdomains/all.txt"; then true; else
+# v10.6.0 — resume gates on a COMPLETION MARKER, not the all.txt data artefact.
+# A partial/early-exit all.txt (emergency-merge or a kill mid-enum) previously
+# looked "done" to phase_done and the resume skipped re-enumeration, locking in
+# an incomplete subdomain set. .enum.done is written ONLY after the authoritative
+# merge below (never in _emergency_merge_subs), so its presence means real done.
+if phase_done "$RECON_DIR/subdomains/.enum.done"; then true; else
 
 # ── Scope-lock: skip all enum tools, test only the exact given target ─────────
 if [ "$SCOPE_LOCK" = "1" ]; then
@@ -527,9 +560,14 @@ fi
 PASSIVE_SOURCES_TOTAL=0
 PASSIVE_SOURCES_EMPTY=0
 log_step "crt.sh..."
-curl -s --max-time 30 --connect-timeout 10 --retry 2 --retry-delay 2 \
-    "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null \
-    | python3 -c "
+# v10.6.0 — distinguish a transport failure (timeout / non-JSON body) from a
+# genuinely-empty CT result. Capture the raw body, verify it parses as a JSON
+# array (starts with '[') before feeding the parser; a curl/transport failure
+# is logged as such instead of masquerading as "0 subdomains".
+_CRTSH_RAW=$(curl -s --max-time 45 --connect-timeout 10 --retry 2 --retry-delay 2 \
+    "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null) || true
+if [ -n "$_CRTSH_RAW" ] && printf '%s' "$_CRTSH_RAW" | head -c 64 | grep -q '^[[:space:]]*\['; then
+    printf '%s' "$_CRTSH_RAW" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -542,25 +580,46 @@ try:
     [print(n) for n in sorted(names)]
 except: pass
 " > "$RECON_DIR/subdomains/crtsh.txt" 2>/dev/null || true
+else
+    : > "$RECON_DIR/subdomains/crtsh.txt"
+    log_warn "crt.sh: transport failure / non-JSON response — result is UNKNOWN, not empty"
+fi
+unset _CRTSH_RAW
 log_done "crt.sh: $(file_lines "$RECON_DIR/subdomains/crtsh.txt") subdomains"
 PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
 [ "$(file_lines "$RECON_DIR/subdomains/crtsh.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
 
 # Wayback Machine subdomains
+# v10.6.0 — capture the raw response so a transport failure (timeout / HTTP error)
+# is distinguished from a genuine empty result and folded into the passive-source
+# tally (was previously uncounted, so its silent failures escaped the coverage
+# warning). curl exit 0 = transport OK (possibly-empty body); non-zero = UNKNOWN.
 log_step "Wayback Machine subdomains..."
-curl -s --max-time 30 \
+if _WB_RAW=$(curl -s --max-time 30 \
     "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey" \
-    2>/dev/null \
-    | sed -nE "s|.*://([a-zA-Z0-9._-]+\.$TARGET).*|\1|p" \
-    | sort -u > "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null || true
+    2>/dev/null); then
+    printf '%s' "$_WB_RAW" \
+        | sed -nE "s|.*://([a-zA-Z0-9._-]+\.$TARGET).*|\1|p" \
+        | sort -u > "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null || true
+    PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
+    [ "$(file_lines "$RECON_DIR/subdomains/wayback_subs.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
+else
+    : > "$RECON_DIR/subdomains/wayback_subs.txt"
+    log_warn "Wayback: transport failure / timeout — result is UNKNOWN, not empty"
+fi
+unset _WB_RAW
 log_done "wayback subs: $(file_lines "$RECON_DIR/subdomains/wayback_subs.txt") subdomains"
 
 # AlienVault OTX
 log_step "AlienVault OTX..."
-curl -s --max-time 20 --connect-timeout 10 --retry 2 --retry-delay 2 \
+# v10.6.0 — same transport-vs-empty distinction as crt.sh. OTX returns a JSON
+# OBJECT ({...}) so we accept a leading '{'; a timeout / HTML error page is
+# logged as a transport failure rather than reported as "0 subdomains".
+_OTX_RAW=$(curl -s --max-time 45 --connect-timeout 10 --retry 2 --retry-delay 2 \
     "https://otx.alienvault.com/api/v1/indicators/domain/$TARGET/passive_dns" \
-    2>/dev/null \
-    | python3 -c "
+    2>/dev/null) || true
+if [ -n "$_OTX_RAW" ] && printf '%s' "$_OTX_RAW" | head -c 64 | grep -q '^[[:space:]]*{'; then
+    printf '%s' "$_OTX_RAW" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -570,23 +629,44 @@ try:
             print(h)
 except: pass
 " | sort -u > "$RECON_DIR/subdomains/otx.txt" 2>/dev/null || true
+else
+    : > "$RECON_DIR/subdomains/otx.txt"
+    log_warn "OTX: transport failure / non-JSON response — result is UNKNOWN, not empty"
+fi
+unset _OTX_RAW
 log_done "OTX: $(file_lines "$RECON_DIR/subdomains/otx.txt") subdomains"
 PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
 [ "$(file_lines "$RECON_DIR/subdomains/otx.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
 
+# HackerTarget
+# v10.6.0 — capture the raw body and detect the rate-limit sentinel
+# ("API count exceeded" / "error") BEFORE parsing. HackerTarget rate-limits
+# aggressively and returns that sentinel as the body, which the `grep -v` strips
+# to empty — previously indistinguishable from a genuine empty result and never
+# counted. A sentinel hit is a transport failure (UNKNOWN, not counted as empty);
+# a clean curl is folded into the tally like crt.sh/OTX.
+log_step "HackerTarget API..."
+if _HT_RAW=$(curl -s --max-time 20 \
+    "https://api.hackertarget.com/hostsearch/?q=$TARGET" 2>/dev/null) \
+    && ! printf '%s' "$_HT_RAW" | head -c 256 | grep -qi 'API count exceeded\|^error'; then
+    printf '%s' "$_HT_RAW" | cut -d',' -f1 | grep -v "^error\|^API" \
+        > "$RECON_DIR/subdomains/hackertarget.txt" 2>/dev/null || true
+    PASSIVE_SOURCES_TOTAL=$((PASSIVE_SOURCES_TOTAL + 1))
+    [ "$(file_lines "$RECON_DIR/subdomains/hackertarget.txt")" -eq 0 ] && PASSIVE_SOURCES_EMPTY=$((PASSIVE_SOURCES_EMPTY + 1))
+else
+    : > "$RECON_DIR/subdomains/hackertarget.txt"
+    log_warn "HackerTarget: transport failure / rate-limited (API count exceeded) — result is UNKNOWN, not empty"
+fi
+unset _HT_RAW
+log_done "hackertarget: $(file_lines "$RECON_DIR/subdomains/hackertarget.txt") subdomains"
+
 # v9.23 — surface widespread passive-source failures so 0-result runs aren't
 # silently treated as "the target genuinely has no subdomains".
+# v10.6.0 — moved here so all four counted sources (crt.sh/OTX/Wayback/HackerTarget)
+# are tallied before the warning fires.
 if [ "${PASSIVE_SOURCES_TOTAL:-0}" -gt 0 ] && [ "$PASSIVE_SOURCES_EMPTY" -eq "$PASSIVE_SOURCES_TOTAL" ]; then
-    log_warn "passive returned 0 from $PASSIVE_SOURCES_EMPTY/$PASSIVE_SOURCES_TOTAL CT sources (crt.sh/OTX) — possible rate-limit/outage, results may be incomplete"
+    log_warn "passive returned 0 from $PASSIVE_SOURCES_EMPTY/$PASSIVE_SOURCES_TOTAL sources (crt.sh/OTX/Wayback/HackerTarget) — possible rate-limit/outage, results may be incomplete"
 fi
-
-# HackerTarget
-log_step "HackerTarget API..."
-curl -s --max-time 20 \
-    "https://api.hackertarget.com/hostsearch/?q=$TARGET" \
-    2>/dev/null | cut -d',' -f1 | grep -v "^error\|^API" \
-    > "$RECON_DIR/subdomains/hackertarget.txt" 2>/dev/null || true
-log_done "hackertarget: $(file_lines "$RECON_DIR/subdomains/hackertarget.txt") subdomains"
 
 # asnmap — enumerate IP ranges for the target org (ASN → CIDR → IPs)
 # v9.23 — asnmap (like cvemap) now requires a ProjectDiscovery Cloud (PDCP)
@@ -632,11 +712,28 @@ except: pass
 fi
 
 # ── Merge & deduplicate ───────────────────────────────────────────────────────
-cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed 's/^\*\.//' \
-    | grep -E "^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$" \
-    | sort -u > "$RECON_DIR/subdomains/all.txt"
+# v10.6.0 — merge ONLY the passive-source files. A blind `*.txt` glob re-ingested
+# derived artefacts on a re-run (all.txt, all_with_permutations.txt, alterx.txt,
+# resolved.txt, shuffledns_resolved.txt …), which on a large estate re-fed the
+# 24M permutation set back into the passive merge. Enumerate the real sources.
+_PASSIVE_SUB_FILES=()
+for _f in subfinder assetfinder amass crtsh wayback_subs otx hackertarget; do
+    [ -f "$RECON_DIR/subdomains/$_f.txt" ] && _PASSIVE_SUB_FILES+=("$RECON_DIR/subdomains/$_f.txt")
+done
+# v10.6.0 — guard the empty-array case (mirrors the emergency-merge path above).
+# Under `set -u` (line 18), expanding "${arr[@]}" on a ZERO-length array raises
+# "unbound variable" on macOS bash 3.2 — and `2>/dev/null` does NOT suppress it
+# (it is a shell evaluation error, not cat's stderr), aborting Phase 1. Degrade
+# to an empty all.txt (0 subdomains) instead of a hard abort.
+if [ "${#_PASSIVE_SUB_FILES[@]}" -eq 0 ]; then
+    : > "$RECON_DIR/subdomains/all.txt"
+else
+    cat "${_PASSIVE_SUB_FILES[@]}" 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/^\*\.//' \
+        | grep -E "^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$" \
+        | sort -u > "$RECON_DIR/subdomains/all.txt"
+fi
 
 TOTAL_SUBS=$(file_lines "$RECON_DIR/subdomains/all.txt")
 log_ok "Total unique subdomains (pre-permutation): $TOTAL_SUBS"
@@ -646,10 +743,31 @@ log_ok "Total unique subdomains (pre-permutation): $TOTAL_SUBS"
 # Often finds assets that passive sources miss entirely.
 if tool_ok alterx && [ "$QUICK_MODE" != "--quick" ] && [ "$TOTAL_SUBS" -gt 0 ]; then
     log_step "alterx (subdomain permutation generation)..."
-    alterx -l "$RECON_DIR/subdomains/all.txt" -silent \
-        > "$RECON_DIR/subdomains/alterx.txt" 2>/dev/null || true
+    # BOUND the permutation explosion: a few-thousand passive set otherwise multiplies into tens
+    # of millions (observed 24M on a large estate), ballooning all.txt so Phase-2 resolution takes
+    # hours even chunked. -limit caps the output; operators wanting unlimited set ALTERX_LIMIT=0.
+    # v10.6.0 — default cap lowered 1,000,000 → 100,000. Even bounded, a 1M-row
+    # permutation set dominates Phase-2 resolution (chunked dnsx still walks every
+    # row) for marginal extra coverage. Operators wanting more raise ALTERX_LIMIT;
+    # ALTERX_LIMIT=0 = unlimited.
+    ALTERX_LIMIT="${ALTERX_LIMIT:-100000}"
+    if [ "${ALTERX_LIMIT:-0}" -gt 0 ] 2>/dev/null; then
+        alterx -l "$RECON_DIR/subdomains/all.txt" -limit "$ALTERX_LIMIT" -silent \
+            > "$RECON_DIR/subdomains/alterx.txt" 2>/dev/null || true
+    else
+        alterx -l "$RECON_DIR/subdomains/all.txt" -silent \
+            > "$RECON_DIR/subdomains/alterx.txt" 2>/dev/null || true
+    fi
     ALTERX_COUNT=$(file_lines "$RECON_DIR/subdomains/alterx.txt")
     log_done "alterx: $ALTERX_COUNT permutations generated"
+    # v10.6.0 — if the generator over-ran the cap (e.g. ALTERX_LIMIT=0 unlimited,
+    # or a future bump), SKIP the merge rather than ballooning all.txt into a
+    # multi-hour Phase-2. ALTERX_MERGE_CAP gates the merge independently of -limit.
+    ALTERX_MERGE_CAP="${ALTERX_MERGE_CAP:-100000}"
+    if [ "${ALTERX_MERGE_CAP:-0}" -gt 0 ] 2>/dev/null && [ "$ALTERX_COUNT" -gt "$ALTERX_MERGE_CAP" ]; then
+        log_warn "alterx: $ALTERX_COUNT permutations exceed merge cap $ALTERX_MERGE_CAP — NOT merging into all.txt (raise ALTERX_MERGE_CAP to override)"
+        ALTERX_COUNT=0
+    fi
     # Merge permutations back into all.txt and re-resolve in Phase 2
     if [ "$ALTERX_COUNT" -gt 0 ]; then
         cat "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/alterx.txt" \
@@ -691,6 +809,10 @@ if tool_ok shuffledns && [ "${SHUFFLEDNS_SKIP:-0}" != "1" ] \
 fi
 
 fi  # end SCOPE_LOCK else block
+# v10.6.0 — authoritative Phase-1 completion marker. Written here (after enum +
+# permutation + shuffledns merges) so resume can trust it; the emergency-merge
+# trap deliberately never writes it.
+date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/subdomains/.enum.done" 2>/dev/null || true
 fi  # end Phase 1 resume skip
 
 # ============================================================
@@ -706,32 +828,105 @@ fi  # end Phase 1 resume skip
 # mistaken for live hosts.
 echo ""
 log_info "Phase 2: DNS Resolution"
-if phase_done "$RECON_DIR/subdomains/resolved.txt"; then true; else
+# v10.6.0 — resume gates on the .dns.done marker, not the resolved.txt data
+# artefact. A partial resolved.txt (kill mid-chunk-loop) previously looked done.
+if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
     DNSX_CAP="${DNSX_MAX:-20000}"          # cap to avoid macOS large-list hang
     ALL_COUNT=$(file_lines "$RECON_DIR/subdomains/all.txt")
     DNS_VALIDATED=0                         # 1 only if dnsx actually resolved >0
-    if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] \
-       && [ -s "$RECON_DIR/subdomains/all.txt" ] && [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
-        log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
-        timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
-            > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
-        if [ -s "$RECON_DIR/subdomains/resolved.txt" ]; then
-            DNS_VALIDATED=1
-            RES_N=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
-            log_done "dnsx: $RES_N resolved (dropped $(( ALL_COUNT - RES_N )) non-resolving candidates)"
+    DNSX_FAILED_CHUNKS=0                    # >0 if any dnsx pass timed out/segfaulted
+    # v10.6.0 — treat a non-positive cap as UNCAPPED (route to the single-pass
+    # branch) instead of chunking with a bogus `split -l 0/-N` that errors out.
+    if [ "${DNSX_CAP:-0}" -le 0 ] 2>/dev/null; then
+        DNSX_CAP="$ALL_COUNT"
+        [ "$DNSX_CAP" -le 0 ] && DNSX_CAP=1
+    fi
+    if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
+        if [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
+            log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
+            # v10.6.0 (FIX) — capture the exit status instead of swallowing it with
+            # `|| true`. On timeout/segfault/rc!=0, resolved.txt holds only the partial
+            # set dnsx flushed before dying; mirror the chunked branch: mark the pass
+            # FAILED (so DNS_VALIDATED is NOT set and the wildcard dig-filter still
+            # runs) and UNION the full candidate set back (fail-OPEN — httpx probes them).
+            if timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
+                > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null; then
+                :
+            else
+                DNSX_FAILED_CHUNKS=1
+                cat "$RECON_DIR/subdomains/all.txt" >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+                sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
+                log_warn "dnsx single-pass FAILED (timeout/segfault) — $ALL_COUNT candidates kept UNVALIDATED (httpx will filter); resolution is NOT marked DNS-validated"
+            fi
         else
-            # dnsx ran but resolved nothing real — fall back to candidate list
-            # rather than an empty resolved.txt (httpx can still try).
+            # CRITICAL FIX: a candidate list LARGER than the cap must STILL be resolved. The old
+            # code skipped resolution entirely (`cp all.txt resolved.txt`), so httpx drowned in
+            # 100k+ UNRESOLVED candidates and surfaced only a few apex hosts — a government-scale
+            # wildcard estate (860k unique / 24M raw) collapsed to 9 "live", silently missing every
+            # real application/admin subdomain. DEDUP first (alterx can emit 20M+ duplicate
+            # permutations), then resolve in DNSX_CAP-sized CHUNKS. split -a 4 gives a 456,976-chunk
+            # ceiling; the DEFAULT 2-char suffix caps at 676 and SILENTLY truncates everything past
+            # 13.52M lines (split exits 65 but set -e is off, so the loop just runs on the partial set).
+            DEDUP="$RECON_DIR/subdomains/.all_dedup.txt"
+            sort -u "$RECON_DIR/subdomains/all.txt" > "$DEDUP"
+            UNIQ_COUNT=$(file_lines "$DEDUP")
+            CHUNK_DIR="$RECON_DIR/subdomains/.dnsx_chunks"
+            rm -rf "$CHUNK_DIR"; mkdir -p "$CHUNK_DIR"
+            split -a 4 -l "$DNSX_CAP" "$DEDUP" "$CHUNK_DIR/c_"
+            NCHUNK=$(ls "$CHUNK_DIR"/c_* 2>/dev/null | wc -l | tr -d ' ')
+            log_step "dnsx resolving $UNIQ_COUNT unique candidates (of $ALL_COUNT) in $NCHUNK chunk(s) of $DNSX_CAP..."
+            : > "$RECON_DIR/subdomains/resolved.txt"
+            # v10.6.0 (FIX) — a per-chunk dnsx failure (timeout / segfault / rc!=0)
+            # was swallowed by `|| true`, so a truncated set was mislabelled as a
+            # fully validated resolution. Track failed chunks: accumulate their
+            # candidates into .dnsx_failed and, after the loop, UNION them back into
+            # resolved.txt (fail-OPEN — httpx still probes them) and refuse to set
+            # DNS_VALIDATED when any chunk failed.
+            DNSX_FAILED_CHUNKS=0
+            DNSX_FAILED_LIST="$RECON_DIR/subdomains/.dnsx_failed.txt"
+            : > "$DNSX_FAILED_LIST"
+            for _chunk in "$CHUNK_DIR"/c_*; do
+                [ -f "$_chunk" ] || continue          # guard: empty glob if split produced nothing
+                if timeout -k 30 300 dnsx -silent -a -l "$_chunk" </dev/null \
+                    >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null; then
+                    :
+                else
+                    DNSX_FAILED_CHUNKS=$((DNSX_FAILED_CHUNKS + 1))
+                    cat "$_chunk" >> "$DNSX_FAILED_LIST" 2>/dev/null || true
+                fi
+            done
+            if [ "$DNSX_FAILED_CHUNKS" -gt 0 ] && [ -s "$DNSX_FAILED_LIST" ]; then
+                # Fail-open: keep the un-validated candidates so httpx still probes them.
+                cat "$DNSX_FAILED_LIST" >> "$RECON_DIR/subdomains/resolved.txt"
+                log_warn "dnsx: $DNSX_FAILED_CHUNKS/$NCHUNK chunk(s) FAILED (timeout/segfault) — $(file_lines "$DNSX_FAILED_LIST") candidates kept UNVALIDATED (httpx will filter); resolution is NOT marked DNS-validated"
+            fi
+            rm -rf "$CHUNK_DIR" "$DEDUP"
+            rm -f "$DNSX_FAILED_LIST"
+            sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
+        fi
+        RES_N=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
+        # dnsx now ACTUALLY runs (single-pass or chunked), so non-empty output is real resolution.
+        # (The old "resolved.txt == all.txt unfiltered" failure was a `cp` no-op that can no longer
+        # occur on the dnsx path; the `-lt ALL_COUNT` guard wrongly failed tiny all-resolving lists.)
+        # A chunked run with ANY failed chunk is NOT trustworthy as "validated".
+        if [ -s "$RECON_DIR/subdomains/resolved.txt" ] && [ "${DNSX_FAILED_CHUNKS:-0}" -eq 0 ]; then
+            DNS_VALIDATED=1
+            log_done "dnsx: $RES_N resolved (dropped $(( ALL_COUNT - RES_N )) non-resolving candidates)"
+        elif [ -s "$RECON_DIR/subdomains/resolved.txt" ]; then
+            # output exists but some chunks failed → keep results, do NOT claim validation
+            DNS_VALIDATED=0
+            log_done "dnsx: $RES_N candidates (partial — $DNSX_FAILED_CHUNKS chunk(s) failed; httpx will filter live)"
+        else
             cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
-            log_warn "dnsx resolved 0 — falling back to $ALL_COUNT unresolved candidates (httpx will filter live)"
+            log_warn "dnsx resolved 0/unfiltered — falling back to $ALL_COUNT unresolved candidates (httpx will filter live)"
         fi
     else
-        # No resolver available (or list too large): do NOT claim resolution.
+        # No resolver available (or explicitly skipped): do NOT claim resolution.
         cp "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/resolved.txt"
         if ! tool_ok dnsx; then
             log_warn "dnsx not installed — $ALL_COUNT brute-force candidates UNRESOLVED (httpx will filter live)"
         else
-            log_warn "candidate list ($ALL_COUNT) exceeds dnsx cap ($DNSX_CAP) — skipping resolve, httpx will filter live"
+            log_warn "dnsx skipped (DNSX_SKIP=1) — $ALL_COUNT candidates UNRESOLVED (httpx will filter live)"
         fi
     fi
     # v9.2.0 (P1-7) — when DNS wildcard was detected, every brute-forced
@@ -742,35 +937,79 @@ if phase_done "$RECON_DIR/subdomains/resolved.txt"; then true; else
     # v9.23: runs unconditionally whenever a wildcard IP was captured (the old
     # WILDCARD_DNS=1 extra gate is gone — WILDCARD_DNS_IP is set only when a
     # wildcard was actually detected, which is the correct trigger).
-    if [ -n "${WILDCARD_DNS_IP:-}" ] && command -v dig &>/dev/null; then
+    # v10.6.0 (FIX 2/3) — this dig-based wildcard filter:
+    #   (a) MUST NOT run on a dnsx-VALIDATED set. dnsx already resolved every host;
+    #       re-pruning here dropped REAL hosts that legitimately share a wildcard /
+    #       load-balancer front-end IP. Gate the whole block on DNS_VALIDATED!=1.
+    #   (b) is a SECOND unbounded full-DNS pass (xargs -P16 dig over ALL of
+    #       resolved.txt). Cap its input at DIG_FILTER_CAP (default 20000) so a
+    #       large estate can't trigger a multi-hour re-resolution.
+    #   (c) per-host check is now fail-OPEN: keep the host on an empty/timeout dig,
+    #       and keep it if ANY A record is not the wildcard IP (multi-A LB hosts).
+    DIG_FILTER_CAP="${DIG_FILTER_CAP:-20000}"
+    if [ -n "${WILDCARD_DNS_IP:-}" ] && command -v dig &>/dev/null \
+       && [ "${DNS_VALIDATED:-0}" != "1" ]; then
         TOTAL_BEFORE=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
+        DIG_INPUT="$RECON_DIR/subdomains/resolved.txt"
+        if [ "${DIG_FILTER_CAP:-0}" -gt 0 ] 2>/dev/null && [ "$TOTAL_BEFORE" -gt "$DIG_FILTER_CAP" ]; then
+            DIG_INPUT="$RECON_DIR/subdomains/.dig_filter_input.txt"
+            head -n "$DIG_FILTER_CAP" "$RECON_DIR/subdomains/resolved.txt" > "$DIG_INPUT"
+            log_warn "Wildcard dig-filter input capped at $DIG_FILTER_CAP/$TOTAL_BEFORE (raise DIG_FILTER_CAP to widen); remaining hosts pass through unfiltered"
+        fi
         FILTERED="$RECON_DIR/subdomains/.resolved.filtered.txt"
         : > "$FILTERED"
         # Always keep the apex
         echo "$TARGET" >> "$FILTERED"
-        # Parallel dig with xargs; drop any host whose A record == wildcard_ip
+        # If we capped, the un-examined tail is kept verbatim (fail-open).
+        if [ "$DIG_INPUT" != "$RECON_DIR/subdomains/resolved.txt" ]; then
+            tail -n +"$(( DIG_FILTER_CAP + 1 ))" "$RECON_DIR/subdomains/resolved.txt" >> "$FILTERED" 2>/dev/null || true
+        fi
+        # v10.6.0 — match against the FULL wildcard IP SET (all round-robin IPs
+        # seen during detection), not just the first. Write the set to a temp file
+        # and drop a host only when EVERY one of its A records is in that set.
+        WC_IP_FILE="$RECON_DIR/subdomains/.wildcard_ips.txt"
+        printf '%s\n' "${WILDCARD_DNS_IPS:-$WILDCARD_DNS_IP}" \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u > "$WC_IP_FILE" 2>/dev/null || true
+        # Parallel dig with xargs. Fail-OPEN: drop a host ONLY when it resolves AND
+        # EVERY A record is in the wildcard IP set. Empty/timeout dig → keep the host.
         xargs -P 16 -I{} sh -c '
-            host="$1"; wc_ip="$2"
+            host="$1"; wc_file="$2"
             [ "$host" = "$3" ] && exit 0   # apex already added
-            real=$(dig +short +time=2 +tries=1 "$host" A 2>/dev/null | head -1)
-            if [ -n "$real" ] && [ "$real" != "$wc_ip" ]; then
+            real=$(dig +short +time=2 +tries=1 "$host" A 2>/dev/null \
+                | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
+            if [ -z "$real" ]; then
+                echo "$host"; exit 0       # fail-open: empty/timeout/non-A → keep
+            fi
+            # keep if ANY A record is NOT in the wildcard IP set (multi-IP LB hosts).
+            # grep -Fxv -f drops the wildcard IPs; a surviving line = a real IP.
+            if printf "%s\n" "$real" | grep -Fxv -f "$wc_file" >/dev/null 2>&1; then
                 echo "$host"
             fi
-        ' _ {} "$WILDCARD_DNS_IP" "$TARGET" < "$RECON_DIR/subdomains/resolved.txt" >> "$FILTERED" 2>/dev/null || true
+        ' _ {} "$WC_IP_FILE" "$TARGET" < "$DIG_INPUT" >> "$FILTERED" 2>/dev/null || true
+        rm -f "$WC_IP_FILE"
         sort -u "$FILTERED" > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null
         rm -f "$FILTERED"
+        [ "$DIG_INPUT" != "$RECON_DIR/subdomains/resolved.txt" ] && rm -f "$DIG_INPUT"
         TOTAL_AFTER=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
         log_step "Wildcard DNS filter: $TOTAL_BEFORE → $TOTAL_AFTER hosts (dropped $(( TOTAL_BEFORE - TOTAL_AFTER )) wildcard-only candidates)"
+    elif [ -n "${WILDCARD_DNS_IP:-}" ] && [ "${DNS_VALIDATED:-0}" = "1" ]; then
+        log_step "Wildcard DNS filter: SKIPPED — set is dnsx-validated (dig re-prune would drop real LB/wildcard-shared hosts)"
     fi
     if [ "${DNS_VALIDATED:-0}" = "1" ]; then
         log_done "Resolved hosts: $(file_lines "$RECON_DIR/subdomains/resolved.txt") (DNS-validated; httpx will probe live)"
     else
         log_done "Brute-force candidates: $(file_lines "$RECON_DIR/subdomains/resolved.txt") (UNRESOLVED; httpx will filter live)"
     fi
+    # v10.6.0 — authoritative Phase-2 completion marker (resume gates on this).
+    date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/subdomains/.dns.done" 2>/dev/null || true
 fi  # end Phase 2 resume skip
 
 RESOLVED_FILE="$RECON_DIR/subdomains/resolved.txt"
 RESOLVED_COUNT=$(file_lines "$RESOLVED_FILE")
+# v10.6.0 — PROBED_COUNT is the size of the set actually fed to httpx (used for
+# batch math). It defaults to the honest RESOLVED_COUNT and is narrowed only when
+# PROBE_CAP trims the probe set; RESOLVED_COUNT itself stays the honest total.
+PROBED_COUNT="$RESOLVED_COUNT"
 
 # ── Large-target adaptive tuning ─────────────────────────────────────────────
 # For targets with many resolved subdomains, probing all of them serially with
@@ -783,6 +1022,17 @@ HTTPX_TARGET_FILE="$RESOLVED_FILE"   # default: probe everything
 # (full subdomain coverage on big estates, at the cost of a longer probe).
 PROBE_CAP="${PROBE_CAP:-1500}"
 
+# v10.6.0 — random-sample helper: macOS lacks `shuf`. Prefer shuf → gshuf →
+# `sort -R` so the PROBE_CAP fill is a RANDOM sample, not an alphabetical
+# head (the old `head` truncation deterministically dropped the back half of
+# the alphabet — z* hosts were never probed on a capped large estate).
+_rand_head() {  # _rand_head <n> < input
+    local _n="$1"
+    if command -v shuf &>/dev/null; then shuf | head -n "$_n"
+    elif command -v gshuf &>/dev/null; then gshuf | head -n "$_n"
+    else sort -R | head -n "$_n"; fi
+}
+
 if [ "$RESOLVED_COUNT" -gt 5000 ] && [ "$PROBE_CAP" -gt 0 ]; then
     LARGE_TARGET=1
     BATCH_SIZE=100
@@ -790,16 +1040,23 @@ if [ "$RESOLVED_COUNT" -gt 5000 ] && [ "$PROBE_CAP" -gt 0 ]; then
     log_warn "Large target: $RESOLVED_COUNT resolved hosts — switching to BATCH_SIZE=100"
     log_step "Building priority-filtered probe list (keyword + cap $PROBE_CAP)..."
     PRIORITY_PROBE="$RECON_DIR/subdomains/priority_probe.txt"
-    # Step 1: keyword-priority hosts first
+    # Step 1: keyword-priority hosts first (random sample within the keyword set)
     grep -iE "(admin|api|portal|login|vpn|mail|dev|staging|test|beta|upload|backup|legacy|ftp|app|dashboard|internal|intranet|monitor|jenkins|grafana|kibana|jira|proxy|gateway|auth|oauth|token|swagger|openapi|console|manage|corp|secure|access|secret|config|db|database|git|ci|cd|build|deploy|infra|cloud|prod|uat|qa|preprod)" \
-        "$RESOLVED_FILE" 2>/dev/null | head -"$_KW_CAP" > "$PRIORITY_PROBE" || true
-    # Step 2: fill up to PROBE_CAP with remaining hosts not already selected
-    grep -vxFf "$PRIORITY_PROBE" "$RESOLVED_FILE" 2>/dev/null | head -"$_FILL_CAP" >> "$PRIORITY_PROBE" || true
+        "$RESOLVED_FILE" 2>/dev/null | _rand_head "$_KW_CAP" > "$PRIORITY_PROBE" || true
+    # Step 2: fill up to PROBE_CAP with a RANDOM sample of remaining hosts (was an
+    # alphabetical `head`, which silently never probed the tail of the alphabet)
+    grep -vxFf "$PRIORITY_PROBE" "$RESOLVED_FILE" 2>/dev/null | _rand_head "$_FILL_CAP" >> "$PRIORITY_PROBE" || true
     awk '!seen[$0]++' "$PRIORITY_PROBE" > "${PRIORITY_PROBE}.dedup" && mv "${PRIORITY_PROBE}.dedup" "$PRIORITY_PROBE"
     PRIORITY_COUNT=$(file_lines "$PRIORITY_PROBE")
+    # v10.6.0 — keep RESOLVED_COUNT as the HONEST total resolved; use a separate
+    # PROBED_COUNT for batch math. The old code overwrote RESOLVED_COUNT with the
+    # capped subset, so every downstream "resolved hosts" figure under-reported.
+    PROBED_COUNT="$PRIORITY_COUNT"
+    if [ "$RESOLVED_COUNT" -gt "$PROBED_COUNT" ]; then
+        log_warn "PROBE_CAP=$PROBE_CAP — $(( RESOLVED_COUNT - PROBED_COUNT )) live host(s) of $RESOLVED_COUNT will NOT be httpx-probed (raise PROBE_CAP or set 0 to probe all)"
+    fi
     log_step "Priority probe list: $PRIORITY_COUNT hosts (from $RESOLVED_COUNT resolved)"
     HTTPX_TARGET_FILE="$PRIORITY_PROBE"
-    RESOLVED_COUNT="$PRIORITY_COUNT"
 
 elif [ "$RESOLVED_COUNT" -gt 5000 ]; then
     # PROBE_CAP=0 → uncapped: probe ALL resolved hosts (full coverage, slower)
@@ -825,8 +1082,9 @@ if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
         | awk 'NF && !seen[$0]++' > "$_PROBE_WITH_APEX" 2>/dev/null || true
     if [ -s "$_PROBE_WITH_APEX" ]; then
         HTTPX_TARGET_FILE="$_PROBE_WITH_APEX"
-        RESOLVED_COUNT=$(file_lines "$HTTPX_TARGET_FILE")
-        log_step "Apex force-included in probe set ($TARGET, www.$TARGET) — $RESOLVED_COUNT hosts to probe"
+        # PROBED_COUNT tracks the actual probe-set size; RESOLVED_COUNT stays honest.
+        PROBED_COUNT=$(file_lines "$HTTPX_TARGET_FILE")
+        log_step "Apex force-included in probe set ($TARGET, www.$TARGET) — $PROBED_COUNT hosts to probe"
     fi
 fi
 
@@ -834,8 +1092,13 @@ fi
 # Phase 3: HTTP Probing in Batches of BATCH_SIZE
 # ============================================================
 echo ""
-log_info "Phase 3: HTTP Probing in batches of $BATCH_SIZE (total: $RESOLVED_COUNT subdomains)"
-if phase_done "$RECON_DIR/live/httpx_full.txt"; then true; else
+log_info "Phase 3: HTTP Probing in batches of $BATCH_SIZE (probing: $PROBED_COUNT of $RESOLVED_COUNT resolved)"
+# v10.6.0 — resume gates on the .probe.done COMPLETION marker, not the
+# httpx_full.txt data artefact. httpx_full.txt is truncated then appended one
+# batch at a time, so a kill mid-batch-loop previously left a non-empty PARTIAL
+# file that phase_done treated as "done", silently locking in an incomplete
+# live-host set on --resume (same fix already applied to Phases 1 and 2).
+if phase_done "$RECON_DIR/live/.probe.done"; then true; else
 
 if ! tool_ok httpx; then
     log_warn "httpx not installed — skipping HTTP probing"
@@ -845,7 +1108,7 @@ else
     : > "$RECON_DIR/live/httpx_all_tech.txt"
 
     BATCH_NUM=0
-    TOTAL_BATCHES=$(( (RESOLVED_COUNT + BATCH_SIZE - 1) / BATCH_SIZE ))
+    TOTAL_BATCHES=$(( (PROBED_COUNT + BATCH_SIZE - 1) / BATCH_SIZE ))
 
     # Split resolved file into batches and process each
     BATCH_NUM=0
@@ -897,7 +1160,7 @@ else
 
     LIVE_COUNT=$(file_lines "$RECON_DIR/live/httpx_full.txt")
 
-    if [ "$LIVE_COUNT" -eq 0 ] && [ "$RESOLVED_COUNT" -gt 0 ] && { [ "${SCOPE_LOCK:-0}" = "1" ] || [ "$RESOLVED_COUNT" -le 50 ]; }; then
+    if [ "$LIVE_COUNT" -eq 0 ] && [ "$PROBED_COUNT" -gt 0 ] && { [ "${SCOPE_LOCK:-0}" = "1" ] || [ "$PROBED_COUNT" -le 50 ]; }; then
         SCHEME_RETRY_FILE="$RECON_DIR/live/.scheme_retry.txt"
         awk '{print "https://" $0 ORS "http://" $0}' "$HTTPX_TARGET_FILE" \
             | awk '!seen[$0]++' > "$SCHEME_RETRY_FILE" 2>/dev/null || true
@@ -974,6 +1237,34 @@ else
         fi
     fi
 
+    # v10.6 — DETECTING a CDN/WAF isn't enough: the edge then stonewalls the scan
+    # (the public host 403s/challenges). HUNT THE ORIGIN so downstream phases can
+    # test it DIRECTLY. Mine the enumerated estate for a non-proxied sibling that
+    # leaks the origin IP, then verify each candidate with a Host-header probe.
+    # Output: live/cf_origin.json {target:{verified:[{ip,status,title}], bypass}}.
+    _CFH="$(dirname "$0")/cf_origin_hunt.py"
+    if [ -s "$RECON_DIR/live/cdn_map.json" ] \
+       && grep -q '"cdn"\|"waf"' "$RECON_DIR/live/cdn_map.json" 2>/dev/null \
+       && [ -f "$_CFH" ] && command -v python3 >/dev/null 2>&1; then
+        # Feed the DNS-RESOLVED hosts (dozens), NOT all.txt — which carries thousands of
+        # alterx permutations that mostly NXDOMAIN. Resolving those sequentially in
+        # classify() was the real budget-killer (thousands of lookups on a real estate). Prefer
+        # resolved.txt; fall back to all.txt only if it is absent.
+        _SUBS="$RECON_DIR/subdomains/resolved.txt"; [ -s "$_SUBS" ] || _SUBS="$RECON_DIR/subdomains/all.txt"
+        log_step "cf_origin_hunt (Cloudflare/CDN origin discovery — WAF bypass)..."
+        # --deadline 180 < the 220s wrapper: the module self-bounds its concurrent
+        # probe phase and ALWAYS writes cf_origin.json before the hard kill (sequential
+        # probes previously overran the wrapper and the module died with no output).
+        if timeout 220 python3 "$_CFH" --target "$TARGET" --deadline 180 \
+               --subdomains-file "$_SUBS" --out "$RECON_DIR/live/cf_origin.json" 2>/dev/null \
+           && grep -q '"bypass": true' "$RECON_DIR/live/cf_origin.json" 2>/dev/null; then
+            _ORIG=$(grep -oE '"ip": "[^"]+"' "$RECON_DIR/live/cf_origin.json" 2>/dev/null | head -1 | cut -d'"' -f4)
+            log_done "CF BYPASS — origin reachable: ${_ORIG:-found} (Host-header) → live/cf_origin.json"
+        else
+            log_warn "cf_origin_hunt: no verified origin (target not CDN-fronted, or origin not exposed)"
+        fi
+    fi
+
     log_done "200 OK:         $(file_lines "$RECON_DIR/live/status_200.txt")"
     log_done "3xx Redirect:   $(file_lines "$RECON_DIR/live/status_3xx.txt")"
     log_done "403 Forbidden:  $(file_lines "$RECON_DIR/live/status_403.txt")"
@@ -993,6 +1284,11 @@ else
             log_warn "Adaptive throttling: 429 rate ${RATE_429_PCT}% — reducing to $RATE_LIMIT rps / $THREADS threads for later phases"
         fi
     fi
+    # v10.6.0 — authoritative Phase-3 completion marker. Written ONLY after the
+    # full batch loop AND downstream URL/IP/status extraction complete; a kill
+    # mid-loop leaves no marker, so --resume re-runs the probe instead of locking
+    # in a partial live set. MUST stay outside the batch loop.
+    date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/live/.probe.done" 2>/dev/null || true
 fi
 fi  # end Phase 3 resume skip
 
@@ -1108,11 +1404,23 @@ start_async_phase "Phase 11: Subdomain Takeover Pre-Check" "$ASYNC_LOG_DIR/phase
 echo ""
 log_info "Phase 4.5: Visual Recon"
 mkdir -p "$RECON_DIR/screenshots"
-if phase_done "$RECON_DIR/screenshots/.gowitness.done"; then true; else
+if [ -n "$SKIP_SCREENSHOTS" ]; then
+    log_warn "Phase 4.5 skipped — SKIP_SCREENSHOTS set (visual recon disabled)"
+    touch "$RECON_DIR/screenshots/.gowitness.done"
+elif phase_done "$RECON_DIR/screenshots/.gowitness.done"; then true; else
 if tool_ok gowitness && [ -s "$RECON_DIR/live/urls.txt" ]; then
     URL_COUNT=$(file_lines "$RECON_DIR/live/urls.txt")
-    log_step "gowitness ($URL_COUNT URLs, 6 threads, 12s/URL timeout)..."
-    gowitness scan file -f "$RECON_DIR/live/urls.txt" -t 6 -T 12 \
+    # Cap the full pass on large estates: screenshot only the top-N priority-ordered
+    # URLs (live/urls.txt is written priority-ordered). At 12s/URL the uncapped pass
+    # is ~40min on 1700+ hosts for zero finding-value; SCREENSHOT_MAX=0 = all.
+    SHOT_SRC="$RECON_DIR/live/urls.txt"
+    if [ "${SCREENSHOT_MAX:-0}" -gt 0 ] 2>/dev/null && [ "$URL_COUNT" -gt "$SCREENSHOT_MAX" ]; then
+        head -n "$SCREENSHOT_MAX" "$RECON_DIR/live/urls.txt" > "$RECON_DIR/screenshots/.shot_targets.txt"
+        SHOT_SRC="$RECON_DIR/screenshots/.shot_targets.txt"
+        log_warn "gowitness: capped to $SCREENSHOT_MAX/$URL_COUNT priority URLs (set SCREENSHOT_MAX=0 for all, SKIP_SCREENSHOTS=1 to skip)"
+    fi
+    log_step "gowitness ($(file_lines "$SHOT_SRC") URLs, 6 threads, 12s/URL timeout)..."
+    gowitness scan file -f "$SHOT_SRC" -t 6 -T 12 \
         -s "$RECON_DIR/screenshots" \
         --write-jsonl --write-jsonl-file "$RECON_DIR/screenshots/gowitness.jsonl" \
         -q 2>/dev/null || true
@@ -1130,7 +1438,11 @@ fi  # end Phase 4.5
 # ============================================================
 echo ""
 log_info "Phase 6: URL Collection"
-if phase_done "$RECON_DIR/urls/gau.txt"; then true; else
+# v10.6.0 — resume gates on the .urls.done COMPLETION marker, not gau.txt. gau.txt
+# is written early in the phase while katana crawl, waymore, the all.txt merge and
+# the with_params/js/api subset extraction still follow; a kill after gau but
+# before the merge previously looked "done" to phase_done and skipped the rest.
+if phase_done "$RECON_DIR/urls/.urls.done"; then true; else
 
 # gau — historical URLs from multiple sources
 if tool_ok gau; then
@@ -1147,10 +1459,10 @@ else
     log_done "wayback: $(file_lines "$RECON_DIR/urls/wayback.txt") URLs"
 fi
 
-# waybackurls — extra coverage
+# waybackurls — extra coverage (timeout-bounded; the Wayback API can hang forever)
 if tool_ok waybackurls; then
     log_step "waybackurls..."
-    echo "$TARGET" | waybackurls \
+    echo "$TARGET" | timeout -k 15 "$WAYBACK_TIMEOUT" waybackurls \
         > "$RECON_DIR/urls/waybackurls.txt" 2>/dev/null || true
     log_done "waybackurls: $(file_lines "$RECON_DIR/urls/waybackurls.txt") URLs"
 fi
@@ -1168,12 +1480,27 @@ fi
 if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
     log_step "katana crawl on high-priority + sample live hosts..."
 
-    # Crawl CRITICAL first, then sample others
+    # v10.6.0 — build the crawl list from ALL priority tiers (critical → high →
+    # medium → low) then backfill from live URLs, dedup with awk to PRESERVE the
+    # priority ORDER (the old `sort -u | head -50` alphabetised first, so the
+    # cap kept a-z-sorted hosts and dropped lower-alphabet criticals). The cap is
+    # now env-controllable: KATANA_HOST_CAP (default 50, 0 = uncapped).
+    KATANA_HOST_CAP="${KATANA_HOST_CAP:-50}"
     {
         [ -s "$RECON_DIR/priority/critical_hosts.txt" ] && cat "$RECON_DIR/priority/critical_hosts.txt"
-        [ -s "$RECON_DIR/priority/high_hosts.txt" ] && head -10 "$RECON_DIR/priority/high_hosts.txt"
-        head -20 "$RECON_DIR/live/urls.txt"
-    } | sort -u | head -50 > "$RECON_DIR/urls/katana_targets.txt"
+        [ -s "$RECON_DIR/priority/high_hosts.txt" ]     && cat "$RECON_DIR/priority/high_hosts.txt"
+        [ -s "$RECON_DIR/priority/medium_hosts.txt" ]   && cat "$RECON_DIR/priority/medium_hosts.txt"
+        [ -s "$RECON_DIR/priority/low_hosts.txt" ]      && cat "$RECON_DIR/priority/low_hosts.txt"
+        cat "$RECON_DIR/live/urls.txt"   # backfill
+    } | awk 'NF && !seen[$0]++' > "$RECON_DIR/urls/.katana_targets.all" 2>/dev/null || true
+    if [ "${KATANA_HOST_CAP:-0}" -gt 0 ] 2>/dev/null; then
+        head -n "$KATANA_HOST_CAP" "$RECON_DIR/urls/.katana_targets.all" > "$RECON_DIR/urls/katana_targets.txt"
+    else
+        cp "$RECON_DIR/urls/.katana_targets.all" "$RECON_DIR/urls/katana_targets.txt"
+    fi
+    rm -f "$RECON_DIR/urls/.katana_targets.all"
+    _KATANA_TGT_N=$(file_lines "$RECON_DIR/urls/katana_targets.txt")
+    log_step "katana target list: $_KATANA_TGT_N hosts (cap=${KATANA_HOST_CAP}; 0=uncapped, priority-ordered)"
 
     timeout 300 katana -list "$RECON_DIR/urls/katana_targets.txt" \
         -d 3 -silent -jc \
@@ -1310,6 +1637,10 @@ if [ -s "$RECON_DIR/urls/all.txt" ]; then
     grep -iE '/graphql' "$RECON_DIR/urls/all.txt" \
         > "$RECON_DIR/urls/graphql.txt" 2>/dev/null || true
 fi
+# v10.6.0 — authoritative Phase-6 completion marker (resume gates on this). Written
+# only after the full collect+merge+filter pipeline finishes; a kill mid-phase
+# leaves no marker so --resume re-runs URL collection instead of skipping it.
+date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/urls/.urls.done" 2>/dev/null || true
 fi  # end Phase 6 resume skip
 
 # Refresh prioritization once URL and JS artifacts exist.
@@ -1711,7 +2042,36 @@ while IFS= read -r base_url; do
                 if [ "$DIFF" -le 2 ]; then continue; fi
             fi
 
-            echo "[EXPOSED] ${base_url}${path}"
+            # Soft-404 false-positive suppression (the dominant FP class). A framework
+            # custom-404 served as HTTP 200 (e.g. ASP.NET) ECHOES the requested path
+            # back into the body — <form action="./.env?404;http://host/..."> — so each
+            # path's body differs from the fingerprint baseline and slips past the
+            # md5/size checks above, producing a bogus [EXPOSED] /.env, /.git/config,
+            # /actuator/heapdump, … all of identical size. Two grounded suppressors:
+            LOWER_BODY=$(printf '%s' "$BODY" | tr 'A-Z' 'a-z')
+            # (a) the path-echo / framework-404 redirect signature (covers .php/.aspx too)
+            case "$LOWER_BODY" in
+                *'?404;'*|*'action="./'*|*"action='./"*|*'?404%3b'*) continue ;;
+            esac
+            # (b) a TEXT config path that returns an HTML document is a soft-404/SPA, not
+            #     the real file (.env/.git/.json/.yml/.ini/.conf/.properties/actuator are
+            #     never HTML when genuinely exposed). .php/.aspx render HTML legitimately,
+            #     so they are left to (a).
+            case "$path" in
+                *.env*|*.git/*|*.json|*.yml|*.yaml|*.ini|*.conf|*.config|*.properties|*.bak|*.sql|*actuator*)
+                    case "$LOWER_BODY" in
+                        *'<!doctype html'*|*'<html'*|*'<head>'*|*'<head '*|*'<form'*) continue ;;
+                    esac ;;
+            esac
+
+            # Persist GROUNDED proof (status + content-type + size + a content
+            # snippet) so a confirmed exposure is reportable evidence, not a bare
+            # URL the reporter/operator can't verify. Snippet capped at 180 chars,
+            # control chars stripped; full body NOT stored (size-bounded + may hold
+            # secrets — config_files.txt lives under gitignored recon/).
+            _SNIP=$(printf '%s' "$BODY" | head -c 180 | tr '\r\n\t' '   ' | tr -cd '[:print:]')
+            _CTV=$(printf '%s' "$CT" | sed -E 's/^[Cc]ontent-[Tt]ype:[[:space:]]*//; s/[\r\n]//g' | cut -d';' -f1)
+            echo "[EXPOSED] ${base_url}${path} :: status=${STATUS} type=${_CTV:-?} bytes=${BODY_SIZE} snippet=${_SNIP}"
         done < "$CONFIG_PATHS_FILE"
     ) >> "$RECON_DIR/exposure/config_files.txt" &
     CONFIG_PIDS+=("$!")

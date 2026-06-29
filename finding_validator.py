@@ -50,6 +50,60 @@ CHAIN_CANDIDATES = {
 
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
+# Default severity per vulnerability type. Used when the finding line carries
+# no explicit severity token. High-impact, generally-confirmed-on-detection
+# classes default to critical/high so they are NOT killed by --strict (which
+# is documented as "Kill below HIGH").
+VTYPE_DEFAULT_SEVERITY = {
+    "sqli": "critical",
+    "rce": "critical",
+    "ssti": "critical",
+    "lfi": "high",
+    "idor": "high",
+    "ssrf": "high",
+    "takeover": "high",
+    "upload": "high",
+    "oauth": "high",
+    "cves": "high",
+    "xss": "medium",
+    "cors": "medium",
+    "redirect": "low",
+    "misconfig": "low",
+    "exposure": "medium",
+    "race": "medium",
+}
+
+# Explicit severity tokens that may appear in a finding line, e.g.
+# "[CRITICAL]", "[HIGH - SQLi]", "(low)", "severity: high".
+#
+# IMPORTANT: only ANCHORED forms count. A bare severity word elsewhere on the
+# line (e.g. "info" inside "http://h/info.php", or "low" inside "low
+# false-positive rate") is NOT a severity declaration — honoring it would
+# silently DOWNGRADE a confirmed finding (a real SQLi line routinely contains
+# such words in its URL/description) and, under --strict, KILL it. So we match
+# only bracketed / parenthesized / "severity:"-labelled tokens; everything
+# else falls through to the per-vtype default.
+_SEVERITY_TOKEN_RE = re.compile(
+    r"\[\s*(critical|high|medium|low|info)\b"                    # [CRITICAL]  /  [HIGH - SQLi]
+    r"|\(\s*(critical|high|medium|low|info)\s*\)"                # (low)
+    r"|\bseverity\s*[:=]\s*(critical|high|medium|low|info)\b"    # severity: high  /  severity=high
+    r"|^\s*(critical|high|medium|low|info)\s*:",                 # leading label: "low: verbose ..."
+    re.IGNORECASE)
+
+
+def parse_severity(line: str, vtype: str = "") -> str:
+    """Derive a finding's severity.
+
+    Precedence:
+      1. An EXPLICIT, anchored severity token in the line (see _SEVERITY_TOKEN_RE).
+      2. The per-vtype default from VTYPE_DEFAULT_SEVERITY.
+      3. "medium" as a last-resort fallback.
+    """
+    m = _SEVERITY_TOKEN_RE.search(line or "")
+    if m:
+        return next(g for g in m.groups() if g).lower()
+    return VTYPE_DEFAULT_SEVERITY.get(vtype, "medium")
+
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower().strip())
@@ -58,7 +112,10 @@ def _normalize(text: str) -> str:
 def is_never_submit(finding_text: str) -> str | None:
     normalized = _normalize(finding_text)
     for pattern in NEVER_SUBMIT:
-        if pattern in normalized:
+        # Word/phrase-boundary aware: a never-submit phrase only matches as a
+        # standalone token sequence, not as incidental context inside a larger
+        # high-impact finding line.
+        if re.search(r"\b" + re.escape(pattern) + r"\b", normalized):
             return pattern
     return None
 
@@ -90,6 +147,14 @@ def validate_finding(finding: dict) -> dict:
         if chains:
             return {"decision": "chain_required", "reason": f"Never-submit '{ns_match}' but chainable",
                     "kill_question": 7, "chains": chains}
+        # A never-submit substring should not silently discard a finding that
+        # parsed as critical/high impact — route it to manual review instead of
+        # an outright kill, so a single context phrase cannot drop a real
+        # high-impact finding with no degradation marker.
+        if SEVERITY_RANK.get(severity, 2) <= 1:
+            return {"decision": "chain_required",
+                    "reason": f"Never-submit '{ns_match}' but parsed {severity} — manual review",
+                    "kill_question": 7, "chains": None}
         return {"decision": "kill", "reason": f"Never-submit: {ns_match}",
                 "kill_question": 7, "chains": None}
 
@@ -124,7 +189,8 @@ def validate_findings_dir(findings_dir: str, strict: bool = False) -> dict:
                         line = line.strip()
                         if not line or line.startswith("#"):
                             continue
-                        finding = {"raw": line, "vtype": vtype, "severity": "medium", "url": ""}
+                        finding = {"raw": line, "vtype": vtype,
+                                   "severity": parse_severity(line, vtype), "url": ""}
                         url_m = re.search(r"https?://\S+", line)
                         if url_m:
                             finding["url"] = url_m.group(0)
@@ -136,10 +202,11 @@ def validate_findings_dir(findings_dir: str, strict: bool = False) -> dict:
                 continue
 
     if strict:
+        # "Kill below HIGH": keep critical(0)/high(1), drop medium(2)/low(3)/info(4).
         for item in list(results["pass"]):
-            if SEVERITY_RANK.get(item["finding"].get("severity", "medium"), 2) >= 2:
+            if SEVERITY_RANK.get(item["finding"].get("severity", "medium"), 2) > 1:
                 item["decision"] = "kill"
-                item["reason"] = f"Strict mode: {item['finding']['severity']} killed"
+                item["reason"] = f"Strict mode: {item['finding']['severity']} killed (below HIGH)"
                 results["kill"].append(item)
                 results["pass"].remove(item)
     return results

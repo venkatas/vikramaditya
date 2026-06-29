@@ -176,7 +176,7 @@ DORK_CATEGORIES: dict[str, list[str]] = {
         'site:outlook.office365.com "{target}"',
         'site:{target} inurl:/.well-known/openid-configuration',
         'site:{target} inurl:/_layouts',           # SharePoint
-        'site:{target} inurl:/sites/             ',  # SharePoint sites
+        'site:{target} inurl:/sites/',              # SharePoint sites
         # Public Teams / OneDrive shares
         '"{target}" site:onedrive.live.com',
         '"{target}" site:1drv.ms',
@@ -288,11 +288,11 @@ def generate(target: str, category: str = "all") -> list[dict]:
             if cat == "all":
                 continue
             for tmpl in templates:
-                d = tmpl.replace("{target}", target)
+                d = tmpl.replace("{target}", target).strip()
                 results.append({"category": cat, "dork": d, "url": google_url(d)})
     else:
         for tmpl in DORK_CATEGORIES[category]:
-            d = tmpl.replace("{target}", target)
+            d = tmpl.replace("{target}", target).strip()
             results.append({"category": category, "dork": d, "url": google_url(d)})
     return results
 
