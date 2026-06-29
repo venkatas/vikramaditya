@@ -1953,6 +1953,35 @@ def _badge(sev: str) -> str:
             f'font-size:0.85em;font-weight:bold">{sev.upper()}</span>')
 
 
+try:
+    import technique_kb as _tkb
+except Exception:  # pragma: no cover - KB is optional; report still renders without it
+    _tkb = None
+
+
+def _attack_chain_str(vtype: str) -> str:
+    """Human attack-path ('SQL Injection → Credential Exposure → Auth Bypass') for a finding
+    vtype, from the technique_kb attack-chain graph. '' when unavailable or single-step. The
+    reporter already renders a MITRE id + remediation; this adds the *chaining* narrative —
+    what the finding ENABLES next — which conveys real business impact."""
+    if _tkb is None or not vtype:
+        return ""
+    try:
+        path = _tkb.chain_path(vtype)
+    except Exception:
+        return ""
+    if not path or len(path) < 2:
+        return ""
+    return " → ".join((_tkb.get(v).title if _tkb.get(v) else v) for v in path)
+
+
+def _attack_chain_row_html(vtype: str) -> str:
+    s = _attack_chain_str(vtype)
+    return ("" if not s else
+            '<tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0;vertical-align:top">'
+            f'Attack chain</td><td style="color:#842029">{s}</td></tr>')
+
+
 def _finding_remediation(f: dict, tmpl: dict) -> str:
     """Resolve the remediation text to render for a finding.
 
@@ -2491,6 +2520,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
         cvss   = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(sev, "N/A"))
         refs   = "".join(f'<li><a href="{u}" target="_blank">{n}</a></li>'
                          for n, u in tmpl.get("references", []))
+        _chain_row = _attack_chain_row_html(vtype)
         details += f"""
 <div id="VN-{i:03d}" style="margin-bottom:36px;border:1px solid #dee2e6;border-radius:6px;overflow:hidden">
   <div style="background:{SEVERITY_COLOR.get(sev, SEVERITY_COLOR['info'])};padding:12px 18px;color:#fff">
@@ -2503,6 +2533,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">CVSS</td><td>{cvss}</td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">CWE</td><td>{tmpl.get("cwe","N/A")}</td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">ATT&amp;CK</td><td><a href="https://attack.mitre.org/techniques/{ATTACK_IDS.get(vtype,'').replace('.','/')}" target="_blank">{ATTACK_IDS.get(vtype,"—")}</a></td></tr>
+      {_chain_row}
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0;vertical-align:top">Affected URL</td>
           <td><code style="word-break:break-all">{f["url"]}</code></td></tr>
     </table>
@@ -2755,6 +2786,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         lines += [
             f"### VN-{i:03d} — {title}",
             f"**Severity:** {f['severity'].upper()} | **CVSS:** {cvss} | **CWE:** {tmpl.get('cwe','N/A')} | **ATT&CK:** {ATTACK_IDS.get(f['vtype'],'—')}  ",
+            *([f"**Attack chain:** {_attack_chain_str(f['vtype'])}  "] if _attack_chain_str(f['vtype']) else []),
             f"**Affected URL:** `{f['url']}`", "",
             f"**Impact:** {tmpl['impact']}", "",
             "**Evidence / Proof of Concept:**", "```",
