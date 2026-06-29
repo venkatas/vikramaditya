@@ -183,6 +183,9 @@ REPORTS_DIR  = os.path.join(BASE_DIR, "reports")
 # authenticated authz/IDOR/PII audit (authz_audit) without threading the cookie through
 # the whole pipeline. Empty => unauthenticated run => the audit is skipped.
 _AUTHED_COOKIE = ""
+# --seed-urls: operator-supplied parameterized URLs forced into the sqli/param test set —
+# the fix for WebForms (__doPostBack) / SPA apps whose GET endpoints the link-crawl can't find.
+_SEED_URLS: list = []
 WORDLIST_DIR = os.path.join(BASE_DIR, "wordlists")
 HOME         = os.path.expanduser("~")
 GOBIN        = os.path.join(HOME, "go", "bin")
@@ -1590,6 +1593,32 @@ def _install_lightpanda() -> bool:
         return False
 
 
+_LP_HEADER_OK: bool | None = None
+
+
+def _lightpanda_supports_header() -> bool:
+    """Cached probe: does this lightpanda build's ``fetch`` accept ``--header``?
+
+    Some builds reject it ('unknown argument arg=--header'), which silently broke
+    authenticated POST-parameter discovery (the fetch errored → 0 forms found). When it is
+    unsupported we fall back to the cookie-capable HTTP path instead of passing a flag the
+    binary rejects (which fetched 0 forms / an unauthenticated page).
+    """
+    global _LP_HEADER_OK
+    if _LP_HEADER_OK is not None:
+        return _LP_HEADER_OK
+    lp = _lightpanda_bin()
+    if not lp:
+        _LP_HEADER_OK = False
+        return False
+    try:
+        res = run_capture([lp, "fetch", "--help"], shell=False, merge_stderr=True, timeout=10)
+        _LP_HEADER_OK = "--header" in (res.get("stdout", "") or "")
+    except Exception:
+        _LP_HEADER_OK = False
+    return _LP_HEADER_OK
+
+
 def _lightpanda_fetch_forms(url: str, cookies: str = "",
                              headers: dict | None = None,
                              timeout: int = 20) -> list[dict]:
@@ -1626,11 +1655,13 @@ def _lightpanda_fetch_forms(url: str, cookies: str = "",
                 self._cur = None
 
     lp = _lightpanda_bin()
+    # When cookies/headers are required for an AUTHENTICATED fetch but this lightpanda build
+    # rejects --header, use the cookie-capable HTTP fallback instead of a flag it errors on.
+    if lp and (cookies or headers) and not _lightpanda_supports_header():
+        lp = None
     html_content = ""
 
     if lp:
-        # Build env for cookies/headers
-        env_extra: dict = {}
         cmd_parts = [lp, "fetch", "--log_level", "warn"]
         if cookies:
             cmd_parts += ["--header", f"Cookie: {cookies}"]
@@ -6361,6 +6392,45 @@ def run_email_audit(domain: str, *, smtp_probe: bool = False) -> bool:
     return True
 
 
+def _parse_seed_urls(spec: str) -> list:
+    """--seed-urls accepts a FILE (one URL per line) OR a comma-separated list. Returns the
+    distinct http(s) URLs in order."""
+    if not spec:
+        return []
+    if os.path.isfile(spec):
+        with open(spec, errors="ignore") as fh:
+            raw = [ln.strip() for ln in fh]
+    else:
+        raw = [p.strip() for p in spec.split(",")]
+    out, seen = [], set()
+    for u in raw:
+        if u.startswith(("http://", "https://")) and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _seed_urls_into_recon(recon_dir: str, seeds: list) -> int:
+    """Append seed URLs into <recon_dir>/urls/with_params.txt so the sqlmap/param phases (and
+    the authz IDOR enumeration) test them — the fix for WebForms (__doPostBack) apps whose GET
+    endpoints the link-crawl never discovers. Dedups; returns the count newly written."""
+    if not seeds:
+        return 0
+    urls_dir = os.path.join(recon_dir, "urls")
+    os.makedirs(urls_dir, exist_ok=True)
+    wp = os.path.join(urls_dir, "with_params.txt")
+    existing = set()
+    if os.path.isfile(wp):
+        with open(wp, errors="ignore") as fh:
+            existing = {ln.strip() for ln in fh if ln.strip()}
+    new = [u for u in seeds if u not in existing]
+    if new:
+        with open(wp, "a") as fh:
+            for u in new:
+                fh.write(u + "\n")
+    return len(new)
+
+
 # ── NEW: sqlmap targeted scan ───────────────────────────────────────────────────
 def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     """
@@ -6368,6 +6438,9 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     """
     log("phase", f"SQLMAP: {domain}")
     recon_dir    = _resolve_recon_dir(domain)
+    _n_seeded = _seed_urls_into_recon(recon_dir, _SEED_URLS)
+    if _n_seeded:
+        log("ok", f"--seed-urls: {_n_seeded} URL(s) seeded into the sqli candidate set")
     findings_dir = _resolve_findings_dir(domain, create=True)
     sqli_dir     = os.path.join(findings_dir, "sqlmap")
     os.makedirs(sqli_dir, exist_ok=True)
@@ -6714,6 +6787,18 @@ def _parse_sqlmap_confirmation(out: str) -> dict:
             if m and m.group(1).lower() not in ("table", "tables"):
                 res["tables"].append(m.group(1))
 
+    # ANTI-FABRICATION veto: sqlmap's explicit not-injectable / false-positive verdict
+    # overrides any heuristic confirmation. The "the back-end dbms is X" line (and a transient
+    # "appears to be ... injectable") is printed DURING false-positive fingerprinting, so it
+    # must not stand once sqlmap rejects the point. A REAL confirmation always carries a
+    # structured "Parameter:"/"Type:" block; absent that, honour the rejection.
+    _NEG = ("false positive or unexploitable injection point",
+            "does not seem to be injectable",
+            "do not appear to be injectable",
+            "all tested parameters do not appear")
+    if any(n in low for n in _NEG) and not res["params"] and not res["types"]:
+        res["confirmed"] = False
+
     for k in ("params", "types", "payloads", "tables"):
         res[k] = list(dict.fromkeys(res[k]))
     return res
@@ -6923,6 +7008,23 @@ def _sqlmap_targeted_extract(req_abs: str, sqli_dir: str, schema: str, table: st
 
 
 # ── NEW: sqlmap via raw request file (--request-file) ───────────────────────────
+def _sqlmap_eval_crashed(out: str) -> bool:
+    """True if sqlmap's --eval (the WebForms VIEWSTATE/EventValidation refresh) crashed, so
+    the run NEVER actually tested the parameter — it must NOT be reported as a clean negative.
+
+    Seen live: a form param value that is a Python-invalid literal (e.g. a leading-zero date
+    like 01/01/2020) makes sqlmap's --eval raise 'SyntaxError: invalid decimal literal', sqlmap
+    aborts after ~1s, and the wrapper would otherwise log 'complete — no injection confirmed'
+    (a silent false-negative). Anti-fabrication: an aborted run is INCONCLUSIVE, not negative.
+    """
+    return "evaluating provided code" in (out or "").lower()
+
+
+def _sqlmap_eval_crash_reason(out: str) -> str:
+    m = re.search(r"evaluating provided code \('([^']+)'\)", out or "")
+    return m.group(1) if m else "eval error"
+
+
 def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                              level: int = 5, risk: int = 3,
                              extra_flags: str = "",
@@ -7175,7 +7277,14 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
         # audit-fix (finding 10): context-managed read (was a leaked fd).
         with open(sqli_out) as _sf:
             for ln in _sf:
-                if "injectable" in ln.lower() or "injection point" in ln.lower():
+                low_ln = ln.lower()
+                # ANTI-FABRICATION: "injection point" also matches "false positive or
+                # unexploitable injection point detected"; "injectable" matches "not
+                # injectable". Only a POSITIVE row may confirm — exclude the rejections.
+                if (("injectable" in low_ln or "injection point" in low_ln)
+                        and "false positive" not in low_ln and "unexploitable" not in low_ln
+                        and "not injectable" not in low_ln and "does not seem" not in low_ln
+                        and "do not appear" not in low_ln):
                     conf["confirmed"] = True
 
     target_url = path_from_file if path_from_file.lower().startswith("http") \
@@ -7208,6 +7317,18 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                 sf.write(f"ENUMERATED TABLES ({len(conf['tables'])}):\n"
                          + "\n".join(conf["tables"]) + "\n")
         log("crit", f"Summary → {summary_f}")
+    elif _sqlmap_eval_crashed(out):
+        # The --eval (WebForms token refresh) crashed → the parameter was NEVER tested.
+        # Report INCONCLUSIVE, not a clean negative (anti-fabrication / false-negative guard).
+        log("warn", f"sqlmap (request-file) INCONCLUSIVE — the WebForms --eval token refresh "
+                    f"CRASHED ({_sqlmap_eval_crash_reason(out)}); the scan did NOT actually test "
+                    f"the parameter, so this is NOT a clean negative. Re-test (e.g. avoid a "
+                    f"Python-invalid param value such as a leading-zero date like 01/01/2020). → {sqli_dir}")
+        try:
+            _mark_degraded("sqlmap_rf", "WebForms --eval crashed; request-file SQLi coverage is "
+                           "UNRELIABLE for this target — do NOT read 'no injection' as a clean result")
+        except Exception:
+            pass
     else:
         log("ok", f"sqlmap (request-file) complete — no injection confirmed → {sqli_dir}")
 
@@ -8758,6 +8879,10 @@ Examples:
                         help="Use real LangGraph backend for agent mode (requires pip install langgraph langchain-ollama)")
     parser.add_argument("--request-file",     type=str, metavar="PATH",
                         help="Raw HTTP request file (Burp export) — runs sqlmap -r directly")
+    parser.add_argument("--seed-urls",        type=str, default="", metavar="PATH_OR_LIST",
+                        help="Seed specific parameterized URLs (file with one URL/line, or a "
+                             "comma-separated list) into the sqli/param test set — for WebForms "
+                             "(__doPostBack) / SPA apps whose GET endpoints the crawl can't find")
     parser.add_argument("--post-params",      action="store_true",
                         help="Run POST parameter discovery (katana forms + arjun POST) on target")
     parser.add_argument("--cookie",           type=str, default="",
@@ -8801,6 +8926,11 @@ Examples:
         # authenticated authz/IDOR/PII audit without threading the cookie through the pipeline.
         global _AUTHED_COOKIE
         _AUTHED_COOKIE = args.cookie
+    # --seed-urls: parse once; run_sqlmap_targeted seeds them into the session's candidate set.
+    global _SEED_URLS
+    _SEED_URLS = _parse_seed_urls(getattr(args, "seed_urls", ""))
+    if _SEED_URLS:
+        log("info", f"--seed-urls: {len(_SEED_URLS)} URL(s) will be added to the sqli/param test set")
         if _authed:
             log("ok", f"Auth pre-flight: {_why}")
         else:
