@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -155,8 +156,11 @@ def create_app(
             upstream_resp = await client.send(upstream_req, stream=True)
         except httpx.HTTPError as e:
             await client.aclose()
+            # Do not echo the upstream exception text back to the caller — it can carry the
+            # upstream URL / internal detail. Log it locally; return a generic message.
+            print(f"[llm_anon] upstream request failed: {e!r}", file=sys.stderr)
             return JSONResponse(
-                {"error": "upstream_error", "detail": str(e)},
+                {"error": "upstream_error", "detail": "upstream request failed"},
                 status_code=502,
             )
 
