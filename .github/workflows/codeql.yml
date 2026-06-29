@@ -79,6 +79,26 @@ jobs:
         # injection rules misfire on test fixtures (e.g. `assert "example.com"
         # in stdout`) and bundled third-party JS — neither is a runtime attack
         # surface. Production modules are still fully analyzed.
+        #
+        # query-filters: four rule classes are STRUCTURAL false-positives for an
+        # offensive-security tool, triaged alert-by-alert (2026-06-29):
+        #   * clear-text-logging / clear-text-storage — the tool's core job is to
+        #     discover, DISPLAY (operator console) and REPORT (the engagement
+        #     report IS the deliverable) credentials/tokens it finds; flagging
+        #     that as a leak is noise. Tokens shown to the operator are truncated.
+        #   * incomplete-url-substring-sanitization — every instance is CANARY
+        #     REFLECTION detection (`"evil.com" in body` after injecting it, for
+        #     host-header-injection / open-redirect / CORS / cache-poisoning) or
+        #     SPF provider FINGERPRINTING (`"_spf.google.com" in spf_record`).
+        #     These are detection substrings, not trust/authorization checks —
+        #     exact-matching would BREAK the scanner.
+        #   * insecure-protocol — the TLS-posture scanner sets CERT_NONE on
+        #     purpose so it can inspect MISCONFIGURED targets (self-signed /
+        #     expired certs are exactly what it must assess).
+        # stack-trace-exposure is deliberately NOT excluded — that one was a real
+        # info-leak (llm_anon proxy) and is fixed in code, so the rule stays live.
+        # Re-review these exclusions if the tool ever adds genuine URL-trust
+        # validation or a secure-transport requirement of its own.
         config: |
           paths-ignore:
             - tests
@@ -86,6 +106,15 @@ jobs:
             - "**/*_test.py"
             - "**/*.min.js"
             - "**/vendor/**"
+          query-filters:
+            - exclude:
+                id: py/clear-text-logging-sensitive-data
+            - exclude:
+                id: py/clear-text-storage-sensitive-data
+            - exclude:
+                id: py/incomplete-url-substring-sanitization
+            - exclude:
+                id: py/insecure-protocol
         # If you wish to specify custom queries, you can do so here or in a config file.
         # By default, queries listed here will override any specified in a config file.
         # Prefix the list here with "+" to use these queries and those in the config file.
