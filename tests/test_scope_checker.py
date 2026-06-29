@@ -51,6 +51,61 @@ class TestExcludedDomains:
         assert sc.is_in_scope("https://status.target.com") is False
 
 
+class TestExclusionSubtree:
+    """Regression: a bare excluded host must exclude its whole subtree.
+
+    Previously the exclusion reused the allowlist's exact-match matcher, so a
+    subdomain of an explicitly out-of-scope host leaked back in-scope.
+    """
+
+    def test_bare_exclusion_blocks_self(self):
+        sc = ScopeChecker(["*.target.com"], ["internal.target.com"])
+        assert sc.is_in_scope("https://internal.target.com/") is False
+
+    def test_bare_exclusion_blocks_subtree(self):
+        sc = ScopeChecker(["*.target.com"], ["internal.target.com"])
+        assert sc.is_in_scope("https://deep.internal.target.com/") is False
+
+    def test_bare_exclusion_blocks_deep_subtree(self):
+        sc = ScopeChecker(["*.target.com"], ["internal.target.com"])
+        assert sc.is_in_scope("https://a.b.internal.target.com/") is False
+
+    def test_non_excluded_sibling_still_in_scope(self):
+        sc = ScopeChecker(["*.target.com"], ["internal.target.com"])
+        assert sc.is_in_scope("https://api.target.com/") is True
+
+    def test_exclusion_does_not_over_match_prefix(self):
+        """internal.target.com must NOT exclude evil-internal.target.com."""
+        sc = ScopeChecker(["*.target.com"], ["internal.target.com"])
+        assert sc.is_in_scope("https://evil-internal.target.com/") is True
+
+    def test_wildcard_exclusion_still_works(self):
+        sc = ScopeChecker(["*.target.com"], ["*.internal.target.com"])
+        assert sc.is_in_scope("https://deep.internal.target.com/") is False
+
+
+class TestTrailingDotFQDN:
+    """Regression: absolute (rooted) FQDNs with a trailing dot resolve
+    identically and must match the same patterns instead of being dropped.
+    """
+
+    def test_trailing_dot_in_scope(self):
+        sc = ScopeChecker(["*.target.com"])
+        assert sc.is_in_scope("https://sub.target.com./") is True
+
+    def test_trailing_dot_apex_exact(self):
+        sc = ScopeChecker(["target.com"])
+        assert sc.is_in_scope("https://target.com./") is True
+
+    def test_trailing_dot_excluded_still_blocked(self):
+        sc = ScopeChecker(["*.target.com"], ["blog.target.com"])
+        assert sc.is_in_scope("https://blog.target.com./") is False
+
+    def test_trailing_dot_out_of_scope_still_out(self):
+        sc = ScopeChecker(["*.target.com"])
+        assert sc.is_in_scope("https://evil.com./") is False
+
+
 class TestOutOfScope:
 
     def test_completely_different_domain(self, scope_domains, scope_excluded):

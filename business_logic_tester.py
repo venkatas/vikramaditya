@@ -151,7 +151,7 @@ def test_negative_values(session: AuthSession, token: str, endpoints: list[dict]
         if not numeric_fields:
             continue
 
-        for field in numeric_fields[:3]:
+        for field in numeric_fields:
             for val in neg_values:
                 test_body = dict(body)
                 test_body[field] = val

@@ -13,7 +13,10 @@ import hmac
 import json
 import os
 import struct
+import tempfile
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,13 +36,22 @@ class ReauthRequired(RuntimeError):
     """
 
 
-# Server responses that mean "this grant is permanently dead — re-auth needed",
-# as opposed to an ordinary wrong-password failure we should just report.
+# Unambiguous OAuth/grant phrases that mean "this grant is permanently dead —
+# re-auth needed", as opposed to an ordinary wrong-password failure we should
+# just report. These are specific enough to match prose safely on their own.
 _GRANT_DEAD_SIGNALS = (
     "invalid_grant", "invalid grant", "token expired", "token_expired",
     "refresh token", "refresh_token expired", "grant expired",
-    "expired token", "revoked",
+    "expired token",
 )
+
+# Broad standalone terms ("revoked", "expired", "invalid") that ALSO appear in
+# ordinary account-status prose ("this account has been revoked", "your trial
+# has expired"). To avoid false-positive re-auth aborts on a normal 401/403,
+# these only count as a dead grant when they co-occur with a grant/token
+# context word in the SAME response body.
+_GRANT_CONTEXT_WORDS = ("grant", "token", "refresh", "oauth")
+_GRANT_DEAD_AMBIGUOUS = ("revoked", "expired", "invalid")
 
 
 # ── TOTP (RFC 6238) — stdlib only ─────────────────────────────────────────────
@@ -109,14 +121,24 @@ class RateLimiter:
     def __init__(self, max_rps: float = 10.0):
         self._interval = 1.0 / max_rps if max_rps > 0 else 0
         self._last = 0.0
+        # Guards the read-compute-write of self._last so the limiter stays
+        # correct if a single instance is ever shared across threads
+        # (e.g. driven from a ThreadPoolExecutor). Without it, concurrent
+        # callers could read the same stale _last and fire simultaneously,
+        # briefly exceeding the configured per-second cap.
+        self._lock = threading.Lock()
 
     def wait(self) -> float:
-        now = time.monotonic()
-        elapsed = now - self._last
-        wait_time = max(0.0, self._interval - elapsed)
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last
+            wait_time = max(0.0, self._interval - elapsed)
+            # Reserve this caller's slot before releasing the lock so a
+            # concurrent caller computes its wait relative to ours, instead
+            # of racing on a stale timestamp. Sleep happens outside the lock.
+            self._last = now + wait_time
         if wait_time > 0:
             time.sleep(wait_time)
-        self._last = time.monotonic()
         return wait_time
 
 
@@ -225,12 +247,23 @@ class AuthSession:
     def __init__(self, base_url: str, rate_limiter: RateLimiter = None):
         import requests as _req
         self._session = _req.Session()
-        self._session.verify = False
+        # Honour the VERIFY_TLS opt-in toggle (strict by default; VAPT_INSECURE_SSL=1
+        # opts out for self-signed staging hosts). Hardcoding False here silently
+        # bypassed the toggle on the default-request path (self._session.request)
+        # and on every auto_login POST, defeating MITM detection on the scanner's
+        # own session even when the operator left the strict default in place.
+        self._session.verify = VERIFY_TLS
         self.base_url = base_url.rstrip("/")
         self._limiter = rate_limiter or RateLimiter(10.0)
         self._creds = None
         self._login_url = None
         self.token = None
+        # Cookie name carrying the auth token for explicit-token requests. Defaults to
+        # 'cf_at' but is overwritten in auto_login() with whichever cookie the server
+        # actually set the JWT in (cf_at/access_token/jwt/token/session), so cookie-only
+        # (non-Bearer) apps are sent the token under the RIGHT cookie name — otherwise an
+        # explicit-token request would carry an unrecognised 'cf_at' and falsely 401.
+        self._auth_cookie_name = "cf_at"
         # Expiry deadline (unix seconds) decoded from a JWT `exp` claim, or None
         # for opaque bearers / cookie-auth. Lets callers proactively re-auth.
         self.token_expires_at: int | None = None
@@ -298,7 +331,17 @@ class AuthSession:
             text = json.dumps(body, default=str).lower() if isinstance(body, (dict, list)) else str(body).lower()
         except Exception:
             text = str(body).lower()
-        return any(sig in text for sig in _GRANT_DEAD_SIGNALS)
+        # Specific, unambiguous grant/token phrases stand on their own.
+        if any(sig in text for sig in _GRANT_DEAD_SIGNALS):
+            return True
+        # Broad terms (revoked/expired/invalid) only count when a grant/token
+        # context word is present, so ordinary "account revoked"/"trial expired"
+        # 401/403 prose does NOT force a spurious re-auth abort.
+        if any(w in text for w in _GRANT_CONTEXT_WORDS) and any(
+            w in text for w in _GRANT_DEAD_AMBIGUOUS
+        ):
+            return True
+        return False
 
     def auto_login(
         self,
@@ -446,6 +489,9 @@ class AuthSession:
                 cookie_val = resp.cookies.get(cookie_name) or self._session.cookies.get(cookie_name)
                 if cookie_val and cookie_val.count(".") == 2:
                     self.token = cookie_val
+                    # Remember which cookie the server uses so explicit-token requests
+                    # send the token under the SAME name (not a hardcoded 'cf_at').
+                    self._auth_cookie_name = cookie_name
                     return cookie_val
 
             # Cookie-auth fallback when the server replied 2xx without a token.
@@ -487,9 +533,11 @@ class AuthSession:
                 # Cookie-based auth: use session cookies as-is
                 hdrs.pop("Authorization", None)
             else:
-                # Token auth: send as both Bearer header and cf_at cookie
+                # Token auth: send as both Bearer header and the auth cookie. The
+                # cookie name is whatever auto_login() observed the server set the JWT
+                # in (default 'cf_at'), so cookie-only apps aren't falsely 401'd.
                 hdrs["Authorization"] = f"Bearer {token}"
-                cookies["cf_at"] = token
+                cookies[self._auth_cookie_name] = token
         if headers:
             hdrs.update(headers)
         try:
@@ -506,7 +554,7 @@ class AuthSession:
                 import requests as _bare_req
                 resp = _bare_req.request(
                     method, url, json=json_body, data=data,
-                    headers=hdrs, cookies={"cf_at": token},
+                    headers=hdrs, cookies={self._auth_cookie_name: token},
                     timeout=timeout, allow_redirects=False,
                     verify=VERIFY_TLS,
                 )
@@ -541,11 +589,29 @@ class FindingSaver:
 
     def save(self, finding: dict):
         self._findings.append(finding)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        # Microsecond resolution + pid + uuid removes the realistic collision
+        # window between two same-category savers writing within one UTC second.
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         idx = len(self._findings)
-        path = os.path.join(self.dir, f"finding_{ts}_{idx:04d}.json")
-        with open(path, "w") as f:
-            json.dump(finding, f, indent=2, default=str)
+        suffix = uuid.uuid4().hex[:6]
+        # "x" (exclusive create) converts any residual collision into a loud
+        # FileExistsError instead of silently truncating/clobbering a finding.
+        for _ in range(5):
+            path = os.path.join(
+                self.dir,
+                f"finding_{ts}_{os.getpid()}_{idx:04d}_{suffix}.json",
+            )
+            try:
+                with open(path, "x") as f:
+                    json.dump(finding, f, indent=2, default=str)
+                return
+            except FileExistsError:
+                # Astronomically unlikely; regenerate the random suffix rather
+                # than overwrite an existing finding file.
+                suffix = uuid.uuid4().hex[:6]
+        raise FileExistsError(
+            f"FindingSaver.save: could not allocate a unique path in {self.dir}"
+        )
 
     def save_txt(self, finding: dict):
         """Also append one-liner to a summary text file for reporter.py."""
@@ -553,13 +619,38 @@ class FindingSaver:
         sev = finding.get("severity", "medium").upper()
         url = finding.get("url", "N/A")
         detail = finding.get("detail", finding.get("type", ""))
+        # reporter.py parses findings.txt strictly one-finding-per-physical-line
+        # and severity-tags via a `[...]` bracket scan. A newline in `detail`
+        # would split one finding across lines (the tail loses its [SEV] tag);
+        # a stray `]`/`[` could be mis-read as a severity tag. Normalise to a
+        # single line and neutralise brackets so the writer is robust no matter
+        # what a future call site places in `detail`.
+        detail = " ".join(str(detail).split())
+        detail = detail.replace("[", "(").replace("]", ")")
         with open(txt_path, "a") as f:
             f.write(f"[{sev}] {detail} {url}\n")
 
     def save_summary(self):
+        # Atomic write: dump to a temp file in the SAME directory, fsync, then
+        # os.replace() over the target. A truncate-then-dump ("w" mode) leaves
+        # summary.json zero-length / half-written if the process is interrupted
+        # (^C, OOM, the recurring macOS TCC Documents file-lock) and the reporter
+        # then silently under-reports findings. os.replace is atomic on POSIX.
         path = os.path.join(self.dir, "summary.json")
-        with open(path, "w") as f:
-            json.dump({"total": len(self._findings), "findings": self._findings}, f, indent=2, default=str)
+        data = {"total": len(self._findings), "findings": self._findings}
+        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".summary.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @property
     def count(self):

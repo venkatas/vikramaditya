@@ -129,8 +129,29 @@ def url_mangling(url: str, out_dir: Path) -> None:
         {"X-Custom-IP-Authorization": "127.0.0.1"},
         {"Referer": base + path},
     ]
+    # Baseline: request the unmangled path once so we can tell a genuine
+    # access-control change from generic non-block responses. Without this,
+    # any non-401/403/404 (5xx WAF block, 3xx login redirect, baseline-200)
+    # would be mis-tagged [BYPASS]. We only flag a request whose baseline was
+    # actually access-controlled (401/403/404) and that now returns a 2xx with
+    # a materially different body size.
+    base_url = base + path
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(base_url), timeout=10
+        ) as br:
+            base_status, base_sz = br.status, len(br.read())
+    except urllib.error.HTTPError as e:
+        base_status, base_sz = e.code, len(e.read())
+    except Exception:
+        base_status, base_sz = None, 0
+    base_blocked = base_status in (401, 403, 404)
+
     log = mangle_dir / "mangle.log"
     with open(log, "w") as fh:
+        fh.write(
+            f"# baseline {base_url} status={base_status} size={base_sz}B\n"
+        )
         for m in mangles:
             test_url = base + m
             for h in headers_set:
@@ -144,11 +165,31 @@ def url_mangling(url: str, out_dir: Path) -> None:
                     sz = len(e.read())
                 except Exception:
                     continue
-                marker = "[BYPASS]" if status not in (401, 403, 404) else "[ ]"
+                marker = _mangle_marker(status, sz, base_blocked, base_sz)
                 line = f"{marker} {status} {sz}B  {test_url}  H={list(h.keys())}\n"
                 fh.write(line)
                 fh.flush()
     print(f"[+] built-in mangle → {log}")
+
+
+def _mangle_marker(status: int, sz: int, base_blocked: bool, base_sz: int) -> str:
+    """Classify a mangled-request response relative to the unmangled baseline.
+
+    Returns:
+      [BYPASS] — baseline was access-controlled (401/403/404) AND this request
+                 got a 2xx with a body that materially differs from the blocked
+                 page (>64B delta). This is a genuine access-control bypass.
+      [?]      — ambiguous 2xx where the baseline was not a clean block (no
+                 useful baseline), so we surface it for manual triage instead
+                 of silently dropping it.
+      [ ]      — everything else (5xx, 3xx, still-blocked, baseline-identical).
+    """
+    is_2xx = 200 <= status < 300
+    if base_blocked and is_2xx and abs(sz - base_sz) > 64:
+        return "[BYPASS]"
+    if is_2xx and not base_blocked:
+        return "[?]"
+    return "[ ]"
 
 
 def fireprox_create(target_url: str, aws_profile: str, out_dir: Path) -> None:

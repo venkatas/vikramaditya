@@ -49,6 +49,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import storage  # atomic temp+fsync+os.replace write primitives (crash/^C/TCC-safe)
+
 # ── LangGraph optional import ──────────────────────────────────────────────────
 try:
     from langgraph.graph import StateGraph, END
@@ -97,6 +99,9 @@ try:
     _BRAIN_OK = True
 except Exception as _brain_err:
     _BRAIN_OK = False
+    BRAIN_SYSTEM = ""
+    MODEL_PRIORITY = ["qwen3:8b"]
+    OLLAMA_HOST = "http://localhost:11434"
 
 # v10.6.0 — host-gating (scopeguard.py, adapted from xalgorix MIT): block tool args
 # that target the operator's own machine/listener.
@@ -124,9 +129,6 @@ try:
     import coverage_gate as _covgate
 except Exception:
     _covgate = None
-    BRAIN_SYSTEM = ""
-    MODEL_PRIORITY = ["qwen3:8b"]
-    OLLAMA_HOST = "http://localhost:11434"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 GREEN   = "\033[0;32m"
@@ -168,8 +170,8 @@ TOOLS: list[dict] = [
                     },
                     "max_urls": {
                         "type": "integer",
-                        "description": "Max URLs to collect (default 100, use 200+ for thorough recon).",
-                        "default": 100,
+                        "description": "Max URLs to collect (default 0 = unlimited; set a positive N to cap).",
+                        "default": 0,
                     },
                 },
                 "required": [],
@@ -519,8 +521,35 @@ class HuntMemory:
                 self.observation_buf  = data.get("observation_buf", [])[-10:]
                 self.completed_steps  = data.get("completed_steps", [])
                 self.step_count       = data.get("step_count", 0)
-            except Exception:
-                pass
+                # Rehydrate the dedup key space from the restored findings_log so
+                # cross-resume classification stays idempotent. Without this, a
+                # --resume run re-walks byte-identical observation lines and
+                # re-appends already-recorded findings (count inflation). The key
+                # must match the (tool, sev, ln.strip()[:300]) form used in
+                # _classify_obs; add_finding stored text already stripped/sliced.
+                for _f in self.findings_log:
+                    self._classified_keys.add((
+                        _f.get("tool", ""),
+                        _f.get("severity", ""),
+                        (_f.get("text") or "")[:300],
+                    ))
+            except Exception as exc:
+                # A corrupt/half-written session file must NOT be silently
+                # reset to defaults — that throws away resume state without a
+                # word. Preserve the bad file for forensics and surface the
+                # problem loudly so the operator knows resume state was lost.
+                try:
+                    backup = f"{self.session_file}.corrupt.{int(time.time())}"
+                    os.replace(self.session_file, backup)
+                    where = backup
+                except OSError:
+                    where = self.session_file
+                print(
+                    f"{RED}[Agent] WARNING: could not parse session file "
+                    f"{self.session_file} ({exc}); starting fresh. "
+                    f"Corrupt file preserved at {where}.{NC}",
+                    file=sys.stderr, flush=True,
+                )
 
     def save(self) -> None:
         Path(self.session_file).parent.mkdir(parents=True, exist_ok=True)
@@ -532,7 +561,11 @@ class HuntMemory:
             "step_count":      self.step_count,
             "saved_at":        datetime.now().isoformat(),
         }
-        Path(self.session_file).write_text(json.dumps(data, indent=2))
+        # Atomic write: serialise in memory, write a temp sibling, fsync, then
+        # os.replace over the destination. _load() therefore always sees either
+        # the previous complete file or the new complete file — never a
+        # truncated one (crash / ^C / full disk / revoked macOS TCC lock).
+        storage.atomic_write_json(self.session_file, data)
 
     def add_observation(self, tool: str, text: str) -> None:
         """Record a tool output to the sliding observation window."""
@@ -586,7 +619,7 @@ class ToolDispatcher:
     """Execute tool calls and return plain-text observations."""
 
     def __init__(self, domain: str, memory: HuntMemory,
-                 scope_lock: bool = False, max_urls: int = 100,
+                 scope_lock: bool = False, max_urls: int = 0,
                  default_cookies: str = ""):
         self.domain          = domain
         self.memory          = memory
@@ -617,13 +650,41 @@ class ToolDispatcher:
         # machine/listener (loopback / 0.0.0.0 / our bind:port / a local interface).
         # RFC1918 / cloud-metadata SSRF targets are still allowed.
         if _scopeguard is not None:
+            # Recurse over nested dict/list args (e.g. http_request headers /
+            # json_body) so a host/URL buried inside a structured arg cannot
+            # silently bypass the self-target gate. Top-level strings AND every
+            # nested string value are vetted.
+            def _iter_strs(_val):
+                if isinstance(_val, str):
+                    yield _val
+                elif isinstance(_val, dict):
+                    for _x in _val.values():
+                        yield from _iter_strs(_x)
+                elif isinstance(_val, (list, tuple)):
+                    for _x in _val:
+                        yield from _iter_strs(_x)
             for _v in (args or {}).values():
-                if isinstance(_v, str):
-                    _hit = _scopeguard.scan_command(_v)
+                for _s in _iter_strs(_v):
+                    _hit = _scopeguard.scan_command(_s)
                     if _hit:
                         return (f"[BLOCKED] tool '{name}' arg targets {_hit} — the operator's "
                                 f"own machine/listener (out of scope). Refusing; point at the "
                                 f"authorized target host instead.")
+        else:
+            # FAIL CLOSED: scopeguard failed to import, so we cannot vet LLM-authored
+            # host/URL/command args against the operator's own machine/listener. Rather
+            # than silently fail OPEN (which would let the LLM aim a probe at loopback /
+            # our own bind:port), refuse any tool call that carries a free-form
+            # network-target arg. Pure-control tools (finish, update_working_memory,
+            # read_playbook, recon/scan toggles) have no such arg and still run.
+            _FREEFORM_TARGET_ARGS = ("url", "command", "cmd", "host", "target",
+                                     "request_file", "body", "headers")
+            for _k in (args or {}):
+                if _k in _FREEFORM_TARGET_ARGS:
+                    return (f"[BLOCKED] tool '{name}' carries a free-form '{_k}' arg but "
+                            f"scopeguard is unavailable — cannot verify it does not target the "
+                            f"operator's own machine/listener. Failing CLOSED (refusing) rather "
+                            f"than running an unvetted LLM-authored target.")
 
         try:
             if name == "run_recon":
@@ -1699,7 +1760,7 @@ def run_agent_hunt(
     domain: str,
     *,
     scope_lock: bool = False,
-    max_urls: int = 100,
+    max_urls: int = 0,
     max_steps: int = 20,
     time_budget_hours: float = 2.0,
     cookies: str = "",
@@ -1780,8 +1841,10 @@ def run_agent_hunt(
     )
     agent.bump_file = bump_path
 
-    result = agent.run()
-    tracer.close()
+    try:
+        result = agent.run()
+    finally:
+        tracer.close()
     result["backend"]    = "builtin-react"
     result["trace_path"] = log_path
     result["bump_path"]  = bump_path
@@ -1812,7 +1875,7 @@ Examples:
     parser.add_argument("--max-steps",   type=int,   default=20,  help="Max ReAct iterations (default 20)")
     parser.add_argument("--cookie",      type=str,   default="",  help="Session cookie for POST discovery")
     parser.add_argument("--scope-lock",  action="store_true",     help="Stick to exact target only")
-    parser.add_argument("--max-urls",    type=int,   default=100, help="Max URLs in recon (default 100)")
+    parser.add_argument("--max-urls",    type=int,   default=0, help="Max URLs in recon (default 0 = unlimited)")
     parser.add_argument("--model",       type=str,   default=None, help="Ollama model override")
     parser.add_argument("--langgraph",   action="store_true",     help="Use real LangGraph backend")
     parser.add_argument("--resume",      type=str,   default=None, help="Resume session ID")

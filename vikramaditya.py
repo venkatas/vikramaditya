@@ -42,6 +42,54 @@ N = "\033[0m"          # Reset
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Fork-safe subprocess launch. macOS' Network.framework registers a NON-fork-safe
+# pthread_atfork child handler that SIGSEGVs (rc=-11 at 0.0s) any subprocess.Popen
+# that takes the fork()+exec path AFTER the parent has done in-process HTTP/TLS I/O
+# (fingerprint_webapp_bounded runs many requests.* calls before the scan dispatch).
+# The rest of the toolkit (hunt.py, brain_scanner.py, brain.py) already routes every
+# post-network child through procutil for exactly this reason; the orchestrator now
+# does too. See procutil.py module docstring / _PosixSpawnProc.
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+from procutil import _fork_safe_spawn, run_capture  # noqa: E402
+
+
+def _run_streaming(cmd, cwd=None, env=None) -> int:
+    """Fork-safe replacement for ``subprocess.run(cmd)`` when output must STREAM
+    to the parent console (no capture) — e.g. long hunt.py phases whose markers
+    flush in real time. Uses procutil's posix_spawn launcher (capture=False lets
+    the child inherit fd 1/2) so we never fork() under live Network.framework
+    state. Returns the child's exit code."""
+    proc = _fork_safe_spawn(cmd, env=env, cwd=cwd, capture=False, shell=False)
+    return proc.wait()
+
+
+def _mark_fallback_degraded(output_dir: str, tool: str, reason: str) -> None:
+    """Record that a direct-fallback tool (sqlmap/nuclei) ran DEGRADED, so a
+    crashed/timed-out launch that produced no output is never silently reported
+    as a clean "No findings". Mirrors hunt.py's ``_mark_degraded`` convention by
+    appending to ``<output_dir>/coverage_degraded.json``."""
+    try:
+        marker = os.path.join(output_dir, "coverage_degraded.json")
+        entries = []
+        if os.path.isfile(marker):
+            try:
+                with open(marker) as fh:
+                    entries = json.load(fh) or []
+            except Exception:
+                entries = []
+        entry = {"tool": tool, "reason": reason,
+                 "phase": "autopilot_fallback", "ts": datetime.now().isoformat()}
+        # Dedupe on (tool, reason, phase) — the timestamp must NOT defeat dedup.
+        _key = (entry["tool"], entry["reason"], entry["phase"])
+        if not any((e.get("tool"), e.get("reason"), e.get("phase")) == _key
+                   for e in entries):
+            entries.append(entry)
+        with open(marker, "w") as fh:
+            json.dump(entries, fh, indent=2)
+    except Exception:
+        pass
+
 # v9.10.0 — single-source-of-truth for the orchestrator version. Emitted in
 # the per-engagement audit CSV (run_bookkeeping_log) so report consumers can
 # correlate findings to a tool build.
@@ -135,6 +183,34 @@ def _maybe_run_whitebox_for_target(target: str, session_dir, autonomous: bool = 
                 argv += ["--profile", p]
             # Use target-level dir so cloud/ is session-agnostic
             argv += ["--session-dir", str(session_dir), "--allowlist", host]
+            # v10.6.0 — the integrated launch previously NEVER plumbed
+            # --secrets-mode, so cloud_hunt always ran the default "heuristic"
+            # name-filter that silently skips every bucket/log-group whose name
+            # lacks a hint word. Exhaustive secret-value scanning was therefore
+            # unreachable from the orchestrator (operator had to drop to the
+            # CLI). Surface the choice: explicit opt-in like every other
+            # coverage-widening switch in this codebase.
+            #   * autonomous: honour whitebox.secrets_mode in config (default
+            #     "heuristic" — exhaustive is slower/wider, so it stays opt-in);
+            #   * interactive: ask once, defaulting OFF (heuristic).
+            _secrets_mode = "heuristic"
+            if autonomous:
+                _cfg_mode = str(
+                    (cfg.get("whitebox", {}) or {}).get("secrets_mode", "heuristic")
+                ).strip().lower()
+                if _cfg_mode == "exhaustive":
+                    _secrets_mode = "exhaustive"
+            else:
+                try:
+                    _ex = input(
+                        "Exhaustive secret-value scan of ALL buckets/log-groups? "
+                        "(default heuristic name-filter skips un-hinted stores) [y/N]: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    _ex = "n"
+                if _ex in ("y", "yes"):
+                    _secrets_mode = "exhaustive"
+            argv += ["--secrets-mode", _secrets_mode]
             _cloud_main(argv)
             # v9.2.0 (P0-1) — when the same AWS profile maps to multiple
             # targets in one sweep (e.g. clienta.com + clienta-adv.com
@@ -877,17 +953,25 @@ def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
     print(f"\n  {B}[»]{N} Launching hunt.py → {target}\n", flush=True)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
-    subprocess.run(cmd, cwd=SCRIPT_DIR, env=env)
+    # Fork-safe launch (this runs AFTER fingerprint_webapp_bounded's in-process
+    # HTTP I/O — see _run_streaming / procutil for the macOS atfork SIGSEGV class).
+    _run_streaming(cmd, cwd=SCRIPT_DIR, env=env)
 
 
 def run_legacy_crawl(target_url: str, creds: str, creds_b: str = None,
-                     output_dir: str = None) -> dict:
-    """Route to legacy_crawler.py for PHP/CGI/JSP app crawling + fuzzing."""
+                     output_dir: str = None, max_urls: int = 0) -> dict:
+    """Route to legacy_crawler.py for PHP/CGI/JSP app crawling + fuzzing.
+
+    v10.6.0 — thread the operator's ``--max-urls`` intent into the legacy
+    crawler's page cap (0 = unlimited, matching the documented contract). A
+    bare full run is therefore genuinely uncapped instead of silently truncated
+    at the engine's legacy 200-page default.
+    """
     sys.path.insert(0, SCRIPT_DIR)
     from legacy_crawler import LegacyCrawler
     crawler = LegacyCrawler(
         target_url=target_url, creds=creds, creds_b=creds_b,
-        output_dir=output_dir,
+        output_dir=output_dir, max_pages=(max_urls if max_urls else 0),
     )
     results = crawler.run_comprehensive_scan()
 
@@ -957,7 +1041,8 @@ def run_report(findings_dir: str, client: str = "", consultant: str = ""):
     if consultant:
         cmd.extend(["--consultant", consultant])
     print(f"\n  {B}[»]{N} Generating report...\n")
-    subprocess.run(cmd, cwd=SCRIPT_DIR)
+    # Fork-safe launch (reporter runs after the scan's in-process network I/O).
+    _run_streaming(cmd, cwd=SCRIPT_DIR)
 
 
 # ── Output Directory ──────────────────────────────────────────────────────────
@@ -976,17 +1061,44 @@ def make_output_dir(target: str) -> str:
         from whitebox.config_lock import write_session_lock
         # v10.2.0 — NEVER persist secret CLI values to config.lock.json. Redact the
         # value that follows a secret flag (Burp API key, credentials).
+        # v10.6.0 — also redact --llm-auth (carries an Authorization: Bearer token,
+        # forwarded as --auth-header) and --header (commonly Authorization/Cookie).
         _secret_flags = {"--burp-key", "--api-key", "--creds", "--creds-b",
-                         "--restler-token", "--ad-pass"}
-        _safe_argv, _redact_next = [], False
+                         "--restler-token", "--ad-pass", "--llm-auth", "--header"}
+        # Header names whose VALUE is a credential — for --header (a "Key: Value"
+        # string) we keep the header NAME visible but mask its value when sensitive.
+        _sensitive_header_names = {"authorization", "cookie", "set-cookie",
+                                   "x-api-key", "proxy-authorization", "x-auth-token"}
+
+        def _redact_header_value(_val: str) -> str:
+            # "Authorization: Bearer xxx" -> "Authorization: ***"; non-secret
+            # headers (e.g. "Accept: application/json") are left intact.
+            if ":" in _val:
+                _name, _ = _val.split(":", 1)
+                if _name.strip().lower() in _sensitive_header_names:
+                    return _name.strip() + ": ***"
+                return _val
+            return "***"  # malformed/unknown header — fail closed
+
+        _safe_argv, _redact_next, _redact_header_next = [], False, False
         for _a in sys.argv:
+            if _redact_header_next:
+                _safe_argv.append(_redact_header_value(_a))
+                _redact_header_next = False
+                continue
             if _redact_next:
                 _safe_argv.append("***"); _redact_next = False; continue
             _safe_argv.append(_a)
-            if _a in _secret_flags:
+            if _a == "--header":
+                _redact_header_next = True
+            elif _a in _secret_flags:
                 _redact_next = True
             elif "=" in _a and _a.split("=", 1)[0] in _secret_flags:
-                _safe_argv[-1] = _a.split("=", 1)[0] + "=***"
+                _k, _v = _a.split("=", 1)
+                if _k == "--header":
+                    _safe_argv[-1] = _k + "=" + _redact_header_value(_v)
+                else:
+                    _safe_argv[-1] = _k + "=***"
         write_session_lock(out_dir, args={"target": target, "argv": _safe_argv})
     except Exception:
         pass
@@ -1969,6 +2081,23 @@ def main():
 
     # ── Step 2: Route based on target type ────────────────────────────────
 
+    # v10.6.0 — resolve the ACTIVE credential blast-radius opt-in ONCE and thread
+    # it through every run_hunt call site. Previously only the no-creds URL path
+    # forwarded it, so --assess-creds was silently dropped on the ASN/CIDR/IP and
+    # apex/URL-error paths. Lazily memoised so the interactive prompt fires at most
+    # once and only on a path that actually reaches a run_hunt dispatch.
+    _assess_creds_cache = {}
+
+    def _resolve_assess_creds_once() -> bool:
+        if "v" not in _assess_creds_cache:
+            _assess_creds_cache["v"] = resolve_assess_creds(
+                cli["assess_creds"], autonomous,
+                prompt=lambda: confirm(
+                    "If a VERIFIED cloud credential is found, actively assess its "
+                    "blast-radius? (read-only AWS calls to the key's own account)",
+                    default_yes=False))
+        return _assess_creds_cache["v"]
+
     # --- HAR file → authenticated VAPT using captured browser session ---
     if target_info["type"] == "har":
         analysis = process_har_file(target_info["value"])
@@ -1997,7 +2126,11 @@ def main():
             if want_report:
                 try:
                     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "reporter.py"), result_file]
-                    subprocess.run(cmd, cwd=SCRIPT_DIR)
+                    # Fork-safe launch: HAR VAPT just did in-process requests I/O,
+                    # so a bare subprocess.run() fork() here is the macOS atfork
+                    # SIGSEGV class. Route through procutil like every other
+                    # post-network dispatch (run_hunt / run_report).
+                    _run_streaming(cmd, cwd=SCRIPT_DIR)
                 except Exception as e:
                     log("warn", f"Report generation failed: {e}")
         print(f"\n  {D}Done.{N}\n")
@@ -2018,7 +2151,8 @@ def main():
             print(f"  {D}Aborted.{N}")
             return
         for c in cidrs:
-            run_hunt(c, full=cli["full"], max_urls=cli["max_urls"])
+            run_hunt(c, full=cli["full"], max_urls=cli["max_urls"],
+                     assess_creds=_resolve_assess_creds_once())
         return
 
     # --- CIDR / IP → hunt.py directly ---
@@ -2029,7 +2163,8 @@ def main():
             return
         # v10.5.0 — full checklist by default (matches the domain/ASN paths);
         # subdomain enum is N/A for an IP/CIDR so hunt.py scope-locks itself.
-        run_hunt(target_info["value"], full=cli["full"], max_urls=cli["max_urls"])
+        run_hunt(target_info["value"], full=cli["full"], max_urls=cli["max_urls"],
+                 assess_creds=_resolve_assess_creds_once())
         return
 
     # --- Bare domain → hunt.py ---
@@ -2062,7 +2197,8 @@ def main():
                          cli["scope_lock"], autonomous,
                          prompt=lambda: confirm("Scope lock? (scan this exact host only, "
                                                 "no subdomain expansion)", default_yes=False)),
-                     max_urls=cli["max_urls"])
+                     max_urls=cli["max_urls"],
+                     assess_creds=_resolve_assess_creds_once())
             return
         else:
             target_info = classify_target(url_to_check)
@@ -2094,7 +2230,8 @@ def main():
                          cli["scope_lock"], autonomous,
                          prompt=lambda: confirm("Scope lock? (scan this exact host only, "
                                                 "no subdomain expansion)", default_yes=False)),
-                     max_urls=cli["max_urls"])
+                     max_urls=cli["max_urls"],
+                     assess_creds=_resolve_assess_creds_once())
             return
 
     show_summary(target_info, fp)
@@ -2222,6 +2359,7 @@ def main():
                     creds=creds,
                     creds_b=creds_b,
                     output_dir=output_dir,
+                    max_urls=cli["max_urls"],
                 )
                 findings_dir = output_dir
                 if result and result.get("vulnerabilities"):
@@ -2267,34 +2405,59 @@ def main():
                 # (legacy apps where REST endpoint patterns don't match)
                 if autonomous:
                     log("info", "Running direct tool scan (sqlmap + nuclei) on base URL...")
+                    # Fork-safe launches: these fire AFTER fingerprint_webapp_bounded's
+                    # in-process HTTP/TLS I/O, which on macOS makes a raw fork()+exec
+                    # SIGSEGV the child at 0.0s (rc=-11) — silently masked by
+                    # capture_output, dropping this safety-net SQLi/CVE coverage with no
+                    # trace. Route through procutil.run_capture (posix_spawn) like the
+                    # rest of the toolkit, and record a degradation marker if a launch
+                    # crashes/times-out so the empty result is never silently swallowed.
+                    sqlmap_rc = None
                     try:
-                        import subprocess as _sp
                         # sqlmap on the login form
                         log("info", "  sqlmap on login form...")
-                        _sp.run(["sqlmap", "-u", api_base,
-                                 "--forms", "--batch", "--level=3", "--risk=2",
-                                 "--random-agent", "--current-db",
-                                 "--output-dir", os.path.join(output_dir, "sqlmap")],
-                                timeout=180, capture_output=True)
+                        _r = run_capture(["sqlmap", "-u", api_base,
+                                          "--forms", "--batch", "--level=3", "--risk=2",
+                                          "--random-agent", "--current-db",
+                                          "--output-dir", os.path.join(output_dir, "sqlmap")],
+                                         timeout=180, shell=False)
+                        sqlmap_rc = _r.get("returncode")
+                        if _r.get("timed_out") or (sqlmap_rc is not None and sqlmap_rc < 0):
+                            _mark_fallback_degraded(
+                                output_dir, "sqlmap",
+                                f"exited abnormally (rc={sqlmap_rc}, timed_out={_r.get('timed_out')})")
                     except Exception as e:
                         log("warn", f"  sqlmap: {e}")
+                        _mark_fallback_degraded(output_dir, "sqlmap", str(e))
+                    nuclei_rc = None
                     try:
                         # nuclei on base URL — write into cves_custom/ so the
                         # reporter's Method 1c picks it up ([id] [proto] [sev] url).
                         log("info", "  nuclei CVE scan...")
                         nuclei_dir = os.path.join(output_dir, "cves_custom")
                         os.makedirs(nuclei_dir, exist_ok=True)
-                        _sp.run(["nuclei", "-u", api_base,
-                                 "-severity", "critical,high,medium", "-silent",
-                                 "-o", os.path.join(nuclei_dir, "nuclei_results.txt")],
-                                timeout=120, capture_output=True)
+                        _r = run_capture(["nuclei", "-u", api_base,
+                                          "-severity", "critical,high,medium", "-silent",
+                                          "-o", os.path.join(nuclei_dir, "nuclei_results.txt")],
+                                         timeout=120, shell=False)
+                        nuclei_rc = _r.get("returncode")
+                        if _r.get("timed_out") or (nuclei_rc is not None and nuclei_rc < 0):
+                            _mark_fallback_degraded(
+                                output_dir, "nuclei",
+                                f"exited abnormally (rc={nuclei_rc}, timed_out={_r.get('timed_out')})")
                     except Exception as e:
                         log("warn", f"  nuclei: {e}")
+                        _mark_fallback_degraded(output_dir, "nuclei", str(e))
                     # Repoint findings_dir ONLY if nuclei actually produced output,
                     # so the empty-fallback case still skips the report.
                     nuclei_out = os.path.join(output_dir, "cves_custom", "nuclei_results.txt")
                     if os.path.isfile(nuclei_out) and os.path.getsize(nuclei_out) > 0:
                         findings_dir = output_dir
+                    elif nuclei_rc is not None and (nuclei_rc < 0):
+                        # nuclei produced nothing AND crashed — make the dropped coverage
+                        # explicit rather than reporting a clean "No findings".
+                        log("warn", "  nuclei produced no output after an abnormal exit — "
+                                    "CVE coverage may be incomplete (see coverage_degraded.json)")
 
     elif not creds:
         # No creds — run hunt.py for unauthenticated scan
@@ -2311,11 +2474,7 @@ def main():
         # sensitive — the key may belong to a THIRD party — so it is explicit opt-in even in
         # autonomous mode (matches the whitebox cloud-audit gate). Passive reporting of a verified
         # leaked credential still happens unconditionally inside hunt.py regardless.
-        assess_creds = resolve_assess_creds(
-            cli["assess_creds"], autonomous,
-            prompt=lambda: confirm(
-                "If a VERIFIED cloud credential is found, actively assess its blast-radius? "
-                "(read-only AWS calls to the key's own account)", default_yes=False))
+        assess_creds = _resolve_assess_creds_once()
         log("info", "No credentials — running unauthenticated recon + vulnerability scan")
         print()
         run_hunt(domain, full=cli["full"], scope_lock=scope_lock,

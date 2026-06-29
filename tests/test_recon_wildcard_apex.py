@@ -74,8 +74,10 @@ def test_apex_forcing_dedups_when_apex_already_present(tmp_path):
 def test_probe_cap_is_env_controllable():
     s = _recon_src()
     assert 'PROBE_CAP="${PROBE_CAP:-1500}"' in s, "probe cap must default to 1500 but be overridable"
-    # the keyword/fill splits derive from PROBE_CAP, not a hardcoded 1000/500
-    assert 'head -"$_KW_CAP"' in s and 'head -"$_FILL_CAP"' in s
+    # the keyword/fill splits derive from PROBE_CAP, not a hardcoded 1000/500.
+    # v10.6.0 — truncation is now a RANDOM sample (_rand_head), not an alphabetical
+    # `head` that silently dropped the tail of the alphabet on a capped estate.
+    assert '_rand_head "$_KW_CAP"' in s and '_rand_head "$_FILL_CAP"' in s
     assert "head -1000" not in s and "head -500" not in s, "old hardcoded caps must be gone"
 
 

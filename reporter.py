@@ -679,6 +679,23 @@ SEVERITY_COLOR = {
     "info":     "#6c757d",
 }
 CVSS_DEFAULT = {"critical": "9.0", "high": "7.5", "medium": "5.0", "low": "2.5", "info": "0.0"}
+
+
+def _severity_counts(findings: list) -> dict:
+    """Per-severity counts for the Executive Summary table that ALWAYS reconcile
+    with len(findings). Loaders normalize severity, but as defense-in-depth any
+    finding whose severity is not a canonical SEVERITY_COLOR key is folded into
+    the 'info' bucket here so the table can never silently sum to less than Total
+    (which would happen with a bare exact-match comprehension)."""
+    counts = {s: 0 for s in SEVERITY_COLOR}
+    for f in findings:
+        sev = str(f.get("severity", "")).strip().lower()
+        if sev in ("informational", "information"):
+            sev = "info"
+        if sev not in counts:
+            sev = "info"
+        counts[sev] += 1
+    return counts
 SUBDIR_VTYPE = {
     "sqli": "sqli", "xss": "xss", "ssti": "ssti", "upload": "upload",
     "rce": "rce", "lfi": "lfi", "idor": "idor", "ssrf": "ssrf",
@@ -716,27 +733,33 @@ def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
     tmpl = VULN_TEMPLATES.get(default_vtype, {})
     sev = tmpl.get("severity", "medium")
 
-    # Override with explicit severity keywords in the raw finding text.
-    # Use word-boundary regex so severity tokens are not matched inside
-    # payload/evidence text — e.g. INFORMATION_SCHEMA must not match "INFO",
-    # HIGHCHARTS must not match "HIGH", SLOWLORIS/yellow must not match "LOW".
-    # Hyphen counts as a \b boundary, so RCE-POC / SSTI-CONFIRMED still match.
-    if re.search(r'\b(SQLI-POC-VERIFIED|RCE-POC|CRITICAL|CONFIRMED)\b', line):
-        sev = "critical"
-    elif re.search(r'\bHIGH\b', line):
-        sev = "high"
-    elif re.search(r'\bINFO\b', line):
-        # Explicit INFO is context, not a low-severity vuln. Mapping it to "low"
-        # turned benign informational lines (e.g. "CORS-INFO" for a wildcard
-        # ACAO without credentials) into LOW findings in the report.
-        sev = "info"
-    elif re.search(r'\bLOW\b', line):
-        sev = "low"
     url = "N/A"
     m = re.search(r'https?://\S+', line)
     if m:
         url = m.group(0).rstrip(".,;)")
-    tags = [tag.strip().lower() for tag in re.findall(r'\[([^\]]+)\]', line)]
+    # v10.6.1 ANTI-FABRICATION: strip ALL URLs before the severity-keyword scan so a
+    # benign URL PATH segment can never promote severity — e.g. a misconfig line for
+    # `https://h/api/CONFIRMED/status` was scored CRITICAL, and `/HIGH-availability/`
+    # was scored HIGH, purely because the path text contained the keyword.
+    text = re.sub(r'https?://\S+', ' ', line)
+
+    # Override with explicit severity keywords in the NON-URL finding text.
+    # Use word-boundary regex so severity tokens are not matched inside
+    # payload/evidence text — e.g. INFORMATION_SCHEMA must not match "INFO",
+    # HIGHCHARTS must not match "HIGH", SLOWLORIS/yellow must not match "LOW".
+    # Hyphen counts as a \b boundary, so RCE-POC / SSTI-CONFIRMED still match.
+    if re.search(r'\b(SQLI-POC-VERIFIED|RCE-POC|CRITICAL|CONFIRMED)\b', text):
+        sev = "critical"
+    elif re.search(r'\bHIGH\b', text):
+        sev = "high"
+    elif re.search(r'\bINFO\b', text):
+        # Explicit INFO is context, not a low-severity vuln. Mapping it to "low"
+        # turned benign informational lines (e.g. "CORS-INFO" for a wildcard
+        # ACAO without credentials) into LOW findings in the report.
+        sev = "info"
+    elif re.search(r'\bLOW\b', text):
+        sev = "low"
+    tags = [tag.strip().lower() for tag in re.findall(r'\[([^\]]+)\]', text)]
     if len(tags) > 1 and tags[1] in SEVERITY_ORDER:
         sev = tags[1]
     elif tags and tags[0] in SEVERITY_ORDER:
@@ -787,7 +810,8 @@ def load_findings(findings_dir: str) -> list:
                       "sqlmap",        # sqlmap/ is handled by Method 1f below
                       "email_auth",    # email_auth/findings.json handled by Method 1d below
                       "exposed_credentials",  # handled by Method 1h below
-                      "burp"}          # burp/findings.json handled by Method 1g below
+                      "burp",          # burp/findings.json handled by Method 1g below
+                      "authz"}         # authz/findings.json handled by Method 1i below
         for entry in sorted(os.listdir(findings_dir)):
             full = os.path.join(findings_dir, entry)
             if not os.path.isdir(full):
@@ -806,6 +830,20 @@ def load_findings(findings_dir: str) -> list:
     except OSError:
         pass
 
+    # Collected here so Method 1's cves/ loader can divert bare/unverified CVE-ID
+    # lines into the SAME "unconfirmed keyword match" collapse that Method 1b uses,
+    # instead of promoting each one to a CRITICAL cves finding (see below).
+    unconfirmed_cves = []
+
+    # ANY line that merely REFERENCES a CVE ID — bare ("CVE-2021-44228") OR with trailing
+    # text ("CVE-2021-44228 CVSS:10.0 Log4Shell") — in a non-allowlisted cves/*.txt is an
+    # unverified, unversioned keyword/ID match: the class Method 1b collapses to INFO. The
+    # generic .txt loader must NOT promote it to a CRITICAL "Known CVE Vulnerability" 9.0.
+    # (friends-review: a prefix-only `^CVE-..$` guard let "CVE-.. CVSS:10 Log4Shell" through.)
+    _CVE_REF_RE = re.compile(r'\bCVE-\d{4}-\d{4,}\b', re.IGNORECASE)
+    # cves/*.txt files that ARE confirmed findings (allowlist; fail-closed for the rest).
+    _CVES_CONFIRMED_TXT = {"nuclei_cve_confirmed.txt"}
+
     # Method 1: Subdirectory-based findings (scanner.sh output)
     for subdir, vtype in SUBDIR_VTYPE.items():
         path = os.path.join(findings_dir, subdir)
@@ -822,21 +860,58 @@ def load_findings(findings_dir: str) -> list:
         # File Upload" HIGHs from auth_required.txt during the 03-May clienta run).
         NON_FINDING_FILES = {
             "auth_required.txt",          # upload/ — paths protected by auth, not vulnerable
-            "timebased_candidates.txt",   # sqli/ — unverified timing candidates
             "auth-required.txt",
+            # NOTE: timebased_candidates.txt is deliberately NOT blacklisted — it can carry a
+            # [SQLI-POC-VERIFIED] line (an EMPIRICALLY-CONFIRMED time-based SQLi PoC) alongside
+            # the unverified [SQLI-CANDIDATE]/[SQLI-TIMEOUT-CANDIDATE] lines. File-level
+            # blacklisting silently dropped the CONFIRMED CRITICAL; the per-line
+            # NON_FINDING_PREFIXES below still suppress the unverified candidate lines.
             # cves/ — cvemap writes global "high-EPSS CVEs worth testing" (CVE IDs,
             # one per line via -lsi); they are NOT host/version-confirmed, so the
             # generic loader must not promote each ID to a CRITICAL cves finding.
             "cvemap_results.txt",
+            # cves/ — check_exposed_configs() (cve.py) writes accessible config-file URLs here, one
+            # per line. The generic cves/ loader rendered each as a CRITICAL "Known CVE Vulnerability"
+            # CVSS 9.0 — a readable config URL is NOT a CVE (wrong category + inflated severity). The
+            # exposed-config signal is better surfaced as a dedicated MEDIUM info-disclosure finding.
+            "exposed_configs.txt",
+            # supply_chain/ — raw `head -5` of cred-file response BODIES (incl. benign lines like
+            # "always-auth=true"). The actual finding is the [CRED-FILE] line in findings.txt; each
+            # snippet body line otherwise became a separate HIGH "Supply-Chain Exposure".
+            "snippets.txt",
+            # xss/ — raw `grep -iE "xss|payload|vulnerable"` of XSStrike PROGRESS output (payload-
+            # generation chatter, not a confirmed reflection). Verified XSS comes from dalfox; these
+            # raw lines were promoted to MEDIUM XSS findings.
+            "xsstrike_results.txt",
         }
         # Line-prefix markers used by scanner.sh to record state, not findings.
         NON_FINDING_PREFIXES = (
-            "[UPLOAD-CANDIDATE-AUTH]",   # path returned 403 to GET+POST = auth-protected
+            "[UPLOAD-CANDIDATE",         # open-ended — covers [UPLOAD-CANDIDATE], -POST, -VALIDATION,
+                                         # -AUTH. A readable file or probed endpoint in an upload dir is a
+                                         # discovery LEAD, not a verified unrestricted-upload vuln. Only a
+                                         # confirmed write/exec ([UPLOAD-ONLY-POC], [POC-RCE-CONFIRMED],
+                                         # [VULN] — none of which match this prefix) is a finding.
+                                         # (Real run: 16 PUBLIC report .html files in an /upload/ dir were
+                                         # promoted to HIGH "Unrestricted File Upload" CVSS 8.8 despite the
+                                         # scan's own summary.txt saying "Verified Upload Only: 0".)
+            "[UPLOAD-ACCEPTED-UNVERIFIED]",  # upload/ — POST accepted (canary path echoed) but the stored
+                                         # file was NEVER retrieved at any probed path: no write/exec confirm.
+                                         # scanner.sh keeps it ONLY as a manual-review signal in a SEPARATE
+                                         # file; without this it shipped as HIGH 8.8 "Unrestricted File Upload".
+            "[IMPORT-ENDPOINT",          # import_export/ — endpoint DISCOVERY (fires on 403/405 too), not an
+                                         # exploited business-logic flaw; was promoted to HIGH 8.1.
+            "[CONVERTER-ENDPOINT",       # import_export/ — converter endpoint guess (bare 200/405), not exploited.
+            "[SAML-ENDPOINT",            # saml/ — endpoint DISCOVERY (HTTP 200/302), NOT an exploited auth
+                                         # bypass; shipped CRITICAL via the auth_bypass template default.
+            "[JAVA-DESER]",              # deserialize/ — Content-Type fingerprint only (no gadget sent).
+            "[PHP-DESER]",               # deserialize/ — unserialize-error reflection heuristic, not exploited.
             "[SQLI-CANDIDATE]",          # unverified time-based candidate, needs follow-up
             "[SQLI-TIMEOUT-CANDIDATE]",  # timeout was server-side slow, not necessarily SQLi
             "[GIT-FLAG-INJECTION-CANDIDATE]",  # candidate, not confirmed
-            "[JAVA-RMI-CANDIDATE]",      # deserialize/ — manual ysoserial follow-up lead,
-                                         # NOT a confirmed HIGH deserialization finding
+            "[JAVA-RMI",                 # deserialize/ — open-ended: covers [JAVA-RMI] (path+banner
+                                         # fingerprint, no gadget executed) and [JAVA-RMI-CANDIDATE]. A manual
+                                         # ysoserial follow-up LEAD, NOT a confirmed HIGH deserialization vuln.
+                                         # Confirmed exec uses [POC-RCE-CONFIRMED]/[VULN] (different prefix).
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
@@ -849,6 +924,17 @@ def load_findings(findings_dir: str) -> list:
                     if not line or line.startswith("#"):
                         continue
                     if any(line.startswith(p) for p in NON_FINDING_PREFIXES):
+                        continue
+                    # cves/ fail-closed guard: only nuclei_cve_confirmed.txt holds confirmed
+                    # findings. Any other cves/*.txt line that REFERENCES a CVE ID (bare or
+                    # with trailing CVSS/name text) is an unverified, unversioned keyword/ID
+                    # match — divert it into the Method-1b INFO collapse, never a CRITICAL.
+                    # EXEMPT lines carrying a URL: a CVE ref WITH a target URL is nuclei
+                    # active-confirmation format (e.g. "[CVE-..] [http] [critical] https://h/x"),
+                    # a real hit — diverting it would be NEW over-suppression (friends 2nd pass).
+                    if vtype == "cves" and fn not in _CVES_CONFIRMED_TXT \
+                            and _CVE_REF_RE.search(line) and "http" not in line.lower():
+                        unconfirmed_cves.append((line.upper(), "", ""))
                         continue
                     finding = parse_custom_line(line, vtype)
                     for poc_key, poc_text in all_pocs.items():
@@ -870,7 +956,8 @@ def load_findings(findings_dir: str) -> list:
     # remaining unverified keyword matches are collapsed into ONE clearly-labelled
     # INFORMATIONAL context item so the findings table stays trustworthy.
     cve_path = os.path.join(findings_dir, "cves")
-    unconfirmed_cves = []
+    # NOTE: unconfirmed_cves is initialised before Method 1 (above) and may already
+    # hold bare-CVE-ID lines diverted from cves/*.txt — do NOT re-initialise it here.
     if os.path.isdir(cve_path):
         for fn in sorted(os.listdir(cve_path)):
             if not fn.endswith(".json"):
@@ -908,8 +995,9 @@ def load_findings(findings_dir: str) -> list:
                         })
                     else:
                         unconfirmed_cves.append((cve_id, product, score))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load CVE file {fn}: {e!r} — "
+                      "CVE findings from this file may be MISSING")
 
     # Collapse unconfirmed keyword matches into a single INFO context item.
     if unconfirmed_cves:
@@ -938,6 +1026,39 @@ def load_findings(findings_dir: str) -> list:
             "poc": (f"{_collapsed_detail}\n\n"
                     "Source: cves/cve_database_matches.json (keyword matches; not version-verified)."),
         })
+
+    # Method 1b-x: Exposed configuration files (cves/exposed_configs.txt).
+    # cve.py::check_exposed_configs writes URLs of ACTIVELY-ACCESSIBLE (HTTP 200, non-HTML)
+    # config files (.env, .git/config, web.config, appsettings.json, ...). The file is in
+    # NON_FINDING_FILES so the generic cves/ loader can't mis-render each as a CRITICAL
+    # "Known CVE" — but it IS a real exposure, so emit it here as a dedicated MEDIUM
+    # info-disclosure finding instead of dropping it (friends-review: it was silently lost).
+    _exposed_cfg = os.path.join(findings_dir, "cves", "exposed_configs.txt")
+    if os.path.isfile(_exposed_cfg):
+        try:
+            _seen_cfg = set()
+            with open(_exposed_cfg, errors="replace") as f:
+                for _ln in f:
+                    _u = _ln.strip()
+                    if not _u or _u.startswith("#") or _u in _seen_cfg:
+                        continue
+                    _seen_cfg.add(_u)                    # de-dup repeated URLs (friends 2nd pass)
+                    # Build via parse_custom_line so it inherits the misconfig template's
+                    # cwe/impact/remediation/cvss (a bare dict left those empty); force MEDIUM.
+                    _f = parse_custom_line(f"Exposed Configuration File {_u}", "misconfig")
+                    _f["severity"] = "medium"
+                    _f.update({
+                        "title": "Exposed Configuration File",
+                        "url": _u,
+                        "detail": (f"A configuration file is directly accessible without "
+                                   f"authentication: {_u} . Config files frequently disclose "
+                                   f"credentials, connection strings, framework versions, or "
+                                   f"internal paths (CWE-538). Review the content and restrict access."),
+                        "poc": f"GET {_u}  ->  HTTP 200 (config file served directly, unauthenticated).",
+                    })
+                    results.append(_f)
+        except OSError:
+            pass
 
     # Method 1c: cves_custom/ — output of scanner.sh Check 1.5 (nuclei custom templates)
     # v9.1.2 — added to surface findings from /Users/venkatasatish/Documents/GitHub/obsidian/nuclei-templates/
@@ -977,8 +1098,9 @@ def load_findings(findings_dir: str) -> list:
                                 "url": url,
                                 "poc": line,
                             })
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load cves_custom file {fn}: "
+                      f"{e!r} — custom-template findings from this file may be MISSING")
 
     # Method 1d: Email authentication posture (email_auth/findings.json)
     # v9.23 — subspace_sentinel writes SPF/DKIM/DMARC/DNSSEC/MTA-STS results as a
@@ -1022,8 +1144,10 @@ def load_findings(findings_dir: str) -> list:
                             f"Result: {item.get('result','')}\n\n"
                             f"{item.get('notes','')}"),
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load "
+                  f"{os.path.relpath(email_auth_path, findings_dir)}: {e!r} — "
+                  "email-auth findings may be MISSING from this report")
 
     # Method 1h: Verified cloud-credential blast-radius (exposed_credentials/findings.json)
     # cred_blast_radius.py writes a confirmed, READ-ONLY-verified assessment of a discovered &
@@ -1076,8 +1200,10 @@ def load_findings(findings_dir: str) -> list:
                     "url": item.get("source_url") or item.get("source_file", "N/A"),
                     "poc": "\n".join(poc),
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load "
+                  f"{os.path.relpath(exposed_cred_path, findings_dir)}: {e!r} — "
+                  "exposed-credential findings may be MISSING from this report")
 
     # Method 1f: sqlmap-confirmed SQL injection (sqlmap/sqlmap_results.txt + results-*.csv)
     # v10.0.1 — hunt.py runs sqlmap with --results-file → sqlmap/sqlmap_results.txt, and
@@ -1201,6 +1327,20 @@ def load_findings(findings_dir: str) -> list:
                     sev = "high"   # Burp has no Critical severity — clamp per contract
                 if sev not in SEVERITY_ORDER:
                     sev = "info"
+                # v10.6.1 — ANTI-FABRICATION: Burp's "Tentative" is its LOWEST
+                # confidence tier (Tentative < Firm < Certain). A Tentative issue is
+                # an UNVERIFIED heuristic guess (frequently a false positive), not a
+                # confirmed vuln. Method 1g previously copied the raw Burp severity
+                # verbatim, so a Tentative-confidence "High" SQLi / "Medium" XSS — and
+                # even issues Burp itself flags as likely false-positive — shipped to
+                # the client report as verified high/medium findings. Downgrade any
+                # Tentative issue to INFO so it is preserved for manual review but
+                # never presented as a confirmed medium+ finding. Firm/Certain (and
+                # any unlabelled confidence) keep their reported severity.
+                confidence = str(item.get("confidence", "")).strip().lower()
+                if (confidence == "tentative"
+                        and SEVERITY_ORDER.get(sev, 4) < SEVERITY_ORDER["info"]):
+                    sev = "info"
                 vtype = (item.get("type") or item.get("vtype") or "misconfig")
                 if vtype not in VULN_TEMPLATES:
                     vtype = "misconfig"
@@ -1217,8 +1357,52 @@ def load_findings(findings_dir: str) -> list:
                 if item.get("cvss"):
                     finding["cvss"] = str(item["cvss"])
                 results.append(finding)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load "
+                  f"{os.path.relpath(burp_path, findings_dir)}: {e!r} — "
+                  "Burp findings may be MISSING from this report")
+
+    # Method 1i: Authz / disclosure detectors (authz/findings.json)
+    # authz_audit_run writes a JSON LIST of normalized findings
+    # {severity, type, title, url, detail, evidence, poc, confidence, source:"authz_audit"}
+    # from bfla_scanner (BFLA), idor_scanner (IDOR/BOLA) and pii_detector (bulk PII /
+    # directory disclosure). Mirrors the burp loader (Method 1g): the dir is in meta_dirs
+    # so the generic .txt walk ignores it; this is the sole ingestion path. Unlike Burp,
+    # these CAN be Critical (IDOR enumeration of a large record set), so severity is NOT
+    # clamped — BUT an UNCONFIRMED (candidate) finding is never shipped as Critical
+    # (anti-fabrication: a heuristic candidate is at most High).
+    authz_path = os.path.join(findings_dir, "authz", "findings.json")
+    if os.path.isfile(authz_path):
+        try:
+            with open(authz_path, errors="replace") as f:
+                authz_data = _json.load(f)
+            for item in (authz_data if isinstance(authz_data, list) else []):
+                sev = str(item.get("severity", "info")).lower()
+                if sev in ("informational", "information"):
+                    sev = "info"
+                if sev not in SEVERITY_ORDER:
+                    sev = "info"
+                confidence = str(item.get("confidence", "")).strip().lower()
+                if confidence == "candidate" and sev == "critical":
+                    sev = "high"   # an unconfirmed candidate is never presented as Critical
+                vtype = (item.get("type") or item.get("vtype") or "misconfig")
+                if vtype not in VULN_TEMPLATES:
+                    vtype = "misconfig"
+                finding = {
+                    "severity": sev,
+                    "vtype": vtype,
+                    "title": item.get("title", "Authorization / disclosure finding"),
+                    "detail": item.get("detail", ""),
+                    "url": item.get("url", "N/A"),
+                    "poc": item.get("poc", ""),
+                }
+                if item.get("cvss"):
+                    finding["cvss"] = str(item["cvss"])
+                results.append(finding)
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load "
+                  f"{os.path.relpath(authz_path, findings_dir)}: {e!r} — "
+                  "authz/IDOR/PII findings may be MISSING from this report")
 
     # Method 1e: Brain active scanner output (brain_active/iteration_*.json)
     # brain_scanner.run_brain_scanner writes iteration_NN.json files whose
@@ -1237,11 +1421,44 @@ def load_findings(findings_dir: str) -> list:
                                 if fn.startswith("iteration_") and fn.endswith(".json"))
             brain_findings = []
             if iter_files:
-                # The last iteration carries the cumulative findings_so_far list.
-                with open(os.path.join(brain_active_path, iter_files[-1]),
-                          errors="replace") as f:
-                    brain_data = _json.load(f)
-                brain_findings = brain_data.get("findings_so_far", []) or []
+                # findings_so_far is CUMULATIVE, so the newest intact iteration
+                # carries the full confirmed list. A scan killed mid-write
+                # (SIGKILL/OOM/disk-full/laptop-sleep) leaves the newest
+                # iteration_NN.json truncated; a bare _json.load on iter_files[-1]
+                # would raise and abandon the WHOLE brain_active block (the outer
+                # `except: pass`), silently dropping every script-confirmed
+                # active-scan finding. Walk newest→oldest and use the first
+                # parseable file; emit a visible degradation marker if none parse.
+                brain_data = None
+                for _cand in reversed(iter_files):
+                    try:
+                        with open(os.path.join(brain_active_path, _cand),
+                                  errors="replace") as f:
+                            brain_data = _json.load(f)
+                        break
+                    except Exception:
+                        continue
+                if brain_data is None:
+                    print(f"[reporter] WARNING: all {len(iter_files)} "
+                          "brain_active/iteration_*.json files failed to parse "
+                          "(likely a truncated write from a killed scan) — "
+                          "script-confirmed active-scan findings may be MISSING "
+                          "from this report")
+                    results.append({
+                        "severity": "info",
+                        "cvss": CVSS_DEFAULT.get("info", "0.0"),
+                        "vtype": "misconfig",
+                        "title": ("Brain active-scan findings UNAVAILABLE "
+                                  "(iteration files unparseable)"),
+                        "detail": (f"All {len(iter_files)} brain_active/iteration_*.json "
+                                   "files failed to parse (likely a truncated write from "
+                                   "a killed scan). Script-confirmed active-scan findings "
+                                   "could NOT be loaded — manual review required."),
+                        "url": "N/A",
+                        "poc": "Source: brain_active/iteration_*.json (corrupt/truncated).",
+                    })
+                else:
+                    brain_findings = brain_data.get("findings_so_far", []) or []
             # Defence-in-depth: a file-access/traversal claim is only kept as a
             # finding if the file's content actually appears in the script output.
             # findings_so_far is cumulative, so aggregate EVERY iteration's raw
@@ -1263,6 +1480,59 @@ def load_findings(findings_dir: str) -> list:
                 from brain_scanner import _access_claim_unproven
             except Exception:
                 _access_claim_unproven = None
+            try:
+                from brain_scanner import _ACCESS_CLAIM_RE, _USAGE_BANNER_RE, _STATUS_NOISE_RE
+            except Exception:
+                _ACCESS_CLAIM_RE = _USAGE_BANNER_RE = _STATUS_NOISE_RE = None
+            try:
+                from brain_scanner import _grounded_read_unproven as _shared_grounded_gate
+            except Exception:
+                _shared_grounded_gate = None
+
+            def _claim_unproven(_line, _out):
+                """Reporter-side proof gate. Prefer the SHARED generalized gate in
+                brain_scanner (_grounded_read_unproven): it keeps grounded reads
+                of non-whitelisted files (source code, YAML/JSON config,
+                /etc/hosts, /proc/self/environ) — substantive content the narrow
+                _FILE_PROOF_RE signature cannot represent — while filtering tool
+                progress-noise so a bare/padded `echo "[CRITICAL] accessible"`
+                stays demoted. Falls back to the inline content check below when
+                the import is unavailable (keeps this path self-contained)."""
+                if _shared_grounded_gate is not None:
+                    return _shared_grounded_gate(_line, _out)
+                if not _access_claim_unproven:
+                    return False
+                if not _access_claim_unproven(_line, _out):
+                    return False  # not a claim, or already proven by signature
+                # Imported gate says "unproven". Apply the generic content check.
+                if _ACCESS_CLAIM_RE is None:
+                    return True   # cannot reason about content → keep strict
+                content = [ln for ln in (_out or "").splitlines()
+                           if ln.strip()
+                           and not _ACCESS_CLAIM_RE.search(ln)
+                           and not (_USAGE_BANNER_RE and _USAGE_BANNER_RE.search(ln))]
+                substantive = [ln for ln in content if len(ln.strip()) >= 8]
+                return len(substantive) < 2  # <2 real content lines ⇒ still unproven
+
+            # v10.6.1 ANTI-FABRICATION: a brain finding counts as "script-confirmed" ONLY
+            # if the active scan's iteration output carries SUBSTANTIVE tool content. The
+            # _claim_unproven gate above only validates file-READ claims; a [CRITICAL]
+            # "SQL injection confirmed" / "RCE confirmed" line whose results were pure
+            # progress chatter ([*] testing ...) otherwise reached a CRITICAL finding
+            # (fail-open _apply_verification_gating treats an unmarked brain line as
+            # EXPLOITED). Require real grounding for ALL claim types, not just file reads.
+            _grounding = [ln for ln in (all_iter_output or "").splitlines()
+                          if ln.strip() and len(ln.strip()) >= 8
+                          and not (_ACCESS_CLAIM_RE and _ACCESS_CLAIM_RE.search(ln))
+                          and not (_USAGE_BANNER_RE and _USAGE_BANNER_RE.search(ln))
+                          and not (_STATUS_NOISE_RE and _STATUS_NOISE_RE.search(ln))]
+            # >=1 (not >=2): a REAL exploit often proves itself in a SINGLE line of tool
+            # output (`uid=0(root) gid=0(root)`, one sqlmap dump row, one dalfox hit) — the
+            # >=2 bar demoted those genuine findings (friends-review). The original leak
+            # (a [CRITICAL] claim whose output is PURE progress chatter = 0 substantive
+            # lines) still collapses to a model claim.
+            _iter_grounded = len(_grounding) >= 1
+
             model_claims = []
             for line in brain_findings:
                 line = (line or "").strip()
@@ -1276,8 +1546,14 @@ def load_findings(findings_dir: str) -> list:
                 # that NO iteration's output actually proves (no file content) — a
                 # buggy PoC (`echo "[CRITICAL] ... accessible" || echo`) prints it
                 # unconditionally. Demote to unverified context, never a finding.
-                if _access_claim_unproven and _access_claim_unproven(line, all_iter_output):
+                if _claim_unproven(line, all_iter_output):
                     model_claims.append("UNVERIFIED (no file content as proof): " + line)
+                    continue
+                # Any brain claim (SQLi/XSS/RCE/auth-bypass — not just file-access) whose
+                # iteration produced no substantive script output is a MODEL CLAIM, not a
+                # confirmed finding; collapse it to context instead of a medium+ row.
+                if not _iter_grounded:
+                    model_claims.append("UNGROUNDED (no script output as proof): " + line)
                     continue
                 # Script-output-grounded line → real finding. Reuse the custom-line
                 # parser so its vtype/severity are derived from any [tag]/keywords.
@@ -1310,8 +1586,9 @@ def load_findings(findings_dir: str) -> list:
                     "url": "N/A",
                     "poc": "Source: brain_active/iteration_*.json (model claims; not script-verified).",
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[reporter] WARNING: failed to load brain_active findings: "
+                  f"{e!r} — brain active-scan findings may be MISSING from this report")
 
     # Method 1c: HAR VAPT / Legacy crawler results (har_vapt_*.json / legacy_vapt_*.json)
     for fn in sorted(os.listdir(findings_dir)):
@@ -1320,8 +1597,18 @@ def load_findings(findings_dir: str) -> list:
                 with open(os.path.join(findings_dir, fn)) as f:
                     har_data = _json.load(f)
                 for vuln in har_data.get("vulnerabilities", []):
+                    # Normalize severity so external/legacy HAR JSON ("Critical",
+                    # "informational", " high ") still lands in a per-severity
+                    # bucket; otherwise it counts in Total but not in the
+                    # Executive Summary table (which exact-matches SEVERITY_COLOR
+                    # keys), so the table fails to reconcile with Total.
+                    _hs = str(vuln.get("severity", "medium")).strip().lower()
+                    if _hs in ("informational", "information"):
+                        _hs = "info"
+                    if _hs not in SEVERITY_ORDER:
+                        _hs = "medium"
                     results.append({
-                        "severity": vuln.get("severity", "medium"),
+                        "severity": _hs,
                         "vtype": vuln.get("type", "misconfig").lower().replace(" ", "_"),
                         "title": vuln.get("type", "Finding"),
                         "detail": vuln.get("details", ""),
@@ -1330,8 +1617,9 @@ def load_findings(findings_dir: str) -> list:
                                f"Payload: {vuln.get('payload','')}\n"
                                f"Evidence: {vuln.get('evidence','')}",
                     })
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load {fn}: {e!r} — "
+                      "HAR/legacy findings from this file may be MISSING")
 
     # Method 2: Flat JSON findings (autopilot_api_hunt.py output)
     # Reads finding_*.json files directly in the findings dir.
@@ -1347,7 +1635,14 @@ def load_findings(findings_dir: str) -> list:
             try:
                 with open(os.path.join(findings_dir, fn)) as f:
                     data = _json.load(f)
-                sev = data.get("severity", "medium").lower()
+                sev = str(data.get("severity", "medium")).strip().lower()
+                # Normalize so a hand-edited finding_*.json with "informational"
+                # / "none" / a typo doesn't escape every per-severity bucket and
+                # desync the Executive Summary table from Total.
+                if sev in ("informational", "information"):
+                    sev = "info"
+                if sev not in SEVERITY_ORDER:
+                    sev = "medium"
                 vtype = data.get("type", "misconfig")
                 tmpl = VULN_TEMPLATES.get(vtype, VULN_TEMPLATES.get("misconfig", {}))
                 evidence = data.get("evidence", "")
@@ -1619,7 +1914,9 @@ def load_findings(findings_dir: str) -> list:
                 if key not in _seen_m2:
                     _seen_m2.add(key)
                     results.append(finding)
-            except Exception:
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load finding file {fn}: "
+                      f"{e!r} — this finding may be MISSING from the report")
                 continue
 
     results.sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 4))
@@ -1654,6 +1951,35 @@ def _badge(sev: str) -> str:
     c = SEVERITY_COLOR.get(sev, "#6c757d")
     return (f'<span style="background:{c};color:#fff;padding:2px 8px;border-radius:3px;'
             f'font-size:0.85em;font-weight:bold">{sev.upper()}</span>')
+
+
+try:
+    import technique_kb as _tkb
+except Exception:  # pragma: no cover - KB is optional; report still renders without it
+    _tkb = None
+
+
+def _attack_chain_str(vtype: str) -> str:
+    """Human attack-path ('SQL Injection → Credential Exposure → Auth Bypass') for a finding
+    vtype, from the technique_kb attack-chain graph. '' when unavailable or single-step. The
+    reporter already renders a MITRE id + remediation; this adds the *chaining* narrative —
+    what the finding ENABLES next — which conveys real business impact."""
+    if _tkb is None or not vtype:
+        return ""
+    try:
+        path = _tkb.chain_path(vtype)
+    except Exception:
+        return ""
+    if not path or len(path) < 2:
+        return ""
+    return " → ".join((_tkb.get(v).title if _tkb.get(v) else v) for v in path)
+
+
+def _attack_chain_row_html(vtype: str) -> str:
+    s = _attack_chain_str(vtype)
+    return ("" if not s else
+            '<tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0;vertical-align:top">'
+            f'Attack chain</td><td style="color:#842029">{s}</td></tr>')
 
 
 def _finding_remediation(f: dict, tmpl: dict) -> str:
@@ -2131,8 +2457,7 @@ Scan Diagnostics</h2>
 def render_html_report(findings: list, target: str, report_dir: str,
                        client: str, consultant: str, title: str) -> str:
     date_str = datetime.now().strftime("%d %B %Y")
-    counts   = {s: sum(1 for f in findings if f["severity"] == s)
-                for s in SEVERITY_COLOR}
+    counts   = _severity_counts(findings)
     total    = len(findings)
     # v10.6.0 — weighted overall risk score + label (report_synthesis)
     _risk_html = ""
@@ -2195,6 +2520,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
         cvss   = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(sev, "N/A"))
         refs   = "".join(f'<li><a href="{u}" target="_blank">{n}</a></li>'
                          for n, u in tmpl.get("references", []))
+        _chain_row = _attack_chain_row_html(vtype)
         details += f"""
 <div id="VN-{i:03d}" style="margin-bottom:36px;border:1px solid #dee2e6;border-radius:6px;overflow:hidden">
   <div style="background:{SEVERITY_COLOR.get(sev, SEVERITY_COLOR['info'])};padding:12px 18px;color:#fff">
@@ -2207,6 +2533,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">CVSS</td><td>{cvss}</td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">CWE</td><td>{tmpl.get("cwe","N/A")}</td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">ATT&amp;CK</td><td><a href="https://attack.mitre.org/techniques/{ATTACK_IDS.get(vtype,'').replace('.','/')}" target="_blank">{ATTACK_IDS.get(vtype,"—")}</a></td></tr>
+      {_chain_row}
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0;vertical-align:top">Affected URL</td>
           <td><code style="word-break:break-all">{f["url"]}</code></td></tr>
     </table>
@@ -2404,8 +2731,7 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 def render_markdown_report(findings: list, target: str, report_dir: str,
                            client: str, consultant: str, title: str) -> str:
     date_str = datetime.now().strftime("%d %B %Y")
-    counts   = {s: sum(1 for f in findings if f["severity"] == s)
-                for s in SEVERITY_COLOR}
+    counts   = _severity_counts(findings)
     lines    = [
         f"# {title}",
         f"**Target:** {target}  \n**Client:** {client or '—'}  \n"
@@ -2460,6 +2786,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         lines += [
             f"### VN-{i:03d} — {title}",
             f"**Severity:** {f['severity'].upper()} | **CVSS:** {cvss} | **CWE:** {tmpl.get('cwe','N/A')} | **ATT&CK:** {ATTACK_IDS.get(f['vtype'],'—')}  ",
+            *([f"**Attack chain:** {_attack_chain_str(f['vtype'])}  "] if _attack_chain_str(f['vtype']) else []),
             f"**Affected URL:** `{f['url']}`", "",
             f"**Impact:** {tmpl['impact']}", "",
             "**Evidence / Proof of Concept:**", "```",

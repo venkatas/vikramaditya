@@ -185,3 +185,56 @@ def test_probe_byte_sniffs_mislabeled_binary(monkeypatch):
     r = agent_http.probe("GET", "http://victim.example/x")
     assert r["is_binary"] is True
     assert "BINARY" not in r["body"]
+
+
+# ── stream=True connection-leak regression (every exit path must close resp) ──
+
+class _ClosableResp(_FakeResp):
+    """A response that records close() calls and exposes iter_content so the
+    stream=True read path in agent_http exercises the same code as production."""
+
+    def __init__(self, status=200, headers=None, content=b"", url="http://t/"):
+        super().__init__(status, headers, content, url)
+        self.closed = 0
+
+    def iter_content(self, chunk_size):
+        for i in range(0, len(self.content), chunk_size):
+            yield self.content[i:i + chunk_size]
+
+    def close(self):
+        self.closed += 1
+
+
+def test_probe_closes_response_on_terminal_path(monkeypatch):
+    # the ordinary 200 terminal response must be closed exactly once
+    resp = _ClosableResp(200, {"Content-Type": "text/html"}, b"<h1>ok</h1>")
+    _patch(monkeypatch, resp)
+    r = agent_http.probe("GET", "http://victim.example/x")
+    assert r["status"] == 200
+    assert "ok" in r["body"]
+    assert resp.closed == 1, "stream=True response leaked: close() never called"
+
+
+def test_probe_closes_response_on_redirect_blocked_path(monkeypatch):
+    # the redirect-blocked branch must also close the response it read
+    blocked = _ClosableResp(302, {"Location": "http://127.0.0.1:8080/", "Content-Type": "text/html"}, b"")
+    _patch(monkeypatch, blocked)
+    r = agent_http.probe("GET", "http://victim.example/redir", allow_url=lambda u: "127.0.0.1" not in u)
+    assert r.get("redirect_blocked") == "http://127.0.0.1:8080/"
+    assert blocked.closed == 1, "redirect_blocked response leaked: close() never called"
+
+
+def test_probe_closes_every_hop_in_redirect_chain(monkeypatch):
+    # each followed hop AND the terminal response must be closed (no leaks)
+    hop = _ClosableResp(302, {"Location": "http://victim.example/next", "Content-Type": "text/html"}, b"")
+    final = _ClosableResp(200, {"Content-Type": "text/html"}, b"<h1>landed</h1>")
+    seq = [hop, final]
+
+    def fake_request(method, url, **kwargs):
+        return seq.pop(0) if seq else final
+
+    monkeypatch.setattr(agent_http.requests, "request", fake_request)
+    r = agent_http.probe("GET", "http://victim.example/start", allow_url=lambda u: True)
+    assert r["status"] == 200
+    assert hop.closed == 1, "intermediate redirect hop leaked"
+    assert final.closed == 1, "terminal response leaked"

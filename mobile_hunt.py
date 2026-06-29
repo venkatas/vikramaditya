@@ -33,7 +33,6 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -53,17 +52,34 @@ def _post(url: str, data: dict, files: dict | None = None) -> dict:
     import urllib.request
     import urllib.parse
     if files:
-        # multipart upload — fall back to curl for simplicity
+        # multipart upload — fall back to curl for simplicity.
+        # Launch via procutil (os.posix_spawn) NOT raw subprocess.run: under the
+        # vikramaditya orchestrator the process has already done in-process HTTPS,
+        # loading Apple's Network.framework whose non-fork-safe pthread_atfork child
+        # handler SIGSEGVs (rc=-11) any fork()+exec child on macOS. posix_spawn skips
+        # atfork handlers. Matches the policy used by frida/objection/drozer below.
         cmd = ["curl", "-sS", "-X", "POST", url, "-H", f"Authorization: {MOBSF_KEY}"]
         for k, v in data.items():
             cmd += ["-F", f"{k}={v}"]
         for k, fp in files.items():
             cmd += ["-F", f"{k}=@{fp}"]
+        import procutil
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            return json.loads(proc.stdout) if proc.stdout.strip() else {}
-        except Exception:
-            return {}
+            res = procutil.run_capture(cmd, timeout=600, shell=False, merge_stderr=False)
+        except Exception as e:
+            return {"_error": f"upload child failed to launch: {e}"}
+        out = (res.get("stdout") or "").strip()
+        if res.get("timed_out"):
+            return {"_error": "upload timed out"}
+        if not out:
+            # Empty stdout from a non-zero rc (or a crashed/killed child) must surface
+            # as an error so mobsf_scan does not mistake it for a clean empty response.
+            rc = res.get("returncode")
+            return {"_error": f"upload child returned empty output (rc={rc})"}
+        try:
+            return json.loads(out)
+        except Exception as e:
+            return {"_error": f"upload response not JSON: {e}"}
     body = urllib.parse.urlencode(data).encode()
     req = urllib.request.Request(
         url, data=body,
@@ -98,14 +114,29 @@ def mobsf_scan(app_path: str, mobsf_url: str, out_dir: Path) -> dict | None:
                 "file_name": upload.get("file_name", ""),
                 "hash": scan_hash})
     print("[*] Waiting for scan completion (up to 5 min)...")
+    last_report = None
     for _ in range(60):
         time.sleep(5)
         report = _post(f"{mobsf_url}/api/v1/report_json",
                        data={"hash": scan_hash})
-        if report and "_error" not in report and report.get("appsec"):
-            (out_dir / "mobsf_static.json").write_text(json.dumps(report, indent=2, default=str))
-            print(f"[+] MobSF report → {out_dir / 'mobsf_static.json'}")
-            return report
+        if report and "_error" not in report:
+            last_report = report
+            # Gate completion on a stable, version-independent core field rather than
+            # the optional 'appsec' scorecard (added in newer MobSF, absent/empty for
+            # some IPA/AAB reports) — keying on 'appsec' alone discards finished scans.
+            if (report.get("appsec") or report.get("version")
+                    or report.get("md5") or report.get("app_name")
+                    or report.get("file_name")):
+                (out_dir / "mobsf_static.json").write_text(json.dumps(report, indent=2, default=str))
+                print(f"[+] MobSF report → {out_dir / 'mobsf_static.json'}")
+                return report
+    # On timeout, persist whatever non-empty report we last fetched rather than
+    # silently dropping a near-complete scan.
+    if last_report:
+        (out_dir / "mobsf_static.json").write_text(json.dumps(last_report, indent=2, default=str))
+        print(f"[!] MobSF scan did not signal completion; persisted last partial report "
+              f"→ {out_dir / 'mobsf_static.json'}")
+        return last_report
     print("[!] MobSF scan timed out")
     return None
 
@@ -117,8 +148,6 @@ def frida_pinning_bypass(app_id: str, out_dir: Path) -> str | None:
         print("[!] frida CLI not found — pip install frida-tools")
         return None
     out_log = out_dir / "frida_pinning.log"
-    cmd = ["frida", "-U", "-l", "-",  # script via stdin
-           "-f", app_id, "--no-pause"]
     # Universal Android SSL pinning bypass (compact form)
     script = """
     Java.perform(function() {
@@ -142,14 +171,21 @@ def frida_pinning_bypass(app_id: str, out_dir: Path) -> str | None:
                     .currentApplication().getPackageName());
     });
     """
+    # Launch via procutil (os.posix_spawn): the MobSF phase runs urllib.urlopen
+    # (in-process HTTPS) before this, loading Apple's Network.framework whose
+    # non-fork-safe pthread_atfork child handler SIGSEGVs (rc=-11) any fork()+exec
+    # child on macOS. posix_spawn skips atfork handlers. procutil has no stdin-input
+    # channel, so the JS script is written to a temp file and passed via `frida -l`.
+    import procutil
+    script_path = out_dir / "frida_pinning_bypass.js"
     try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=open(out_log, "w"), stderr=subprocess.STDOUT)
-        proc.communicate(input=script.encode(), timeout=30)
+        script_path.write_text(script)
+        cmd = ["frida", "-U", "-l", str(script_path), "-f", app_id, "--no-pause"]
+        res = procutil.run_capture(cmd, timeout=30, shell=False, merge_stderr=True)
+        out_log.write_text(res["stdout"] or "")
+        if res["returncode"] not in (0, None) and not res["timed_out"]:
+            print(f"[!] frida exited rc={res['returncode']} — possible crashed child")
         print(f"[+] Frida pinning-bypass attempted → {out_log}")
-        return str(out_log)
-    except subprocess.TimeoutExpired:
-        proc.kill()
         return str(out_log)
     except Exception as e:
         print(f"[!] frida failed: {e}")
@@ -165,9 +201,14 @@ def objection_keychain(app_id: str, out_dir: Path) -> str | None:
     cmd = ["objection", "-g", app_id, "explore",
            "-c", "ios keychain dump",
            "-q"]
+    # posix_spawn launch — runs after the MobSF urllib HTTPS phase loaded Apple's
+    # Network.framework; a raw fork()+exec would SIGSEGV (rc=-11) on macOS.
+    import procutil
     try:
-        with open(out_log, "w") as fh:
-            subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, timeout=60)
+        res = procutil.run_capture(cmd, timeout=60, shell=False, merge_stderr=True)
+        out_log.write_text(res["stdout"] or "")
+        if res["returncode"] not in (0, None) and not res["timed_out"]:
+            print(f"[!] objection exited rc={res['returncode']} — possible crashed child")
         print(f"[+] Objection keychain dump → {out_log}")
         return str(out_log)
     except Exception as e:
@@ -188,12 +229,18 @@ def drozer_ipc(app_id: str, out_dir: Path) -> str | None:
         f"run app.broadcast.info -a {app_id}",
         f"run app.service.info -a {app_id}",
     ]
+    # posix_spawn launch — runs after the MobSF urllib HTTPS phase loaded Apple's
+    # Network.framework; a raw fork()+exec would SIGSEGV (rc=-11) on macOS.
+    import procutil
     try:
         with open(out_log, "w") as fh:
             for c in commands:
                 fh.write(f"\n## {c}\n")
-                subprocess.run(["drozer", "console", "connect", "-c", c],
-                               stdout=fh, stderr=subprocess.STDOUT, timeout=60)
+                res = procutil.run_capture(["drozer", "console", "connect", "-c", c],
+                                           timeout=60, shell=False, merge_stderr=True)
+                fh.write(res["stdout"] or "")
+                if res["returncode"] not in (0, None) and not res["timed_out"]:
+                    print(f"[!] drozer exited rc={res['returncode']} on '{c}' — possible crashed child")
         print(f"[+] Drozer IPC → {out_log}")
         return str(out_log)
     except Exception as e:
@@ -227,8 +274,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[*] Mobile VAPT — output: {out_dir}")
     print(f"[*] Started: {datetime.now().isoformat(timespec='seconds')}")
 
+    mobsf_status = "not_run"
     if app_path:
-        mobsf_scan(app_path, args.mobsf_url, out_dir)
+        mobsf_report = mobsf_scan(app_path, args.mobsf_url, out_dir)
+        mobsf_status = "ok" if mobsf_report else "degraded"
     if args.app_id and args.frida_pinning_bypass:
         frida_pinning_bypass(args.app_id, out_dir)
     if args.app_id and args.objection_keychain:
@@ -243,9 +292,16 @@ def main(argv: list[str] | None = None) -> int:
         "app_id": args.app_id,
         "ran_at": datetime.now().isoformat(timespec="seconds"),
         "artifacts": [str(p) for p in out_dir.iterdir() if p.is_file()],
+        # Per-phase status so a consumer of summary.json can distinguish
+        # "MobSF ran and found nothing" from "MobSF never ran / failed / timed out".
+        "phases": {"mobsf_static": mobsf_status},
+        "degraded": mobsf_status == "degraded",
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"[+] summary → {out_dir / 'summary.json'}")
+    if mobsf_status == "degraded":
+        print("[!] mobsf_static phase degraded — core static analysis did not complete")
+        return 2
     return 0
 
 

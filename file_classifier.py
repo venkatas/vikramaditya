@@ -23,13 +23,33 @@ import os
 from dataclasses import dataclass
 
 # ── Risk tier mapping ────────────────────────────────────────────────────────
-# Magika content-type labels → execution risk tiers
+# Magika content-type labels → execution risk tiers.
+#
+# IMPORTANT: these sets are matched against the *normalized* Magika label by
+# EXACT membership (see _norm / _risk_tier), NOT substring containment. Use the
+# real Magika 0.6.x content-type labels here (e.g. "macho", "exe", "dll",
+# "pebin", "batch"), normalized the same way (lowercase, hyphens/underscores
+# stripped). Substring matching previously silently downgraded real executables
+# (Mach-O/exe/dll) to "low" and falsely promoted benign files ("jpeg" → "pe").
+
+
+def _norm(s: str) -> str:
+    """Normalize a content-type label for exact-match comparison."""
+    return s.lower().replace("-", "").replace("_", "")
+
 
 CRITICAL_TYPES = frozenset({
-    "php", "jsp", "asp", "aspx", "python", "perl", "ruby",
-    "shell", "bash", "powershell", "vbscript",
-    "elf", "pe", "mach-o", "executable", "com",
+    # Server-side scripts
+    "php", "phps", "jsp", "asp", "aspx", "python", "perl", "ruby",
+    "shell", "sh", "bash", "powershell", "ps1", "vbscript", "wsf",
+    # Native executables / libraries (real Magika labels)
+    "elf", "pe", "pebin", "exe", "dll", "macho", "mach-o",
+    "executable", "com", "dosmbr", "msi",
+    # JVM
     "java", "class", "jar",
+    # Windows batch (also kept in HIGH for legacy callers, but a confirmed
+    # executable label like "batch" is genuinely critical when uploaded)
+    "batch", "bat", "cmd",
 })
 
 HIGH_TYPES = frozenset({
@@ -38,7 +58,7 @@ HIGH_TYPES = frozenset({
     "zip", "tar", "rar", "7z", "gzip", "bzip2", "xz",  # Archives
     "cab", "iso", "dmg",     # Disk images / installers
     "htaccess",              # Apache config override
-    "bat", "cmd", "vbs",     # Windows script extensions
+    "vbs",                   # Windows script extensions
 })
 
 MEDIUM_TYPES = frozenset({
@@ -46,6 +66,11 @@ MEDIUM_TYPES = frozenset({
     "rtf", "doc", "xls", "ppt",  # Legacy Office (macro-possible)
     "swf",  # Flash (legacy but still exploitable)
 })
+
+# Pre-normalized lookup sets (exact membership, no substring containment).
+CRITICAL_NORM = frozenset(_norm(t) for t in CRITICAL_TYPES)
+HIGH_NORM = frozenset(_norm(t) for t in HIGH_TYPES)
+MEDIUM_NORM = frozenset(_norm(t) for t in MEDIUM_TYPES)
 
 TEXT_LIKE_TYPES = frozenset({
     "javascript", "json", "xml", "html", "xhtml", "css",
@@ -69,13 +94,19 @@ class ClassifyResult:
 
 
 def _risk_tier(label: str) -> str:
-    """Map a Magika content-type label to a VAPT risk tier."""
-    low = label.lower().replace("-", "").replace("_", "")
-    if any(t in low for t in CRITICAL_TYPES):
+    """Map a Magika content-type label to a VAPT risk tier.
+
+    Uses EXACT membership on the normalized label (not substring containment),
+    so "jpeg" no longer matches "pe" and "macho" correctly matches the
+    normalized "mach-o" token. Both the label and the token sets are normalized
+    identically via _norm().
+    """
+    low = _norm(label)
+    if low in CRITICAL_NORM:
         return "critical"
-    if any(t in low for t in HIGH_TYPES):
+    if low in HIGH_NORM:
         return "high"
-    if any(t in low for t in MEDIUM_TYPES):
+    if low in MEDIUM_NORM:
         return "medium"
     return "low"
 

@@ -273,7 +273,7 @@ def _stub_sqlmap_env(monkeypatch, tmp_path, *, run_cmd_ok, sqli_lines=""):
                         lambda d, create=False: str(findings))
     monkeypatch.setattr(hunt, "_which", lambda name: "/usr/bin/" + name)
     # one reachable GET candidate, no POST endpoints
-    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r: [])
+    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
                         lambda r, limit=15: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file",
@@ -343,7 +343,7 @@ def test_sqlmap_post_only_failure_returns_false(monkeypatch, tmp_path):
     monkeypatch.setattr(hunt, "_resolve_findings_dir",
                         lambda d, create=False: str(findings))
     monkeypatch.setattr(hunt, "_which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r: [])
+    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file", lambda *a, **k: [])
     # no GET candidates, one POST endpoint
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
@@ -377,7 +377,7 @@ def test_sqlmap_post_only_success_returns_true(monkeypatch, tmp_path):
     monkeypatch.setattr(hunt, "_resolve_findings_dir",
                         lambda d, create=False: str(findings))
     monkeypatch.setattr(hunt, "_which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r: [])
+    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file", lambda *a, **k: [])
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
                         lambda r, limit=15: [{"url": "http://victim.example/api/x",
@@ -412,7 +412,7 @@ def test_sqlmap_all_unreachable_logs_distinct_message(monkeypatch, tmp_path):
     monkeypatch.setattr(hunt, "_resolve_findings_dir",
                         lambda d, create=False: str(findings))
     monkeypatch.setattr(hunt, "_which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r: [])
+    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
                         lambda r, limit=15: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file",
@@ -450,7 +450,7 @@ def test_sqlmap_never_discovered_logs_recon_hint(monkeypatch, tmp_path):
     monkeypatch.setattr(hunt, "_resolve_findings_dir",
                         lambda d, create=False: str(findings))
     monkeypatch.setattr(hunt, "_which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r: [])
+    monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
                         lambda r, limit=15: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file", lambda *a, **k: [])

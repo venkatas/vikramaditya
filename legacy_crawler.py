@@ -88,6 +88,15 @@ class LegacyCrawler:
         self.vulnerabilities: List[Dict] = []
         self.forms_fuzzed = 0
         self.payloads_tested = 0
+        # Coverage-cap degradation markers (surfaced in results so a consumer
+        # can tell a fully-crawled app from a truncated one).
+        self.cap_reached: bool = False
+        self.queue_remaining: int = 0
+        # Per-bare-path cap on query-distinct variants, so keying visited on
+        # path+query (below) cannot explode into an unbounded fuzz loop on
+        # pages that mint a fresh ?token=/&ts= on every render.
+        self.max_query_variants_per_path: int = 10
+        self._path_variant_count: Dict[str, int] = {}
 
         # requests session for fast fuzzing
         self.rsession = requests.Session()
@@ -158,13 +167,26 @@ class LegacyCrawler:
         # Set hidden fields via JS (for apps like clientg-mail)
         user_part = user.split('@')[0] if '@' in user else user
         domain_part = user.split('@')[1] if '@' in user else ''
-        await page.evaluate(f'''() => {{
-            const setVal = (n, v) => {{ const el = document.querySelector('[name="'+n+'"]'); if(el) el.value = v; }};
-            setVal("login", "{user}");
-            setVal("domain", "{domain_part}");
-            setVal("user", "{user_part}");
-            setVal("FormName", "existing");
-        }}''')
+        # Pass values as a DATA argument (serialized by Playwright), never
+        # interpolated into the JS source. Raw f-string interpolation here let a
+        # credential containing a double-quote/backslash/backtick break out of
+        # the JS string literal — injecting arbitrary JS into the page context
+        # (and corrupting authenticated crawling for legitimate such passwords).
+        # The field NAMES below are hardcoded literals, so concatenating them
+        # into the CSS attribute selector is safe.
+        await page.evaluate(
+            '''(vals) => {
+                const setVal = (n, v) => {
+                    const el = document.querySelector('[name="' + n + '"]');
+                    if (el) el.value = v;
+                };
+                setVal("login", vals.user);
+                setVal("domain", vals.domain_part);
+                setVal("user", vals.user_part);
+                setVal("FormName", "existing");
+            }''',
+            {"user": user, "domain_part": domain_part, "user_part": user_part},
+        )
 
         # Submit form
         submitted = False
@@ -210,6 +232,37 @@ class LegacyCrawler:
 
     # ── Crawling ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _norm_key(parsed) -> str:
+        """Dedup key = path + query so query-distinct variants
+        (/view.php?id=1 vs /view.php?id=2) are crawled separately instead of
+        collapsing to the bare path. Without this, sibling pages that render
+        DIFFERENT forms per query (e.g. /edit.php?type=admin vs ?type=user) are
+        silently dropped after the first variant is seen."""
+        return parsed.path + (('?' + parsed.query) if parsed.query else '')
+
+    def _variant_budget_ok(self, parsed) -> bool:
+        """Bound query-variant fan-out per bare path. Returns False (and logs a
+        one-time degradation marker) once a single path has minted more than
+        ``max_query_variants_per_path`` distinct query strings, so a page that
+        embeds a fresh nonce/timestamp on every link can't drive an unbounded
+        crawl. Variant-less paths (no query) are never throttled."""
+        if not parsed.query:
+            return True
+        bare = parsed.path
+        n = self._path_variant_count.get(bare, 0)
+        if n >= self.max_query_variants_per_path:
+            if n == self.max_query_variants_per_path:
+                self.cap_reached = True
+                _log_line('warn',
+                          f"Query-variant cap hit for {bare} "
+                          f"(>{self.max_query_variants_per_path} distinct query strings) "
+                          f"— further variants of this path skipped (coverage truncated)")
+                self._path_variant_count[bare] = n + 1  # log only once
+            return False
+        self._path_variant_count[bare] = n + 1
+        return True
+
     async def _crawl(self, page) -> None:
         """BFS crawl from current page, extracting forms."""
         # Start with target URL + current page URL + common admin paths
@@ -229,15 +282,18 @@ class LegacyCrawler:
         except Exception:
             pass
 
-        while queue and len(self.visited) < self.max_pages:
+        # max_pages <= 0 means UNLIMITED (matches the platform's --max-urls
+        # 0=unlimited contract). A positive value caps the BFS and, if the
+        # queue isn't drained, sets cap_reached so the truncation is visible.
+        while queue and (self.max_pages <= 0 or len(self.visited) < self.max_pages):
             url = queue.pop(0)
 
             # Normalize and filter
             parsed = urlparse(url)
             if parsed.netloc != self.target_domain and self.target_domain not in parsed.netloc:
                 continue
-            norm_path = parsed.path
-            if _is_static(norm_path):
+            norm_path = self._norm_key(parsed)
+            if _is_static(parsed.path):
                 continue
             if norm_path in self.visited:
                 continue
@@ -266,8 +322,10 @@ class LegacyCrawler:
                         .map(a => a.href).filter(h => h.startsWith('http')))];
                 }''')
                 for link in new_links:
-                    lp = urlparse(link).path
-                    if lp not in self.visited and not _is_static(lp):
+                    lparsed = urlparse(link)
+                    lp = self._norm_key(lparsed)
+                    if (lp not in self.visited and not _is_static(lparsed.path)
+                            and self._variant_budget_ok(lparsed)):
                         queue.append(link)
 
                 # Extract forms
@@ -291,8 +349,22 @@ class LegacyCrawler:
                 for form in forms:
                     fuzzable = [f for f in form['fields']
                                 if f['name'].lower() not in _skip_params()
-                                and f['type'] not in ('hidden', 'submit', 'button', 'reset')
-                                and f['name'] not in ('login', 'session_id')]
+                                and f['type'] not in ('hidden', 'submit', 'button', 'reset')]
+                    # The crawler authenticates first and reuses ONE live
+                    # session, so fuzzing the field it fills with the logged-in
+                    # username ('login') would corrupt that session. We still
+                    # SURFACE the dropped injection point (auth-bypass SQLi lives
+                    # exactly here) with a degradation marker instead of silently
+                    # losing it, so the operator can test it manually pre-auth.
+                    # session_id is already covered by _skip_params().
+                    dropped = [f for f in fuzzable if f['name'] == 'login']
+                    if dropped:
+                        for f in dropped:
+                            _log_line('warn',
+                                      f"Skipping fuzz of session/auth field "
+                                      f"'{f['name']}' on {self._norm_key(urlparse(url))} "
+                                      f"(would corrupt the live session) — test manually pre-auth")
+                        fuzzable = [f for f in fuzzable if f['name'] != 'login']
                     if fuzzable:
                         self.forms.append({
                             'page_url': url,
@@ -306,7 +378,18 @@ class LegacyCrawler:
             except Exception:
                 continue
 
-        _log_line('ok', f"Crawled {len(self.visited)} pages, found {len(self.forms)} forms")
+        # Record cap/degradation markers. cap_reached is true if the page cap
+        # was hit with URLs still queued, OR a query-variant cap fired above.
+        self.queue_remaining = len(queue)
+        if (self.max_pages > 0 and len(self.visited) >= self.max_pages
+                and self.queue_remaining > 0):
+            self.cap_reached = True
+            _log_line('warn',
+                      f"Crawled {len(self.visited)} pages (CAP REACHED at "
+                      f"max_pages={self.max_pages}, {self.queue_remaining} URLs "
+                      f"left unvisited — coverage truncated)")
+        else:
+            _log_line('ok', f"Crawled {len(self.visited)} pages, found {len(self.forms)} forms")
         return page  # return the page (may have changed due to reauth)
 
     # ── Fuzzing ───────────────────────────────────────────────────────────
@@ -354,33 +437,56 @@ class LegacyCrawler:
                     except Exception:
                         pass
 
-                # SQLi time-based
+                # SQLi time-based.
+                # A single fast confirm retry is too weak: a transient one-off
+                # slowdown on the first (delay=5) request followed by a normal
+                # second request trivially satisfies "slow then fast" and yields
+                # a FALSE-POSITIVE CRITICAL. So we (1) learn a baseline latency
+                # with a benign value, (2) require the injected delay to exceed
+                # baseline by a clear margin, and (3) demand the
+                # slow(delay=5)/fast(delay=1) differential to hold across
+                # multiple rounds (median over single-sample) before reporting.
                 for tpl in [SQLI_TIME_ORACLE, SQLI_TIME_MYSQL]:
                     self.payloads_tested += 1
                     delay = 5
                     payload = tpl.format(delay=delay)
-                    data = self._build_form_data(form, fname, payload)
-                    try:
-                        t0 = time.time()
+
+                    def _send(field_payload, timeout):
+                        d = self._build_form_data(form, fname, field_payload)
+                        t = time.time()
                         if method == 'POST':
-                            self.rsession.post(action, data=data, timeout=delay + 10)
+                            self.rsession.post(action, data=d, timeout=timeout)
                         else:
-                            self.rsession.get(action, params=data, timeout=delay + 10)
-                        elapsed = time.time() - t0
-                        if elapsed >= delay - 0.5:
-                            # Confirm
-                            payload2 = tpl.format(delay=1)
-                            data2 = self._build_form_data(form, fname, payload2)
-                            t1 = time.time()
-                            if method == 'POST':
-                                self.rsession.post(action, data=data2, timeout=12)
-                            else:
-                                self.rsession.get(action, params=data2, timeout=12)
-                            elapsed2 = time.time() - t1
-                            if elapsed2 < delay - 0.5:
-                                self._log_vuln('critical', 'SQL Injection (Time-Based)', action,
-                                               f"Delay {elapsed:.1f}s/{elapsed2:.1f}s in '{fname}'",
-                                               param=fname, payload=payload)
+                            self.rsession.get(action, params=d, timeout=timeout)
+                        return time.time() - t
+
+                    try:
+                        # (1) Baseline control: benign (non-injecting) value.
+                        baseline = _send('vikram_baseline', timeout=15)
+
+                        # (2)+(3) Require every round to show the pattern:
+                        #   injected delay >= baseline + (delay - margin)  AND
+                        #   confirm(delay=1) < baseline + small_margin
+                        rounds = 2
+                        confirmed = True
+                        last_slow = last_fast = 0.0
+                        for _r in range(rounds):
+                            slow = _send(payload, timeout=delay + 10)
+                            fast = _send(tpl.format(delay=1), timeout=12)
+                            last_slow, last_fast = slow, fast
+                            # injected 5s payload must add ~>= 3.5s over baseline,
+                            # and the 1s confirm must stay close to baseline (<1.5s over).
+                            if not (slow - baseline >= 3.5 and fast - baseline < 1.5):
+                                confirmed = False
+                                break
+
+                        if confirmed:
+                            self._log_vuln(
+                                'critical', 'SQL Injection (Time-Based)', action,
+                                f"Delay base={baseline:.1f}s slow={last_slow:.1f}s "
+                                f"confirm={last_fast:.1f}s in '{fname}' "
+                                f"(stable over {rounds} rounds)",
+                                param=fname, payload=payload)
                     except Exception:
                         pass
 
@@ -592,7 +698,9 @@ class LegacyCrawler:
 
         t0 = time.time()
         _log_line('info', f"Legacy Crawler starting: {self.target_url}")
-        _log_line('info', f"Max pages: {self.max_pages} | Reauth every: {self.reauth_interval} forms")
+        _log_line('info',
+                  f"Max pages: {'unlimited' if self.max_pages <= 0 else self.max_pages} "
+                  f"| Reauth every: {self.reauth_interval} forms")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -671,6 +779,9 @@ class LegacyCrawler:
                 'forms_discovered': len(self.forms),
                 'payloads_tested': self.payloads_tested,
                 'engine': 'legacy_crawler',
+                'max_pages': self.max_pages,
+                'cap_reached': self.cap_reached,
+                'queue_remaining': self.queue_remaining,
             },
             'vulnerability_summary': {
                 'total_vulnerabilities': len(self.vulnerabilities),
@@ -684,6 +795,8 @@ class LegacyCrawler:
                 'forms': len(self.forms),
                 'file_upload_forms': sum(1 for f in self.forms if 'multipart' in f.get('enctype', '')),
                 'idor_tested': bool(self.creds_b),
+                'cap_reached': self.cap_reached,
+                'queue_remaining': self.queue_remaining,
             },
             'vulnerabilities': self.vulnerabilities,
             'recommendations': self._recommendations(),
@@ -728,7 +841,8 @@ def main():
     parser.add_argument('--creds', required=True, help='Credentials (user:pass)')
     parser.add_argument('--creds-b', help='Second account for IDOR (user:pass)')
     parser.add_argument('--login-url', help='Override login page URL')
-    parser.add_argument('--max-pages', type=int, default=200, help='Max pages to crawl')
+    parser.add_argument('--max-pages', type=int, default=200,
+                        help='Max pages to crawl (0 = unlimited)')
     parser.add_argument('--reauth', type=int, default=8, help='Re-auth every N forms')
     parser.add_argument('--output', default='.', help='Output directory')
     args = parser.parse_args()

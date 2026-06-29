@@ -27,13 +27,14 @@ def test_reports_verified_cred_from_js(tmp_path, monkeypatch):
     findings = []
     monkeypatch.setattr("shutil.which", lambda n: "/usr/bin/trufflehog" if n == "trufflehog" else None)
 
-    def _fake_run(cmd, stdout=None, **kw):
-        stdout.write(_TH_VERIFIED + "\n")   # simulate trufflehog writing its JSON to the file
-        class _R:
-            returncode = 0
-        return _R()
+    # Fork-safe path: _report_js_credentials now launches trufflehog via
+    # procutil.run_capture (os.posix_spawn) and writes the captured stdout to the
+    # report file, instead of redirecting subprocess.run's stdout to a handle.
+    def _fake_run_capture(cmd, **kw):
+        return {"stdout": _TH_VERIFIED + "\n", "stderr": "",
+                "returncode": 0, "timed_out": False}
 
-    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("procutil.run_capture", _fake_run_capture)
     ah._report_js_credentials(str(out), {"/assets/index.js": "var k='AKIA...'"},
                               findings, None, "https://t.example")
     assert any(f.get("type") == "exposed_credential" and f.get("severity") == "critical"
