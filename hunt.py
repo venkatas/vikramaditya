@@ -254,6 +254,11 @@ TOOL_REGISTRY = [
     ("waybackurls",       "waybackurls",                                "go install github.com/tomnomnom/waybackurls@latest"),
     ("anew",              "anew",                                       "go install github.com/tomnomnom/anew@latest"),
     ("amass",             "amass",                                      "go install github.com/owasp-amass/amass/v4/...@master"),
+    # ── Wildcard-safe resolve / TLS SAN / service banners (recon.sh callers) ─
+    ("tlsx",              f"{GOBIN}/tlsx",                             "go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest"),
+    ("shuffledns",        f"{GOBIN}/shuffledns",                       "go install github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"),
+    ("massdns",           "massdns",                                    "brew install massdns"),
+    ("fingerprintx",      f"{GOBIN}/fingerprintx",                     "go install github.com/praetorian-inc/fingerprintx/cmd/fingerprintx@latest"),
     # ── Vulnerability scanners ──────────────────────────────────────────────
     ("dalfox",            "dalfox",                                     "go install github.com/hahwul/dalfox/v2@latest"),
     ("subzy",             "subzy",                                      "go install github.com/LukaSikic/subzy@latest"),
@@ -287,7 +292,7 @@ TOOL_REGISTRY = [
 
 TOOL_LIST = [t[0] for t in TOOL_REGISTRY]
 AUTO_INSTALL_SYSTEM_TOOLS = {
-    "arjun", "feroxbuster", "metasploit", "nmap", "paramspider",
+    "arjun", "feroxbuster", "metasploit", "massdns", "nmap", "paramspider",
     "semgrep", "sqlmap", "trufflehog", "whatweb",
 }
 SKIP_ALIASES = {
