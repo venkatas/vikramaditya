@@ -1129,11 +1129,23 @@ def load_findings(findings_dir: str) -> list:
                             sev = "info"
                         if sev not in SEVERITY_ORDER:
                             sev = "info"
+                        detail = f"nuclei -dast template fired via active parameter fuzzing: {template_id}"
+                        # Timing/blind detections are a single jitter-prone window; Vik's
+                        # own SQLi path requires linear-scaling confirmation. Cap severity
+                        # and flag for verification instead of auto-shipping a CRITICAL.
+                        tid = template_id.lower()
+                        if any(k in tid for k in ("time-based", "time_based", "timing",
+                                                  "blind-sql", "blind_sql")):
+                            if SEVERITY_ORDER.get(sev, 4) < SEVERITY_ORDER["medium"]:
+                                sev = "medium"
+                            detail += (" [UNCONFIRMED timing — verify with sqlmap "
+                                       "linear-scaling before reporting]")
                         results.append({
                             "severity": sev,
+                            "cvss": CVSS_DEFAULT.get(sev, "0.0"),
                             "vtype": "nuclei_finding",
                             "title": f"DAST fuzzing match: {template_id}",
-                            "detail": f"nuclei -dast template fired via active parameter fuzzing: {template_id}",
+                            "detail": detail,
                             "url": url,
                             "poc": line,
                         })

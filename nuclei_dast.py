@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import tempfile
 from typing import Callable, Optional
 
 # nuclei < this carries the community-template file-read advisory.
@@ -29,7 +30,9 @@ _VER_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 
 
 def find_binary(explicit: Optional[str] = None) -> Optional[str]:
-    for cand in (explicit, os.path.join(_HOME, "go", "bin", "nuclei"), shutil.which("nuclei")):
+    # PATH first so runtime uses the SAME binary setup.sh upgrades (`command -v
+    # nuclei`); nuclei has no Python-CLI shadow so this is safe (unlike httpx).
+    for cand in (explicit, shutil.which("nuclei"), os.path.join(_HOME, "go", "bin", "nuclei")):
         if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
     return None
@@ -71,12 +74,12 @@ def get_version(binary: str, runner: Optional[Callable] = None):
 
 def build_cmd(binary: str, input_file: str, out_file: str, domain: str, *,
               aggression: str = "low", rate: int = 50, concurrency: int = 25,
-              oob_server: Optional[str] = None, oob_token: Optional[str] = None,
-              input_mode: Optional[str] = None) -> list:
+              retries: int = 1, oob_server: Optional[str] = None,
+              oob_token: Optional[str] = None, input_mode: Optional[str] = None) -> list:
     argv = [binary, "-l", input_file, "-dast",
             "-fa", aggression, "-cs", scope_regex(domain),
             "-rl", str(int(rate)), "-c", str(int(concurrency)),
-            "-retries", "0", "-silent", "-o", out_file]
+            "-retries", str(int(retries)), "-silent", "-o", out_file]
     if input_mode:
         argv += ["-im", input_mode]
     if oob_server:
@@ -91,12 +94,18 @@ def build_cmd(binary: str, input_file: str, out_file: str, domain: str, *,
 
 def run(input_file: str, out_dir: str, domain: str, *, binary: Optional[str] = None,
         aggression: str = "low", rate: int = 50, concurrency: int = 25,
-        timeout: int = 1800, oob_server: Optional[str] = None,
-        oob_token: Optional[str] = None, input_mode: Optional[str] = None,
-        runner: Optional[Callable] = None) -> dict:
+        retries: int = 1, max_urls: int = 500, timeout: int = 1800,
+        oob_server: Optional[str] = None, oob_token: Optional[str] = None,
+        input_mode: Optional[str] = None, runner: Optional[Callable] = None) -> dict:
     """Run the nuclei DAST fuzzing pass. Returns a summary dict."""
     result = {"ran": False, "reason": "", "findings": 0, "out_file": None,
-              "cve_warn": False, "version": None}
+              "cve_warn": False, "version": None, "timed_out": False,
+              "returncode": None, "urls_total": 0, "urls_scanned": 0, "capped": False}
+    # DAST fuzzes web parameters — a CIDR/IP-range target has no param URLs and the
+    # domain-based scope regex can't model it (fails closed anyway). Skip cleanly.
+    if "/" in domain:
+        result["reason"] = "nuclei -dast not applicable to a CIDR/IP-range target"
+        return result
     binary = find_binary(binary)
     if not binary:
         result["reason"] = "nuclei not installed"
@@ -111,12 +120,39 @@ def run(input_file: str, out_dir: str, domain: str, *, binary: Optional[str] = N
         return result
     result["cve_warn"] = not cve_safe(ver)
 
+    # Cap input volume: a large with_params.txt on a real target would fan out to
+    # tens of thousands of fuzzing requests (mirrors the sqlmap-path cap).
+    try:
+        with open(input_file, errors="replace") as f:
+            urls = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    except OSError:
+        urls = []
+    result["urls_total"] = len(urls)
+    result["urls_scanned"] = min(len(urls), max_urls)
+    scan_input, tmp_input = input_file, None
+    if len(urls) > max_urls:
+        tmp_fd, tmp_input = tempfile.mkstemp(prefix="nuclei_dast_in_", suffix=".txt")
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write("\n".join(urls[:max_urls]) + "\n")
+        scan_input = tmp_input
+        result["capped"] = True
+
     os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, "nuclei_dast.txt")
-    argv = build_cmd(binary, input_file, out_file, domain, aggression=aggression,
-                     rate=rate, concurrency=concurrency, oob_server=oob_server,
-                     oob_token=oob_token, input_mode=input_mode)
-    (runner or _default_runner)(argv, timeout)
+    argv = build_cmd(binary, scan_input, out_file, domain, aggression=aggression,
+                     rate=rate, concurrency=concurrency, retries=retries,
+                     oob_server=oob_server, oob_token=oob_token, input_mode=input_mode)
+    try:
+        res = (runner or _default_runner)(argv, timeout)
+        if isinstance(res, dict):
+            result["timed_out"] = bool(res.get("timed_out"))
+            result["returncode"] = res.get("returncode")
+    finally:
+        if tmp_input:
+            try:
+                os.unlink(tmp_input)
+            except OSError:
+                pass
 
     n = 0
     if os.path.isfile(out_file):

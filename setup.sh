@@ -446,7 +446,9 @@ fi
 if command -v nuclei &>/dev/null; then
     NUCLEI_VER="$(nuclei -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
     NUCLEI_NUM="$(echo "${NUCLEI_VER:-0.0.0}" | awk -F. '{printf "%d%03d%03d", $1,$2,$3}')"
-    if [ "${NUCLEI_NUM:-0}" -lt 3008000 ]; then
+    # 10# forces base-10 so a leading-zero build (e.g. 0.8.0 -> 0008000) can't be
+    # mis-parsed as octal by the [ -lt ] test.
+    if [ "$((10#${NUCLEI_NUM:-0}))" -lt 3008000 ]; then
         log_warn "nuclei ${NUCLEI_VER:-unknown} < 3.8.0 (template file-read advisory) — upgrading..."
         if brew upgrade nuclei 2>/dev/null || go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null; then
             log_ok "nuclei upgraded"
