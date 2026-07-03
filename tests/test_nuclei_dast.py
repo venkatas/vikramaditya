@@ -57,6 +57,19 @@ def test_build_cmd_openapi_input_mode():
     assert argv[argv.index("-im") + 1] == "openapi"
 
 
+def test_build_cmd_retries_default_one():
+    # -retries 1 (not 0) so nuclei re-confirms — reduces timing/network FPs
+    argv = nd.build_cmd("/b/nuclei", "in.txt", "out.txt", "example.com")
+    assert argv[argv.index("-retries") + 1] == "1"
+
+
+def test_find_binary_prefers_path(monkeypatch, tmp_path):
+    path_bin = tmp_path / "path_nuclei"
+    path_bin.write_text("#!/bin/sh\n"); path_bin.chmod(0o755)
+    monkeypatch.setattr(nd.shutil, "which", lambda n: str(path_bin))
+    assert nd.find_binary() == str(path_bin)   # PATH wins over ~/go/bin
+
+
 # ── run orchestration (injected runner, no real binary) ──────────────────────
 def test_run_skips_without_binary(tmp_path, monkeypatch):
     monkeypatch.setattr(nd, "find_binary", lambda explicit=None: None)
@@ -80,6 +93,40 @@ def test_run_skips_when_version_too_old(tmp_path, monkeypatch):
         return {"stdout": "Nuclei Engine Version: v3.0.0", "stderr": "", "returncode": 0}
     res = nd.run(str(inp), str(tmp_path / "dast"), "example.com", runner=old_runner)
     assert res["ran"] is False and "lacks -dast" in res["reason"]
+
+
+def test_run_skips_cidr(tmp_path):
+    res = nd.run("x", str(tmp_path / "dast"), "192.168.1.0/24")
+    assert res["ran"] is False and "CIDR" in res["reason"]
+
+
+def test_run_caps_large_input(tmp_path, monkeypatch):
+    monkeypatch.setattr(nd, "find_binary", lambda explicit=None: "/bin/true")
+    inp = tmp_path / "with_params.txt"
+    inp.write_text("\n".join(f"https://example.com/?a={i}" for i in range(20)) + "\n")
+    seen = {}
+
+    def runner(argv, timeout):
+        if "-version" in argv:
+            return {"stdout": "v3.10.0", "stderr": "", "returncode": 0}
+        li = argv[argv.index("-l") + 1]
+        seen["lines"] = sum(1 for _ in open(li))
+        return {"stdout": "", "stderr": "", "returncode": 0}
+    res = nd.run(str(inp), str(tmp_path / "dast"), "example.com", max_urls=5, runner=runner)
+    assert res["capped"] is True and res["urls_scanned"] == 5 and res["urls_total"] == 20
+    assert seen["lines"] == 5   # nuclei got the capped file
+
+
+def test_run_surfaces_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(nd, "find_binary", lambda explicit=None: "/bin/true")
+    inp = tmp_path / "with_params.txt"; inp.write_text("https://example.com/?a=1\n")
+
+    def runner(argv, timeout):
+        if "-version" in argv:
+            return {"stdout": "v3.10.0", "stderr": "", "returncode": 0}
+        return {"stdout": "", "stderr": "", "returncode": -9, "timed_out": True}
+    res = nd.run(str(inp), str(tmp_path / "dast"), "example.com", runner=runner)
+    assert res["ran"] is True and res["timed_out"] is True and res["returncode"] == -9
 
 
 def test_run_counts_findings_and_flags_cve(tmp_path, monkeypatch):
@@ -117,3 +164,27 @@ def test_reporter_ingests_dast_findings(tmp_path):
     assert len(dast) == 2
     sev = {f["title"].split(": ", 1)[1]: f["severity"] for f in dast}
     assert sev["reflected-xss"] == "high" and sev["crlf-injection"] == "medium"
+
+
+def test_reporter_dast_sets_cvss_by_severity(tmp_path):
+    import reporter
+    fdir = tmp_path / "findings"
+    (fdir / "dast").mkdir(parents=True)
+    (fdir / "dast" / "nuclei_dast.txt").write_text(
+        "[open-redirect] [http] [low] https://example.com/?next=1\n")
+    findings = reporter.load_findings(str(fdir))
+    f = next(x for x in findings if "open-redirect" in x.get("title", ""))
+    # low DAST finding must NOT inherit the nuclei_finding CVSS-7.5 default
+    assert f["severity"] == "low" and f["cvss"] == "2.5"
+
+
+def test_reporter_dast_timing_capped_to_candidate(tmp_path):
+    import reporter
+    fdir = tmp_path / "findings"
+    (fdir / "dast").mkdir(parents=True)
+    (fdir / "dast" / "nuclei_dast.txt").write_text(
+        "[time-based-sqli] [http] [critical] https://example.com/?id=1\n")
+    findings = reporter.load_findings(str(fdir))
+    f = next(x for x in findings if "time-based-sqli" in x.get("title", ""))
+    assert f["severity"] == "medium"                 # capped down from critical
+    assert "UNCONFIRMED timing" in f["detail"]

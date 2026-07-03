@@ -8128,7 +8128,13 @@ def run_nuclei_dast(domain: str) -> bool:
         log("info", f"nuclei -dast skipped: {res.get('reason', 'n/a')}")
     else:
         n = res.get("findings", 0)
-        log("crit" if n else "info", f"nuclei -dast: {n} fuzzing finding(s)")
+        if res.get("capped"):
+            log("info", f"nuclei -dast capped input to {res.get('urls_scanned')} of "
+                        f"{res.get('urls_total')} param URLs")
+        if res.get("timed_out"):
+            log("warn", f"nuclei -dast TIMED OUT — partial results ({n} finding(s) captured)")
+        else:
+            log("crit" if n else "info", f"nuclei -dast: {n} fuzzing finding(s)")
     _brain_phase_complete(
         "NUCLEI DAST",
         res.get("ran", False),
