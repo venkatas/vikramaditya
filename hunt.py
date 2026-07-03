@@ -8095,6 +8095,49 @@ def run_cve_hunt(domain: str) -> bool:
     return ok
 
 
+def run_nuclei_dast(domain: str) -> bool:
+    """Opt-in nuclei -dast fuzzing over recon's param URLs (NUCLEI_DAST=1).
+
+    Turns on the fuzzing engine Vik ships but never runs (static tags only). Writes
+    findings/dast/nuclei_dast.txt (reporter ingests at nuclei's severity). Default
+    -ni (no OAST) so client req/resp is never exfiltrated to public interactsh;
+    set NUCLEI_INTERACTSH_SERVER (+_TOKEN) for a self-hosted OOB.
+    """
+    import nuclei_dast
+    recon_dir = _resolve_recon_dir(domain)
+    params = os.path.join(recon_dir, "urls", "with_params.txt")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    out_dir = os.path.join(findings_dir, "dast")
+    if _brain and _brain.enabled:
+        _brain.phase_start("NUCLEI DAST", f"target={domain}")
+    log("info", f"nuclei -dast fuzzing (param URLs): {domain}")
+    try:
+        res = nuclei_dast.run(
+            params, out_dir, domain,
+            timeout=int(os.environ.get("NUCLEI_DAST_TIMEOUT", "1800")),
+            oob_server=os.environ.get("NUCLEI_INTERACTSH_SERVER") or None,
+            oob_token=os.environ.get("NUCLEI_INTERACTSH_TOKEN") or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — keep the pipeline resilient
+        log("warn", f"nuclei -dast errored: {exc}")
+        res = {"ran": False, "findings": 0, "reason": str(exc), "cve_warn": False}
+    if res.get("cve_warn"):
+        log("warn", "nuclei < 3.8.0 has GHSA-29rg-wmcw-hpf4 (template file-read) — "
+                    "upgrade: brew upgrade nuclei")
+    if not res.get("ran"):
+        log("info", f"nuclei -dast skipped: {res.get('reason', 'n/a')}")
+    else:
+        n = res.get("findings", 0)
+        log("crit" if n else "info", f"nuclei -dast: {n} fuzzing finding(s)")
+    _brain_phase_complete(
+        "NUCLEI DAST",
+        res.get("ran", False),
+        detail=f"findings={res.get('findings', 0)}",
+        artifacts={"dast": out_dir},
+    )
+    return True
+
+
 def run_auth_bypass(domain: str) -> bool:
     """Calibrated 401/403 bypass audit (nomore403).
 
@@ -8466,6 +8509,16 @@ def hunt_target(
         except Exception as _ab_err:  # noqa: BLE001 — keep pipeline resilient
             log("warn", f"403 bypass phase errored: {_ab_err}")
             result["auth_bypass"] = False
+
+    # ── Phase 7.7: nuclei -dast fuzzing (OPT-IN via NUCLEI_DAST=1) ─────────
+    # Active parameter fuzzing — slower + noisier, so off unless explicitly enabled.
+    if os.environ.get("NUCLEI_DAST") == "1" and should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "nuclei_dast"):
+        try:
+            result["nuclei_dast"] = run_nuclei_dast(domain)
+        except Exception as _nd_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"nuclei -dast phase errored: {_nd_err}")
+            result["nuclei_dast"] = False
 
     # ── Phase 7.5: Next.js CVE-2025-29927 middleware bypass (v9.x) ─────────
     # Cheap (~one HTTP round-trip per protected route per Next.js host).

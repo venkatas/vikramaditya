@@ -440,6 +440,24 @@ if command -v nuclei &>/dev/null; then
     log_ok "Nuclei templates updated"
 fi
 
+# Ensure nuclei >= 3.8.0 — GHSA-29rg-wmcw-hpf4 (community-template file-read) fix,
+# and the -dast fuzzing engine (hunt.py run_nuclei_dast). Numeric compare avoids
+# the lexicographic 3.10 < 3.8 trap.
+if command -v nuclei &>/dev/null; then
+    NUCLEI_VER="$(nuclei -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    NUCLEI_NUM="$(echo "${NUCLEI_VER:-0.0.0}" | awk -F. '{printf "%d%03d%03d", $1,$2,$3}')"
+    if [ "${NUCLEI_NUM:-0}" -lt 3008000 ]; then
+        log_warn "nuclei ${NUCLEI_VER:-unknown} < 3.8.0 (template file-read advisory) — upgrading..."
+        if brew upgrade nuclei 2>/dev/null || go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null; then
+            log_ok "nuclei upgraded"
+        else
+            log_warn "nuclei upgrade failed — run manually: brew upgrade nuclei"
+        fi
+    else
+        log_ok "nuclei ${NUCLEI_VER} (>= 3.8.0)"
+    fi
+fi
+
 # Ensure Go bin is in PATH
 GOPATH="${GOPATH:-$HOME/go}"
 if [[ ":$PATH:" != *":$GOPATH/bin:"* ]]; then

@@ -1106,6 +1106,41 @@ def load_findings(findings_dir: str) -> list:
                 print(f"[reporter] WARNING: failed to load cves_custom file {fn}: "
                       f"{e!r} — custom-template findings from this file may be MISSING")
 
+    # Method 1c-DAST: dast/ — nuclei -dast (fuzzing) output (hunt.run_nuclei_dast).
+    # Same nuclei text format as cves_custom; a fired fuzzing template is a real
+    # active-fuzzing detection, shipped at nuclei's own severity (not inflated).
+    dast_path = os.path.join(findings_dir, "dast")
+    if os.path.isdir(dast_path):
+        import re as _re
+        for fn in sorted(os.listdir(dast_path)):
+            if not fn.endswith(".txt"):
+                continue
+            try:
+                with open(os.path.join(dast_path, fn), errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        m = _re.search(r"\[([^\]]+)\]\s+\[\w+\]\s+\[(\w+)\]\s+(\S+)", line)
+                        if not m:
+                            continue
+                        template_id, sev, url = m.group(1), m.group(2).lower(), m.group(3)
+                        if sev in ("informational", "information"):
+                            sev = "info"
+                        if sev not in SEVERITY_ORDER:
+                            sev = "info"
+                        results.append({
+                            "severity": sev,
+                            "vtype": "nuclei_finding",
+                            "title": f"DAST fuzzing match: {template_id}",
+                            "detail": f"nuclei -dast template fired via active parameter fuzzing: {template_id}",
+                            "url": url,
+                            "poc": line,
+                        })
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load dast file {fn}: "
+                      f"{e!r} — DAST findings from this file may be MISSING")
+
     # Method 1d: Email authentication posture (email_auth/findings.json)
     # v9.23 — subspace_sentinel writes SPF/DKIM/DMARC/DNSSEC/MTA-STS results as a
     # JSON list, which Method 1's .txt scan never picked up. These are real,
