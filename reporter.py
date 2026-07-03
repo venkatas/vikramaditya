@@ -912,6 +912,10 @@ def load_findings(findings_dir: str) -> list:
                                          # fingerprint, no gadget executed) and [JAVA-RMI-CANDIDATE]. A manual
                                          # ysoserial follow-up LEAD, NOT a confirmed HIGH deserialization vuln.
                                          # Confirmed exec uses [POC-RCE-CONFIRMED]/[VULN] (different prefix).
+            "[403-BYPASS-CANDIDATE]",    # auth_bypass/403_bypass_hits.txt — nomore403 CALIBRATED bypass
+                                         # (40x flipped to 2xx/3xx). A strong LEAD the brain/operator verifies
+                                         # (behind-the-403 content may be a login page / soft-200), NOT an
+                                         # auto-shipped CRITICAL via the auth_bypass template default.
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
