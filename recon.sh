@@ -795,10 +795,16 @@ if [ -z "$SHUFFLEDNS_RESOLVERS" ]; then
 fi
 if tool_ok shuffledns && [ "${SHUFFLEDNS_SKIP:-0}" != "1" ] \
    && [ -n "$SHUFFLEDNS_RESOLVERS" ] && [ -s "$RECON_DIR/subdomains/all.txt" ] \
+   && [ "$TOTAL_SUBS" -gt 100 ] && ! tool_ok massdns; then
+    # shuffledns is a massdns wrapper — without massdns it errors on stderr
+    # (suppressed below) and silently no-ops. Make that visible instead.
+    log_warn "shuffledns present but massdns not found — wildcard-aware resolve SKIPPED (install: brew install massdns)"
+elif tool_ok shuffledns && [ "${SHUFFLEDNS_SKIP:-0}" != "1" ] \
+   && [ -n "$SHUFFLEDNS_RESOLVERS" ] && [ -s "$RECON_DIR/subdomains/all.txt" ] \
    && [ "$TOTAL_SUBS" -gt 100 ]; then
     log_step "shuffledns (wildcard-aware resolve, $TOTAL_SUBS candidates)..."
     shuffledns -d "$TARGET" -list "$RECON_DIR/subdomains/all.txt" \
-        -r "$SHUFFLEDNS_RESOLVERS" -mode resolve -silent \
+        -r "$SHUFFLEDNS_RESOLVERS" -m "$(command -v massdns)" -mode resolve -silent \
         -o "$RECON_DIR/subdomains/shuffledns_resolved.txt" 2>/dev/null || true
     if [ -s "$RECON_DIR/subdomains/shuffledns_resolved.txt" ]; then
         RESOLVED_COUNT=$(file_lines "$RECON_DIR/subdomains/shuffledns_resolved.txt")
