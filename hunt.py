@@ -254,9 +254,15 @@ TOOL_REGISTRY = [
     ("waybackurls",       "waybackurls",                                "go install github.com/tomnomnom/waybackurls@latest"),
     ("anew",              "anew",                                       "go install github.com/tomnomnom/anew@latest"),
     ("amass",             "amass",                                      "go install github.com/owasp-amass/amass/v4/...@master"),
+    # ── Wildcard-safe resolve / TLS SAN / service banners (recon.sh callers) ─
+    ("tlsx",              f"{GOBIN}/tlsx",                             "go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest"),
+    ("shuffledns",        f"{GOBIN}/shuffledns",                       "go install github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"),
+    ("massdns",           "massdns",                                    "brew install massdns"),
+    ("fingerprintx",      f"{GOBIN}/fingerprintx",                     "go install github.com/praetorian-inc/fingerprintx/cmd/fingerprintx@latest"),
     # ── Vulnerability scanners ──────────────────────────────────────────────
     ("dalfox",            "dalfox",                                     "go install github.com/hahwul/dalfox/v2@latest"),
     ("subzy",             "subzy",                                      "go install github.com/LukaSikic/subzy@latest"),
+    ("nomore403",         f"{GOBIN}/nomore403",                        "go install github.com/devploit/nomore403@latest"),
     ("sqlmap",            "sqlmap",                                     "brew install sqlmap"),
     ("nmap",              "nmap",                                       "brew install nmap"),
     ("whatweb",           "whatweb",                                    "brew install whatweb"),
@@ -287,7 +293,7 @@ TOOL_REGISTRY = [
 
 TOOL_LIST = [t[0] for t in TOOL_REGISTRY]
 AUTO_INSTALL_SYSTEM_TOOLS = {
-    "arjun", "feroxbuster", "metasploit", "nmap", "paramspider",
+    "arjun", "feroxbuster", "metasploit", "massdns", "nmap", "paramspider",
     "semgrep", "sqlmap", "trufflehog", "whatweb",
 }
 SKIP_ALIASES = {
@@ -8089,6 +8095,117 @@ def run_cve_hunt(domain: str) -> bool:
     return ok
 
 
+def _host_in_scope(url: str, domain: str) -> bool:
+    """True iff url's host is the target domain or a subdomain of it — the
+    scope-safety gate for active phases. Rejects suffix-attacks (notexample.com)
+    and example.com.evil.net; empty/unparseable host → out of scope.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    dl = (domain or "").lower()
+    return bool(host) and bool(dl) and (host == dl or host.endswith("." + dl))
+
+
+def run_nuclei_dast(domain: str) -> bool:
+    """Opt-in nuclei -dast fuzzing over recon's param URLs (NUCLEI_DAST=1).
+
+    Turns on the fuzzing engine Vik ships but never runs (static tags only). Writes
+    findings/dast/nuclei_dast.txt (reporter ingests at nuclei's severity). Default
+    -ni (no OAST) so client req/resp is never exfiltrated to public interactsh;
+    set NUCLEI_INTERACTSH_SERVER (+_TOKEN) for a self-hosted OOB.
+    """
+    import nuclei_dast
+    recon_dir = _resolve_recon_dir(domain)
+    params = os.path.join(recon_dir, "urls", "with_params.txt")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    out_dir = os.path.join(findings_dir, "dast")
+    if _brain and _brain.enabled:
+        _brain.phase_start("NUCLEI DAST", f"target={domain}")
+    log("info", f"nuclei -dast fuzzing (param URLs): {domain}")
+    try:
+        res = nuclei_dast.run(
+            params, out_dir, domain,
+            timeout=int(os.environ.get("NUCLEI_DAST_TIMEOUT", "1800")),
+            oob_server=os.environ.get("NUCLEI_INTERACTSH_SERVER") or None,
+            oob_token=os.environ.get("NUCLEI_INTERACTSH_TOKEN") or None,
+        )
+    except Exception as exc:  # noqa: BLE001 — keep the pipeline resilient
+        log("warn", f"nuclei -dast errored: {exc}")
+        res = {"ran": False, "findings": 0, "reason": str(exc), "cve_warn": False}
+    if res.get("cve_warn"):
+        log("warn", "nuclei < 3.8.0 has GHSA-29rg-wmcw-hpf4 (template file-read) — "
+                    "upgrade: brew upgrade nuclei")
+    if not res.get("ran"):
+        log("info", f"nuclei -dast skipped: {res.get('reason', 'n/a')}")
+    else:
+        n = res.get("findings", 0)
+        if res.get("capped"):
+            log("info", f"nuclei -dast capped input to {res.get('urls_scanned')} of "
+                        f"{res.get('urls_total')} param URLs")
+        if res.get("timed_out"):
+            log("warn", f"nuclei -dast TIMED OUT — partial results ({n} finding(s) captured)")
+        else:
+            log("crit" if n else "info", f"nuclei -dast: {n} fuzzing finding(s)")
+    _brain_phase_complete(
+        "NUCLEI DAST",
+        res.get("ran", False),
+        detail=f"findings={res.get('findings', 0)}",
+        artifacts={"dast": out_dir},
+    )
+    return True
+
+
+def run_auth_bypass(domain: str) -> bool:
+    """Calibrated 401/403 bypass audit (nomore403).
+
+    Replaces fuzzer.py's uncalibrated first-200==HIGH routine. Runs nomore403
+    against recon's forbidden URLs (live/status_403.txt + status_401.txt) and
+    writes findings/auth_bypass/403_bypass_hits.txt with [403-BYPASS-CANDIDATE]
+    leads — reporter-suppressed, so the brain/operator verify a real bypass
+    rather than it auto-shipping CRITICAL via the auth_bypass template default.
+    """
+    import nomore403_audit
+    recon_dir = _resolve_recon_dir(domain)
+    targets = nomore403_audit.read_targets(recon_dir)
+    if not targets:
+        return True  # no forbidden URLs discovered — clean no-op
+    # Scope safety: recon files are already scoped, but never actively fuzz a
+    # crawler-discovered off-scope 403 (external OAuth/CDN/partner host).
+    targets = [(u, s) for (u, s) in targets if _host_in_scope(u, domain)]
+    if not targets:
+        log("info", f"403 bypass: no in-scope forbidden URLs for {domain}")
+        return True
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    out_dir = os.path.join(findings_dir, "auth_bypass")
+    if _brain and _brain.enabled:
+        _brain.phase_start("403 BYPASS", f"target={domain} urls={len(targets)}")
+    log("info", f"403/401 bypass audit (nomore403): {len(targets)} forbidden URL(s)")
+    try:
+        # Bounded per-URL timeout (default 180s) so a tarpit/WAF host can't stall the
+        # phase for hours — 25 URLs x the 900s module default would be ~6h.
+        res = nomore403_audit.audit(
+            targets, out_dir, max_urls=25,
+            timeout=int(os.environ.get("NOMORE403_TIMEOUT", "180")),
+        )
+    except Exception as exc:  # noqa: BLE001 — keep the pipeline resilient
+        log("warn", f"403 bypass audit errored: {exc}")
+        res = {"ran": False, "hits": 0, "urls_tested": 0, "reason": str(exc)}
+    if not res.get("ran"):
+        log("info", f"403 bypass audit skipped: {res.get('reason', 'n/a')}")
+    else:
+        n = res.get("hits", 0)
+        # 'warn' not 'crit': these are reporter-suppressed CANDIDATE leads (may be a
+        # login page / soft-200), so the console must not frame them as confirmed.
+        log("warn" if n else "info",
+            f"403 bypass: {n} calibrated candidate(s) from {res.get('urls_tested', 0)} URL(s)")
+    _brain_phase_complete(
+        "403 BYPASS",
+        res.get("ran", False),
+        detail=f"hits={res.get('hits', 0)} tested={res.get('urls_tested', 0)}",
+        artifacts={"auth_bypass": out_dir},
+    )
+    return True
+
+
 def run_fuzzer(domain: str, deep: bool = False) -> bool:
     log("info", f"Zero-day fuzzer: {domain}")
     script     = os.path.join(SCRIPT_DIR, "fuzzer.py")
@@ -8399,6 +8516,27 @@ def hunt_target(
     else:
         result["scan"] = run_vuln_scan(domain, quick=quick, skip_items=skip_items, full=full)
 
+    # ── Phase 7.6: Calibrated 401/403 bypass audit (nomore403) ─────────────
+    # Honours the same skip predicate as the vuln scan (active requests). No-ops
+    # when recon surfaced no in-scope 401/403 URLs. Writes reporter-suppressed leads.
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "auth_bypass"):
+        try:
+            result["auth_bypass"] = run_auth_bypass(domain)
+        except Exception as _ab_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"403 bypass phase errored: {_ab_err}")
+            result["auth_bypass"] = False
+
+    # ── Phase 7.7: nuclei -dast fuzzing (OPT-IN via NUCLEI_DAST=1) ─────────
+    # Active parameter fuzzing — slower + noisier, so off unless explicitly enabled.
+    if os.environ.get("NUCLEI_DAST") == "1" and should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "nuclei_dast"):
+        try:
+            result["nuclei_dast"] = run_nuclei_dast(domain)
+        except Exception as _nd_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"nuclei -dast phase errored: {_nd_err}")
+            result["nuclei_dast"] = False
+
     # ── Phase 7.5: Next.js CVE-2025-29927 middleware bypass (v9.x) ─────────
     # Cheap (~one HTTP round-trip per protected route per Next.js host).
     # Skips automatically when httpx didn't fingerprint any Next.js hosts.
@@ -8497,6 +8635,8 @@ def hunt_target(
         # the vuln-scan watch_phase label is "VULN SCAN" (and "VULN SCAN (Batch
         # X/Y)") — NOT "SCAN" — so the degraded-tool match below is prefix-aware.
         "scan":            {"VULN SCAN", "SCAN", "scan"},
+        "auth_bypass":     {"nomore403"},
+        "nuclei_dast":     {"nuclei"},
     }
     _phase_requested = {
         "recon":           should_run_recon,
@@ -8506,6 +8646,10 @@ def hunt_target(
         "api_fuzz":        api_fuzz and not quick,
         "cors":            cors_check,
         "scan":            should_run_vuln_scan and not (skip_scan or skip_has(skip_items, "scan", "vuln_scan")),
+        # mirror the Phase 7.6 / 7.7 orchestration gates so the dashboard can show
+        # ran/skipped/errored for the new active phases.
+        "auth_bypass":     should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "auth_bypass"),
+        "nuclei_dast":     os.environ.get("NUCLEI_DAST") == "1" and should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "nuclei_dast"),
         "cms_exploit":     cms_exploit,
         "rce_scan":        rce_scan,
         "sqlmap":          sqlmap_scan,

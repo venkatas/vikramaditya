@@ -87,6 +87,7 @@ BREW_TOOLS=(
     "gitleaks"
     "whatweb"
     "feroxbuster"
+    "massdns"
 )
 
 echo ""
@@ -128,6 +129,13 @@ GO_TOOLS=(
     "github.com/projectdiscovery/urlfinder/cmd/urlfinder@latest"
     "github.com/s0md3v/uro@latest"
     "github.com/KathanP19/Gxss@latest"
+    # v10.7.0 — recon binaries recon.sh already calls but setup.sh never installed
+    "github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
+    "github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"
+    "github.com/praetorian-inc/fingerprintx/cmd/fingerprintx@latest"
+    "github.com/BishopFox/jsluice/cmd/jsluice@latest"
+    # v10.7.0 — calibrated 401/403 bypass engine (payloads copied below)
+    "github.com/devploit/nomore403@latest"
 )
 
 GO_TOOL_NAMES=(
@@ -150,6 +158,11 @@ GO_TOOL_NAMES=(
     "urlfinder"
     "uro"
     "Gxss"
+    "tlsx"
+    "shuffledns"
+    "fingerprintx"
+    "jsluice"
+    "nomore403"
 )
 
 for i in "${!GO_TOOLS[@]}"; do
@@ -228,6 +241,25 @@ for pkg in "${PIP_TOOLS[@]}"; do
     fi
 done
 
+# garak (NVIDIA LLM vulnerability scanner) — the breadth engine of llm_hunt.py.
+# Installed in an ISOLATED venv: it pulls heavy ML deps that would bloat/conflict
+# with the main venv. llm_hunt._garak_bin() discovers ~/.venvs/garak/bin/garak.
+echo ""
+echo "[*] Installing garak (LLM red-team) in an isolated venv..."
+if [ -x "$HOME/.venvs/garak/bin/garak" ]; then
+    log_ok "garak already installed ($HOME/.venvs/garak/bin/garak)"
+else
+    if python3.11 -m venv "$HOME/.venvs/garak" 2>/dev/null || python3 -m venv "$HOME/.venvs/garak" 2>/dev/null; then
+        if "$HOME/.venvs/garak/bin/pip" install --quiet garak 2>/dev/null; then
+            log_ok "garak installed to $HOME/.venvs/garak/bin/garak"
+        else
+            log_warn "garak pip install failed — llm_hunt.py will skip the garak engine"
+        fi
+    else
+        log_warn "garak venv creation failed (need python3.11) — llm_hunt.py garak engine unavailable"
+    fi
+fi
+
 # Apple Silicon MLX — faster than Ollama on M-series chips
 echo ""
 if [[ "$(uname -m)" == "arm64" ]]; then
@@ -297,6 +329,52 @@ else
         log_ok "XSStrike installed to $REPO_TOOLS_DIR/XSStrike/"
     else
         log_err "XSStrike failed to clone"
+    fi
+fi
+
+# graphql-cop (MIT) — GraphQL DoS/CSRF/info-leak checks (graphql_audit.py run_graphql_cop).
+# NOT on PyPI (git-clone only). Deps are installed into the active venv WITHOUT its stale
+# requests==2.25.1 pin (which would downgrade a shared dep); graphql-cop works with any
+# recent requests.
+if [ -f "$REPO_TOOLS_DIR/graphql-cop/graphql-cop.py" ]; then
+    log_ok "graphql-cop already present"
+else
+    echo "    Cloning graphql-cop..."
+    if git clone --quiet https://github.com/dolevf/graphql-cop.git "$REPO_TOOLS_DIR/graphql-cop" 2>/dev/null; then
+        pip3 install --quiet simplejson termcolor PySocks 2>/dev/null || true
+        log_ok "graphql-cop installed to $REPO_TOOLS_DIR/graphql-cop/"
+    else
+        log_err "graphql-cop failed to clone"
+    fi
+fi
+
+# nomore403 payloads (headers/ips/httpmethods/midpaths/endpaths/...) — REQUIRED by
+# the header/path bypass techniques. `go install` drops only the binary, so copy the
+# payloads out of the Go module cache to a stable path nomore403_audit.py looks in
+# (tools/nomore403/payloads). Without them nomore403 silently skips its best techniques.
+echo ""
+echo "[*] Installing nomore403 payloads..."
+NM_PAYLOADS_DST="$REPO_TOOLS_DIR/nomore403/payloads"
+if [ -d "$NM_PAYLOADS_DST" ] && [ -n "$(ls -A "$NM_PAYLOADS_DST" 2>/dev/null)" ]; then
+    log_ok "nomore403 payloads already present ($NM_PAYLOADS_DST)"
+else
+    # Newest-by-mtime = the version go just installed (portable: `ls -td` avoids
+    # the BSD-vs-GNU `sort -V` trap and lexicographic v1.10 < v1.5 misordering).
+    # `|| true` — a no-match glob makes `ls -td` exit non-zero; under `set -euo
+    # pipefail` the bare assignment would abort the whole installer before the
+    # empty-guard below (offline / pruned GOMODCACHE / renamed upstream dir).
+    NM_SRC="$(ls -td "$(go env GOMODCACHE 2>/dev/null)"/github.com/devploit/nomore403@*/payloads 2>/dev/null | head -1)" || true
+    if [ -n "$NM_SRC" ] && [ -d "$NM_SRC" ]; then
+        mkdir -p "$NM_PAYLOADS_DST"
+        if cp -Rf "$NM_SRC"/. "$NM_PAYLOADS_DST"/ 2>/dev/null; then
+            chmod -R u+rw "$NM_PAYLOADS_DST" 2>/dev/null || true
+            log_ok "nomore403 payloads copied to $NM_PAYLOADS_DST"
+        else
+            log_err "nomore403 payloads copy failed from $NM_SRC"
+        fi
+    else
+        log_warn "nomore403 payloads not in Go module cache — header/path bypass techniques limited"
+        log_warn "  fix: git clone https://github.com/devploit/nomore403 && cp -r nomore403/payloads $NM_PAYLOADS_DST"
     fi
 fi
 
@@ -371,12 +449,56 @@ SUBFINDER_EOF
     log_warn "Edit $SUBFINDER_CONFIG to add API keys for better coverage"
 fi
 
+# Seed a DNS resolvers list for shuffledns (recon.sh Phase 1 mass-resolve /
+# wildcard filter). recon.sh looks first at ~/.config/shuffledns/resolvers.txt;
+# without it, the pre-httpx dead-name/wildcard filter silently no-ops.
+echo ""
+echo "[*] Seeding DNS resolvers for shuffledns..."
+SHUFFLEDNS_RESOLVERS="$HOME/.config/shuffledns/resolvers.txt"
+if [ -s "$SHUFFLEDNS_RESOLVERS" ]; then
+    log_ok "resolvers.txt already present: $SHUFFLEDNS_RESOLVERS ($(wc -l < "$SHUFFLEDNS_RESOLVERS" | tr -d ' ') resolvers)"
+else
+    mkdir -p "$(dirname "$SHUFFLEDNS_RESOLVERS")"
+    # Trusted, frequently-refreshed public resolver list.
+    if curl -fsSL "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" -o "$SHUFFLEDNS_RESOLVERS" 2>/dev/null \
+        && [ -s "$SHUFFLEDNS_RESOLVERS" ]; then
+        log_ok "resolvers.txt seeded to $SHUFFLEDNS_RESOLVERS ($(wc -l < "$SHUFFLEDNS_RESOLVERS" | tr -d ' ') resolvers)"
+    else
+        # Fallback: a small set of reliable public resolvers so shuffledns still fires.
+        printf '%s\n' 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 208.67.222.222 208.67.220.220 > "$SHUFFLEDNS_RESOLVERS"
+        log_warn "resolvers.txt fetch failed — wrote 8 fallback public resolvers to $SHUFFLEDNS_RESOLVERS"
+    fi
+fi
+
 # Update nuclei templates
 echo ""
 echo "[*] Updating nuclei templates..."
 if command -v nuclei &>/dev/null; then
     nuclei -update-templates 2>/dev/null || true
     log_ok "Nuclei templates updated"
+fi
+
+# Ensure nuclei >= 3.8.0 — GHSA-29rg-wmcw-hpf4 (community-template file-read) fix,
+# and the -dast fuzzing engine (hunt.py run_nuclei_dast). Numeric compare avoids
+# the lexicographic 3.10 < 3.8 trap.
+if command -v nuclei &>/dev/null; then
+    # `|| true` — a present-but-broken nuclei emitting no parseable semver makes
+    # grep exit non-zero; under `set -euo pipefail` that would abort setup.sh
+    # before the ${NUCLEI_VER:-0.0.0} fallback can apply.
+    NUCLEI_VER="$(nuclei -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" || true
+    NUCLEI_NUM="$(echo "${NUCLEI_VER:-0.0.0}" | awk -F. '{printf "%d%03d%03d", $1,$2,$3}')"
+    # 10# forces base-10 so a leading-zero build (e.g. 0.8.0 -> 0008000) can't be
+    # mis-parsed as octal by the [ -lt ] test.
+    if [ "$((10#${NUCLEI_NUM:-0}))" -lt 3008000 ]; then
+        log_warn "nuclei ${NUCLEI_VER:-unknown} < 3.8.0 (template file-read advisory) — upgrading..."
+        if brew upgrade nuclei 2>/dev/null || go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null; then
+            log_ok "nuclei upgraded"
+        else
+            log_warn "nuclei upgrade failed — run manually: brew upgrade nuclei"
+        fi
+    else
+        log_ok "nuclei ${NUCLEI_VER} (>= 3.8.0)"
+    fi
 fi
 
 # Ensure Go bin is in PATH
@@ -393,7 +515,7 @@ echo "============================================="
 echo "[*] Installation Verification"
 echo "============================================="
 
-ALL_TOOLS=(subfinder httpx nuclei ffuf feroxbuster nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss)
+ALL_TOOLS=(subfinder httpx nuclei ffuf feroxbuster nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss tlsx shuffledns fingerprintx jsluice massdns nomore403)
 INSTALLED=0
 MISSING=0
 

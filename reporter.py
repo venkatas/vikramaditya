@@ -912,6 +912,10 @@ def load_findings(findings_dir: str) -> list:
                                          # fingerprint, no gadget executed) and [JAVA-RMI-CANDIDATE]. A manual
                                          # ysoserial follow-up LEAD, NOT a confirmed HIGH deserialization vuln.
                                          # Confirmed exec uses [POC-RCE-CONFIRMED]/[VULN] (different prefix).
+            "[403-BYPASS-CANDIDATE]",    # auth_bypass/403_bypass_hits.txt — nomore403 CALIBRATED bypass
+                                         # (40x flipped to 2xx/3xx). A strong LEAD the brain/operator verifies
+                                         # (behind-the-403 content may be a login page / soft-200), NOT an
+                                         # auto-shipped CRITICAL via the auth_bypass template default.
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
@@ -1101,6 +1105,60 @@ def load_findings(findings_dir: str) -> list:
             except Exception as e:
                 print(f"[reporter] WARNING: failed to load cves_custom file {fn}: "
                       f"{e!r} — custom-template findings from this file may be MISSING")
+
+    # Method 1c-DAST: dast/ — nuclei -dast (fuzzing) output (hunt.run_nuclei_dast).
+    # Same nuclei text format as cves_custom; a fired fuzzing template is a real
+    # active-fuzzing detection, shipped at nuclei's own severity (not inflated).
+    dast_path = os.path.join(findings_dir, "dast")
+    if os.path.isdir(dast_path):
+        import re as _re
+        for fn in sorted(os.listdir(dast_path)):
+            if not fn.endswith(".txt"):
+                continue
+            try:
+                with open(os.path.join(dast_path, fn), errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        m = _re.search(r"\[([^\]]+)\]\s+\[\w+\]\s+\[(\w+)\]\s+(\S+)", line)
+                        if not m:
+                            continue
+                        template_id, sev, url = m.group(1), m.group(2).lower(), m.group(3)
+                        if sev in ("informational", "information"):
+                            sev = "info"
+                        if sev not in SEVERITY_ORDER:
+                            sev = "info"
+                        detail = f"nuclei -dast template fired via active parameter fuzzing: {template_id}"
+                        # DAST matches are SINGLE-REQUEST active-fuzzing detections (default
+                        # -ni excludes OAST-confirmed classes). Consistent with Vik's proof-gate
+                        # (unverified XSS routed to dalfox, [SQLI-CANDIDATE] suppressed, timing
+                        # SQLi needs linear-scaling), do NOT auto-ship any of them at native
+                        # HIGH/CRITICAL: cap to medium + a verify caveat so they are strong LEADS
+                        # the operator confirms, not fabricated criticals.
+                        tid = template_id.lower()
+                        is_timing = any(k in tid for k in ("time-based", "time_based",
+                                                           "timing", "blind-sql", "blind_sql"))
+                        if SEVERITY_ORDER.get(sev, 4) < SEVERITY_ORDER["medium"]:
+                            sev = "medium"
+                        if is_timing:
+                            detail += (" [UNCONFIRMED timing — verify with sqlmap "
+                                       "linear-scaling before reporting]")
+                        else:
+                            detail += (" [UNCONFIRMED DAST fuzzing match — verify with "
+                                       "dalfox/sqlmap before reporting]")
+                        results.append({
+                            "severity": sev,
+                            "cvss": CVSS_DEFAULT.get(sev, "0.0"),
+                            "vtype": "nuclei_finding",
+                            "title": f"DAST fuzzing match: {template_id}",
+                            "detail": detail,
+                            "url": url,
+                            "poc": line,
+                        })
+            except Exception as e:
+                print(f"[reporter] WARNING: failed to load dast file {fn}: "
+                      f"{e!r} — DAST findings from this file may be MISSING")
 
     # Method 1d: Email authentication posture (email_auth/findings.json)
     # v9.23 — subspace_sentinel writes SPF/DKIM/DMARC/DNSSEC/MTA-STS results as a
