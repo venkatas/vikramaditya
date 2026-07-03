@@ -241,6 +241,25 @@ for pkg in "${PIP_TOOLS[@]}"; do
     fi
 done
 
+# garak (NVIDIA LLM vulnerability scanner) — the breadth engine of llm_hunt.py.
+# Installed in an ISOLATED venv: it pulls heavy ML deps that would bloat/conflict
+# with the main venv. llm_hunt._garak_bin() discovers ~/.venvs/garak/bin/garak.
+echo ""
+echo "[*] Installing garak (LLM red-team) in an isolated venv..."
+if [ -x "$HOME/.venvs/garak/bin/garak" ]; then
+    log_ok "garak already installed ($HOME/.venvs/garak/bin/garak)"
+else
+    if python3.11 -m venv "$HOME/.venvs/garak" 2>/dev/null || python3 -m venv "$HOME/.venvs/garak" 2>/dev/null; then
+        if "$HOME/.venvs/garak/bin/pip" install --quiet garak 2>/dev/null; then
+            log_ok "garak installed to $HOME/.venvs/garak/bin/garak"
+        else
+            log_warn "garak pip install failed — llm_hunt.py will skip the garak engine"
+        fi
+    else
+        log_warn "garak venv creation failed (need python3.11) — llm_hunt.py garak engine unavailable"
+    fi
+fi
+
 # Apple Silicon MLX — faster than Ollama on M-series chips
 echo ""
 if [[ "$(uname -m)" == "arm64" ]]; then
