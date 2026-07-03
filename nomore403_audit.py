@@ -25,7 +25,11 @@ from typing import Callable, Optional, Sequence
 CANDIDATE_PREFIX = "[403-BYPASS-CANDIDATE]"
 
 # Success codes that constitute a bypass when the baseline was forbidden.
-_BYPASS_OK = frozenset({200, 201, 202, 203, 204, 206, 301, 302, 307, 308})
+# Redirects (301/302/303/307/308) are DELIBERATELY excluded: nomore403 runs
+# without -r, so we only see the first-hop status and no Location header, and a
+# 40x->30x is usually a redirect-to-login or a canonicalisation bounce back to
+# the same 403 — not access. Only a real 2xx flip counts (anti-false-positive).
+_BYPASS_OK = frozenset({200, 201, 202, 203, 204, 206})
 # Baseline codes a bypass can "open".
 _FORBIDDEN = frozenset({401, 402, 403, 405, 407})
 
@@ -99,7 +103,13 @@ def calibrate_hits(results: Sequence[dict], recon_status: int) -> list[dict]:
 
     if len(hits) >= 5:
         sigs = {(h.get("status_code"), h.get("content_length")) for h in hits}
-        if len(sigs) == 1:
+        # Catch-all noise ONLY when EVERY non-default technique flipped to that one
+        # signature (the server answers 2xx for everything). If some techniques
+        # still returned a 40x, the flips are a genuine multi-vector bypass (e.g.
+        # several IP headers opening the same admin page) — keep them.
+        non_default = [r for r in results if r.get("technique") != "default"]
+        still_forbidden = any(r.get("status_code") in _FORBIDDEN for r in non_default)
+        if len(sigs) == 1 and not still_forbidden:
             return []
     return hits
 
@@ -124,7 +134,8 @@ def _default_runner(argv, timeout):
 
 def run_nomore403(binary: str, url: str, *, payloads: Optional[str] = None,
                   headers: Optional[Sequence[str]] = None,
-                  rate_limit_ms: int = 0, timeout: int = _DEFAULT_TIMEOUT,
+                  rate_limit_ms: int = 0, max_goroutines: int = 10,
+                  timeout: int = _DEFAULT_TIMEOUT,
                   runner: Optional[Callable] = None) -> list[dict]:
     """Run nomore403 against one URL; return the parsed --json result list ([] on failure)."""
     runner = runner or _default_runner
@@ -136,6 +147,8 @@ def run_nomore403(binary: str, url: str, *, payloads: Optional[str] = None,
             argv += ["-f", payloads]
         for h in (headers or []):
             argv += ["-H", h]
+        if max_goroutines and max_goroutines > 0:
+            argv += ["-m", str(int(max_goroutines))]  # concurrency cap (politeness)
         if rate_limit_ms and rate_limit_ms > 0:
             argv += ["-d", str(int(rate_limit_ms))]
         runner(argv, timeout)
@@ -154,8 +167,8 @@ def run_nomore403(binary: str, url: str, *, payloads: Optional[str] = None,
 
 def audit(targets, out_dir: str, *, binary: Optional[str] = None,
           payloads: Optional[str] = None, headers: Optional[Sequence[str]] = None,
-          max_urls: int = 25, rate_limit_ms: int = 0, timeout: int = _DEFAULT_TIMEOUT,
-          runner: Optional[Callable] = None,
+          max_urls: int = 25, rate_limit_ms: int = 0, max_goroutines: int = 10,
+          timeout: int = _DEFAULT_TIMEOUT, runner: Optional[Callable] = None,
           results_fn: Optional[Callable[[str], list]] = None) -> dict:
     """Run the calibrated 403/401 bypass audit.
 
@@ -163,7 +176,8 @@ def audit(targets, out_dir: str, *, binary: Optional[str] = None,
     Writes ``<out_dir>/403_bypass_hits.txt`` with ``[403-BYPASS-CANDIDATE]`` lines.
     ``results_fn`` (test seam) overrides the real nomore403 invocation.
     """
-    result = {"ran": False, "reason": "", "urls_tested": 0, "hits": 0, "out_file": None}
+    result = {"ran": False, "reason": "", "urls_tested": 0, "hits": 0,
+              "errors": 0, "out_file": None}
     if results_fn is None:
         binary = find_binary(binary)
         if not binary:
@@ -187,13 +201,19 @@ def audit(targets, out_dir: str, *, binary: Optional[str] = None,
     out_file = os.path.join(out_dir, "403_bypass_hits.txt")
     lines: list[str] = []
     tested = 0
+    errors = 0
     for url, status in ordered:
-        if results_fn is not None:
-            results = results_fn(url)
-        else:
-            results = run_nomore403(binary, url, payloads=payloads, headers=headers,
-                                    rate_limit_ms=rate_limit_ms, timeout=timeout,
-                                    runner=runner)
+        try:
+            if results_fn is not None:
+                results = results_fn(url)
+            else:
+                results = run_nomore403(binary, url, payloads=payloads, headers=headers,
+                                        rate_limit_ms=rate_limit_ms,
+                                        max_goroutines=max_goroutines,
+                                        timeout=timeout, runner=runner)
+        except Exception:  # noqa: BLE001 — isolate one URL's failure from the phase
+            errors += 1
+            continue
         tested += 1
         if not results:
             continue
@@ -205,6 +225,7 @@ def audit(targets, out_dir: str, *, binary: Optional[str] = None,
 
     result["ran"] = True
     result["urls_tested"] = tested
+    result["errors"] = errors
     result["hits"] = len(lines)
     if lines:
         with open(out_file, "w") as f:

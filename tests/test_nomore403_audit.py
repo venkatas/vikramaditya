@@ -46,19 +46,36 @@ def test_tool_baseline_not_forbidden_yields_nothing():
     assert nm.calibrate_hits(results, 403) == []
 
 
-def test_catchall_guard_drops_uniform_signature():
-    # many techniques all flip to the SAME (200, len) → catch-all noise, not real
+def test_catchall_guard_drops_when_everything_flips():
+    # every non-default technique flips to the SAME (200, len), nothing stays
+    # forbidden → the server 2xx's everything → catch-all noise, drop all.
     results = [_default(403, 9)] + [_row(f"t{i}", 200, 777) for i in range(6)]
     assert nm.calibrate_hits(results, 403) == []
+
+
+def test_catchall_guard_keeps_multi_vector_bypass():
+    # 5 IP-header techniques open the SAME admin page (one signature) but other
+    # techniques still return 403 → a genuine multi-vector bypass, must NOT drop.
+    results = [_default(403, 9)]
+    results += [_row(f"ip{i}", 200, 4500) for i in range(5)]   # the real bypass
+    results += [_row(f"path{i}", 403, 9) for i in range(4)]    # still forbidden
+    assert len(nm.calibrate_hits(results, 403)) == 5
 
 
 def test_distinct_signatures_survive_catchall_guard():
     results = [_default(403, 9),
                _row("hdr-ip", 200, 100), _row("verbs", 200, 200),
-               _row("unicode", 302, 0), _row("path-case", 200, 300),
+               _row("unicode", 200, 250), _row("path-case", 200, 300),
                _row("double", 200, 400)]
-    hits = nm.calibrate_hits(results, 403)
-    assert len(hits) == 5
+    assert len(nm.calibrate_hits(results, 403)) == 5
+
+
+def test_redirects_are_not_bypasses():
+    # 40x -> 301/302/307/308 is redirect-to-login or a canonicalisation bounce,
+    # NOT access (nomore403 runs without -r, no Location visible).
+    results = [_default(403, 9), _row("hdr-ip", 302, 0),
+               _row("verbs", 301, 0), _row("unicode", 307, 0), _row("path", 308, 0)]
+    assert nm.calibrate_hits(results, 403) == []
 
 
 def test_dedup_identical_technique_status_length():
@@ -124,3 +141,26 @@ def test_audit_clean_target_writes_nothing(tmp_path):
     res = nm.audit([("https://a/x", 403)], str(tmp_path), results_fn=fake_results)
     assert res["ran"] and res["hits"] == 0
     assert not (tmp_path / "403_bypass_hits.txt").exists()
+
+
+def test_audit_isolates_per_url_errors(tmp_path):
+    """A single URL's failure must not abort the whole phase."""
+    def flaky(url):
+        if "bad" in url:
+            raise RuntimeError("spawn failed")
+        return [_default(403, 9), _row("hdr", 200, 500)]
+    targets = [("https://a/bad", 403), ("https://a/good", 403)]
+    res = nm.audit(targets, str(tmp_path), results_fn=flaky)
+    assert res["ran"] and res["errors"] == 1 and res["urls_tested"] == 1 and res["hits"] == 1
+
+
+def test_run_nomore403_passes_concurrency_cap():
+    captured = {}
+
+    def fake_runner(argv, timeout):
+        captured["argv"] = list(argv)
+        return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
+    nm.run_nomore403("/bin/true", "http://t/x", runner=fake_runner, max_goroutines=7)
+    argv = captured["argv"]
+    assert "-m" in argv and argv[argv.index("-m") + 1] == "7"
+    assert "--json" in argv and "--no-banner" in argv

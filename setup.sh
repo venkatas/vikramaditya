@@ -323,10 +323,12 @@ NM_PAYLOADS_DST="$REPO_TOOLS_DIR/nomore403/payloads"
 if [ -d "$NM_PAYLOADS_DST" ] && [ -n "$(ls -A "$NM_PAYLOADS_DST" 2>/dev/null)" ]; then
     log_ok "nomore403 payloads already present ($NM_PAYLOADS_DST)"
 else
-    NM_SRC="$(find "$(go env GOMODCACHE 2>/dev/null)/github.com/devploit" -maxdepth 2 -type d -name payloads 2>/dev/null | sort | tail -1)"
+    # Newest-by-mtime = the version go just installed (portable: `ls -td` avoids
+    # the BSD-vs-GNU `sort -V` trap and lexicographic v1.10 < v1.5 misordering).
+    NM_SRC="$(ls -td "$(go env GOMODCACHE 2>/dev/null)"/github.com/devploit/nomore403@*/payloads 2>/dev/null | head -1)"
     if [ -n "$NM_SRC" ] && [ -d "$NM_SRC" ]; then
         mkdir -p "$NM_PAYLOADS_DST"
-        if cp -f "$NM_SRC"/* "$NM_PAYLOADS_DST"/ 2>/dev/null; then
+        if cp -Rf "$NM_SRC"/. "$NM_PAYLOADS_DST"/ 2>/dev/null; then
             chmod -R u+rw "$NM_PAYLOADS_DST" 2>/dev/null || true
             log_ok "nomore403 payloads copied to $NM_PAYLOADS_DST"
         else

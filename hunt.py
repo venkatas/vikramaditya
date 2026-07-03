@@ -8109,6 +8109,18 @@ def run_auth_bypass(domain: str) -> bool:
     targets = nomore403_audit.read_targets(recon_dir)
     if not targets:
         return True  # no forbidden URLs discovered — clean no-op
+    # Scope safety: recon files are already scoped, but never actively fuzz a
+    # crawler-discovered off-scope 403 (external OAuth/CDN/partner host).
+    dl = domain.lower()
+
+    def _in_scope(u: str) -> bool:
+        host = (urlsplit(u).hostname or "").lower()
+        return bool(host) and (host == dl or host.endswith("." + dl))
+
+    targets = [(u, s) for (u, s) in targets if _in_scope(u)]
+    if not targets:
+        log("info", f"403 bypass: no in-scope forbidden URLs for {domain}")
+        return True
     findings_dir = _resolve_findings_dir(domain, create=True)
     out_dir = os.path.join(findings_dir, "auth_bypass")
     if _brain and _brain.enabled:
@@ -8445,9 +8457,10 @@ def hunt_target(
         result["scan"] = run_vuln_scan(domain, quick=quick, skip_items=skip_items, full=full)
 
     # ── Phase 7.6: Calibrated 401/403 bypass audit (nomore403) ─────────────
-    # Only when a vuln scan is intended (active requests). No-ops when recon
-    # surfaced no 401/403 URLs. Writes reporter-suppressed candidate leads.
-    if should_run_vuln_scan and not skip_has(skip_items, "auth_bypass"):
+    # Honours the same skip predicate as the vuln scan (active requests). No-ops
+    # when recon surfaced no in-scope 401/403 URLs. Writes reporter-suppressed leads.
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "auth_bypass"):
         try:
             result["auth_bypass"] = run_auth_bypass(domain)
         except Exception as _ab_err:  # noqa: BLE001 — keep pipeline resilient
