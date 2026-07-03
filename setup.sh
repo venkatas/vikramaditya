@@ -87,6 +87,7 @@ BREW_TOOLS=(
     "gitleaks"
     "whatweb"
     "feroxbuster"
+    "massdns"
 )
 
 echo ""
@@ -128,6 +129,11 @@ GO_TOOLS=(
     "github.com/projectdiscovery/urlfinder/cmd/urlfinder@latest"
     "github.com/s0md3v/uro@latest"
     "github.com/KathanP19/Gxss@latest"
+    # v10.7.0 — recon binaries recon.sh already calls but setup.sh never installed
+    "github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
+    "github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"
+    "github.com/praetorian-inc/fingerprintx/cmd/fingerprintx@latest"
+    "github.com/BishopFox/jsluice/cmd/jsluice@latest"
 )
 
 GO_TOOL_NAMES=(
@@ -150,6 +156,10 @@ GO_TOOL_NAMES=(
     "urlfinder"
     "uro"
     "Gxss"
+    "tlsx"
+    "shuffledns"
+    "fingerprintx"
+    "jsluice"
 )
 
 for i in "${!GO_TOOLS[@]}"; do
@@ -371,6 +381,27 @@ SUBFINDER_EOF
     log_warn "Edit $SUBFINDER_CONFIG to add API keys for better coverage"
 fi
 
+# Seed a DNS resolvers list for shuffledns (recon.sh Phase 1 mass-resolve /
+# wildcard filter). recon.sh looks first at ~/.config/shuffledns/resolvers.txt;
+# without it, the pre-httpx dead-name/wildcard filter silently no-ops.
+echo ""
+echo "[*] Seeding DNS resolvers for shuffledns..."
+SHUFFLEDNS_RESOLVERS="$HOME/.config/shuffledns/resolvers.txt"
+if [ -s "$SHUFFLEDNS_RESOLVERS" ]; then
+    log_ok "resolvers.txt already present: $SHUFFLEDNS_RESOLVERS ($(wc -l < "$SHUFFLEDNS_RESOLVERS" | tr -d ' ') resolvers)"
+else
+    mkdir -p "$(dirname "$SHUFFLEDNS_RESOLVERS")"
+    # Trusted, frequently-refreshed public resolver list.
+    if curl -fsSL "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" -o "$SHUFFLEDNS_RESOLVERS" 2>/dev/null \
+        && [ -s "$SHUFFLEDNS_RESOLVERS" ]; then
+        log_ok "resolvers.txt seeded to $SHUFFLEDNS_RESOLVERS ($(wc -l < "$SHUFFLEDNS_RESOLVERS" | tr -d ' ') resolvers)"
+    else
+        # Fallback: a small set of reliable public resolvers so shuffledns still fires.
+        printf '%s\n' 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 208.67.222.222 208.67.220.220 > "$SHUFFLEDNS_RESOLVERS"
+        log_warn "resolvers.txt fetch failed — wrote 8 fallback public resolvers to $SHUFFLEDNS_RESOLVERS"
+    fi
+fi
+
 # Update nuclei templates
 echo ""
 echo "[*] Updating nuclei templates..."
@@ -393,7 +424,7 @@ echo "============================================="
 echo "[*] Installation Verification"
 echo "============================================="
 
-ALL_TOOLS=(subfinder httpx nuclei ffuf feroxbuster nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss)
+ALL_TOOLS=(subfinder httpx nuclei ffuf feroxbuster nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss tlsx shuffledns fingerprintx jsluice massdns)
 INSTALLED=0
 MISSING=0
 
