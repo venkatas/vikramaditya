@@ -134,6 +134,8 @@ GO_TOOLS=(
     "github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"
     "github.com/praetorian-inc/fingerprintx/cmd/fingerprintx@latest"
     "github.com/BishopFox/jsluice/cmd/jsluice@latest"
+    # v10.7.0 — calibrated 401/403 bypass engine (payloads copied below)
+    "github.com/devploit/nomore403@latest"
 )
 
 GO_TOOL_NAMES=(
@@ -160,6 +162,7 @@ GO_TOOL_NAMES=(
     "shuffledns"
     "fingerprintx"
     "jsluice"
+    "nomore403"
 )
 
 for i in "${!GO_TOOLS[@]}"; do
@@ -310,6 +313,31 @@ else
     fi
 fi
 
+# nomore403 payloads (headers/ips/httpmethods/midpaths/endpaths/...) — REQUIRED by
+# the header/path bypass techniques. `go install` drops only the binary, so copy the
+# payloads out of the Go module cache to a stable path nomore403_audit.py looks in
+# (tools/nomore403/payloads). Without them nomore403 silently skips its best techniques.
+echo ""
+echo "[*] Installing nomore403 payloads..."
+NM_PAYLOADS_DST="$REPO_TOOLS_DIR/nomore403/payloads"
+if [ -d "$NM_PAYLOADS_DST" ] && [ -n "$(ls -A "$NM_PAYLOADS_DST" 2>/dev/null)" ]; then
+    log_ok "nomore403 payloads already present ($NM_PAYLOADS_DST)"
+else
+    NM_SRC="$(find "$(go env GOMODCACHE 2>/dev/null)/github.com/devploit" -maxdepth 2 -type d -name payloads 2>/dev/null | sort | tail -1)"
+    if [ -n "$NM_SRC" ] && [ -d "$NM_SRC" ]; then
+        mkdir -p "$NM_PAYLOADS_DST"
+        if cp -f "$NM_SRC"/* "$NM_PAYLOADS_DST"/ 2>/dev/null; then
+            chmod -R u+rw "$NM_PAYLOADS_DST" 2>/dev/null || true
+            log_ok "nomore403 payloads copied to $NM_PAYLOADS_DST"
+        else
+            log_err "nomore403 payloads copy failed from $NM_SRC"
+        fi
+    else
+        log_warn "nomore403 payloads not in Go module cache — header/path bypass techniques limited"
+        log_warn "  fix: git clone https://github.com/devploit/nomore403 && cp -r nomore403/payloads $NM_PAYLOADS_DST"
+    fi
+fi
+
 # Install gf patterns (tomnomnom's pattern pack)
 GF_PATTERNS_DIR="$HOME/.gf"
 _GF_PATTERN_COUNT=$(find "$GF_PATTERNS_DIR" -maxdepth 1 -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
@@ -424,7 +452,7 @@ echo "============================================="
 echo "[*] Installation Verification"
 echo "============================================="
 
-ALL_TOOLS=(subfinder httpx nuclei ffuf feroxbuster nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss tlsx shuffledns fingerprintx jsluice massdns)
+ALL_TOOLS=(subfinder httpx nuclei ffuf feroxbuster nmap amass sqlmap trufflehog gitleaks whatweb dnsx katana naabu cdncheck interactsh-client gau dalfox subzy gowitness waybackurls anew qsreplace assetfinder arjun gf asnmap mapcidr alterx uro Gxss tlsx shuffledns fingerprintx jsluice massdns nomore403)
 INSTALLED=0
 MISSING=0
 

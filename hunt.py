@@ -262,6 +262,7 @@ TOOL_REGISTRY = [
     # ── Vulnerability scanners ──────────────────────────────────────────────
     ("dalfox",            "dalfox",                                     "go install github.com/hahwul/dalfox/v2@latest"),
     ("subzy",             "subzy",                                      "go install github.com/LukaSikic/subzy@latest"),
+    ("nomore403",         f"{GOBIN}/nomore403",                        "go install github.com/devploit/nomore403@latest"),
     ("sqlmap",            "sqlmap",                                     "brew install sqlmap"),
     ("nmap",              "nmap",                                       "brew install nmap"),
     ("whatweb",           "whatweb",                                    "brew install whatweb"),
@@ -8094,6 +8095,45 @@ def run_cve_hunt(domain: str) -> bool:
     return ok
 
 
+def run_auth_bypass(domain: str) -> bool:
+    """Calibrated 401/403 bypass audit (nomore403).
+
+    Replaces fuzzer.py's uncalibrated first-200==HIGH routine. Runs nomore403
+    against recon's forbidden URLs (live/status_403.txt + status_401.txt) and
+    writes findings/auth_bypass/403_bypass_hits.txt with [403-BYPASS-CANDIDATE]
+    leads — reporter-suppressed, so the brain/operator verify a real bypass
+    rather than it auto-shipping CRITICAL via the auth_bypass template default.
+    """
+    import nomore403_audit
+    recon_dir = _resolve_recon_dir(domain)
+    targets = nomore403_audit.read_targets(recon_dir)
+    if not targets:
+        return True  # no forbidden URLs discovered — clean no-op
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    out_dir = os.path.join(findings_dir, "auth_bypass")
+    if _brain and _brain.enabled:
+        _brain.phase_start("403 BYPASS", f"target={domain} urls={len(targets)}")
+    log("info", f"403/401 bypass audit (nomore403): {len(targets)} forbidden URL(s)")
+    try:
+        res = nomore403_audit.audit(targets, out_dir, max_urls=25)
+    except Exception as exc:  # noqa: BLE001 — keep the pipeline resilient
+        log("warn", f"403 bypass audit errored: {exc}")
+        res = {"ran": False, "hits": 0, "urls_tested": 0, "reason": str(exc)}
+    if not res.get("ran"):
+        log("info", f"403 bypass audit skipped: {res.get('reason', 'n/a')}")
+    else:
+        n = res.get("hits", 0)
+        log("crit" if n else "info",
+            f"403 bypass: {n} calibrated candidate(s) from {res.get('urls_tested', 0)} URL(s)")
+    _brain_phase_complete(
+        "403 BYPASS",
+        res.get("ran", False),
+        detail=f"hits={res.get('hits', 0)} tested={res.get('urls_tested', 0)}",
+        artifacts={"auth_bypass": out_dir},
+    )
+    return True
+
+
 def run_fuzzer(domain: str, deep: bool = False) -> bool:
     log("info", f"Zero-day fuzzer: {domain}")
     script     = os.path.join(SCRIPT_DIR, "fuzzer.py")
@@ -8403,6 +8443,16 @@ def hunt_target(
         log("info", f"Skipping vuln scan for {domain} (already covered by autonomous session)")
     else:
         result["scan"] = run_vuln_scan(domain, quick=quick, skip_items=skip_items, full=full)
+
+    # ── Phase 7.6: Calibrated 401/403 bypass audit (nomore403) ─────────────
+    # Only when a vuln scan is intended (active requests). No-ops when recon
+    # surfaced no 401/403 URLs. Writes reporter-suppressed candidate leads.
+    if should_run_vuln_scan and not skip_has(skip_items, "auth_bypass"):
+        try:
+            result["auth_bypass"] = run_auth_bypass(domain)
+        except Exception as _ab_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"403 bypass phase errored: {_ab_err}")
+            result["auth_bypass"] = False
 
     # ── Phase 7.5: Next.js CVE-2025-29927 middleware bypass (v9.x) ─────────
     # Cheap (~one HTTP round-trip per protected route per Next.js host).
