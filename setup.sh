@@ -332,6 +332,22 @@ else
     fi
 fi
 
+# graphql-cop (MIT) — GraphQL DoS/CSRF/info-leak checks (graphql_audit.py run_graphql_cop).
+# NOT on PyPI (git-clone only). Deps are installed into the active venv WITHOUT its stale
+# requests==2.25.1 pin (which would downgrade a shared dep); graphql-cop works with any
+# recent requests.
+if [ -f "$REPO_TOOLS_DIR/graphql-cop/graphql-cop.py" ]; then
+    log_ok "graphql-cop already present"
+else
+    echo "    Cloning graphql-cop..."
+    if git clone --quiet https://github.com/dolevf/graphql-cop.git "$REPO_TOOLS_DIR/graphql-cop" 2>/dev/null; then
+        pip3 install --quiet simplejson termcolor PySocks 2>/dev/null || true
+        log_ok "graphql-cop installed to $REPO_TOOLS_DIR/graphql-cop/"
+    else
+        log_err "graphql-cop failed to clone"
+    fi
+fi
+
 # nomore403 payloads (headers/ips/httpmethods/midpaths/endpaths/...) — REQUIRED by
 # the header/path bypass techniques. `go install` drops only the binary, so copy the
 # payloads out of the Go module cache to a stable path nomore403_audit.py looks in
