@@ -325,7 +325,10 @@ if [ -d "$NM_PAYLOADS_DST" ] && [ -n "$(ls -A "$NM_PAYLOADS_DST" 2>/dev/null)" ]
 else
     # Newest-by-mtime = the version go just installed (portable: `ls -td` avoids
     # the BSD-vs-GNU `sort -V` trap and lexicographic v1.10 < v1.5 misordering).
-    NM_SRC="$(ls -td "$(go env GOMODCACHE 2>/dev/null)"/github.com/devploit/nomore403@*/payloads 2>/dev/null | head -1)"
+    # `|| true` — a no-match glob makes `ls -td` exit non-zero; under `set -euo
+    # pipefail` the bare assignment would abort the whole installer before the
+    # empty-guard below (offline / pruned GOMODCACHE / renamed upstream dir).
+    NM_SRC="$(ls -td "$(go env GOMODCACHE 2>/dev/null)"/github.com/devploit/nomore403@*/payloads 2>/dev/null | head -1)" || true
     if [ -n "$NM_SRC" ] && [ -d "$NM_SRC" ]; then
         mkdir -p "$NM_PAYLOADS_DST"
         if cp -Rf "$NM_SRC"/. "$NM_PAYLOADS_DST"/ 2>/dev/null; then
@@ -444,7 +447,10 @@ fi
 # and the -dast fuzzing engine (hunt.py run_nuclei_dast). Numeric compare avoids
 # the lexicographic 3.10 < 3.8 trap.
 if command -v nuclei &>/dev/null; then
-    NUCLEI_VER="$(nuclei -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    # `|| true` — a present-but-broken nuclei emitting no parseable semver makes
+    # grep exit non-zero; under `set -euo pipefail` that would abort setup.sh
+    # before the ${NUCLEI_VER:-0.0.0} fallback can apply.
+    NUCLEI_VER="$(nuclei -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" || true
     NUCLEI_NUM="$(echo "${NUCLEI_VER:-0.0.0}" | awk -F. '{printf "%d%03d%03d", $1,$2,$3}')"
     # 10# forces base-10 so a leading-zero build (e.g. 0.8.0 -> 0008000) can't be
     # mis-parsed as octal by the [ -lt ] test.
