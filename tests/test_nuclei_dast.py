@@ -95,6 +95,31 @@ def test_run_skips_when_version_too_old(tmp_path, monkeypatch):
     assert res["ran"] is False and "lacks -dast" in res["reason"]
 
 
+def test_host_in_scope():
+    assert nd.host_in_scope("https://example.com/a", "example.com")
+    assert nd.host_in_scope("https://api.example.com/b?x=1", "example.com")
+    assert not nd.host_in_scope("https://evil.com/c", "example.com")
+    assert not nd.host_in_scope("https://notexample.com/d", "example.com")
+    assert not nd.host_in_scope("https://example.com.evil.net/e", "example.com")
+
+
+def test_run_drops_off_scope_urls(tmp_path, monkeypatch):
+    monkeypatch.setattr(nd, "find_binary", lambda explicit=None: "/bin/true")
+    inp = tmp_path / "with_params.txt"
+    inp.write_text("https://example.com/?a=1\nhttps://evil.com/?b=2\nhttps://api.example.com/?c=3\n")
+    seen = {}
+
+    def runner(argv, timeout):
+        if "-version" in argv:
+            return {"stdout": "v3.10.0", "stderr": "", "returncode": 0}
+        seen["urls"] = [x.strip() for x in open(argv[argv.index("-l") + 1]) if x.strip()]
+        return {"stdout": "", "stderr": "", "returncode": 0}
+    res = nd.run(str(inp), str(tmp_path / "dast"), "example.com", runner=runner)
+    assert res["urls_total"] == 2                              # evil.com dropped in Python
+    assert not any("evil.com" in u for u in seen["urls"])       # nuclei never sees it
+    assert all("example.com" in u for u in seen["urls"])
+
+
 def test_run_skips_cidr(tmp_path):
     res = nd.run("x", str(tmp_path / "dast"), "192.168.1.0/24")
     assert res["ran"] is False and "CIDR" in res["reason"]
@@ -163,7 +188,10 @@ def test_reporter_ingests_dast_findings(tmp_path):
     dast = [f for f in findings if "DAST fuzzing match" in f.get("title", "")]
     assert len(dast) == 2
     sev = {f["title"].split(": ", 1)[1]: f["severity"] for f in dast}
-    assert sev["reflected-xss"] == "high" and sev["crlf-injection"] == "medium"
+    d = {f["title"].split(": ", 1)[1]: f["detail"] for f in dast}
+    # single-request DAST matches are capped to <=medium + a verify caveat (anti-fab)
+    assert sev["reflected-xss"] == "medium" and sev["crlf-injection"] == "medium"
+    assert "verify with dalfox/sqlmap" in d["reflected-xss"]
 
 
 def test_reporter_dast_sets_cvss_by_severity(tmp_path):
