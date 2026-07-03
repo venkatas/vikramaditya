@@ -111,6 +111,99 @@ def run_inql(url: str, headers: list[str], out_dir: Path) -> None:
     _run(cmd, out_dir / "inql.log", timeout=600)
 
 
+# graphql-cop resource-heavy DoS probes — gated behind --graphql-cop-aggressive.
+_GQL_COP_DOS_TESTS = ("alias_overloading", "batch_query",
+                      "directive_overloading", "circular_query_introspection")
+
+
+def _graphql_cop_script() -> Path | None:
+    p = REPO / "tools" / "graphql-cop" / "graphql-cop.py"
+    return p if p.is_file() else None
+
+
+def _headers_to_gcop_json(headers: list[str]) -> str | None:
+    """graphql-cop's -H takes a JSON dict; merge the 'Name: value' list into one."""
+    d: dict[str, str] = {}
+    for h in headers or []:
+        if ":" in h:
+            name, _, value = h.partition(":")
+            name, value = name.strip(), value.strip()
+            if name:
+                d[name] = value
+    return json.dumps(d) if d else None
+
+
+def parse_graphql_cop_output(stdout_text: str) -> list[dict]:
+    """graphql-cop -o json prints a JSON list (possibly after a plain 'not GraphQL'
+    line). Keep only the result==True entries — those are the fired checks."""
+    data = None
+    for line in (stdout_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("["):
+            continue
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, list):
+            data = parsed
+            break
+    if data is None:
+        return []
+    findings = []
+    for e in data:
+        if not isinstance(e, dict) or not e.get("result"):
+            continue
+        findings.append({
+            "title": e.get("title"),
+            "description": e.get("description"),
+            "impact": e.get("impact"),
+            "severity": (e.get("severity") or "info").lower(),
+            "curl_verify": e.get("curl_verify", ""),
+        })
+    return findings
+
+
+def _run_capture(cmd: list[str], log_path: Path, timeout: int = 600) -> str:
+    """Like _run but RETURNS stdout (graphql-cop writes its JSON to stdout)."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[*] $ {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        log_path.write_text(
+            f"# {' '.join(cmd)}\n# {datetime.now().isoformat(timespec='seconds')}\n\n"
+            f"{r.stdout}\n--- stderr ---\n{r.stderr}")
+        return r.stdout or ""
+    except subprocess.TimeoutExpired:
+        return ""
+    except FileNotFoundError:
+        return ""
+
+
+def run_graphql_cop(url: str, headers: list[str], out_dir: Path, *,
+                    aggressive: bool = False, runner=None) -> dict | None:
+    """graphql-cop (MIT) — the GraphQL DoS / CSRF / info-leak matrix graphw00f,
+    Clairvoyance and InQL don't cover. Heavy DoS probes are gated behind aggressive."""
+    script = _graphql_cop_script()
+    if script is None and runner is None:
+        print("[!] graphql-cop not found — clone to tools/graphql-cop (see setup.sh)")
+        return None
+    gc_dir = out_dir / "graphql_cop"
+    gc_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, str(script) if script else "graphql-cop.py",
+           "-t", url, "-o", "json"]
+    hdr = _headers_to_gcop_json(headers)
+    if hdr:
+        cmd += ["-H", hdr]
+    if not aggressive:
+        cmd += ["-e", ",".join(_GQL_COP_DOS_TESTS)]  # skip resource-heavy DoS probes
+    stdout = (runner or _run_capture)(cmd, gc_dir / "graphql_cop.log")
+    findings = parse_graphql_cop_output(stdout)
+    (gc_dir / "findings.json").write_text(json.dumps(findings, indent=2))
+    print(f"[+] graphql-cop: {len(findings)} finding(s) → {gc_dir / 'findings.json'}")
+    return {"findings": findings}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="graphql_audit",
                                  description="Vikramaditya GraphQL DAST bundle")
@@ -121,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="Run Clairvoyance schema reconstruction (slow)")
     ap.add_argument("--wordlist", default=None,
                     help="Wordlist for Clairvoyance brute-force")
+    ap.add_argument("--graphql-cop-aggressive", action="store_true",
+                    help="Run graphql-cop's resource-heavy DoS probes (alias/batch/directive/circular)")
     ap.add_argument("--output-dir", default=None)
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -136,11 +231,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.clairvoyance:
         run_clairvoyance(args.url, args.header, args.wordlist, out_dir)
     run_inql(args.url, args.header, out_dir)
+    gcop = run_graphql_cop(args.url, args.header, out_dir,
+                           aggressive=args.graphql_cop_aggressive)
 
+    gcop_findings = (gcop or {}).get("findings", []) or []
     summary = {
         "tool": "vikramaditya.graphql_audit",
         "version": "9.13.0",
         "url": args.url,
+        "graphql_cop_finding_count": len(gcop_findings),
+        "graphql_cop_findings": gcop_findings,
         "ran_at": datetime.now().isoformat(timespec="seconds"),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
