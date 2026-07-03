@@ -1130,16 +1130,23 @@ def load_findings(findings_dir: str) -> list:
                         if sev not in SEVERITY_ORDER:
                             sev = "info"
                         detail = f"nuclei -dast template fired via active parameter fuzzing: {template_id}"
-                        # Timing/blind detections are a single jitter-prone window; Vik's
-                        # own SQLi path requires linear-scaling confirmation. Cap severity
-                        # and flag for verification instead of auto-shipping a CRITICAL.
+                        # DAST matches are SINGLE-REQUEST active-fuzzing detections (default
+                        # -ni excludes OAST-confirmed classes). Consistent with Vik's proof-gate
+                        # (unverified XSS routed to dalfox, [SQLI-CANDIDATE] suppressed, timing
+                        # SQLi needs linear-scaling), do NOT auto-ship any of them at native
+                        # HIGH/CRITICAL: cap to medium + a verify caveat so they are strong LEADS
+                        # the operator confirms, not fabricated criticals.
                         tid = template_id.lower()
-                        if any(k in tid for k in ("time-based", "time_based", "timing",
-                                                  "blind-sql", "blind_sql")):
-                            if SEVERITY_ORDER.get(sev, 4) < SEVERITY_ORDER["medium"]:
-                                sev = "medium"
+                        is_timing = any(k in tid for k in ("time-based", "time_based",
+                                                           "timing", "blind-sql", "blind_sql"))
+                        if SEVERITY_ORDER.get(sev, 4) < SEVERITY_ORDER["medium"]:
+                            sev = "medium"
+                        if is_timing:
                             detail += (" [UNCONFIRMED timing — verify with sqlmap "
                                        "linear-scaling before reporting]")
+                        else:
+                            detail += (" [UNCONFIRMED DAST fuzzing match — verify with "
+                                       "dalfox/sqlmap before reporting]")
                         results.append({
                             "severity": sev,
                             "cvss": CVSS_DEFAULT.get(sev, "0.0"),

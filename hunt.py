@@ -8635,6 +8635,8 @@ def hunt_target(
         # the vuln-scan watch_phase label is "VULN SCAN" (and "VULN SCAN (Batch
         # X/Y)") — NOT "SCAN" — so the degraded-tool match below is prefix-aware.
         "scan":            {"VULN SCAN", "SCAN", "scan"},
+        "auth_bypass":     {"nomore403"},
+        "nuclei_dast":     {"nuclei"},
     }
     _phase_requested = {
         "recon":           should_run_recon,
@@ -8644,6 +8646,10 @@ def hunt_target(
         "api_fuzz":        api_fuzz and not quick,
         "cors":            cors_check,
         "scan":            should_run_vuln_scan and not (skip_scan or skip_has(skip_items, "scan", "vuln_scan")),
+        # mirror the Phase 7.6 / 7.7 orchestration gates so the dashboard can show
+        # ran/skipped/errored for the new active phases.
+        "auth_bypass":     should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "auth_bypass"),
+        "nuclei_dast":     os.environ.get("NUCLEI_DAST") == "1" and should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "nuclei_dast"),
         "cms_exploit":     cms_exploit,
         "rce_scan":        rce_scan,
         "sqlmap":          sqlmap_scan,

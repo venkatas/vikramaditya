@@ -20,6 +20,7 @@ import re
 import shutil
 import tempfile
 from typing import Callable, Optional
+from urllib.parse import urlsplit
 
 # nuclei < this carries the community-template file-read advisory.
 _MIN_SAFE = (3, 8, 0)
@@ -55,6 +56,15 @@ def scope_regex(domain: str) -> str:
     """In-scope fuzz regex: the domain itself or a subdomain of it (with port)."""
     d = re.escape(domain)
     return rf"^https?://([a-zA-Z0-9._-]+\.)?{d}(:\d+)?(/|$|\?)"
+
+
+def host_in_scope(url: str, domain: str) -> bool:
+    """True iff url's host is the target domain or a subdomain of it — a Python-side
+    scope gate layered UNDER nuclei's -cs regex (the with_params.txt corpus can carry
+    crawler-discovered off-scope URLs)."""
+    host = (urlsplit(url).hostname or "").lower()
+    dl = (domain or "").lower()
+    return bool(host) and bool(dl) and (host == dl or host.endswith("." + dl))
 
 
 def _default_runner(argv, timeout):
@@ -127,15 +137,22 @@ def run(input_file: str, out_dir: str, domain: str, *, binary: Optional[str] = N
             urls = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
     except OSError:
         urls = []
+    # Defense-in-depth scope gate (mirrors run_auth_bypass): drop crawler-discovered
+    # off-scope URLs in Python too, not only via nuclei's -cs regex.
+    urls = [u for u in urls if host_in_scope(u, domain)]
     result["urls_total"] = len(urls)
-    result["urls_scanned"] = min(len(urls), max_urls)
-    scan_input, tmp_input = input_file, None
-    if len(urls) > max_urls:
-        tmp_fd, tmp_input = tempfile.mkstemp(prefix="nuclei_dast_in_", suffix=".txt")
-        with os.fdopen(tmp_fd, "w") as f:
-            f.write("\n".join(urls[:max_urls]) + "\n")
-        scan_input = tmp_input
-        result["capped"] = True
+    if not urls:
+        result["reason"] = "no in-scope param URLs after scope filter"
+        return result
+    result["capped"] = len(urls) > max_urls
+    scan_urls = urls[:max_urls]
+    result["urls_scanned"] = len(scan_urls)
+    # ALWAYS scan a temp file of the filtered+capped list — never fall back to the raw
+    # input_file, or the scope filter and cap would silently not apply to nuclei.
+    tmp_fd, tmp_input = tempfile.mkstemp(prefix="nuclei_dast_in_", suffix=".txt")
+    with os.fdopen(tmp_fd, "w") as f:
+        f.write("\n".join(scan_urls) + "\n")
+    scan_input = tmp_input
 
     os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, "nuclei_dast.txt")
