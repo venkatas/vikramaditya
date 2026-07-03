@@ -71,14 +71,22 @@ def find_payloads_dir(binary: Optional[str] = None) -> Optional[str]:
 def calibrate_hits(results: Sequence[dict], recon_status: int) -> list[dict]:
     """Return the genuine bypass entries from nomore403 --json results for ONE URL.
 
-    Calibration (anti-false-positive):
+    nomore403's --json output is ALREADY auto-calibrated: it samples the default
+    request and reports only DEVIATIONS from that baseline (a soft-200/catch-all
+    host calibrates to 200, so a 200 technique is not a deviation and is dropped by
+    the tool). We layer two cheap guards on top and trust that calibration:
       * recon must have labelled the URL forbidden (40x);
-      * nomore403's own baseline row (technique == "default") must ALSO be
-        forbidden — else the host is not really gated and every "200" is noise;
-      * a hit is a non-default technique whose status flipped to 2xx/3xx;
-      * de-duplicated by (technique, status, length);
-      * if many candidates collapse to ONE identical (status, length) signature,
-        treat it as catch-all noise and drop them all.
+      * nomore403's own baseline row (technique == "default") must ALSO be forbidden
+        — else the host is not really gated;
+      * a hit is a non-default technique whose status flipped to 2xx (redirects
+        excluded — no -r, no Location, so a 30x is ambiguous);
+      * de-duplicated by (technique, status, length).
+
+    We deliberately do NOT re-apply an aggressive "N identical signatures = catch-all"
+    filter: VERIFIED that nomore403 EXCLUDES baseline-matching rows from --json, so a
+    heuristic keyed on "some technique stayed 40x" is inert AND would drop a genuine
+    multi-vector bypass (e.g. 5 IP headers opening the same admin page). Emitted rows
+    are [403-BYPASS-CANDIDATE] leads the brain/operator verify anyway.
     """
     if recon_status not in _FORBIDDEN:
         return []
@@ -100,17 +108,6 @@ def calibrate_hits(results: Sequence[dict], recon_status: int) -> list[dict]:
             continue
         seen.add(key)
         hits.append(r)
-
-    if len(hits) >= 5:
-        sigs = {(h.get("status_code"), h.get("content_length")) for h in hits}
-        # Catch-all noise ONLY when EVERY non-default technique flipped to that one
-        # signature (the server answers 2xx for everything). If some techniques
-        # still returned a 40x, the flips are a genuine multi-vector bypass (e.g.
-        # several IP headers opening the same admin page) — keep them.
-        non_default = [r for r in results if r.get("technique") != "default"]
-        still_forbidden = any(r.get("status_code") in _FORBIDDEN for r in non_default)
-        if len(sigs) == 1 and not still_forbidden:
-            return []
     return hits
 
 

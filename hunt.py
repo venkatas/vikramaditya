@@ -8095,6 +8095,16 @@ def run_cve_hunt(domain: str) -> bool:
     return ok
 
 
+def _host_in_scope(url: str, domain: str) -> bool:
+    """True iff url's host is the target domain or a subdomain of it — the
+    scope-safety gate for active phases. Rejects suffix-attacks (notexample.com)
+    and example.com.evil.net; empty/unparseable host → out of scope.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    dl = (domain or "").lower()
+    return bool(host) and bool(dl) and (host == dl or host.endswith("." + dl))
+
+
 def run_nuclei_dast(domain: str) -> bool:
     """Opt-in nuclei -dast fuzzing over recon's param URLs (NUCLEI_DAST=1).
 
@@ -8160,13 +8170,7 @@ def run_auth_bypass(domain: str) -> bool:
         return True  # no forbidden URLs discovered — clean no-op
     # Scope safety: recon files are already scoped, but never actively fuzz a
     # crawler-discovered off-scope 403 (external OAuth/CDN/partner host).
-    dl = domain.lower()
-
-    def _in_scope(u: str) -> bool:
-        host = (urlsplit(u).hostname or "").lower()
-        return bool(host) and (host == dl or host.endswith("." + dl))
-
-    targets = [(u, s) for (u, s) in targets if _in_scope(u)]
+    targets = [(u, s) for (u, s) in targets if _host_in_scope(u, domain)]
     if not targets:
         log("info", f"403 bypass: no in-scope forbidden URLs for {domain}")
         return True
@@ -8176,7 +8180,12 @@ def run_auth_bypass(domain: str) -> bool:
         _brain.phase_start("403 BYPASS", f"target={domain} urls={len(targets)}")
     log("info", f"403/401 bypass audit (nomore403): {len(targets)} forbidden URL(s)")
     try:
-        res = nomore403_audit.audit(targets, out_dir, max_urls=25)
+        # Bounded per-URL timeout (default 180s) so a tarpit/WAF host can't stall the
+        # phase for hours — 25 URLs x the 900s module default would be ~6h.
+        res = nomore403_audit.audit(
+            targets, out_dir, max_urls=25,
+            timeout=int(os.environ.get("NOMORE403_TIMEOUT", "180")),
+        )
     except Exception as exc:  # noqa: BLE001 — keep the pipeline resilient
         log("warn", f"403 bypass audit errored: {exc}")
         res = {"ran": False, "hits": 0, "urls_tested": 0, "reason": str(exc)}
@@ -8184,7 +8193,9 @@ def run_auth_bypass(domain: str) -> bool:
         log("info", f"403 bypass audit skipped: {res.get('reason', 'n/a')}")
     else:
         n = res.get("hits", 0)
-        log("crit" if n else "info",
+        # 'warn' not 'crit': these are reporter-suppressed CANDIDATE leads (may be a
+        # login page / soft-200), so the console must not frame them as confirmed.
+        log("warn" if n else "info",
             f"403 bypass: {n} calibrated candidate(s) from {res.get('urls_tested', 0)} URL(s)")
     _brain_phase_complete(
         "403 BYPASS",

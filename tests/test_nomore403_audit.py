@@ -46,19 +46,21 @@ def test_tool_baseline_not_forbidden_yields_nothing():
     assert nm.calibrate_hits(results, 403) == []
 
 
-def test_catchall_guard_drops_when_everything_flips():
-    # every non-default technique flips to the SAME (200, len), nothing stays
-    # forbidden → the server 2xx's everything → catch-all noise, drop all.
+def test_uniform_hits_kept_trusting_tool_calibration():
+    # nomore403 already reports ONLY deviations from its calibrated baseline; we no
+    # longer second-guess it with a "N identical signatures = drop" filter (which was
+    # inert vs real output and dropped real multi-vector bypasses). All 6 kept as leads.
     results = [_default(403, 9)] + [_row(f"t{i}", 200, 777) for i in range(6)]
-    assert nm.calibrate_hits(results, 403) == []
+    assert len(nm.calibrate_hits(results, 403)) == 6
 
 
-def test_catchall_guard_keeps_multi_vector_bypass():
-    # 5 IP-header techniques open the SAME admin page (one signature) but other
-    # techniques still return 403 → a genuine multi-vector bypass, must NOT drop.
+def test_multi_vector_bypass_all_kept():
+    # 5 IP-header techniques open the SAME admin page (one signature) — a genuine
+    # multi-vector bypass; every one is kept (nomore403 excludes the 40x rows from
+    # --json, so the old still_forbidden escape hatch was inert — VERIFIED live).
     results = [_default(403, 9)]
     results += [_row(f"ip{i}", 200, 4500) for i in range(5)]   # the real bypass
-    results += [_row(f"path{i}", 403, 9) for i in range(4)]    # still forbidden
+    results += [_row(f"path{i}", 403, 9) for i in range(4)]    # excluded (not 2xx)
     assert len(nm.calibrate_hits(results, 403)) == 5
 
 
@@ -90,12 +92,65 @@ def test_hit_line_has_candidate_prefix():
     assert "403→200" in line and "technique=hdr-ip" in line
 
 
-def test_reporter_suppresses_candidate_prefix():
-    """The calibrated candidate must be a LEAD, not an auto-CRITICAL auth_bypass finding."""
-    reporter_py = os.path.join(os.path.dirname(__file__), "..", "reporter.py")
-    src = open(reporter_py).read()
-    assert '"[403-BYPASS-CANDIDATE]"' in src, \
-        "reporter.py NON_FINDING_PREFIXES must suppress [403-BYPASS-CANDIDATE]"
+def test_reporter_suppresses_candidate_functionally(tmp_path):
+    """FUNCTIONAL guard (not a source grep): drive reporter.load_findings. auth_bypass
+    findings ship CRITICAL by default, so a [403-BYPASS-CANDIDATE] line must produce ZERO
+    findings; a non-prefixed line in the same file proves the dir IS scanned (so the test
+    can't pass vacuously by the loader skipping the dir)."""
+    import reporter
+    fdir = tmp_path / "findings"
+    (fdir / "auth_bypass").mkdir(parents=True)
+    hits = fdir / "auth_bypass" / "403_bypass_hits.txt"
+
+    # candidate-only → SUPPRESSED → zero auth_bypass findings
+    hits.write_text(f"{nm.CANDIDATE_PREFIX} https://h.example/admin  403->200  technique=headers\n")
+    only_cand = [f for f in reporter.load_findings(str(fdir)) if f.get("vtype") == "auth_bypass"]
+    assert only_cand == [], "a [403-BYPASS-CANDIDATE] line must NOT become an auth_bypass finding"
+
+    # candidate + a non-prefixed line → exactly ONE finding (proves the dir IS scanned)
+    hits.write_text(f"{nm.CANDIDATE_PREFIX} https://h.example/admin  403->200  technique=headers\n"
+                    "https://h.example/plainbypass confirmed auth bypass\n")
+    both = [f for f in reporter.load_findings(str(fdir)) if f.get("vtype") == "auth_bypass"]
+    assert len(both) == 1, f"expected 1 finding (candidate suppressed, plain kept), got {len(both)}"
+
+
+def test_hunt_host_in_scope():
+    """The active-phase scope gate must reject off-scope + suffix-attack hosts."""
+    import hunt
+    assert hunt._host_in_scope("https://example.com/a", "example.com")
+    assert hunt._host_in_scope("https://api.example.com/b?x=1", "example.com")
+    assert not hunt._host_in_scope("https://evil.com/c", "example.com")
+    assert not hunt._host_in_scope("https://notexample.com/d", "example.com")
+    assert not hunt._host_in_scope("https://example.com.evil.net/e", "example.com")
+    assert not hunt._host_in_scope("https://user@example.com.evil/x", "example.com")
+    assert not hunt._host_in_scope("not a url", "example.com")
+
+
+def test_run_nomore403_reads_json_from_output_file():
+    import json
+
+    def runner(argv, timeout):
+        out = argv[argv.index("-o") + 1]
+        with open(out, "w") as f:
+            json.dump([{"status_code": 200, "content_length": 5,
+                        "technique": "headers", "payload": "x"}], f)
+        return {"stdout": "", "stderr": "", "returncode": 0}
+    res = nm.run_nomore403("/bin/true", "http://t/x", runner=runner)
+    assert isinstance(res, list) and len(res) == 1 and res[0]["technique"] == "headers"
+
+
+def test_run_nomore403_malformed_and_non_list_json_return_empty():
+    def bad(argv, timeout):
+        with open(argv[argv.index("-o") + 1], "w") as f:
+            f.write("{not json")
+        return {"stdout": "", "stderr": "", "returncode": 0}
+
+    def obj(argv, timeout):
+        with open(argv[argv.index("-o") + 1], "w") as f:
+            f.write('{"an": "object"}')
+        return {"stdout": "", "stderr": "", "returncode": 0}
+    assert nm.run_nomore403("/bin/true", "http://t/x", runner=bad) == []
+    assert nm.run_nomore403("/bin/true", "http://t/x", runner=obj) == []
 
 
 # ── url extraction ───────────────────────────────────────────────────────────
