@@ -25,7 +25,7 @@ _SYSTEM_METADATA_MARKER = re.compile(r"java\.version=\S+")
 # SpEL expression that both proves arithmetic evaluation (7*7) and, on a
 # vulnerable sink, additionally leaks a benign system property — a single
 # probe covers both proof tiers so we don't need two round trips.
-SPEL_PROOF_PAYLOAD = "#{7*7}{T(java.lang.System).getProperty('java.version')}"
+SPEL_PROOF_PAYLOAD = "#{7*7}#{T(java.lang.System).getProperty('java.version')}"
 
 
 @dataclass
@@ -75,23 +75,75 @@ def parse_actuator_env_secrets(json_body: dict) -> list[dict]:
 
     For detectors that require keyword context (e.g., aws_secret_access_key),
     we construct a synthetic "KEY=VALUE" string using the property name and value
-    so the detector's regex can match."""
-    hits = []
+    so the detector's regex can match.
+
+    Two invariants enforced here (both keyed on (source_name, prop_name)):
+    - a property is reported AT MOST ONCE, no matter how many detectors (or
+      which of the two loops below) would otherwise match it — the same
+      leaked secret should not surface as two "different" findings just
+      because two regexes both happened to match it;
+    - that "at most once" scoping is per property SOURCE, not just per
+      property name, because Spring's own property-source precedence means
+      the exact same name legitimately carries different values across
+      systemEnvironment / applicationConfig / commandLineArgs / etc., and a
+      real secret in one source must not be dropped because a same-named
+      property in another source was already reported.
+    """
+    hits: list[dict] = []
+    # (source_name, prop_name) pairs that already produced a hit, from either
+    # loop below. Once a property is reported, we stop looking at it.
+    reported: set[tuple[str, str]] = set()
+
+    # generic_password_assignment is deliberately excluded from the synthetic
+    # "KEY=VALUE" matching path. That regex only requires the property NAME to
+    # end in password/passwd/pwd plus ANY 8+ char value — true of huge numbers
+    # of totally benign Spring Boot config keys (spring.datasource.password,
+    # db_password, spring.mail.password, ...) regardless of whether the value
+    # is a real secret or a benign toggle/placeholder (Spring's own Sanitizer
+    # masks genuinely sensitive values to `******` by default anyway, so a real
+    # leak here usually has actual entropy/shape). Once we manufacture
+    # "prop_name=value" ourselves, that keyword adjacency exists for nearly
+    # every such property, so the detector can no longer discriminate a real
+    # secret from a config toggle — it is structurally the wrong detector to
+    # run against a reconstructed string. It stays wired into the raw-value
+    # loop below, where a bare secret VALUE practically never itself contains
+    # the literal word "password", so it is effectively inert there (which is
+    # fine — it isn't doing useful work in this module either way).
+    SYNTHETIC_EXCLUDED_DETECTORS = {"generic_password_assignment"}
+
     for source in json_body.get("propertySources", []):
         source_name = source.get("name", "unknown")
         for prop_name, prop_value in source.get("properties", {}).items():
+            key = (source_name, prop_name)
+            if key in reported:
+                continue
             value = str(prop_value.get("value", ""))
-            # Try matching on raw value first
+
+            # Try matching on raw value first (covers detectors whose pattern
+            # needs nothing but the secret's own shape: AWS access key ID,
+            # JWT, PEM header, provider token prefixes, and
+            # generic_password_assignment when the VALUE itself happens to
+            # contain "password="/"pwd=" etc.).
             for detector_name, pattern in DETECTORS.items():
                 if pattern.search(value):
                     hits.append({"detector": detector_name, "property_name": prop_name, "source": source_name})
-                    break  # Only report first match per property to avoid duplicates
-            # For keyword-context detectors, also try with property name context
-            # (e.g., aws_secret_access_key detector expects "aws_secret_access_key=...")
+                    reported.add(key)
+                    break  # one finding per property is enough
+
+            if key in reported:
+                continue
+
+            # For keyword-context detectors (e.g. aws_secret_access_key,
+            # whose pattern requires a "secret_key="-style keyword immediately
+            # before the value and therefore can never fire on a bare secret
+            # VALUE alone), also try with property-name context. This never
+            # runs generic_password_assignment — see comment above.
             synthetic = f"{prop_name}={value}"
             for detector_name, pattern in DETECTORS.items():
+                if detector_name in SYNTHETIC_EXCLUDED_DETECTORS:
+                    continue
                 if pattern.search(synthetic):
-                    # Check if we already reported this property with this detector
-                    if not any(h["detector"] == detector_name and h["property_name"] == prop_name for h in hits):
-                        hits.append({"detector": detector_name, "property_name": prop_name, "source": source_name})
+                    hits.append({"detector": detector_name, "property_name": prop_name, "source": source_name})
+                    reported.add(key)
+                    break
     return hits
