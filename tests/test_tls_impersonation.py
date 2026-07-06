@@ -5,6 +5,7 @@ Infrastructure module, not a finding-producing phase: a real bot-management bloc
 info-severity coverage lead ([WAF-BLOCK-DETECTED]) — see record_waf_block.
 """
 import os
+from unittest.mock import MagicMock
 
 import tls_impersonation as ti
 
@@ -66,3 +67,52 @@ def test_get_client_falls_back_to_httpx_without_curl_cffi(monkeypatch):
     client = ti.get_client(fingerprint="chrome124")
     assert client is not None
     assert hasattr(client, "get")
+
+
+def test_get_client_curl_cffi_path_disables_redirects(monkeypatch):
+    """Regression test for Critical #1: curl_cffi's Session defaults
+    allow_redirects=True, which would silently auto-follow 3xx responses
+    unlike the httpx fallback (follow_redirects=False). curl_cffi is not
+    installed in this dev environment, so we fake its presence: flip the
+    availability flag and swap in a fake module whose Session records the
+    kwargs it was constructed with, then assert get_client() explicitly
+    passes allow_redirects=False."""
+    monkeypatch.setattr(ti, "_CURL_CFFI_AVAILABLE", True)
+
+    fake_session_cls = MagicMock()
+    fake_curl_cffi_requests = MagicMock()
+    fake_curl_cffi_requests.Session = fake_session_cls
+    monkeypatch.setattr(ti, "_curl_cffi_requests", fake_curl_cffi_requests, raising=False)
+
+    client = ti.get_client(fingerprint="chrome124", proxy="http://proxy:8080", timeout=7.5)
+
+    assert client is fake_session_cls.return_value
+    fake_session_cls.assert_called_once_with(
+        impersonate="chrome124",
+        proxies={"https": "http://proxy:8080", "http": "http://proxy:8080"},
+        timeout=7.5,
+        verify=False,
+        allow_redirects=False,
+    )
+
+
+def test_get_client_curl_cffi_path_no_proxy(monkeypatch):
+    """Same regression coverage as above, but exercises the no-proxy branch
+    (proxies=None) to make sure allow_redirects=False holds regardless of
+    the proxy kwarg path taken."""
+    monkeypatch.setattr(ti, "_CURL_CFFI_AVAILABLE", True)
+
+    fake_session_cls = MagicMock()
+    fake_curl_cffi_requests = MagicMock()
+    fake_curl_cffi_requests.Session = fake_session_cls
+    monkeypatch.setattr(ti, "_curl_cffi_requests", fake_curl_cffi_requests, raising=False)
+
+    ti.get_client(fingerprint="firefox133")
+
+    fake_session_cls.assert_called_once_with(
+        impersonate="firefox133",
+        proxies=None,
+        timeout=15.0,
+        verify=False,
+        allow_redirects=False,
+    )
