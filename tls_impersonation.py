@@ -10,8 +10,11 @@ degrades gracefully to stock httpx if curl_cffi's native wheel is unavailable
 
 This module is INFRASTRUCTURE, not a finding-producing phase: detecting a bot-
 management product is not itself a client vulnerability. record_waf_block writes
-an info-severity coverage lead so operators see degraded coverage instead of a
-silent gap — it never escalates to a real finding on its own.
+an info-severity [WAF-BLOCK-DETECTED] coverage lead so operators see degraded
+coverage instead of a silent gap. NOTE: reporter.py does not yet suppress this
+prefix as of this module — a later integration task must add it to reporter.py's
+NON_FINDING_PREFIXES before this ships to a real engagement, see record_waf_block's
+docstring.
 """
 from __future__ import annotations
 
@@ -64,9 +67,14 @@ def detect_bot_management(response) -> str | None:
 
 
 def record_waf_block(findings_dir: str, url: str, product: str) -> None:
-    """Append an info-severity [WAF-BLOCK-DETECTED] coverage lead. Never a finding
-    on its own — reporter.py's NON_FINDING_PREFIXES keeps this out of the report
-    body while still being visible to the operator/brain for coverage triage."""
+    """Writes an info-severity [WAF-BLOCK-DETECTED] coverage lead, visible to the
+    operator/brain for coverage triage.
+
+    NOTE: as of this module, reporter.py does not yet suppress this prefix — a
+    separate integration task must add "[WAF-BLOCK-DETECTED]" to reporter.py's
+    NON_FINDING_PREFIXES before any code path that calls this function ships to
+    a real engagement, or a benign WAF block will be mis-reported as a
+    misconfiguration finding."""
     out_dir = os.path.join(findings_dir, "misconfig")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "waf_fingerprint.txt")
@@ -100,4 +108,4 @@ def get_client(fingerprint: str = "chrome124", proxy: str | None = None,
         return _HttpxClientAdapter(timeout=timeout, proxy=proxy)
     impersonate = _FINGERPRINT_MAP.get(fingerprint, "chrome124")
     return _curl_cffi_requests.Session(impersonate=impersonate, proxies={"https": proxy, "http": proxy} if proxy else None,
-                                        timeout=timeout, verify=False)
+                                        timeout=timeout, verify=False, allow_redirects=False)
