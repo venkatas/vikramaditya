@@ -109,3 +109,68 @@ def test_confirm_replay_false_when_forged_matches_unauthenticated_baseline():
     result = jki.confirm_replay(client, "https://api.example.com/whoami",
                                  forged_token="forged.tok.en", original_token="original.tok.en")
     assert result.confirmed is False
+
+
+def test_confirm_replay_false_when_both_original_and_forged_coincidentally_500():
+    # Adversarial case: the original token's request 500s for some unrelated
+    # reason (flaky endpoint / expired original token / server hiccup), and
+    # the forged token's request ALSO 500s for a completely unrelated reason.
+    # A naive "forged.status_code == original.status_code" check would treat
+    # this as "forged token accepted with original-token-shaped response" —
+    # a genuine false positive, since neither response demonstrates anything
+    # about authentication. This must now report confirmed=False.
+    class _Client:
+        def get(self, url, headers=None, **kwargs):
+            token = (headers or {}).get("Authorization", "")
+            if "forged" in token:
+                return _FakeResponse(500, {"error": "internal server error"})
+            if "original" in token:
+                return _FakeResponse(500, {"error": "internal server error"})
+            return _FakeResponse(401, {"error": "unauthorized"})
+
+    client = _Client()
+    result = jki.confirm_replay(client, "https://api.example.com/whoami",
+                                 forged_token="forged.tok.en", original_token="original.tok.en")
+    assert result.confirmed is False
+    assert "baseline" in result.detail
+    # Must not be reported via the old "accepted" success detail.
+    assert "accepted" not in result.detail
+
+
+def test_confirm_replay_false_when_original_baseline_itself_is_non_2xx():
+    # Even if forged happens to land on a 2xx and diverges from unauth, an
+    # original-token baseline that isn't a genuine success (non-2xx) can
+    # never validate anything about the forged token.
+    class _Client:
+        def get(self, url, headers=None, **kwargs):
+            token = (headers or {}).get("Authorization", "")
+            if "forged" in token:
+                return _FakeResponse(200, {"sub": "alice", "role": "admin"})
+            if "original" in token:
+                return _FakeResponse(403, {"error": "forbidden"})
+            return _FakeResponse(401, {"error": "unauthorized"})
+
+    client = _Client()
+    result = jki.confirm_replay(client, "https://api.example.com/whoami",
+                                 forged_token="forged.tok.en", original_token="original.tok.en")
+    assert result.confirmed is False
+
+
+def test_confirm_replay_true_when_original_is_genuine_2xx_and_forged_replays_success():
+    # The real attack-success case must still work: a genuinely successful
+    # (2xx) original-token baseline, and a forged token that independently
+    # lands in the 2xx range while diverging from the unauthenticated
+    # baseline, is a confirmed forgery.
+    class _Client:
+        def get(self, url, headers=None, **kwargs):
+            token = (headers or {}).get("Authorization", "")
+            if "forged" in token:
+                return _FakeResponse(201, {"sub": "alice", "role": "admin"})
+            if "original" in token:
+                return _FakeResponse(200, {"sub": "alice", "role": "user"})
+            return _FakeResponse(401, {"error": "unauthorized"})
+
+    client = _Client()
+    result = jki.confirm_replay(client, "https://api.example.com/whoami",
+                                 forged_token="forged.tok.en", original_token="original.tok.en")
+    assert result.confirmed is True

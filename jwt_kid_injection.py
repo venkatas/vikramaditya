@@ -111,15 +111,33 @@ class ReplayResult:
 def confirm_replay(client, endpoint: str, forged_token: str, original_token: str) -> ReplayResult:
     """3-way baseline diff: the forged token must produce a response that (a)
     differs from the unauthenticated baseline AND (b) matches the *shape* of an
-    authenticated response (same status class as the original token), not just
-    any 200. This avoids false-positiving on a public 200 endpoint and false-
-    negatives on a 401-with-parsed-claims response."""
+    authenticated response, not just any 200. This avoids false-positiving on
+    a public 200 endpoint and false-negatives on a 401-with-parsed-claims
+    response.
+
+    Critically, the ORIGINAL token's response is only a trustworthy baseline
+    if it is itself a genuine 2xx success — i.e. proof the original token
+    really does authenticate. If the original token's request errors (4xx/5xx,
+    e.g. a flaky endpoint, an expired original token, or an unrelated server
+    error), that is not a successful-auth shape at all, and matching the
+    forged response's status code to it proves nothing. Concretely: original
+    500 + forged 500 must NOT be reported as "forged token accepted" — that
+    was a real false-positive in an earlier version of this function, since
+    two coincidental/unrelated 500s satisfied a naive status-code-equality
+    check. So the forged token must independently land in the 2xx range
+    (matching the successful-auth pattern the original demonstrated), not
+    merely produce the same numeric status code as original."""
     unauth = client.get(endpoint, headers={})
     original = client.get(endpoint, headers={"Authorization": f"Bearer {original_token}"})
     forged = client.get(endpoint, headers={"Authorization": f"Bearer {forged_token}"})
 
+    if not (200 <= original.status_code < 300):
+        return ReplayResult(
+            confirmed=False,
+            detail="original token baseline did not itself succeed (non-2xx) — no valid baseline to confirm against",
+        )
     if forged.status_code == unauth.status_code:
         return ReplayResult(confirmed=False, detail="forged token response matches unauthenticated baseline")
-    if forged.status_code != original.status_code:
+    if not (200 <= forged.status_code < 300):
         return ReplayResult(confirmed=False, detail="forged token response status differs from original-token baseline")
     return ReplayResult(confirmed=True, detail="forged token accepted with original-token-shaped response")
