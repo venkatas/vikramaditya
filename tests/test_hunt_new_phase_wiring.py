@@ -476,3 +476,325 @@ def test_ldap_injection_skip_path_calls_brain_phase_complete(monkeypatch, tmp_pa
     assert phase_calls[0][0] == "LDAP INJECTION"
     assert phase_calls[0][1] is True
     assert "ldap" in phase_calls[0][2].lower() or "LDAP" in phase_calls[0][2]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fix Round 2 — LDAP builder functions were fully implemented and unit-tested
+# (build_rfc4515_fuzz_payloads, build_always_true_bypass_payloads) but
+# run_ldap_injection never called either — it only called
+# looks_like_ldap_backed_auth (the gate) and run_blind_oracle (which has its
+# own hardcoded payload). An entire attack class (LDAP always-true
+# auth-bypass) was never exercised. Fixed by wiring both builders into
+# run_ldap_injection with real proof-tier discipline: a single differing
+# response to an RFC 4515 fuzz payload is a lead only ([LDAP-FUZZ-CANDIDATE]);
+# an always-true bypass payload additionally requires the response to look
+# like a genuine auth SUCCESS against a baseline that looked like a FAILURE,
+# tiered confirmed/candidate via hunt._ldap_bypass_verdict.
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_run_ldap_injection_source_calls_both_builder_functions():
+    """Source-level regression guard: catches a future revert that deletes
+    the call sites while leaving the rest of the function intact."""
+    source = inspect.getsource(hunt.run_ldap_injection)
+    assert "ldap_injection_tester.build_rfc4515_fuzz_payloads()" in source
+    assert "ldap_injection_tester.build_always_true_bypass_payloads(" in source
+    # both must feed the SAME baseline run_blind_oracle already establishes --
+    # no second baseline fetch inside the per-payload loops.
+    assert source.count('client.get(url, params={param: "baseline_probe_value"})') == 1
+
+
+class _ParamAwareFakeHttpClient:
+    """Like _FakeHttpClient, but returns a different canned response keyed by
+    the actual query-param VALUE sent -- needed to exercise the fuzz/bypass
+    tiering logic, which depends on what payload was actually transmitted,
+    not just which URL was hit."""
+    def __init__(self, responses_by_value, default_response=None):
+        self._responses_by_value = responses_by_value
+        self._default = default_response if default_response is not None else _FakeHttpResponse()
+        self.gets = []
+
+    def get(self, url, params=None, **kwargs):
+        self.gets.append((url, {"params": params, **kwargs}))
+        value = (params or {}).get("q")
+        return self._responses_by_value.get(value, self._default)
+
+    def post(self, url, **kwargs):
+        raise AssertionError("run_ldap_injection must never POST")
+
+
+def _setup_ldap_env(monkeypatch, tmp_path, fingerprint_tags):
+    import cve as cve_module
+
+    recon_dir = tmp_path / "recon"
+    findings_dir = tmp_path / "findings"
+    (recon_dir / "urls").mkdir(parents=True)
+    (recon_dir / "urls" / "all.txt").write_text("https://victim.example/login\n")
+    findings_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(hunt, "_brain", None, raising=False)
+    monkeypatch.setattr(hunt, "_resolve_recon_dir", lambda d, session_id=None: str(recon_dir))
+    monkeypatch.setattr(hunt, "_resolve_findings_dir", lambda d, session_id=None, create=False: str(findings_dir))
+    monkeypatch.setattr(cve_module, "detect_technologies",
+                        lambda domain, recon_dir=None: {tag: {} for tag in fingerprint_tags})
+    return recon_dir, findings_dir
+
+
+def test_ldap_injection_calls_both_builders_and_sends_every_payload_over_the_wire(monkeypatch, tmp_path):
+    """Behavioral test (not source-presence): spies on the REAL module builder
+    functions, asserts each is called with real arguments (no args for the
+    fuzz builder, the real query-param name for the bypass builder), and
+    that every single payload either builder produced was actually
+    transmitted as the 'q' query-param value."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _setup_ldap_env(monkeypatch, tmp_path, {"active-directory"})
+
+    real_build_fuzz = ldap_injection_tester.build_rfc4515_fuzz_payloads
+    real_build_bypass = ldap_injection_tester.build_always_true_bypass_payloads
+    fuzz_calls = []
+    bypass_calls = []
+
+    def spy_build_fuzz():
+        fuzz_calls.append(())
+        return real_build_fuzz()
+
+    def spy_build_bypass(username_field):
+        bypass_calls.append(username_field)
+        return real_build_bypass(username_field)
+
+    monkeypatch.setattr(ldap_injection_tester, "build_rfc4515_fuzz_payloads", spy_build_fuzz)
+    monkeypatch.setattr(ldap_injection_tester, "build_always_true_bypass_payloads", spy_build_bypass)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    fake_client = _FakeHttpClient()  # identical canned response everywhere -> everything "clean"
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    assert fuzz_calls == [()], "build_rfc4515_fuzz_payloads must be called exactly once, with no arguments"
+    assert bypass_calls == ["q"], (
+        "build_always_true_bypass_payloads must be called with the SAME query-param name "
+        "run_blind_oracle already uses ('q')"
+    )
+
+    sent_values = {kwargs["params"]["q"] for _url, kwargs in fake_client.gets if kwargs.get("params")}
+    for payload in real_build_fuzz():
+        assert payload in sent_values, f"RFC 4515 fuzz payload {payload!r} was never sent over the wire"
+    for payload in real_build_bypass("q"):
+        assert payload in sent_values, f"always-true bypass payload {payload!r} was never sent over the wire"
+
+
+def test_ldap_injection_fuzz_payload_diverging_from_baseline_is_a_candidate_lead(monkeypatch, tmp_path):
+    """A single RFC 4515 fuzz payload producing a response that differs from
+    baseline is a LEAD (unescaped special char reached the filter), never an
+    auto-confirmed finding -- exploitability isn't proven by one divergence."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"openldap"})
+
+    baseline_response = _FakeHttpResponse(status_code=200, text="login form")
+    fuzz_payload = ldap_injection_tester.build_rfc4515_fuzz_payloads()[0]
+    diverging_response = _FakeHttpResponse(status_code=500, text="ldap search filter error")
+
+    fake_client = _ParamAwareFakeHttpClient(
+        {"baseline_probe_value": baseline_response, fuzz_payload: diverging_response},
+        default_response=baseline_response,
+    )
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    findings_txt = (findings_dir / "ldap" / "findings.txt").read_text()
+    assert "[LDAP-FUZZ-CANDIDATE]" in findings_txt
+    assert f"payload={fuzz_payload!r}" in findings_txt
+    assert "[LDAP-INJECTION-CONFIRMED]" not in findings_txt
+    assert "[LDAP-BYPASS-CONFIRMED]" not in findings_txt
+    assert "[LDAP-BYPASS-CANDIDATE]" not in findings_txt
+
+
+def test_ldap_injection_always_true_payload_success_without_new_session_is_candidate_only(monkeypatch, tmp_path):
+    """An always-true payload flipping a failed (401) baseline to a clean 200
+    is a real lead, but WITHOUT a fresh session cookie it is only a
+    candidate -- never auto-confirmed on a weak signal alone."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"ldap-realm"})
+
+    baseline_response = _FakeHttpResponse(status_code=401, text="unauthorized")
+    bypass_payload = ldap_injection_tester.build_always_true_bypass_payloads("q")[0]
+    success_response = _FakeHttpResponse(status_code=200, text="search results")
+
+    fake_client = _ParamAwareFakeHttpClient(
+        {"baseline_probe_value": baseline_response, bypass_payload: success_response},
+        default_response=baseline_response,
+    )
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    findings_txt = (findings_dir / "ldap" / "findings.txt").read_text()
+    assert "[LDAP-BYPASS-CANDIDATE]" in findings_txt
+    assert f"payload={bypass_payload!r}" in findings_txt
+    assert "[LDAP-BYPASS-CONFIRMED]" not in findings_txt
+
+
+def test_ldap_injection_always_true_payload_with_fresh_session_cookie_is_confirmed(monkeypatch, tmp_path):
+    """The strong-proof tier: a failed baseline plus a payload response that
+    both looks un-failed AND issues a session cookie the baseline never had
+    -- the same 'a new session was actually established' proof
+    saml_xsw_tester.confirm_new_session requires via Set-Cookie."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"adfs"})
+
+    baseline_response = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
+    bypass_payload = ldap_injection_tester.build_always_true_bypass_payloads("q")[1]
+    success_response = _FakeHttpResponse(
+        status_code=200, text="welcome back",
+        headers={"Set-Cookie": "sessionid=abc123; Path=/; HttpOnly"},
+    )
+
+    fake_client = _ParamAwareFakeHttpClient(
+        {"baseline_probe_value": baseline_response, bypass_payload: success_response},
+        default_response=baseline_response,
+    )
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    findings_txt = (findings_dir / "ldap" / "findings.txt").read_text()
+    assert "[LDAP-BYPASS-CONFIRMED]" in findings_txt
+    assert f"payload={bypass_payload!r}" in findings_txt
+
+
+def test_ldap_injection_bypass_payload_still_looking_like_failure_is_clean(monkeypatch, tmp_path):
+    """A response that merely DIFFERS from baseline but still carries an
+    explicit auth-failure marker (e.g. a differently-worded error page) must
+    not be flagged as any tier of bypass -- 'different' is not 'succeeded'."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"samba-ad"})
+
+    baseline_response = _FakeHttpResponse(status_code=401, text="unauthorized")
+    bypass_payload = ldap_injection_tester.build_always_true_bypass_payloads("q")[2]
+    still_failed_response = _FakeHttpResponse(status_code=200, text="Access Denied: invalid credentials")
+
+    fake_client = _ParamAwareFakeHttpClient(
+        {"baseline_probe_value": baseline_response, bypass_payload: still_failed_response},
+        default_response=baseline_response,
+    )
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    findings_file = findings_dir / "ldap" / "findings.txt"
+    if findings_file.is_file():
+        text = findings_file.read_text()
+        assert "[LDAP-BYPASS-CONFIRMED]" not in text
+        assert "[LDAP-BYPASS-CANDIDATE]" not in text
+
+
+def test_ldap_injection_phase_complete_detail_reports_all_four_counters(monkeypatch, tmp_path):
+    """The dashboard detail string must surface all four independent
+    counters (blind-oracle confirmed, fuzz candidates, bypass confirmed,
+    bypass candidates) -- not just the original blind-oracle count, or the
+    two new attack classes stay invisible on the phase dashboard even when
+    they DO find something."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"389-ds"})
+
+    baseline_response = _FakeHttpResponse(status_code=401, text="unauthorized")
+    fuzz_payload = ldap_injection_tester.build_rfc4515_fuzz_payloads()[0]
+    bypass_payload = ldap_injection_tester.build_always_true_bypass_payloads("q")[0]
+    fuzz_diverging = _FakeHttpResponse(status_code=500, text="ldap error")
+    bypass_success = _FakeHttpResponse(status_code=200, text="results")
+
+    fake_client = _ParamAwareFakeHttpClient(
+        {
+            "baseline_probe_value": baseline_response,
+            fuzz_payload: fuzz_diverging,
+            bypass_payload: bypass_success,
+        },
+        default_response=baseline_response,
+    )
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    phase_calls = []
+    monkeypatch.setattr(hunt, "_brain_phase_complete",
+                        lambda phase, ok, detail="", artifacts=None: phase_calls.append((phase, ok, detail)))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+    assert phase_calls
+    detail = phase_calls[-1][2]
+    assert "fuzz_candidates=1" in detail
+    assert "bypass_candidates=1" in detail
+    assert "bypass_confirmed=0" in detail
+    assert "confirmed=0" in detail
+
+
+# ── Unit tests for hunt._ldap_bypass_verdict (fast, deterministic tiering) ──
+
+def test_ldap_bypass_verdict_clean_when_baseline_does_not_look_failed():
+    baseline = _FakeHttpResponse(status_code=200, text="search page")
+    response = _FakeHttpResponse(status_code=200, text="something else entirely")
+    assert hunt._ldap_bypass_verdict(response, baseline) == "clean"
+
+
+def test_ldap_bypass_verdict_clean_when_response_is_a_redirect():
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized")
+    response = _FakeHttpResponse(status_code=302, text="", headers={"Location": "/login"})
+    assert hunt._ldap_bypass_verdict(response, baseline) == "clean"
+
+
+def test_ldap_bypass_verdict_clean_when_response_still_carries_a_failure_marker():
+    baseline = _FakeHttpResponse(status_code=403, text="access denied")
+    response = _FakeHttpResponse(status_code=200, text="Please log in to continue")
+    assert hunt._ldap_bypass_verdict(response, baseline) == "clean"
+
+
+def test_ldap_bypass_verdict_candidate_on_clean_success_without_cookie():
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized")
+    response = _FakeHttpResponse(status_code=200, text="welcome")
+    assert hunt._ldap_bypass_verdict(response, baseline) == "candidate"
+
+
+def test_ldap_bypass_verdict_confirmed_on_fresh_session_cookie():
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
+    response = _FakeHttpResponse(status_code=200, text="welcome",
+                                  headers={"Set-Cookie": "sessionid=xyz; Path=/"})
+    assert hunt._ldap_bypass_verdict(response, baseline) == "confirmed"
+
+
+def test_ldap_bypass_verdict_candidate_not_confirmed_when_baseline_already_had_a_cookie():
+    """If the baseline probe ALSO got a Set-Cookie (e.g. a generic
+    tracking/session cookie issued to every visitor), that is not evidence
+    of a NEW authenticated session -- must not over-claim 'confirmed'."""
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized",
+                                  headers={"Set-Cookie": "trackingid=anon; Path=/"})
+    response = _FakeHttpResponse(status_code=200, text="welcome",
+                                  headers={"Set-Cookie": "trackingid=anon; Path=/"})
+    assert hunt._ldap_bypass_verdict(response, baseline) == "candidate"

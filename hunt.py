@@ -8108,8 +8108,69 @@ def run_actuator_probe(domain: str) -> bool:
     return True
 
 
+# RFC 4515 auth-failure shapes a login/search endpoint typically renders when
+# the query legitimately fails. Mirrors har_vapt_engine._is_success_response's
+# negative-marker list (same idea, applied to an HTML login response instead
+# of a JSON API body) — used below so an always-true bypass payload's response
+# has to affirmatively look UN-failed, not merely differ from the baseline.
+_LDAP_AUTH_FAILURE_MARKERS = (
+    "invalid session", "invalid_session", "session expired", "not authenticated",
+    "authentication required", "unauthorized", "please log in", "please login",
+    "invalid credentials", "login failed", "access denied", "incorrect password",
+)
+
+
+def _ldap_bypass_verdict(response, baseline) -> str:
+    """Classify an always-true LDAP filter-injection payload's response
+    against the known-probe baseline as "confirmed", "candidate", or "clean".
+
+    A response merely DIFFERING from baseline (ldap_injection_tester's own
+    ``_looks_different_from``) is not proof of an auth bypass — that is what
+    the RFC 4515 fuzz leads above already surface. An always-true payload's
+    entire point is to make an authentication/search that normally FAILS
+    appear to SUCCEED, so this requires the baseline to actually look like a
+    failure first — mirrors nomore403_audit.calibrate_hits, which only counts
+    a 2xx flip as a bypass when the baseline itself looked forbidden (401/403),
+    and deliberately excludes redirects as ambiguous (no -r, no reliable
+    Location signal, same reasoning nomore403_audit documents for its own
+    30x exclusion).
+
+    Tiering (never auto-confirm on a weak signal alone, same discipline as
+    saml_xsw_tester.confirm_new_session):
+      - "confirmed" — response looks un-failed AND a session cookie was
+        issued that the baseline never had (a genuinely new session is the
+        same strong proof tier confirm_new_session requires via Set-Cookie).
+      - "candidate" — response looks un-failed (2xx, no failure markers) but
+        without corroborating session evidence — a real lead, not proof.
+      - "clean" — baseline didn't look like a failure to begin with (nothing
+        to bypass), or the response still looks like a failure/error/redirect.
+    """
+    baseline_text = (baseline.text or "").lower()
+    response_text = (response.text or "").lower()
+
+    baseline_looks_failed = (
+        baseline.status_code in (401, 403)
+        or any(marker in baseline_text for marker in _LDAP_AUTH_FAILURE_MARKERS)
+    )
+    if not baseline_looks_failed:
+        return "clean"
+
+    if response.status_code >= 400 or response.status_code in (301, 302, 303, 307, 308):
+        return "clean"
+    if any(marker in response_text for marker in _LDAP_AUTH_FAILURE_MARKERS):
+        return "clean"
+
+    baseline_cookie = dict(baseline.headers).get("Set-Cookie")
+    response_cookie = dict(response.headers).get("Set-Cookie")
+    if response_cookie and not baseline_cookie:
+        return "confirmed"
+
+    return "candidate"
+
+
 def run_ldap_injection(domain: str) -> bool:
-    """RFC 4515 fuzz + blind oracle — gated on stack fingerprint."""
+    """RFC 4515 fuzz + blind oracle + always-true auth-bypass payloads —
+    gated on stack fingerprint."""
     import ldap_injection_tester
     import tls_impersonation
     import cve as cve_module  # cve.py::detect_technologies is the existing, real
@@ -8151,18 +8212,56 @@ def run_ldap_injection(domain: str) -> bool:
     ][:20]
 
     client = tls_impersonation.get_client(fingerprint="chrome124")
+    param = "q"
     confirmed = 0
+    fuzz_candidates = 0
+    bypass_confirmed = 0
+    bypass_candidates = 0
     out_path = os.path.join(ldap_dir, "findings.txt")
     for url in login_urls:
-        baseline = client.get(url, params={"q": "baseline_probe_value"})
-        result = ldap_injection_tester.run_blind_oracle(client, url, "q", baseline)
+        baseline = client.get(url, params={param: "baseline_probe_value"})
+
+        result = ldap_injection_tester.run_blind_oracle(client, url, param, baseline)
         if result.confirmed:
             confirmed += 1
             with open(out_path, "a") as f:
                 f.write(f"[LDAP-INJECTION-CONFIRMED] {url} | {result.detail}\n")
 
+        # RFC 4515 fuzz: an unescaped special character reaching the filter is
+        # the signal this builder is FOR, but a single differing response only
+        # proves "the character reached the filter unescaped" — not
+        # exploitability — so this is always a lead, never an auto-confirm.
+        for payload in ldap_injection_tester.build_rfc4515_fuzz_payloads():
+            fuzz_response = client.get(url, params={param: payload})
+            if ldap_injection_tester._looks_different_from(fuzz_response, baseline):
+                fuzz_candidates += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[LDAP-FUZZ-CANDIDATE] {url} | payload={payload!r} "
+                            f"response diverged from baseline (status {baseline.status_code} "
+                            f"-> {fuzz_response.status_code})\n")
+
+        # Always-true bypass payloads: the point is the login/search should
+        # appear to SUCCEED where the baseline failed -- see
+        # _ldap_bypass_verdict's docstring for the confirmed/candidate tiering.
+        for payload in ldap_injection_tester.build_always_true_bypass_payloads(param):
+            bypass_response = client.get(url, params={param: payload})
+            verdict = _ldap_bypass_verdict(bypass_response, baseline)
+            if verdict == "confirmed":
+                bypass_confirmed += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[LDAP-BYPASS-CONFIRMED] {url} | payload={payload!r} "
+                            f"new session issued on an always-true filter injection\n")
+            elif verdict == "candidate":
+                bypass_candidates += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[LDAP-BYPASS-CANDIDATE] {url} | payload={payload!r} "
+                            f"baseline looked like a failed auth, response did not\n")
+
     _brain_phase_complete("LDAP INJECTION", True,
-                           detail=f"target={domain} confirmed={confirmed}",
+                           detail=(f"target={domain} confirmed={confirmed} "
+                                   f"fuzz_candidates={fuzz_candidates} "
+                                   f"bypass_confirmed={bypass_confirmed} "
+                                   f"bypass_candidates={bypass_candidates}"),
                            artifacts={"ldap": ldap_dir})
     return True
 
