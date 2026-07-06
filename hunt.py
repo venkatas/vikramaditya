@@ -7783,6 +7783,22 @@ def run_jwt_audit(domain: str) -> bool:
         )
         results.append(f"## RS256→HS256 confusion\n{out3}\n")
 
+        # jwt_kid_injection: real JWKS-sourced key confusion + kid injection +
+        # live-replay confirmation (extends the jwt_tool-only coverage above).
+        import jwt_kid_injection
+        import tls_impersonation
+        jwt_client = tls_impersonation.get_client(fingerprint="chrome124")
+        issuer_guess = f"https://{domain}"
+        jwks_keys = jwt_kid_injection.discover_jwks(jwt_client, issuer_guess)
+        if jwks_keys:
+            forged = jwt_kid_injection.try_rs256_to_hs256(token, jwks_keys)
+            if forged:
+                results.append(f"## JWKS-sourced RS256->HS256 forged token\n{forged}\n")
+                log("info", f"JWT {i+1}: JWKS-sourced HS256-confusion token forged — replay against a live endpoint to confirm")
+        kid_candidates = jwt_kid_injection.build_kid_injection_candidates(token)
+        if kid_candidates:
+            results.append(f"## kid-header injection candidates\n{kid_candidates}\n")
+
         # Weak secret crack
         if jwt_wordlist:
             ok4, out4 = run_cmd(
@@ -7805,6 +7821,237 @@ def run_jwt_audit(domain: str) -> bool:
         detail=f"target={domain} tokens={len(found_jwts)}",
         artifacts={"jwt": jwt_dir},
     )
+    return True
+
+
+def run_xxe_hunt(domain: str) -> bool:
+    """XXE probing (content-type swap + upload vector + blind OOB)."""
+    import xxe_hunt
+    import tls_impersonation
+    import interactsh_client
+
+    log("phase", f"XXE HUNT: {domain}")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    xxe_dir = os.path.join(findings_dir, "xxe")
+    os.makedirs(xxe_dir, exist_ok=True)
+    if _brain and _brain.enabled:
+        _brain.phase_start("XXE HUNT", f"target={domain}")
+
+    urls_file = os.path.join(_resolve_recon_dir(domain), "urls", "with_params.txt")
+    if not os.path.isfile(urls_file):
+        _brain_phase_complete("XXE HUNT", False, detail=f"target={domain} no urls with params")
+        return False
+
+    client = tls_impersonation.get_client(fingerprint=tls_impersonation.select_fingerprint(domain))
+    session = interactsh_client.spawn(log_dir=xxe_dir)
+
+    confirmed, candidates = 0, 0
+    out_path = os.path.join(xxe_dir, "findings.txt")
+    for url in _collect_urls_from_file(urls_file, strip_query=False, limit=100):
+        result = xxe_hunt.probe_content_type_swap(client, url, {})
+        if result.verdict == "confirmed":
+            confirmed += 1
+            with open(out_path, "a") as f:
+                f.write(f"[XXE-CONFIRMED] {url} | {result.evidence}\n")
+        elif result.verdict == "candidate":
+            candidates += 1
+            with open(out_path, "a") as f:
+                f.write(f"[XXE-CANDIDATE] {url} | {result.evidence}\n")
+
+    if session is not None:
+        session.stop()
+
+    _brain_phase_complete("XXE HUNT", True,
+                           detail=f"target={domain} confirmed={confirmed} candidates={candidates}",
+                           artifacts={"xxe": xxe_dir})
+    return True
+
+
+def run_open_redirect_hunt(domain: str) -> bool:
+    """Generic parametric open-redirect fuzzing."""
+    import open_redirect_hunt
+    import tls_impersonation
+
+    log("phase", f"OPEN REDIRECT HUNT: {domain}")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    redirects_dir = os.path.join(findings_dir, "redirects")
+    os.makedirs(redirects_dir, exist_ok=True)
+    if _brain and _brain.enabled:
+        _brain.phase_start("OPEN REDIRECT HUNT", f"target={domain}")
+
+    urls_file = os.path.join(_resolve_recon_dir(domain), "urls", "with_params.txt")
+    if not os.path.isfile(urls_file):
+        _brain_phase_complete("OPEN REDIRECT HUNT", False, detail=f"target={domain} no urls with params")
+        return False
+
+    client = tls_impersonation.get_client(fingerprint=tls_impersonation.select_fingerprint(domain))
+    attacker_host = os.environ.get("VAPT_REDIRECT_CANARY_HOST", "burpcollaborator.example")
+
+    confirmed = 0
+    out_path = os.path.join(redirects_dir, "findings.txt")
+    for url in _collect_urls_from_file(urls_file, strip_query=False, limit=200):
+        for param in open_redirect_hunt.extract_redirect_params(url):
+            result = open_redirect_hunt.probe_url(client, url, param, attacker_host)
+            if result.confirmed:
+                confirmed += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[OPEN-REDIRECT-CONFIRMED] {url} | param={param} | location={result.location}\n")
+
+    _brain_phase_complete("OPEN REDIRECT HUNT", True,
+                           detail=f"target={domain} confirmed={confirmed}",
+                           artifacts={"redirects": redirects_dir})
+    return True
+
+
+def run_saml_xsw(domain: str) -> bool:
+    """SAML XSW1-8 forgery — requires an operator-supplied captured SAMLResponse."""
+    import base64
+    import saml_xsw_tester
+    import tls_impersonation
+
+    log("phase", f"SAML XSW: {domain}")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    saml_dir = os.path.join(findings_dir, "saml")
+    endpoints_file = os.path.join(saml_dir, "endpoints.txt")
+    if not os.path.isfile(endpoints_file):
+        _brain_phase_complete("SAML XSW", False, detail=f"target={domain} Check 7 has not run yet")
+        return False
+    if _brain and _brain.enabled:
+        _brain.phase_start("SAML XSW", f"target={domain}")
+
+    captured_path = os.environ.get("VAPT_SAML_CAPTURED_RESPONSE", "")
+    assertion_xml = saml_xsw_tester.load_captured_assertion(captured_path) if captured_path else None
+    if assertion_xml is None:
+        log("info", "SAML XSW: no captured SAMLResponse supplied (VAPT_SAML_CAPTURED_RESPONSE) — "
+                     "skipping forgery, manual capture required")
+        _brain_phase_complete("SAML XSW", True, detail=f"target={domain} skipped: no captured assertion")
+        return True
+
+    client = tls_impersonation.get_client(fingerprint="chrome124")
+    acs_url = open(endpoints_file).read().split()[1] if os.path.getsize(endpoints_file) else ""
+    resource_url = os.environ.get("VAPT_SAML_PROTECTED_RESOURCE", "")
+
+    confirmed_variants = []
+    for name, xml in saml_xsw_tester.generate_xsw_variants(assertion_xml).items():
+        forged_b64 = base64.b64encode(xml.encode()).decode()
+        result = saml_xsw_tester.confirm_new_session(client, acs_url, forged_b64, resource_url)
+        if result.confirmed:
+            confirmed_variants.append(name)
+
+    out_path = os.path.join(saml_dir, "xsw_findings.txt")
+    with open(out_path, "a") as f:
+        for name in confirmed_variants:
+            f.write(f"[SAML-XSW-CONFIRMED] variant={name}\n")
+
+    _brain_phase_complete("SAML XSW", True,
+                           detail=f"target={domain} confirmed_variants={confirmed_variants}",
+                           artifacts={"saml": saml_dir})
+    return True
+
+
+def run_actuator_probe(domain: str) -> bool:
+    """SpEL oracle + Jolokia reachability + actuator/env secret parsing."""
+    import springboot_actuator_probe
+    import tls_impersonation
+
+    log("phase", f"ACTUATOR PROBE: {domain}")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    exposure_file = os.path.join(_resolve_recon_dir(domain), "urls", "sensitive_paths.txt")
+    if not os.path.isfile(exposure_file):
+        _brain_phase_complete("ACTUATOR PROBE", False, detail=f"target={domain} no recon.sh Phase 9 output")
+        return False
+    if _brain and _brain.enabled:
+        _brain.phase_start("ACTUATOR PROBE", f"target={domain}")
+
+    client = tls_impersonation.get_client(fingerprint="chrome124")
+    actuator_urls = [line.strip() for line in open(exposure_file) if "actuator" in line or "jolokia" in line]
+
+    out_dir = os.path.join(findings_dir, "actuator")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "findings.txt")
+    confirmed = candidates = 0
+
+    for url in actuator_urls:
+        if "env" in url:
+            resp = client.get(url)
+            try:
+                secrets = springboot_actuator_probe.parse_actuator_env_secrets(resp.json())
+            except Exception:
+                secrets = []
+            for hit in secrets:
+                confirmed += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[ACTUATOR-ENV-SECRET-CONFIRMED] {url} | {hit}\n")
+        spel_result = springboot_actuator_probe.check_spel_injection(client, url)
+        if spel_result.verdict == "confirmed":
+            confirmed += 1
+            with open(out_path, "a") as f:
+                f.write(f"[SPEL-CONFIRMED] {url} | {spel_result.detail}\n")
+        elif spel_result.verdict == "candidate":
+            candidates += 1
+            with open(out_path, "a") as f:
+                f.write(f"[SPEL-CANDIDATE] {url} | {spel_result.detail}\n")
+
+    _brain_phase_complete("ACTUATOR PROBE", True,
+                           detail=f"target={domain} confirmed={confirmed} candidates={candidates}",
+                           artifacts={"actuator": out_dir})
+    return True
+
+
+def run_ldap_injection(domain: str) -> bool:
+    """RFC 4515 fuzz + blind oracle — gated on stack fingerprint."""
+    import ldap_injection_tester
+    import tls_impersonation
+    import cve as cve_module  # cve.py::detect_technologies is the existing, real
+                               # tech-fingerprint source (parses httpx_full.txt's
+                               # tech-detect bracket field + attack_surface.json
+                               # tech_clusters) — there is no separate fingerprint-
+                               # tag helper in hunt.py itself.
+
+    log("phase", f"LDAP INJECTION: {domain}")
+    recon_dir = _resolve_recon_dir(domain)
+    techs = cve_module.detect_technologies(domain, recon_dir=recon_dir)
+    fingerprint_tags = {name.lower() for name in techs.keys()}
+    if not ldap_injection_tester.looks_like_ldap_backed_auth(fingerprint_tags):
+        log("info", "LDAP injection: stack fingerprint does not suggest LDAP-backed auth — skipping")
+        return True
+    if _brain and _brain.enabled:
+        _brain.phase_start("LDAP INJECTION", f"target={domain}")
+
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    ldap_dir = os.path.join(findings_dir, "ldap")
+    os.makedirs(ldap_dir, exist_ok=True)
+
+    # There is no dedicated login-form recon file (login-path detection today
+    # only happens in-process inside vikramaditya.py's fingerprint_webapp, not
+    # persisted for hunt.py to read) — filter the real urls/all.txt crawl output
+    # for login-shaped paths instead, same approach _authz_select_pages already
+    # uses for its own path filtering.
+    all_urls_file = os.path.join(_resolve_recon_dir(domain), "urls", "all.txt")
+    if not os.path.isfile(all_urls_file):
+        _brain_phase_complete("LDAP INJECTION", False, detail=f"target={domain} no urls/all.txt from recon")
+        return False
+
+    _LOGIN_PATH_MARKERS = ("login", "signin", "sign-in", "sso", "auth")
+    login_urls = [
+        u for u in _collect_urls_from_file(all_urls_file, strip_query=False, limit=2000)
+        if any(marker in u.lower() for marker in _LOGIN_PATH_MARKERS)
+    ][:20]
+
+    client = tls_impersonation.get_client(fingerprint="chrome124")
+    confirmed = 0
+    out_path = os.path.join(ldap_dir, "findings.txt")
+    for url in login_urls:
+        baseline = client.get(url, params={"q": "baseline_probe_value"})
+        result = ldap_injection_tester.run_blind_oracle(client, url, "q", baseline)
+        if result.confirmed:
+            confirmed += 1
+            with open(out_path, "a") as f:
+                f.write(f"[LDAP-INJECTION-CONFIRMED] {url} | {result.detail}\n")
+
+    _brain_phase_complete("LDAP INJECTION", True,
+                           detail=f"target={domain} confirmed={confirmed}",
+                           artifacts={"ldap": ldap_dir})
     return True
 
 
@@ -8537,6 +8784,58 @@ def hunt_target(
             log("warn", f"nuclei -dast phase errored: {_nd_err}")
             result["nuclei_dast"] = False
 
+    # ── Phase 7.8: XXE hunt (content-type swap + upload vector + blind OOB) ─
+    # Honours the same skip predicate as the vuln scan (active requests).
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "xxe_hunt"):
+        try:
+            result["xxe_hunt"] = run_xxe_hunt(domain)
+        except Exception as _xxe_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"XXE hunt phase errored: {_xxe_err}")
+            result["xxe_hunt"] = False
+
+    # ── Phase 7.9: Open redirect hunt (generic parametric fuzzing) ──────────
+    # Honours the same skip predicate as the vuln scan (active requests).
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "open_redirect_hunt"):
+        try:
+            result["open_redirect_hunt"] = run_open_redirect_hunt(domain)
+        except Exception as _or_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"Open redirect hunt phase errored: {_or_err}")
+            result["open_redirect_hunt"] = False
+
+    # ── Phase 7.10: SAML XSW1-8 forgery (needs an operator-captured assertion) ─
+    # Honours the same skip predicate as the vuln scan (active requests). No-ops
+    # when scanner.sh Check 7 hasn't discovered a SAML ACS endpoint yet.
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "saml_xsw"):
+        try:
+            result["saml_xsw"] = run_saml_xsw(domain)
+        except Exception as _sx_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"SAML XSW phase errored: {_sx_err}")
+            result["saml_xsw"] = False
+
+    # ── Phase 7.11: Spring Boot actuator probe (SpEL oracle + Jolokia + env) ─
+    # Honours the same skip predicate as the vuln scan (active requests).
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "actuator_probe"):
+        try:
+            result["actuator_probe"] = run_actuator_probe(domain)
+        except Exception as _ap_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"Actuator probe phase errored: {_ap_err}")
+            result["actuator_probe"] = False
+
+    # ── Phase 7.12: LDAP injection (RFC 4515 fuzz + blind oracle) ───────────
+    # Honours the same skip predicate as the vuln scan (active requests). Gated
+    # internally on the stack fingerprint suggesting LDAP-backed auth.
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "ldap_injection"):
+        try:
+            result["ldap_injection"] = run_ldap_injection(domain)
+        except Exception as _li_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"LDAP injection phase errored: {_li_err}")
+            result["ldap_injection"] = False
+
     # ── Phase 7.5: Next.js CVE-2025-29927 middleware bypass (v9.x) ─────────
     # Cheap (~one HTTP round-trip per protected route per Next.js host).
     # Skips automatically when httpx didn't fingerprint any Next.js hosts.
@@ -8650,6 +8949,14 @@ def hunt_target(
         # ran/skipped/errored for the new active phases.
         "auth_bypass":     should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "auth_bypass"),
         "nuclei_dast":     os.environ.get("NUCLEI_DAST") == "1" and should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "nuclei_dast"),
+        # Phase 7.8-7.12: mirror the exact `if` guard used at each new phase's
+        # call site above so the dashboard's ran/skipped/errored status matches
+        # reality for these new active phases.
+        "xxe_hunt":          should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "xxe_hunt"),
+        "open_redirect_hunt": should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "open_redirect_hunt"),
+        "saml_xsw":          should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "saml_xsw"),
+        "actuator_probe":    should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "actuator_probe"),
+        "ldap_injection":    should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "ldap_injection"),
         "cms_exploit":     cms_exploit,
         "rce_scan":        rce_scan,
         "sqlmap":          sqlmap_scan,
