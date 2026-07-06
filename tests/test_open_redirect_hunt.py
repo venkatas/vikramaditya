@@ -8,9 +8,9 @@ import open_redirect_hunt as orh
 
 
 class _FakeResponse:
-    def __init__(self, status_code, location=None):
+    def __init__(self, status_code, location=None, header_key="Location"):
         self.status_code = status_code
-        self.headers = {"Location": location} if location else {}
+        self.headers = {header_key: location} if location else {}
 
 
 class _FakeClient:
@@ -58,3 +58,54 @@ def test_probe_url_not_confirmed_on_non_redirect_status():
     client = _FakeClient(_FakeResponse(200))
     result = orh.probe_url(client, "https://example.com/login?next=X", "next", "evil.example")
     assert result.confirmed is False
+
+
+# --- Fix Round 1: false-negative regression coverage -----------------------
+
+def test_probe_url_confirms_userinfo_at_sign_variant():
+    """Important #1: the `https://example.com@{attacker_host}` bypass variant
+    must be confirmed via .hostname (which strips userinfo), not .netloc
+    (which would incorrectly compare against 'example.com@evil.example')."""
+    client = _FakeClient(_FakeResponse(302, location="https://example.com@evil.example/"))
+    result = orh.probe_url(client, "https://example.com/login?next=X", "next", "evil.example")
+    assert result.confirmed is True
+
+
+def test_probe_url_confirms_lenient_scheme_single_slash_variant():
+    """Important #2: `https:/{attacker_host}` (single slash after the colon) is
+    one of the two variants Python's strict urlparse cannot natively resolve
+    to a host. Lenient pre-normalization must auto-correct it to
+    `https://{attacker_host}` (mimicking browser behaviour) before parsing."""
+    client = _FakeClient(_FakeResponse(302, location="https:/evil.example/"))
+    result = orh.probe_url(client, "https://example.com/login?next=X", "next", "evil.example")
+    assert result.confirmed is True
+
+
+def test_probe_url_confirms_backslash_slash_variant():
+    """Important #2 (bonus coverage): the `/\\/{attacker_host}` variant relies
+    on backslash-as-forward-slash browser normalization. After replacing
+    backslashes and collapsing the resulting leading slash-run, it should
+    resolve to attacker_host too."""
+    client = _FakeClient(_FakeResponse(302, location="/\\/evil.example/"))
+    result = orh.probe_url(client, "https://example.com/login?next=X", "next", "evil.example")
+    assert result.confirmed is True
+
+
+def test_probe_url_confirms_lowercase_location_header_key():
+    """Important #3: HTTP/2 mandates lowercase header names on the wire. A
+    server emitting `location:` instead of `Location:` must still be
+    detected — this simulates a real-world case-insensitive-mapping-less
+    (plain dict) fixture with the lowercase key, as real HTTP/2 traffic
+    would produce via curl_cffi/httpx over h2."""
+    client = _FakeClient(_FakeResponse(302, location="https://evil.example/", header_key="location"))
+    result = orh.probe_url(client, "https://example.com/login?next=X", "next", "evil.example")
+    assert result.confirmed is True
+
+
+def test_probe_url_confirms_capitalized_location_header_key_still_works():
+    """Important #3 regression guard: the httpx/requests-normalized 'Location'
+    casing (capitalized) must continue to work after switching away from the
+    case-destroying dict(response.headers) wrapper."""
+    client = _FakeClient(_FakeResponse(302, location="https://evil.example/", header_key="Location"))
+    result = orh.probe_url(client, "https://example.com/login?next=X", "next", "evil.example")
+    assert result.confirmed is True

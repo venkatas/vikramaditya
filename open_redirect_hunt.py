@@ -9,6 +9,7 @@ back to the app's own domain is not a finding, regardless of status code.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit, parse_qs, urlparse
 
@@ -44,6 +45,54 @@ class RedirectResult:
     location: str = ""
 
 
+# Matches "scheme:/host" (a single slash after the colon, NOT "scheme://host").
+# Browsers auto-correct this shape by inserting the missing slash; Python's
+# strict RFC-3986 urlparse does not, so we mimic the browser here.
+_SCHEME_SINGLE_SLASH_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/(?!/)")
+
+# Collapses a leading run of 2+ slashes down to exactly "//" so protocol-relative
+# variants that pick up an extra slash (e.g. from backslash normalization) still
+# parse to an authority component instead of being swallowed into the path.
+_LEADING_SLASHES_RE = re.compile(r"^/{2,}")
+
+
+def _normalize_location(location: str) -> str:
+    """Lenient, browser-like pre-normalization of a raw Location header value.
+
+    Python's urlparse is strict RFC-3986 and will NOT auto-correct shapes that
+    real browsers happily normalize (backslash-as-slash, missing double-slash
+    after a scheme). A target reflecting an open-redirect payload verbatim into
+    its Location header may produce exactly these lenient shapes, so we
+    normalize before parsing rather than conditionally per-variant, since a
+    real target's response could contain either shape regardless of which
+    bypass variant triggered it.
+    """
+    normalized = location.replace("\\", "/")
+    normalized = _SCHEME_SINGLE_SLASH_RE.sub(lambda m: f"{m.group(1)}://", normalized, count=1)
+    normalized = _LEADING_SLASHES_RE.sub("//", normalized)
+    return normalized
+
+
+def _get_location_header(headers) -> str:
+    """Case-insensitive Location header lookup.
+
+    HTTP/2 mandates lowercase header names on the wire, and this tool is meant
+    to run against real-world clients (httpx/requests/curl_cffi) whose header
+    mapping objects are already case-insensitive. Try that native .get() first
+    so we don't break it; only fall back to a manual case-insensitive scan for
+    plain-dict fixtures (e.g. this module's own tests) that may use
+    inconsistent casing. Deliberately does NOT wrap headers in dict() first,
+    since that would discard case-insensitivity on a real mapping.
+    """
+    location = headers.get("Location")
+    if location:
+        return location
+    for key, value in headers.items():
+        if key.lower() == "location":
+            return value
+    return ""
+
+
 def probe_url(client, url: str, param: str, attacker_host: str) -> RedirectResult:
     """Replace param's value with each bypass variant; confirm the first variant
     whose Location header actually points at attacker_host."""
@@ -57,10 +106,10 @@ def probe_url(client, url: str, param: str, attacker_host: str) -> RedirectResul
         response = client.get(test_url, allow_redirects=False)
         if response.status_code not in (301, 302, 303, 307, 308):
             continue
-        location = dict(response.headers).get("Location", "")
+        location = _get_location_header(response.headers)
         if not location:
             continue
-        location_host = urlparse(location).netloc
+        location_host = urlparse(_normalize_location(location)).hostname or ""
         if location_host == attacker_host or location_host.endswith("." + attacker_host):
             return RedirectResult(confirmed=True, location=location)
     return RedirectResult(confirmed=False)
