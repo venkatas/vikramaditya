@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+# Linux/glibc-style /etc/passwd only ("root:x:0:0:...") — macOS/BSD-style
+# entries ("root:*:0:0:...") are out of scope for v1 and will not match.
 _PASSWD_MARKER = re.compile(r"root:x:0:0:")
 _PARSER_ERROR_MARKER = re.compile(r"(?i)xml parsing error|undefined entity|DOCTYPE is not allowed")
 
@@ -60,12 +62,22 @@ def probe_upload_xxe(client, endpoint: str, doc_type: str = "svg") -> XxeResult:
     """Upload an XXE-laden document. v1 supports SVG only (DOCX/XLSX are a
     zip-of-XML container — deferred, same interface, filed as a follow-up)."""
     if doc_type != "svg":
-        raise NotImplementedError(f"doc_type={doc_type!r} not yet supported (svg only in v1)")
+        return XxeResult(
+            verdict="clean",
+            evidence=f"doc_type={doc_type!r} not yet supported (svg only in v1)",
+        )
     response = client.post(endpoint, files={"file": ("image.svg", _SVG_XXE_PAYLOAD, "image/svg+xml")})
     text = getattr(response, "text", "") or ""
     if _PASSWD_MARKER.search(text):
         return XxeResult(verdict="confirmed", evidence="in-band /etc/passwd content in upload response")
-    if _PARSER_ERROR_MARKER.search(text):
+    # Gated on status_code >= 400 rather than the exact 500 that
+    # probe_content_type_swap requires: upload endpoints commonly reject a
+    # malformed/rejected file with a 400-class response (not just 500), and
+    # we still want that counted as real error signal, not just any 2xx
+    # response that happens to contain matching text. This deliberately
+    # widens the status check while keeping the same "error + marker"
+    # candidate discipline as the sibling function.
+    if response.status_code >= 400 and _PARSER_ERROR_MARKER.search(text):
         return XxeResult(verdict="candidate", evidence="XML parser error on uploaded SVG")
     return XxeResult(verdict="clean", evidence="no XXE signal")
 

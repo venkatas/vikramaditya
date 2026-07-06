@@ -59,7 +59,30 @@ def test_upload_xxe_svg_payload_contains_entity_and_reasonable_dimensions():
     assert b"<svg" in body
 
 
-def test_blind_oob_confirms_on_matching_callback(monkeypatch):
+def test_upload_xxe_candidate_on_parser_error_with_error_status():
+    client = _FakeClient(_FakeResponse(400, "XML parsing error: undefined entity"))
+    result = xh.probe_upload_xxe(client, "https://example.com/upload", doc_type="svg")
+    assert result.verdict == "candidate"
+
+
+def test_upload_xxe_clean_when_parser_error_text_but_200_status():
+    # A 200 response containing marker-like text (e.g. an unrelated generic
+    # form-validation message) must NOT be tagged "candidate" — there is no
+    # real error signal without an error-class status code.
+    client = _FakeClient(_FakeResponse(200, "XML parsing error: undefined entity"))
+    result = xh.probe_upload_xxe(client, "https://example.com/upload", doc_type="svg")
+    assert result.verdict == "clean"
+
+
+def test_upload_xxe_unsupported_doc_type_returns_clean_not_raise():
+    client = _FakeClient(_FakeResponse(200, ""))
+    result = xh.probe_upload_xxe(client, "https://example.com/upload", doc_type="docx")
+    assert result.verdict == "clean"
+    assert "docx" in result.evidence.lower()
+    assert client.last_request is None
+
+
+def test_blind_oob_confirms_on_matching_callback():
     class _Session:
         url = "https://tok123.interact.sh"
         def poll_callbacks(self, token):
