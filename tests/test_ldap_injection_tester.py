@@ -81,3 +81,32 @@ def test_blind_oracle_not_confirmed_when_inconsistent_across_repeats():
     client = _FakeClient(responses)
     result = lit.run_blind_oracle(client, "https://example.com/search?q=X", "q", baseline)
     assert result.confirmed is False
+
+
+def test_blind_oracle_not_confirmed_when_control_diverges_in_final_round():
+    # This is the module's central anti-false-positive guarantee: a
+    # stable-FALSE control is required in EVERY round, including the last.
+    # Rounds 1-2 look perfect (control matches baseline, true-condition
+    # diverges). Round 3's CONTROL query unexpectedly diverges from the
+    # baseline — simulating transient server flakiness, NOT an injection
+    # signal — while round 3's true-condition query ALSO happens to diverge
+    # from baseline, coincidentally, for unrelated reasons. Because the
+    # control's stability was violated in round 3, the whole oracle must
+    # abort with confirmed=False — two good earlier rounds do not excuse a
+    # late-round control failure, and "3 rounds ran" alone is not sufficient.
+    baseline = _FakeResponse(200, "no results")
+    responses = [
+        _FakeResponse(200, "no results"),        # round 1 control: stable
+        _FakeResponse(200, "1 result found"),    # round 1 true-condition: diverges
+        _FakeResponse(200, "no results"),        # round 2 control: stable
+        _FakeResponse(200, "1 result found"),    # round 2 true-condition: diverges
+        _FakeResponse(200, "transient error"),   # round 3 control: UNEXPECTEDLY diverges (flakiness)
+        _FakeResponse(200, "unrelated result"),  # round 3 true-condition: also diverges (coincidence)
+    ]
+    client = _FakeClient(responses)
+    result = lit.run_blind_oracle(client, "https://example.com/search?q=X", "q", baseline)
+    assert result.confirmed is False
+    # Exactly 5 client calls should have happened: round1 (control+true),
+    # round2 (control+true), round3 (control only — the true-condition probe
+    # for round 3 is never reached because the control check aborts first).
+    assert len(client.calls) == 5

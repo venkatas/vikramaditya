@@ -31,9 +31,29 @@ def build_rfc4515_fuzz_payloads() -> list[str]:
 
 
 def build_always_true_bypass_payloads(username_field: str) -> list[str]:
-    """Always-true auth-bypass filter injections, correctly paren-balanced."""
+    """Always-true auth-bypass filter injections. All 4 have equal open/close
+    paren COUNTS, but they assume two *different* embedding contexts, verified
+    separately — this is not a single uniform "correctly nested" claim:
+
+    - Payloads #1, #3, #4 assume a single-field filter template, e.g.
+      ``(field=<payload>)``. Embedded there, nesting depth never goes negative
+      (no mid-string unmatched closing paren).
+    - Payload #2 (the classic ``*)(uid=*))(|(uid=*``) is the textbook
+      username+password bind-filter bypass. It only nests validly inside a
+      two-condition AND bind-filter template, e.g.
+      ``(&(uid=<payload>)(userPassword=<pw>))`` — the realistic shape of an
+      LDAP auth bind filter this payload actually targets. Embedded in a
+      single-field template instead (``(uid=<payload>)``), it produces a
+      mid-string unmatched closing paren (nesting depth goes to -1) — it is
+      NOT validly nested in that context. Kept as-is (rather than rewritten)
+      because this is the real-world attack shape; see payload comment below.
+    """
     return [
         f"{username_field}*)(|({username_field}=*)",
+        # Classic bind-filter bypass — assumes a two-condition AND template
+        # like (&(uid=<payload>)(userPassword=...)), NOT a single-field
+        # template. See docstring above: this payload's nesting only stays
+        # non-negative when embedded that way.
         f"*)(uid=*))(|(uid=*",
         f"admin)(&(password=*)",
         f"*)(&(objectClass=*)",
