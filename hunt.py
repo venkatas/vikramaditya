@@ -8279,7 +8279,13 @@ def _ldap_bypass_verdict(client, url: str, response, baseline) -> str:
     # confirm_new_session's own follow-up-request discipline: a Set-Cookie
     # header alone is never proof).
     session_cookie = new_cookie_header.split(";")[0]
-    followup = client.get(url, cookies={"raw": session_cookie})
+    # cookies={} is keyed by cookie NAME -> value; passing the whole
+    # "name=value" string under a literal "raw" key sends a cookie literally
+    # named "raw" (Cookie: raw=JSESSIONID=abc123), not the real session
+    # cookie -- httpx/requests/curl_cffi all build the Cookie header
+    # verbatim from the dict keys, none of them parse "name=value" back out.
+    cookie_name, _, cookie_value = session_cookie.partition("=")
+    followup = client.get(url, cookies={cookie_name: cookie_value})
     if _ldap_response_looks_like_failure(followup):
         return "candidate"
 

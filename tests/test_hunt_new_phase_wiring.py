@@ -700,7 +700,9 @@ def test_ldap_injection_always_true_payload_with_fresh_session_cookie_is_confirm
     followup_calls = [c for c in fake_client.gets if c[1].get("params") is None and "cookies" in c[1]]
     assert followup_calls, "the strong-proof tier must re-fetch the login url with the new cookie attached"
     assert followup_calls[0][0] == "https://victim.example/login"
-    assert followup_calls[0][1]["cookies"] == {"raw": "sessionid=abc123"}
+    # The real cookie NAME/VALUE must be split apart -- a dict keyed "raw"
+    # would send a cookie literally named "raw", not "sessionid".
+    assert followup_calls[0][1]["cookies"] == {"sessionid": "abc123"}
 
 
 def test_ldap_injection_always_true_payload_with_analytics_cookie_is_not_confirmed(monkeypatch, tmp_path):
@@ -973,8 +975,9 @@ def test_ldap_bypass_verdict_confirmed_on_fresh_session_cookie_with_verified_fol
     followup = _FakeHttpResponse(status_code=200, text="welcome back, authenticated dashboard")
     client = _FollowupFakeClient(followup_response=followup)
     assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "confirmed"
-    assert client.calls == [(_LOGIN_URL, {"cookies": {"raw": "sessionid=xyz"}})], (
-        "must re-fetch the SAME login url with the new cookie attached, not a fabricated resource"
+    assert client.calls == [(_LOGIN_URL, {"cookies": {"sessionid": "xyz"}})], (
+        "must re-fetch the SAME login url with the real cookie NAME/VALUE split apart -- "
+        "a dict keyed 'raw' would send a cookie literally named 'raw', not 'sessionid'"
     )
 
 
