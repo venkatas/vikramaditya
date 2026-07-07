@@ -50,3 +50,15 @@ principalmapper>=1.1.5
 PyYAML>=6.0
 # Test-only (already in dev environments, but pinned here for whitebox)
 moto[all]>=5.0.0,<6
+
+# ── recon-skills adoption batch 1 (TLS/HTTP2 fingerprint impersonation, XXE,
+#    SAML XSW, JWT JWKS, actuator, LDAP injection) ──────────────────────────
+curl_cffi>=0.7.0    # graceful-degrades to stock httpx if the native wheel is unavailable
+lxml>=5.0.0
+PyJWT>=2.12.0
+cryptography>=42.0.0    # jwt_kid_injection.py: derives a real RSA public-key PEM from a
+                        # JWKS JWK (via jwt.algorithms.RSAAlgorithm.from_jwk) for the
+                        # RS256->HS256 confusion HMAC secret — must be the actual key
+                        # bytes a real verifier holds, not the JWK's raw encoded text.
+ldap3>=2.9.1
+h2>=4.1.0
