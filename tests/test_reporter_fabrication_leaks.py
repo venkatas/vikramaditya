@@ -51,6 +51,12 @@ SUPPRESS = [
     ("deserialize/findings.txt", "[JAVA-RMI] https://t.example.invalid/z (401, JBoss/MBean banner)"),
     ("supply_chain/snippets.txt", "always-auth=true"),
     ("xss/xsstrike_results.txt", "https://t.example.invalid/s?q=FUZZ payload reflected"),
+    # Fix Round 3 (hunt.py Task 9): tls_impersonation.detect_bot_management/
+    # record_waf_block started actually being called from hunt.py's phases —
+    # this is an operator coverage note ("this phase got blocked by a WAF"),
+    # not a client-side misconfiguration.
+    ("misconfig/waf_fingerprint.txt",
+     "[WAF-BLOCK-DETECTED] 2026-07-06T00:00:00+00:00 | product=cloudflare | url=https://t.example.invalid/login"),
 ]
 
 KEEP = [

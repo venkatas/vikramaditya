@@ -40,6 +40,11 @@ _SVG_XXE_PAYLOAD = (
 class XxeResult:
     verdict: str  # "confirmed" | "candidate" | "clean"
     evidence: str
+    # The raw HTTP response the verdict was derived from (None when no
+    # request was actually issued, e.g. the unsupported-doc_type early return
+    # below). Lets callers (hunt.py) check for a bot-management/WAF block on
+    # this response without a second round-trip.
+    response: object = None
 
 
 def probe_content_type_swap(client, url: str, json_body: dict) -> XxeResult:
@@ -52,10 +57,10 @@ def probe_content_type_swap(client, url: str, json_body: dict) -> XxeResult:
     )
     text = getattr(response, "text", "") or ""
     if _PASSWD_MARKER.search(text):
-        return XxeResult(verdict="confirmed", evidence="in-band /etc/passwd content in response body")
+        return XxeResult(verdict="confirmed", evidence="in-band /etc/passwd content in response body", response=response)
     if response.status_code == 500 and _PARSER_ERROR_MARKER.search(text):
-        return XxeResult(verdict="candidate", evidence="XML parser touched the payload but no impact proven")
-    return XxeResult(verdict="clean", evidence="no XXE signal")
+        return XxeResult(verdict="candidate", evidence="XML parser touched the payload but no impact proven", response=response)
+    return XxeResult(verdict="clean", evidence="no XXE signal", response=response)
 
 
 def probe_upload_xxe(client, endpoint: str, doc_type: str = "svg") -> XxeResult:
@@ -69,7 +74,7 @@ def probe_upload_xxe(client, endpoint: str, doc_type: str = "svg") -> XxeResult:
     response = client.post(endpoint, files={"file": ("image.svg", _SVG_XXE_PAYLOAD, "image/svg+xml")})
     text = getattr(response, "text", "") or ""
     if _PASSWD_MARKER.search(text):
-        return XxeResult(verdict="confirmed", evidence="in-band /etc/passwd content in upload response")
+        return XxeResult(verdict="confirmed", evidence="in-band /etc/passwd content in upload response", response=response)
     # Gated on status_code >= 400 rather than the exact 500 that
     # probe_content_type_swap requires: upload endpoints commonly reject a
     # malformed/rejected file with a 400-class response (not just 500), and
@@ -78,8 +83,8 @@ def probe_upload_xxe(client, endpoint: str, doc_type: str = "svg") -> XxeResult:
     # widens the status check while keeping the same "error + marker"
     # candidate discipline as the sibling function.
     if response.status_code >= 400 and _PARSER_ERROR_MARKER.search(text):
-        return XxeResult(verdict="candidate", evidence="XML parser error on uploaded SVG")
-    return XxeResult(verdict="clean", evidence="no XXE signal")
+        return XxeResult(verdict="candidate", evidence="XML parser error on uploaded SVG", response=response)
+    return XxeResult(verdict="clean", evidence="no XXE signal", response=response)
 
 
 def confirm_blind_oob(session, token: str) -> XxeResult:

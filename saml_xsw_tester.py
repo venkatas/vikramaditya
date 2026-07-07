@@ -265,6 +265,11 @@ def generate_xsw_variants(saml_response_xml: str) -> dict[str, str]:
 class XswResult:
     confirmed: bool
     detail: str = ""
+    # The last raw HTTP response examined (the ACS response if no session
+    # cookie was ever issued, otherwise the protected-resource follow-up).
+    # Lets callers check for a bot-management/WAF block without a second
+    # round-trip.
+    response: object = None
 
 
 def confirm_new_session(client, acs_url: str, forged_response_b64: str,
@@ -275,7 +280,7 @@ def confirm_new_session(client, acs_url: str, forged_response_b64: str,
     acs_response = client.post(acs_url, data={"SAMLResponse": forged_response_b64})
     set_cookie = dict(acs_response.headers).get("Set-Cookie")
     if not set_cookie:
-        return XswResult(confirmed=False, detail="no session cookie issued")
+        return XswResult(confirmed=False, detail="no session cookie issued", response=acs_response)
 
     session_cookie = set_cookie.split(";")[0]
     resource_response = client.get(protected_resource_url,
@@ -283,8 +288,8 @@ def confirm_new_session(client, acs_url: str, forged_response_b64: str,
     if resource_response.status_code in (301, 302, 303, 307, 308):
         location = dict(resource_response.headers).get("Location", "")
         if "login" in location.lower():
-            return XswResult(confirmed=False, detail="redirected back to login")
-        return XswResult(confirmed=False, detail=f"unexpected redirect to {location}")
+            return XswResult(confirmed=False, detail="redirected back to login", response=resource_response)
+        return XswResult(confirmed=False, detail=f"unexpected redirect to {location}", response=resource_response)
     if resource_response.status_code == 200 and _ATTACKER_NAMEID in (resource_response.text or ""):
-        return XswResult(confirmed=True, detail="protected resource rendered forged identity")
-    return XswResult(confirmed=False, detail="protected resource did not reflect forged identity")
+        return XswResult(confirmed=True, detail="protected resource rendered forged identity", response=resource_response)
+    return XswResult(confirmed=False, detail="protected resource did not reflect forged identity", response=resource_response)

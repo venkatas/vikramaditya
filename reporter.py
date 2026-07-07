@@ -916,6 +916,12 @@ def load_findings(findings_dir: str) -> list:
                                          # (40x flipped to 2xx/3xx). A strong LEAD the brain/operator verifies
                                          # (behind-the-403 content may be a login page / soft-200), NOT an
                                          # auto-shipped CRITICAL via the auth_bypass template default.
+            "[WAF-BLOCK-DETECTED]",      # misconfig/waf_fingerprint.txt — tls_impersonation.record_waf_block's
+                                         # coverage note: a Cloudflare/Akamai/F5 403/429/503 mid-scan, NOT a
+                                         # client-side misconfiguration. hunt.py's Task-9 phases (xxe/redirect/
+                                         # saml/actuator/ldap) started actually calling this in Fix Round 3 —
+                                         # without this suppression it would ship as a fabricated MEDIUM
+                                         # "misconfig" finding every time a WAF blocked the scanner.
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
