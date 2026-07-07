@@ -283,8 +283,14 @@ def confirm_new_session(client, acs_url: str, forged_response_b64: str,
         return XswResult(confirmed=False, detail="no session cookie issued", response=acs_response)
 
     session_cookie = set_cookie.split(";")[0]
+    # cookies={} is keyed by cookie NAME -> value; passing the whole
+    # "name=value" string under a literal "raw" key sends a cookie literally
+    # named "raw" (Cookie: raw=JSESSIONID=abc123), not the real session
+    # cookie -- httpx/requests/curl_cffi all build the Cookie header
+    # verbatim from the dict keys, none of them parse "name=value" back out.
+    cookie_name, _, cookie_value = session_cookie.partition("=")
     resource_response = client.get(protected_resource_url,
-                                    cookies={"raw": session_cookie})
+                                    cookies={cookie_name: cookie_value})
     if resource_response.status_code in (301, 302, 303, 307, 308):
         location = dict(resource_response.headers).get("Location", "")
         if "login" in location.lower():

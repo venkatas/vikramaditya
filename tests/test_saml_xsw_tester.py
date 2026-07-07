@@ -169,6 +169,20 @@ def test_confirm_new_session_true_when_protected_resource_returns_identity_conte
     assert result.confirmed is True
 
 
+def test_confirm_new_session_replays_the_real_cookie_name_not_a_literal_raw_key():
+    # A dict keyed "raw" sends a cookie literally named "raw" (httpx/requests/
+    # curl_cffi all build the Cookie header verbatim from dict keys) -- the
+    # follow-up must split "name=value" apart so the real cookie name/value
+    # actually reach the target's session check.
+    acs_resp = _FakeResponse(302, headers={"Set-Cookie": "session=abc123"})
+    resource_resp = _FakeResponse(200, text="Welcome, attacker@evil.example")
+    client = _FakeClient(acs_resp, resource_resp)
+    sx.confirm_new_session(client, "https://sp.example.com/acs",
+                            base64.b64encode(b"<forged/>").decode(),
+                            "https://sp.example.com/whoami")
+    assert client.cookies_sent == {"session": "abc123"}
+
+
 def test_confirm_new_session_false_when_resource_redirects_to_login():
     acs_resp = _FakeResponse(302, headers={"Set-Cookie": "session=abc123"})
     resource_resp = _FakeResponse(302, headers={"Location": "https://sp.example.com/login"})
