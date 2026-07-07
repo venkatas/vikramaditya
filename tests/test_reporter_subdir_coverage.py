@@ -41,6 +41,8 @@ _SCANNER_FINDINGS_DIRS = (
     "mfa", "saml",
     # scanner.sh long-running additions that also slipped out:
     "deserialize", "import_export", "supply_chain",
+    # recon-skills-adoption batch (Task 9/10) — new hunt.py phases:
+    "xxe", "redirects", "actuator", "ldap",
 )
 
 
