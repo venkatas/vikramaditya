@@ -43,6 +43,10 @@ def build_bypass_variants(attacker_host: str) -> list[str]:
 class RedirectResult:
     confirmed: bool
     location: str = ""
+    # The last raw HTTP response probe_url examined (None if the URL had no
+    # bypass-variant candidates at all). Lets callers check for a
+    # bot-management/WAF block without a second round-trip.
+    response: object = None
 
 
 # Matches "scheme:/host" (a single slash after the colon, NOT "scheme://host").
@@ -96,6 +100,7 @@ def _get_location_header(headers) -> str:
 def probe_url(client, url: str, param: str, attacker_host: str) -> RedirectResult:
     """Replace param's value with each bypass variant; confirm the first variant
     whose Location header actually points at attacker_host."""
+    last_response = None
     for variant in build_bypass_variants(attacker_host):
         parsed = urlsplit(url)
         query = parse_qs(parsed.query)
@@ -104,6 +109,7 @@ def probe_url(client, url: str, param: str, attacker_host: str) -> RedirectResul
         test_url = parsed._replace(query=new_query).geturl()
 
         response = client.get(test_url, allow_redirects=False)
+        last_response = response
         if response.status_code not in (301, 302, 303, 307, 308):
             continue
         location = _get_location_header(response.headers)
@@ -111,5 +117,5 @@ def probe_url(client, url: str, param: str, attacker_host: str) -> RedirectResul
             continue
         location_host = urlparse(_normalize_location(location)).hostname or ""
         if location_host == attacker_host or location_host.endswith("." + attacker_host):
-            return RedirectResult(confirmed=True, location=location)
-    return RedirectResult(confirmed=False)
+            return RedirectResult(confirmed=True, location=location, response=response)
+    return RedirectResult(confirmed=False, response=last_response)

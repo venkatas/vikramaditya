@@ -32,26 +32,32 @@ SPEL_PROOF_PAYLOAD = "#{7*7}#{T(java.lang.System).getProperty('java.version')}"
 class SpelResult:
     verdict: str  # "confirmed" | "candidate" | "clean"
     detail: str = ""
+    # The raw HTTP response the verdict was derived from. Lets callers check
+    # for a bot-management/WAF block without a second round-trip.
+    response: object = None
 
 
 def check_spel_injection(client, url: str) -> SpelResult:
     response = client.get(url, params={"expr": SPEL_PROOF_PAYLOAD})
     text = getattr(response, "text", "") or ""
     if response.status_code != 200:
-        return SpelResult(verdict="clean", detail="no evaluation signal")
+        return SpelResult(verdict="clean", detail="no evaluation signal", response=response)
     arithmetic_proven = bool(_ARITHMETIC_MARKER.search(text))
     metadata_proven = bool(_SYSTEM_METADATA_MARKER.search(text))
     if arithmetic_proven and metadata_proven:
-        return SpelResult(verdict="confirmed", detail="SpEL evaluated arithmetic AND leaked java.version — real code execution proven")
+        return SpelResult(verdict="confirmed", detail="SpEL evaluated arithmetic AND leaked java.version — real code execution proven", response=response)
     if arithmetic_proven:
-        return SpelResult(verdict="candidate", detail="arithmetic evaluated but no system-metadata proof yet — theoretical until deepened")
-    return SpelResult(verdict="clean", detail="no evaluation signal")
+        return SpelResult(verdict="candidate", detail="arithmetic evaluated but no system-metadata proof yet — theoretical until deepened", response=response)
+    return SpelResult(verdict="clean", detail="no evaluation signal", response=response)
 
 
 @dataclass
 class JolokiaResult:
     reachable: bool
     mbean_count: int = 0
+    # The raw HTTP response check_jolokia_reachability examined. Lets callers
+    # check for a bot-management/WAF block without a second round-trip.
+    response: object = None
 
 
 def check_jolokia_reachability(client, url: str) -> JolokiaResult:
@@ -59,13 +65,13 @@ def check_jolokia_reachability(client, url: str) -> JolokiaResult:
     exposed) without executing anything (no write/exec calls made)."""
     response = client.get(url)
     if response.status_code != 200:
-        return JolokiaResult(reachable=False)
+        return JolokiaResult(reachable=False, response=response)
     try:
         body = response.json()
     except Exception:
-        return JolokiaResult(reachable=False)
+        return JolokiaResult(reachable=False, response=response)
     mbeans = body.get("value", {})
-    return JolokiaResult(reachable=True, mbean_count=len(mbeans))
+    return JolokiaResult(reachable=True, mbean_count=len(mbeans), response=response)
 
 
 def parse_actuator_env_secrets(json_body: dict) -> list[dict]:

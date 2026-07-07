@@ -507,14 +507,22 @@ class _ParamAwareFakeHttpClient:
     """Like _FakeHttpClient, but returns a different canned response keyed by
     the actual query-param VALUE sent -- needed to exercise the fuzz/bypass
     tiering logic, which depends on what payload was actually transmitted,
-    not just which URL was hit."""
-    def __init__(self, responses_by_value, default_response=None):
+    not just which URL was hit.
+
+    Fix Round 3: also answers the new _ldap_bypass_verdict verification
+    follow-up (a `client.get(url, cookies=...)` call with no `params`) with a
+    separately-configurable `followup_response`, so tests can exercise the
+    strong-proof tier's re-fetch-with-cookie discipline."""
+    def __init__(self, responses_by_value, default_response=None, followup_response=None):
         self._responses_by_value = responses_by_value
         self._default = default_response if default_response is not None else _FakeHttpResponse()
+        self._followup_response = followup_response
         self.gets = []
 
     def get(self, url, params=None, **kwargs):
         self.gets.append((url, {"params": params, **kwargs}))
+        if params is None and "cookies" in kwargs:
+            return self._followup_response if self._followup_response is not None else self._default
         value = (params or {}).get("q")
         return self._responses_by_value.get(value, self._default)
 
@@ -650,10 +658,12 @@ def test_ldap_injection_always_true_payload_success_without_new_session_is_candi
 
 
 def test_ldap_injection_always_true_payload_with_fresh_session_cookie_is_confirmed(monkeypatch, tmp_path):
-    """The strong-proof tier: a failed baseline plus a payload response that
-    both looks un-failed AND issues a session cookie the baseline never had
-    -- the same 'a new session was actually established' proof
-    saml_xsw_tester.confirm_new_session requires via Set-Cookie."""
+    """The strong-proof tier (Fix Round 3): a failed baseline, a payload
+    response that looks un-failed AND issues a session-shaped cookie the
+    baseline never had, AND a verification re-fetch of the same login url
+    with that cookie attached that no longer looks like the failed baseline
+    -- the same 'a new session was actually established, verified via a real
+    follow-up request' proof saml_xsw_tester.confirm_new_session requires."""
     import ldap_injection_tester
     import tls_impersonation
 
@@ -665,10 +675,15 @@ def test_ldap_injection_always_true_payload_with_fresh_session_cookie_is_confirm
         status_code=200, text="welcome back",
         headers={"Set-Cookie": "sessionid=abc123; Path=/; HttpOnly"},
     )
+    # The verification re-fetch (with the new cookie attached) must itself
+    # look genuinely authenticated, not merely "not 401" -- a real target
+    # would render distinct authenticated content here.
+    verified_followup_response = _FakeHttpResponse(status_code=200, text="welcome back, admin dashboard")
 
     fake_client = _ParamAwareFakeHttpClient(
         {"baseline_probe_value": baseline_response, bypass_payload: success_response},
         default_response=baseline_response,
+        followup_response=verified_followup_response,
     )
     monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
     monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
@@ -680,6 +695,131 @@ def test_ldap_injection_always_true_payload_with_fresh_session_cookie_is_confirm
     findings_txt = (findings_dir / "ldap" / "findings.txt").read_text()
     assert "[LDAP-BYPASS-CONFIRMED]" in findings_txt
     assert f"payload={bypass_payload!r}" in findings_txt
+    # the verification re-fetch must have actually been issued, with the new
+    # cookie attached, against the SAME login url (not a fabricated resource).
+    followup_calls = [c for c in fake_client.gets if c[1].get("params") is None and "cookies" in c[1]]
+    assert followup_calls, "the strong-proof tier must re-fetch the login url with the new cookie attached"
+    assert followup_calls[0][0] == "https://victim.example/login"
+    assert followup_calls[0][1]["cookies"] == {"raw": "sessionid=abc123"}
+
+
+def test_ldap_injection_always_true_payload_with_analytics_cookie_is_not_confirmed(monkeypatch, tmp_path):
+    """Critical #1 adversarial regression: an unrelated Google Analytics
+    cookie appearing on the bypass response (but not the baseline) must NEVER
+    be treated as session evidence, even though the response itself looks
+    un-failed -- this is the exact scenario the reviewer reproduced empirically
+    (a mundane analytics cookie previously satisfied the old 'any new
+    Set-Cookie' check and produced a fabricated [LDAP-BYPASS-CONFIRMED])."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"openldap"})
+
+    baseline_response = _FakeHttpResponse(status_code=200, text="Login failed: invalid credentials", headers={})
+    bypass_payload = ldap_injection_tester.build_always_true_bypass_payloads("q")[0]
+    analytics_cookie_response = _FakeHttpResponse(
+        status_code=200, text="unrelated page content, nothing to do with auth",
+        headers={"Set-Cookie": "_ga=GA1.2.123456789.987654321; Path=/"},
+    )
+
+    def _must_not_verify(*a, **k):
+        raise AssertionError(
+            "a known non-auth (analytics) cookie must never trigger the verification re-fetch at all"
+        )
+
+    fake_client = _ParamAwareFakeHttpClient(
+        {"baseline_probe_value": baseline_response, bypass_payload: analytics_cookie_response},
+        default_response=baseline_response,
+    )
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    findings_txt_path = findings_dir / "ldap" / "findings.txt"
+    text = findings_txt_path.read_text() if findings_txt_path.is_file() else ""
+    assert "[LDAP-BYPASS-CONFIRMED]" not in text, (
+        "an unrelated analytics cookie must never be promoted to LDAP-BYPASS-CONFIRMED"
+    )
+    # it's still a real lead (response looked un-failed) -- just not verified proof.
+    assert "[LDAP-BYPASS-CANDIDATE]" in text
+    # no verification re-fetch (cookies=...) call should have been made at all --
+    # the reject-list check must short-circuit before ever considering a follow-up.
+    followup_calls = [c for c in fake_client.gets if c[1].get("params") is None and "cookies" in c[1]]
+    assert followup_calls == []
+
+
+def test_ldap_injection_always_true_payload_with_csrf_cookie_is_not_confirmed(monkeypatch, tmp_path):
+    """Same adversarial case with a CSRF-token-shaped cookie name instead of
+    an analytics one -- a CSRF token is minted on every page load (including
+    a failed login), so its mere presence on the bypass response proves
+    nothing about a new authenticated session."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"389-ds"})
+
+    baseline_response = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
+    bypass_payload = ldap_injection_tester.build_always_true_bypass_payloads("q")[0]
+    csrf_cookie_response = _FakeHttpResponse(
+        status_code=200, text="search results",
+        headers={"Set-Cookie": "XSRF-TOKEN=eyJpdiI6IkFCQyJ9; Path=/"},
+    )
+
+    fake_client = _ParamAwareFakeHttpClient(
+        {"baseline_probe_value": baseline_response, bypass_payload: csrf_cookie_response},
+        default_response=baseline_response,
+    )
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    findings_txt = (findings_dir / "ldap" / "findings.txt").read_text()
+    assert "[LDAP-BYPASS-CONFIRMED]" not in findings_txt
+    assert "[LDAP-BYPASS-CANDIDATE]" in findings_txt
+
+
+def test_ldap_injection_session_shaped_cookie_whose_followup_still_fails_is_candidate_only(monkeypatch, tmp_path):
+    """A cookie whose NAME looks session-shaped (passes the heuristic) is
+    still not proof on its own -- if the verification re-fetch (with that
+    cookie attached) still looks like the failure-shaped baseline, this must
+    downgrade to candidate, not confirm."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"samba-ad"})
+
+    baseline_response = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
+    bypass_payload = ldap_injection_tester.build_always_true_bypass_payloads("q")[1]
+    success_response = _FakeHttpResponse(
+        status_code=200, text="welcome",
+        headers={"Set-Cookie": "JSESSIONID=abc123; Path=/"},
+    )
+    # the cookie LOOKS real, but replaying it doesn't actually grant access --
+    # a stale/rotating cookie, or a cookie that was never bound to a real
+    # session server-side.
+    still_failed_followup = _FakeHttpResponse(status_code=401, text="unauthorized")
+
+    fake_client = _ParamAwareFakeHttpClient(
+        {"baseline_probe_value": baseline_response, bypass_payload: success_response},
+        default_response=baseline_response,
+        followup_response=still_failed_followup,
+    )
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    findings_txt = (findings_dir / "ldap" / "findings.txt").read_text()
+    assert "[LDAP-BYPASS-CONFIRMED]" not in findings_txt
+    assert "[LDAP-BYPASS-CANDIDATE]" in findings_txt
 
 
 def test_ldap_injection_bypass_payload_still_looking_like_failure_is_clean(monkeypatch, tmp_path):
@@ -756,37 +896,99 @@ def test_ldap_injection_phase_complete_detail_reports_all_four_counters(monkeypa
     assert "confirmed=0" in detail
 
 
-# ── Unit tests for hunt._ldap_bypass_verdict (fast, deterministic tiering) ──
+# ════════════════════════════════════════════════════════════════════════════
+# Fix Round 3 — Critical #1: _ldap_bypass_verdict's "confirmed" tier was
+# gameable by ANY unrelated cookie (analytics/CSRF), because its only "new
+# session" test was `response_cookie and not baseline_cookie` with zero check
+# that the cookie was actually a session/auth cookie, and zero attempt to
+# verify the cookie actually granted authenticated access to anything. Fixed
+# by requiring BOTH: (1) the new cookie's NAME looks session/auth-shaped and
+# is not a known analytics/CSRF cookie, and (2) re-fetching the same login
+# `url` with that cookie attached produces a response that no longer looks
+# like the failure-shaped baseline -- this is the real "mirrors
+# confirm_new_session" discipline the old docstring only claimed to have.
+# The signature changed from (response, baseline) to (client, url, response,
+# baseline) to support that verification re-fetch.
+# ════════════════════════════════════════════════════════════════════════════
+
+class _FollowupFakeClient:
+    """Minimal client double for hunt._ldap_bypass_verdict's unit tests: only
+    ever expects the verification re-fetch call (`client.get(url,
+    cookies=...)`) -- raises if called any other way, so a test that expects
+    NO verification call (e.g. the reject-listed-cookie case) can assert
+    on `calls == []` and a test that expects one can assert on its args."""
+    def __init__(self, followup_response=None):
+        self._followup_response = followup_response
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if "cookies" not in kwargs:
+            raise AssertionError("_ldap_bypass_verdict must only re-fetch WITH the new cookie attached")
+        return self._followup_response
+
+
+_LOGIN_URL = "https://victim.example/login"
+
 
 def test_ldap_bypass_verdict_clean_when_baseline_does_not_look_failed():
     baseline = _FakeHttpResponse(status_code=200, text="search page")
     response = _FakeHttpResponse(status_code=200, text="something else entirely")
-    assert hunt._ldap_bypass_verdict(response, baseline) == "clean"
+    client = _FollowupFakeClient()
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "clean"
+    assert client.calls == [], "must never issue a verification request when the baseline never looked failed"
 
 
 def test_ldap_bypass_verdict_clean_when_response_is_a_redirect():
     baseline = _FakeHttpResponse(status_code=401, text="unauthorized")
     response = _FakeHttpResponse(status_code=302, text="", headers={"Location": "/login"})
-    assert hunt._ldap_bypass_verdict(response, baseline) == "clean"
+    client = _FollowupFakeClient()
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "clean"
+    assert client.calls == []
 
 
 def test_ldap_bypass_verdict_clean_when_response_still_carries_a_failure_marker():
     baseline = _FakeHttpResponse(status_code=403, text="access denied")
     response = _FakeHttpResponse(status_code=200, text="Please log in to continue")
-    assert hunt._ldap_bypass_verdict(response, baseline) == "clean"
+    client = _FollowupFakeClient()
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "clean"
+    assert client.calls == []
 
 
 def test_ldap_bypass_verdict_candidate_on_clean_success_without_cookie():
     baseline = _FakeHttpResponse(status_code=401, text="unauthorized")
     response = _FakeHttpResponse(status_code=200, text="welcome")
-    assert hunt._ldap_bypass_verdict(response, baseline) == "candidate"
+    client = _FollowupFakeClient()
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "candidate"
+    assert client.calls == [], "no new cookie at all -- nothing to verify"
 
 
-def test_ldap_bypass_verdict_confirmed_on_fresh_session_cookie():
+def test_ldap_bypass_verdict_confirmed_on_fresh_session_cookie_with_verified_followup():
+    """The strong-proof tier: a session-shaped new cookie AND a verification
+    re-fetch (with that cookie attached) that no longer looks like the failed
+    baseline."""
     baseline = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
     response = _FakeHttpResponse(status_code=200, text="welcome",
                                   headers={"Set-Cookie": "sessionid=xyz; Path=/"})
-    assert hunt._ldap_bypass_verdict(response, baseline) == "confirmed"
+    followup = _FakeHttpResponse(status_code=200, text="welcome back, authenticated dashboard")
+    client = _FollowupFakeClient(followup_response=followup)
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "confirmed"
+    assert client.calls == [(_LOGIN_URL, {"cookies": {"raw": "sessionid=xyz"}})], (
+        "must re-fetch the SAME login url with the new cookie attached, not a fabricated resource"
+    )
+
+
+def test_ldap_bypass_verdict_candidate_when_session_cookie_followup_still_looks_failed():
+    """Session-shaped cookie NAME is necessary but not sufficient -- if the
+    verification re-fetch still looks like the failure-shaped baseline (the
+    cookie didn't actually grant anything), this must downgrade to candidate,
+    never confirm on the cookie's mere presence."""
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
+    response = _FakeHttpResponse(status_code=200, text="welcome",
+                                  headers={"Set-Cookie": "sessionid=xyz; Path=/"})
+    followup = _FakeHttpResponse(status_code=401, text="unauthorized")
+    client = _FollowupFakeClient(followup_response=followup)
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "candidate"
 
 
 def test_ldap_bypass_verdict_candidate_not_confirmed_when_baseline_already_had_a_cookie():
@@ -797,4 +999,214 @@ def test_ldap_bypass_verdict_candidate_not_confirmed_when_baseline_already_had_a
                                   headers={"Set-Cookie": "trackingid=anon; Path=/"})
     response = _FakeHttpResponse(status_code=200, text="welcome",
                                   headers={"Set-Cookie": "trackingid=anon; Path=/"})
-    assert hunt._ldap_bypass_verdict(response, baseline) == "candidate"
+    client = _FollowupFakeClient()
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "candidate"
+    assert client.calls == [], "an unchanged cookie is not a NEW session -- nothing to verify"
+
+
+# ── Adversarial regressions: the reviewer's empirically-reproduced case ────
+
+def test_ldap_bypass_verdict_analytics_cookie_is_never_confirmed_and_never_verified():
+    """The reviewer's exact empirical repro: a baseline failed-login response
+    (200, 'Login failed: invalid credentials', no cookie) vs. a bypass
+    response that is ALSO just 200 with unrelated content but sets an
+    unrelated Google Analytics _ga cookie. Must NOT be 'confirmed' -- and
+    must not even trigger a verification re-fetch, since an explicitly
+    reject-listed cookie name is not counted as any signal at all."""
+    baseline = _FakeHttpResponse(status_code=200, text="Login failed: invalid credentials", headers={})
+    response = _FakeHttpResponse(
+        status_code=200, text="unrelated marketing page content",
+        headers={"Set-Cookie": "_ga=GA1.2.111111111.222222222; Path=/; Domain=.victim.example"},
+    )
+    client = _FollowupFakeClient()
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "candidate"
+    assert client.calls == []
+
+
+def test_ldap_bypass_verdict_csrf_token_cookie_is_never_confirmed():
+    """A CSRF token cookie is minted on every page load, including a failed
+    one -- its mere presence on the bypass response (but not baseline) must
+    never be treated as new-session proof, even though its name contains
+    'token' (a session-shaped marker) -- the reject-list must take priority."""
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
+    response = _FakeHttpResponse(
+        status_code=200, text="search results",
+        headers={"Set-Cookie": "csrftoken=abcdef0123456789; Path=/"},
+    )
+    client = _FollowupFakeClient()
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "candidate"
+    assert client.calls == []
+
+
+def test_ldap_looks_like_session_cookie_rejects_analytics_and_csrf_names():
+    assert hunt._ldap_looks_like_session_cookie("_ga") is False
+    assert hunt._ldap_looks_like_session_cookie("_gid") is False
+    assert hunt._ldap_looks_like_session_cookie("_fbp") is False
+    assert hunt._ldap_looks_like_session_cookie("csrftoken") is False
+    assert hunt._ldap_looks_like_session_cookie("XSRF-TOKEN") is False
+
+
+def test_ldap_looks_like_session_cookie_accepts_real_session_cookie_shapes():
+    assert hunt._ldap_looks_like_session_cookie("JSESSIONID") is True
+    assert hunt._ldap_looks_like_session_cookie("PHPSESSID") is True
+    assert hunt._ldap_looks_like_session_cookie("ASP.NET_SessionId") is True
+    assert hunt._ldap_looks_like_session_cookie("sessionid") is True
+    assert hunt._ldap_looks_like_session_cookie("sid") is True
+    assert hunt._ldap_looks_like_session_cookie("auth_token") is True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fix Round 3 — Critical #2: tls_impersonation.detect_bot_management() /
+# record_waf_block() were fully implemented and unit-tested (Task 2) but never
+# called from any of hunt.py's 6 live-HTTP-issuing Task-9 call sites (xxe_hunt,
+# open_redirect_hunt, saml_xsw, actuator_probe, ldap_injection, and the
+# jwt_kid_injection extension). A 403/429/503 bot-management block mid-scan
+# was silently indistinguishable from a genuinely clean target. These tests
+# exercise the REAL tls_impersonation functions (not mocked) against a
+# Cloudflare-shaped blocked response and confirm the coverage note actually
+# lands in <findings_dir>/misconfig/waf_fingerprint.txt, recorded at most
+# once per phase.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _cloudflare_block_response(status_code=403):
+    return _FakeHttpResponse(
+        status_code=status_code, text="Attention Required! | Cloudflare",
+        headers={"cf-ray": "89abcdef1234-DEL", "Server": "cloudflare"},
+    )
+
+
+def test_ldap_injection_records_waf_block_on_cloudflare_baseline_via_real_tls_impersonation(monkeypatch, tmp_path):
+    """run_ldap_injection's baseline probe is a real, direct client.get -- a
+    bot-management block on it must be recorded via the REAL (unmocked)
+    tls_impersonation.detect_bot_management/record_waf_block, exactly once
+    per phase even though many further requests hit the same blocked client."""
+    import ldap_injection_tester
+    import tls_impersonation
+
+    _, findings_dir = _setup_ldap_env(monkeypatch, tmp_path, {"openldap"})
+
+    blocked = _cloudflare_block_response()
+    fake_client = _FakeHttpClient(response=blocked)  # every .get/.post returns the SAME blocked response
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+    monkeypatch.setattr(ldap_injection_tester, "run_blind_oracle",
+                        lambda client, url, param, baseline: ldap_injection_tester.OracleResult(confirmed=False))
+
+    ok = hunt.run_ldap_injection("victim.example")
+    assert ok is True
+
+    waf_path = findings_dir / "misconfig" / "waf_fingerprint.txt"
+    assert waf_path.is_file(), "a WAF-blocked phase must write a coverage note via tls_impersonation.record_waf_block"
+    text = waf_path.read_text()
+    assert "[WAF-BLOCK-DETECTED]" in text
+    assert "product=cloudflare" in text
+    assert "https://victim.example/login" in text
+    assert text.count("[WAF-BLOCK-DETECTED]") == 1, "must be recorded once per phase, not once per request"
+
+
+def test_xxe_hunt_records_waf_block_on_blocked_oob_post_via_real_tls_impersonation(monkeypatch, tmp_path):
+    """The blind-OOB variant POST inside run_xxe_hunt is a real, direct
+    client.post -- a bot-management block on it must be recorded via the
+    REAL (unmocked) tls_impersonation functions."""
+    import interactsh_client
+    import tls_impersonation
+    import xxe_hunt
+
+    recon_dir = tmp_path / "recon"
+    findings_dir = tmp_path / "findings"
+    (recon_dir / "urls").mkdir(parents=True)
+    (recon_dir / "urls" / "with_params.txt").write_text("https://victim.example/api?id=1\n")
+    findings_dir.mkdir(parents=True)
+    _patch_common(monkeypatch, recon_dir, findings_dir)
+
+    fake_session = interactsh_client.InteractshSession(
+        url="https://tok123abc.oast.pro",
+        log_path=str(tmp_path / "interactsh_log.jsonl"),
+        token="tok123abc",
+        proc=None,
+    )
+    monkeypatch.setattr(interactsh_client, "spawn", lambda log_dir: fake_session)
+    monkeypatch.setattr(hunt.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(xxe_hunt, "confirm_blind_oob",
+                        lambda session, token: xxe_hunt.XxeResult(verdict="candidate", evidence="no callback yet"))
+    # content-type-swap probe itself is clean/unblocked -- only the OOB POST
+    # (a raw client.post hunt.py issues directly) is blocked.
+    monkeypatch.setattr(
+        xxe_hunt, "probe_content_type_swap",
+        lambda client, url, body: xxe_hunt.XxeResult(
+            verdict="clean", evidence="no XXE signal", response=_FakeHttpResponse(status_code=200)),
+    )
+
+    blocked = _cloudflare_block_response()
+    fake_client = _FakeHttpClient(response=blocked)
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+
+    ok = hunt.run_xxe_hunt("victim.example")
+    assert ok is True
+
+    waf_path = findings_dir / "misconfig" / "waf_fingerprint.txt"
+    assert waf_path.is_file()
+    text = waf_path.read_text()
+    assert "[WAF-BLOCK-DETECTED]" in text
+    assert "product=cloudflare" in text
+
+
+def test_actuator_probe_records_waf_block_on_blocked_env_fetch_via_real_tls_impersonation(monkeypatch, tmp_path):
+    """The /actuator/env branch inside run_actuator_probe is a real, direct
+    client.get -- a bot-management block on it must be recorded via the REAL
+    (unmocked) tls_impersonation functions."""
+    import springboot_actuator_probe
+    import tls_impersonation
+
+    recon_dir = tmp_path / "recon"
+    findings_dir = tmp_path / "findings"
+    (recon_dir / "urls").mkdir(parents=True)
+    (recon_dir / "urls" / "sensitive_paths.txt").write_text("https://victim.example/actuator/env\n")
+    findings_dir.mkdir(parents=True)
+    _patch_common(monkeypatch, recon_dir, findings_dir)
+
+    blocked = _cloudflare_block_response()
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: _FakeHttpClient(response=blocked))
+
+    ok = hunt.run_actuator_probe("victim.example")
+    assert ok is True
+
+    waf_path = findings_dir / "misconfig" / "waf_fingerprint.txt"
+    assert waf_path.is_file()
+    text = waf_path.read_text()
+    assert "[WAF-BLOCK-DETECTED]" in text
+    assert "product=cloudflare" in text
+
+
+def test_saml_xsw_records_waf_block_on_blocked_acs_response_via_real_tls_impersonation(monkeypatch, tmp_path):
+    """confirm_new_session itself is NOT mocked here -- the ACS POST is a
+    real, direct client.post issued by the real saml_xsw_tester module. A
+    bot-management block on it (403, no Set-Cookie) must be recorded via the
+    REAL (unmocked) tls_impersonation functions."""
+    import saml_xsw_tester
+    import tls_impersonation
+
+    findings_dir = tmp_path / "findings"
+    saml_dir = findings_dir / "saml"
+    saml_dir.mkdir(parents=True)
+    (saml_dir / "endpoints.txt").write_text(
+        "[SAML-ENDPOINT] https://victim.example/saml/acs | HTTP 200\n"
+    )
+    captured = tmp_path / "captured.xml"
+    captured.write_text(_SAMPLE_SAML_RESPONSE)
+    monkeypatch.setenv("VAPT_SAML_CAPTURED_RESPONSE", str(captured))
+
+    monkeypatch.setattr(hunt, "_brain", None, raising=False)
+    monkeypatch.setattr(hunt, "_resolve_findings_dir", lambda d, session_id=None, create=False: str(findings_dir))
+
+    blocked = _cloudflare_block_response()
+    fake_client = _FakeHttpClient(response=blocked)  # ACS POST returns a 403 cloudflare block, no Set-Cookie
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: fake_client)
+
+    ok = hunt.run_saml_xsw("victim.example")
+    assert ok is True
+
+    waf_path = findings_dir / "misconfig" / "waf_fingerprint.txt"
+    assert waf_path.is_file()
+    text = waf_path.read_text()
+    assert "[WAF-BLOCK-DETECTED]" in text
+    assert "product=cloudflare" in text

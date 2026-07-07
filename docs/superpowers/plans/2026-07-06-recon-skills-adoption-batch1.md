@@ -6,7 +6,7 @@
 
 **Architecture:** Every module is a new standalone `.py` file at repo root (no edits to any shared file at authoring time). One integrator pass afterward wires all of them into `hunt.py` (new phase functions + `_phase_tool_map`/`_phase_requested` entries), `reporter.py` (`NON_FINDING_PREFIXES` + `SUBDIR_VTYPE` + `VULN_TEMPLATES`), and `requirements.txt`.
 
-**Tech Stack:** Python 3.14, `httpx` (existing dep), `curl_cffi` (new, TLS/HTTP2 impersonation), `lxml`/`PyJWT`/`ldap3`/`h2` (already installed, now formalized in `requirements.txt`), `procutil.run_capture` (fork-safe subprocess), pytest.
+**Tech Stack:** Python 3.14, `httpx` (existing dep), `curl_cffi` (new, TLS/HTTP2 impersonation), `lxml`/`PyJWT`/`ldap3`/`h2` (already installed, now formalized in `requirements.txt`), `cryptography` (new, RSA public-key PEM derivation for JWT confusion), `procutil.run_capture` (fork-safe subprocess), pytest.
 
 ## Global Constraints
 
@@ -2130,7 +2130,7 @@ import reporter
 def test_new_candidate_prefixes_are_non_finding():
     import inspect
     source = inspect.getsource(reporter)
-    for prefix in ("[XXE-CANDIDATE]", "[SPEL-CANDIDATE]"):
+    for prefix in ("[XXE-CANDIDATE]", "[SPEL-CANDIDATE]", "[WAF-BLOCK-DETECTED]"):
         assert prefix in source, f"{prefix} missing from reporter.py NON_FINDING_PREFIXES"
 
 
@@ -2158,6 +2158,10 @@ In `reporter.py`, add to the `NON_FINDING_PREFIXES` tuple (after the existing `"
             "[SPEL-CANDIDATE]",          # actuator/ — arithmetic-only SpEL evaluation proven, no
                                          # system-metadata read confirmed. Reads as theoretical
                                          # until a benign java.version leak also succeeds.
+            "[WAF-BLOCK-DETECTED]",      # misconfig/ — tls_impersonation.py's bot-management
+                                         # detection lead. A blocked scan is NOT a client
+                                         # misconfiguration; this is a coverage/visibility signal
+                                         # for the operator, never a finding on its own.
 ```
 
 In `reporter.py`'s `SUBDIR_VTYPE` dict, add (after the existing `"smuggling": "smuggling",` entry):
@@ -2219,6 +2223,10 @@ Add after the existing `certifi>=2024.7.4` line, matching the existing comment s
 curl_cffi>=0.7.0    # graceful-degrades to stock httpx if the native wheel is unavailable
 lxml>=5.0.0
 PyJWT>=2.12.0
+cryptography>=42.0.0    # jwt_kid_injection.py: derives a real RSA public-key PEM from a
+                        # JWKS JWK (via jwt.algorithms.RSAAlgorithm.from_jwk) for the
+                        # RS256->HS256 confusion HMAC secret — must be the actual key
+                        # bytes a real verifier holds, not the JWK's raw encoded text.
 ldap3>=2.9.1
 h2>=4.1.0
 ```
