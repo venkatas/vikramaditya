@@ -6438,6 +6438,33 @@ def _seed_urls_into_recon(recon_dir: str, seeds: list) -> int:
 
 
 # ── NEW: sqlmap targeted scan ───────────────────────────────────────────────────
+def _build_get_sqlmap_command(cand_file: str, sqli_dir: str, sqli_out: str,
+                              cookie_opt: str = "", *, deep: bool = False) -> str:
+    """Build the multi-target GET-candidate sqlmap command.
+
+    Defaults to a FAST confirm-first pass — ``--level=1 --risk=1
+    --technique=BEU --smart`` — mirroring the POST/OpenAPI path's v7.1.10
+    hardening. The old hardcoded ``--level=3 --risk=2`` with NO ``--technique``
+    tested every payload family (incl. time-based) across every header/param
+    permutation; on a slow target one ``sqlmap -m`` batch burned the entire
+    phase budget and confirmed NOTHING even on a trivial error/UNION SQLi
+    (reproduced on testaspnet.vulnweb.com/ReadNews.aspx?id=). ``--technique``
+    deliberately EXCLUDES T(ime) so a slow/blocking WAF timeout can never be
+    misread as SQLi — the same false-positive posture scanner.sh's time-based
+    tier already enforces via linear-scaling. ``deep=True`` restores an
+    exhaustive sweep (still time-based-free) for a deliberate second pass."""
+    if deep:
+        level, risk, technique = 3, 2, "BEUS"   # +Stacked, still no Time-based
+    else:
+        level, risk, technique = 1, 1, "BEU"     # Boolean/Error/Union — fast
+    return (
+        f'sqlmap -m {shlex.quote(cand_file)} --batch '
+        f'--level={level} --risk={risk} --technique={technique} --smart '
+        f'--output-dir={shlex.quote(sqli_dir)} --results-file={shlex.quote(sqli_out)} '
+        f'--random-agent --timeout=10 {cookie_opt}'
+    )
+
+
 def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
     """
     Run sqlmap on SQLi candidates from nuclei findings and parameterized URLs.
@@ -6606,9 +6633,7 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
             f.write("\n".join(candidates))
 
         ok, out = run_cmd(
-            f'sqlmap -m {shlex.quote(cand_file)} --batch --level=3 --risk=2 '
-            f'--output-dir={shlex.quote(sqli_dir)} --results-file={shlex.quote(sqli_out)} '
-            f'--random-agent --timeout=10 {cookie_opt}',
+            _build_get_sqlmap_command(cand_file, sqli_dir, sqli_out, cookie_opt),
             timeout=1800,
             watch_file=sqli_dir,
             watch_phase="SQLMAP"
