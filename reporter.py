@@ -874,6 +874,14 @@ def load_findings(findings_dir: str) -> list:
     _CVE_REF_RE = re.compile(r'\bCVE-\d{4}-\d{4,}\b', re.IGNORECASE)
     # cves/*.txt files that ARE confirmed findings (allowlist; fail-closed for the rest).
     _CVES_CONFIRMED_TXT = {"nuclei_cve_confirmed.txt"}
+    # jwt/ per-token NARRATIVE dumps: hunt.py run_jwt_audit writes jwt_<N>.txt
+    # (the raw token) and jwt_<N>_results.txt (jwt_tool decode/alg=none/RS256->
+    # HS256/kid-candidate/crack output). jwt_tool `-X a` only *generates* a
+    # forged token locally (never sends it), so none of these lines prove server
+    # acceptance — they are manual-followup leads, not findings. Pattern-matched
+    # (files are numbered per token). A genuinely CONFIRMED weak-secret crack is
+    # written separately to jwt/jwt_confirmed.txt (no digit -> not exempted).
+    _JWT_NARRATIVE_FILE_RE = re.compile(r'^jwt_\d+(_results)?\.txt$')
 
     # Method 1: Subdirectory-based findings (scanner.sh output)
     for subdir, vtype in SUBDIR_VTYPE.items():
@@ -979,6 +987,8 @@ def load_findings(findings_dir: str) -> list:
             if not fn.endswith(".txt"):
                 continue
             if fn in NON_FINDING_FILES:
+                continue
+            if vtype == "jwt" and _JWT_NARRATIVE_FILE_RE.match(fn):
                 continue
             with open(os.path.join(path, fn), errors="replace") as f:
                 for line in f:

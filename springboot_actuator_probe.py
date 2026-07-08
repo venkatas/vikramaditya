@@ -19,13 +19,27 @@ from dataclasses import dataclass
 
 from whitebox.secrets.detectors import DETECTORS
 
-_ARITHMETIC_MARKER = re.compile(r"result:\s*49\b")
-_SYSTEM_METADATA_MARKER = re.compile(r"java\.version=\S+")
+# Both proof tiers embed a UNIQUE, self-labeling marker built by SpEL string
+# concatenation INSIDE the payload, so the regex matches genuine evaluation and
+# nothing else. The old markers (`result:\s*49`, `java.version=\S+`) never
+# matched real output: `#{7*7}` reflects a bare `49` (not `result: 49`) and
+# `getProperty('java.version')` reflects a bare version string (e.g. `17.0.9`,
+# not `java.version=17.0.9`), so a genuinely vulnerable target always scored
+# `clean`. The literal-49 / literal-digit anchors below also can't false-positive
+# on an UN-evaluated payload echo, whose text is `SPEL_ARITH_PROOF:' + (7*7)` /
+# `SPEL_JAVA_VERSION:' + T(...)` — i.e. a quote after the colon, never a digit.
+_ARITHMETIC_MARKER = re.compile(r"SPEL_ARITH_PROOF:49")
+_SYSTEM_METADATA_MARKER = re.compile(r"SPEL_JAVA_VERSION:\d[\w._-]*")
 
-# SpEL expression that both proves arithmetic evaluation (7*7) and, on a
-# vulnerable sink, additionally leaks a benign system property — a single
-# probe covers both proof tiers so we don't need two round trips.
-SPEL_PROOF_PAYLOAD = "#{7*7}#{T(java.lang.System).getProperty('java.version')}"
+# SpEL expression that both proves arithmetic evaluation (7*7 -> 49) and, on a
+# vulnerable sink, additionally leaks a benign system property (java.version) —
+# a single probe covers both proof tiers so we don't need two round trips. Each
+# block prefixes its result with a unique literal via `'MARKER:' + <expr>` so the
+# reflected, EVALUATED output is unambiguously attributable to our injection.
+SPEL_PROOF_PAYLOAD = (
+    "#{'SPEL_ARITH_PROOF:' + (7*7)}"
+    "#{'SPEL_JAVA_VERSION:' + T(java.lang.System).getProperty('java.version')}"
+)
 
 
 @dataclass

@@ -57,6 +57,15 @@ SUPPRESS = [
     # not a client-side misconfiguration.
     ("misconfig/waf_fingerprint.txt",
      "[WAF-BLOCK-DETECTED] 2026-07-06T00:00:00+00:00 | product=cloudflare | url=https://t.example.invalid/login"),
+    # hunt.py run_jwt_audit writes per-token jwt_<N>.txt (the raw token) and
+    # jwt_<N>_results.txt (jwt_tool decode / alg=none / crack NARRATIVE output).
+    # jwt_tool `-X a` (no -t) only *generates* a forged token locally — it never
+    # sends it, so it proves nothing about server acceptance. These are
+    # manual-followup leads, not findings; every non-`#` line was shipping as a
+    # fabricated HIGH "jwt" finding via the generic Method-1 .txt loader.
+    ("jwt/jwt_1.txt", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiJ9.s5c8Rt0kA1b2C3d4E5f6G7h8I9j0K"),
+    ("jwt/jwt_1_results.txt", "Original JWT: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.sig | alg=HS256 sub=admin"),
+    ("jwt/jwt_2_results.txt", "[+] Testing potential signing keys... jwttool_forged=eyJ0eXAiOi...tampered token"),
 ]
 
 KEEP = [
@@ -64,6 +73,12 @@ KEEP = [
     ("supply_chain/findings.txt", "[CRED-FILE] https://t.example.invalid/.npmrc"),
     ("rce/verified.txt", "[POC-RCE-CONFIRMED] https://t.example.invalid/x cmd=id uid=0"),
     ("sqli/timebased_candidates.txt", "[SQLI-POC-VERIFIED] https://t.example.invalid/a?id=1 :: time-based confirmed"),
+    # A genuinely cracked weak signing secret IS an empirically-confirmed
+    # finding — run_jwt_audit writes it as a structured [JWT-WEAK-SECRET-
+    # CONFIRMED] line into the canonical jwt/jwt_confirmed.txt (NOT a numbered
+    # jwt_<N>*.txt narrative file), so the numbered-file exemption must not
+    # swallow it.
+    ("jwt/jwt_confirmed.txt", "[JWT-WEAK-SECRET-CONFIRMED] https://t.example.invalid/api :: jwt_tool -C cracked weak signing secret 'secret123'"),
 ]
 
 

@@ -7,6 +7,8 @@ FP gate: arithmetic-only SpEL evaluation is a [SPEL-CANDIDATE] lead, not a
 finding — only a benign system-metadata read (proving real Java code execution
 capability) escalates further. A bare /actuator/health 200 is never a finding.
 """
+import re
+
 import springboot_actuator_probe as sap
 
 
@@ -30,17 +32,67 @@ class _FakeClient:
         return self._response
 
 
-def test_spel_arithmetic_only_is_candidate_not_confirmed():
-    # 7 * 7 evaluated to 49 in the response, but no system-metadata proof
-    client = _FakeClient(_FakeResponse(200, text="result: 49"))
+def _spel_evaluate(expr, java_version="17.0.9"):
+    """Minimal stand-in for a SpEL-vulnerable Spring app: evaluate the ``#{...}``
+    blocks the probe actually sends, the way a real vulnerable target would
+    (arithmetic + optional-string concatenation + a java.version property read).
+    Payload-agnostic on purpose — it evaluates whatever ``SPEL_PROOF_PAYLOAD``
+    is, so the test verifies genuine end-to-end behavior, not a hardcoded
+    marker string."""
+    out = expr
+    # #{'PREFIX' + (7*7)} -> PREFIX49  (string-concat arithmetic proof)
+    out = re.sub(r"#\{'([^']*)'\s*\+\s*\(?\s*7\s*\*\s*7\s*\)?\}", lambda m: m.group(1) + "49", out)
+    # #{7*7} -> 49  (bare arithmetic)
+    out = re.sub(r"#\{\s*7\s*\*\s*7\s*\}", "49", out)
+    # #{'PREFIX' + T(java.lang.System).getProperty('java.version')} -> PREFIX<ver>
+    out = re.sub(
+        r"#\{'([^']*)'\s*\+\s*T\(java\.lang\.System\)\.getProperty\('java\.version'\)\}",
+        lambda m: m.group(1) + java_version, out,
+    )
+    # #{T(java.lang.System).getProperty('java.version')} -> <ver>  (bare read)
+    out = re.sub(r"#\{T\(java\.lang\.System\)\.getProperty\('java\.version'\)\}", java_version, out)
+    return out
+
+
+class _SpelEvalClient:
+    """Fake HTTP client whose response reflects the SpEL payload EVALUATED (if
+    ``vulnerable``) or echoed verbatim (if not) — models a real target."""
+
+    def __init__(self, vulnerable=True, java_version="17.0.9", status_code=200):
+        self.vulnerable = vulnerable
+        self.java_version = java_version
+        self.status_code = status_code
+        self.last_url = None
+
+    def get(self, url, **kwargs):
+        self.last_url = url
+        expr = (kwargs.get("params") or {}).get("expr", "")
+        text = _spel_evaluate(expr, self.java_version) if self.vulnerable else expr
+        return _FakeResponse(self.status_code, text=text)
+
+
+def test_spel_vulnerable_server_evaluating_payload_is_confirmed():
+    # A genuinely vulnerable target evaluates the probe's SpEL: the arithmetic
+    # proof AND the benign java.version read both surface -> confirmed RCE.
+    client = _SpelEvalClient(vulnerable=True, java_version="17.0.9")
+    result = sap.check_spel_injection(client, "https://example.com/actuator/env")
+    assert result.verdict == "confirmed"
+
+
+def test_spel_arithmetic_only_evaluation_is_candidate():
+    # Server evaluates SpEL but the java.version read yields nothing (blocked /
+    # empty) — arithmetic proof only, no system-metadata proof -> candidate.
+    client = _SpelEvalClient(vulnerable=True, java_version="")
     result = sap.check_spel_injection(client, "https://example.com/actuator/env")
     assert result.verdict == "candidate"
 
 
-def test_spel_with_system_metadata_proof_is_confirmed():
-    client = _FakeClient(_FakeResponse(200, text="result: 49 | java.version=17.0.9"))
-    result = sap.check_spel_injection(client, "https://example.com/actuator/env")
-    assert result.verdict == "confirmed"
+def test_spel_literal_echo_without_evaluation_is_clean():
+    # A non-vulnerable server reflects the payload verbatim (no evaluation).
+    # The markers must NOT false-positive on the un-evaluated literal payload.
+    client = _SpelEvalClient(vulnerable=False)
+    result = sap.check_spel_injection(client, "https://example.com/search")
+    assert result.verdict == "clean"
 
 
 def test_spel_no_evaluation_signal_is_clean():

@@ -7837,6 +7837,18 @@ def run_jwt_audit(domain: str) -> bool:
             results.append(f"## Secret crack\n{out4}\n")
             if "SECRET FOUND" in out4 or "secret found" in out4.lower():
                 log("crit", f"JWT {i+1}: WEAK SECRET CRACKED!")
+                # A cracked signing secret is EMPIRICALLY confirmed (jwt_tool
+                # brute-forced the real HS256 key), unlike the alg=none/kid
+                # forge candidates which only prove local generation. Emit it as
+                # a structured finding to the canonical jwt/jwt_confirmed.txt so
+                # it survives the reporter's exemption of the per-token narrative
+                # dumps (jwt_<N>*.txt); the `CONFIRMED` keyword scores CRITICAL.
+                confirmed_file = os.path.join(jwt_dir, "jwt_confirmed.txt")
+                with open(confirmed_file, "a") as cf:
+                    cf.write(
+                        f"[JWT-WEAK-SECRET-CONFIRMED] token={token[:60]}... "
+                        f"source={source} :: jwt_tool -C brute-forced the HS256 signing secret\n"
+                    )
 
         with open(result_file, "w") as f:
             f.write("\n".join(results))
@@ -8056,6 +8068,10 @@ def run_saml_xsw(domain: str) -> bool:
         return True
 
     client = tls_impersonation.get_client(fingerprint="chrome124")
+    # An empty resource_url is tolerated here (not an early skip): the loop
+    # still lets WAF-block detection observe each ACS response, and
+    # confirm_new_session itself guards the empty-URL case rather than calling
+    # client.get("") (which would raise in the real HTTP client).
     resource_url = os.environ.get("VAPT_SAML_PROTECTED_RESOURCE", "")
 
     confirmed_variants = []
@@ -8175,12 +8191,6 @@ _LDAP_NON_AUTH_COOKIE_NAME_MARKERS = (
 _LDAP_SESSION_COOKIE_NAME_MARKERS = ("sess", "sid", "auth", "token")
 
 
-def _ldap_cookie_name(set_cookie_header: str) -> str:
-    """The cookie NAME (before '=') out of a raw Set-Cookie header value,
-    lowercased for marker matching."""
-    return set_cookie_header.split("=", 1)[0].strip().lower()
-
-
 def _ldap_looks_like_session_cookie(name: str) -> bool:
     """True only for cookie names that plausibly carry session/auth state.
 
@@ -8204,6 +8214,51 @@ def _ldap_response_looks_like_failure(response) -> bool:
     return any(marker in text for marker in _LDAP_AUTH_FAILURE_MARKERS)
 
 
+def _ldap_set_cookie_pairs(headers) -> dict:
+    """Parse the Set-Cookie header value into {cookie_name: cookie_value}.
+    Mirrors the module's existing single-Set-Cookie assumption (dict(headers)
+    collapses duplicate header keys) — enough to detect a NEW or value-CHANGED
+    session cookie between the baseline and the injection response. The name is
+    returned in its real case so it can be replayed verbatim in the follow-up."""
+    raw = dict(headers).get("Set-Cookie")
+    if not raw:
+        return {}
+    name, _, value = raw.split(";")[0].partition("=")
+    name = name.strip()
+    return {name: value} if name else {}
+
+
+_LDAP_DIVERGENCE_MIN_BYTES = 256
+_LDAP_DIVERGENCE_MIN_RATIO = 0.15
+
+
+def _ldap_responses_diverge(response, control) -> bool:
+    """True when the WITH-cookie response differs from the no-cookie control in an
+    authentication-MEANINGFUL way. Deliberately NOT byte-for-byte inequality:
+    any page carrying a per-request CSRF token / timestamp / nonce differs
+    between two fetches even when nothing was authenticated, which would let a
+    benign ROTATED session cookie fake a bypass on every dynamic page (moving the
+    old gameable gap rather than closing it). Accept only:
+      - a status-code change (e.g. login/redirect/401 -> 200 authed),
+      - a failure->non-failure flip (the cookie turned a failed control into a
+        non-failure response), or
+      - a body-size delta well beyond per-request token churn (an authenticated
+        view differs from a login/search page by far more than a rotated token).
+    Favours "candidate" over a false "confirmed" when the divergence is small —
+    the correct bias for a fabrication-averse tool."""
+    if response.status_code != control.status_code:
+        return True
+    if _ldap_response_looks_like_failure(control) and not _ldap_response_looks_like_failure(response):
+        return True
+    a = response.text or ""
+    b = control.text or ""
+    larger = max(len(a), len(b))
+    if larger == 0:
+        return False
+    delta = abs(len(a) - len(b))
+    return delta >= _LDAP_DIVERGENCE_MIN_BYTES and (delta / larger) >= _LDAP_DIVERGENCE_MIN_RATIO
+
+
 def _ldap_bypass_verdict(client, url: str, response, baseline) -> str:
     """Classify an always-true LDAP filter-injection payload's response
     against the known-probe baseline as "confirmed", "candidate", or "clean".
@@ -8219,28 +8274,35 @@ def _ldap_bypass_verdict(client, url: str, response, baseline) -> str:
     Location signal, same reasoning nomore403_audit documents for its own
     30x exclusion).
 
-    Tiering (never auto-confirm on a weak signal alone). Fix Round 3: a
-    Set-Cookie header appearing that wasn't on the baseline is NOT, by
-    itself, proof of anything — an unrelated analytics/CSRF cookie set on
-    every page load (failed or not) would satisfy that check trivially. This
-    now genuinely mirrors saml_xsw_tester.confirm_new_session's discipline:
-    that function never trusts a bare Set-Cookie either, it REPLAYS the
-    cookie against a real protected-resource URL and only confirms if that
-    follow-up request reflects the forged identity. There is no equivalent
-    "protected resource" for a login/search endpoint, so the follow-up here
-    re-fetches the SAME `url` with the new cookie attached and requires the
-    result to no longer look like the failure-shaped baseline.
-      - "confirmed" — response looks un-failed AND a NEW cookie was issued
-        whose NAME looks like a real session/auth cookie (not a known
-        analytics/CSRF cookie) AND re-fetching `url` with that cookie
-        attached produces a response that itself does not look like the
-        failure-shaped baseline (the actual "does this cookie grant a
-        genuinely different, authenticated-shaped response" proof).
+    Tiering (never auto-confirm on a weak signal alone). A Set-Cookie header is
+    NOT, by itself, proof — an unrelated analytics/CSRF cookie set on every page
+    load (failed or not) would satisfy that trivially. This mirrors
+    saml_xsw_tester.confirm_new_session's discipline: never trust a bare
+    Set-Cookie; REPLAY the candidate cookie and only confirm on a genuinely
+    authenticated-looking result. There is no equivalent "protected resource"
+    for a login/search endpoint, so the follow-up re-fetches the SAME `url`.
+
+    Fix Round 4 closed two opposite gaps in the earlier "new cookie the baseline
+    didn't have + follow-up isn't failure-shaped" rule:
+      * It gated the new-session test on the baseline having had NO cookie, which
+        made "confirmed" unreachable whenever the baseline set any cookie
+        (near-universal). Now we compare the session cookie's VALUE: a new OR
+        value-CHANGED session-shaped cookie qualifies, regardless of whether the
+        baseline also set one.
+      * "follow-up isn't failure-shaped" was gameable — a bare login/search page
+        is never failure-shaped, so ANY session-shaped cookie a visitor happens
+        to get passed. Now the WITH-cookie follow-up must materially DIVERGE from
+        a no-cookie CONTROL fetch of the same url (a benign cookie yields an
+        identical page either way).
+      - "confirmed" — response looks un-failed AND a session/auth-shaped cookie
+        was issued whose VALUE is new or changed vs the baseline (not a known
+        analytics/CSRF cookie) AND re-fetching `url` WITH that cookie both looks
+        un-failed AND materially diverges from a no-cookie control of `url`.
       - "candidate" — response looks un-failed (2xx, no failure markers) but
-        without corroborating, VERIFIED session evidence (no new cookie, a
-        non-session-shaped/reject-listed cookie name, or a session-shaped
-        cookie whose follow-up request still looks like a failure) — a real
-        lead, not proof.
+        without corroborating VERIFIED session evidence (no new/changed session
+        cookie, a non-session-shaped/reject-listed cookie name, a follow-up that
+        still looks failed, or a follow-up indistinguishable from the no-cookie
+        control) — a real lead, not proof.
       - "clean" — baseline didn't look like a failure to begin with (nothing
         to bypass), or the response still looks like a failure/error/redirect.
     """
@@ -8259,34 +8321,48 @@ def _ldap_bypass_verdict(client, url: str, response, baseline) -> str:
     if any(marker in response_text for marker in _LDAP_AUTH_FAILURE_MARKERS):
         return "clean"
 
-    baseline_cookie = dict(baseline.headers).get("Set-Cookie")
-    response_cookie = dict(response.headers).get("Set-Cookie")
-    new_cookie_header = response_cookie if (response_cookie and not baseline_cookie) else None
-    if not new_cookie_header:
+    # A "new session" requires a Set-Cookie on the injection response whose NAME
+    # looks session/auth-shaped (not a known analytics/CSRF cookie) AND whose
+    # VALUE is genuinely new or CHANGED vs the baseline. Fix Round 4: compare the
+    # cookie VALUE rather than gating on "the baseline had zero cookies" — that
+    # earlier gate made "confirmed" UNREACHABLE the moment the baseline set any
+    # cookie at all, which is near-universal (session/CSRF cookies are handed out
+    # on unauthenticated GETs everywhere).
+    baseline_cookies = _ldap_set_cookie_pairs(baseline.headers)
+    response_cookies = _ldap_set_cookie_pairs(response.headers)
+    new_session = None
+    for name, value in response_cookies.items():
+        if not _ldap_looks_like_session_cookie(name):
+            # A known non-auth cookie (analytics/CSRF — never counted as signal)
+            # or an ambiguous name that doesn't look session-shaped either way.
+            continue
+        if baseline_cookies.get(name) == value:
+            # Identical session cookie the baseline already carried — a cookie
+            # every visitor receives, not evidence of a NEW authenticated session.
+            continue
+        new_session = (name, value)
+        break
+    if new_session is None:
+        # Response looked un-failed but there is no corroborating new/changed
+        # session cookie — a real lead, not verified proof.
         return "candidate"
 
-    cookie_name = _ldap_cookie_name(new_cookie_header)
-    if not _ldap_looks_like_session_cookie(cookie_name):
-        # Either a known non-auth cookie (analytics/CSRF — explicitly not
-        # counted as any signal) or an ambiguous name that doesn't look like
-        # a session cookie either way. The response itself already looked
-        # un-failed, so this is still a lead, just not a verified one.
+    # A session-shaped, value-changed cookie is necessary but NOT sufficient.
+    # Prove it actually grants access: (1) re-fetch the SAME login/search url
+    # WITH it attached and require a non-failure-shaped response, AND (2) require
+    # that response to materially DIVERGE from a no-cookie control of the same
+    # url. Fix Round 4: the divergence-vs-control check closes the gap where any
+    # session-shaped cookie passed merely because a bare login page is never
+    # failure-shaped — a benign session cookie every visitor gets yields the
+    # SAME page with or without it. cookies={} is keyed by cookie NAME -> value
+    # (httpx/requests/curl_cffi build the Cookie header verbatim from dict keys),
+    # so the name/value are already split apart in `new_session`.
+    cookie_name, cookie_value = new_session
+    with_cookie = client.get(url, cookies={cookie_name: cookie_value})
+    if _ldap_response_looks_like_failure(with_cookie):
         return "candidate"
-
-    # Session-cookie-SHAPED name is necessary but not sufficient -- verify it
-    # actually grants a materially different, non-failure-shaped response by
-    # re-fetching the SAME login/search url with it attached (mirrors
-    # confirm_new_session's own follow-up-request discipline: a Set-Cookie
-    # header alone is never proof).
-    session_cookie = new_cookie_header.split(";")[0]
-    # cookies={} is keyed by cookie NAME -> value; passing the whole
-    # "name=value" string under a literal "raw" key sends a cookie literally
-    # named "raw" (Cookie: raw=JSESSIONID=abc123), not the real session
-    # cookie -- httpx/requests/curl_cffi all build the Cookie header
-    # verbatim from the dict keys, none of them parse "name=value" back out.
-    cookie_name, _, cookie_value = session_cookie.partition("=")
-    followup = client.get(url, cookies={cookie_name: cookie_value})
-    if _ldap_response_looks_like_failure(followup):
+    control = client.get(url)  # same url, NO injected cookie
+    if not _ldap_responses_diverge(with_cookie, control):
         return "candidate"
 
     return "confirmed"
