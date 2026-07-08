@@ -914,20 +914,24 @@ def test_ldap_injection_phase_complete_detail_reports_all_four_counters(monkeypa
 # ════════════════════════════════════════════════════════════════════════════
 
 class _FollowupFakeClient:
-    """Minimal client double for hunt._ldap_bypass_verdict's unit tests: only
-    ever expects the verification re-fetch call (`client.get(url,
-    cookies=...)`) -- raises if called any other way, so a test that expects
-    NO verification call (e.g. the reject-listed-cookie case) can assert
-    on `calls == []` and a test that expects one can assert on its args."""
-    def __init__(self, followup_response=None):
+    """Client double for hunt._ldap_bypass_verdict's unit tests. The strong-
+    proof tier makes up to two follow-up requests to the SAME login url: a
+    WITH-cookie re-fetch (the candidate session) AND a no-cookie CONTROL fetch
+    (to prove the cookie ITSELF causes the divergence — a benign session cookie
+    every visitor gets would yield an identical page either way). Returns
+    `followup_response` for the WITH-cookie call and `control_response` for the
+    no-cookie control, recording every call so tests can assert exactly what
+    was issued (a test expecting NO follow-up at all asserts `calls == []`)."""
+    def __init__(self, followup_response=None, control_response=None):
         self._followup_response = followup_response
+        self._control_response = control_response
         self.calls = []
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        if "cookies" not in kwargs:
-            raise AssertionError("_ldap_bypass_verdict must only re-fetch WITH the new cookie attached")
-        return self._followup_response
+        if "cookies" in kwargs:
+            return self._followup_response
+        return self._control_response
 
 
 _LOGIN_URL = "https://victim.example/login"
@@ -966,19 +970,81 @@ def test_ldap_bypass_verdict_candidate_on_clean_success_without_cookie():
 
 
 def test_ldap_bypass_verdict_confirmed_on_fresh_session_cookie_with_verified_followup():
-    """The strong-proof tier: a session-shaped new cookie AND a verification
-    re-fetch (with that cookie attached) that no longer looks like the failed
-    baseline."""
+    """The strong-proof tier: a session-shaped new cookie AND a WITH-cookie
+    re-fetch that is non-failure-shaped AND materially diverges from a no-cookie
+    control of the same url (proving the COOKIE, not the url, produced the
+    authenticated view)."""
     baseline = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
     response = _FakeHttpResponse(status_code=200, text="welcome",
                                   headers={"Set-Cookie": "sessionid=xyz; Path=/"})
     followup = _FakeHttpResponse(status_code=200, text="welcome back, authenticated dashboard")
-    client = _FollowupFakeClient(followup_response=followup)
+    # No-cookie control still looks like a failed/unauthenticated view -> the
+    # cookie flipped failure to success (an authentication-meaningful divergence).
+    control = _FakeHttpResponse(status_code=200, text="please log in to continue")
+    client = _FollowupFakeClient(followup_response=followup, control_response=control)
     assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "confirmed"
-    assert client.calls == [(_LOGIN_URL, {"cookies": {"sessionid": "xyz"}})], (
+    with_cookie_calls = [c for c in client.calls if "cookies" in c[1]]
+    control_calls = [c for c in client.calls if "cookies" not in c[1]]
+    assert with_cookie_calls == [(_LOGIN_URL, {"cookies": {"sessionid": "xyz"}})], (
         "must re-fetch the SAME login url with the real cookie NAME/VALUE split apart -- "
         "a dict keyed 'raw' would send a cookie literally named 'raw', not 'sessionid'"
     )
+    assert control_calls and control_calls[0][0] == _LOGIN_URL, (
+        "must also fetch a no-cookie control of the same url to prove positive divergence"
+    )
+
+
+def test_ldap_bypass_verdict_candidate_when_cookie_yields_no_divergence_from_control():
+    """Gameable-path fix (Fix Round 4): a session-SHAPED cookie whose WITH-cookie
+    re-fetch is IDENTICAL to a no-cookie control of the same url grants nothing —
+    a benign session cookie every visitor receives. 'Not failure-shaped' is not
+    proof (a bare login/search page never is), so this must stay a candidate.
+    The old logic confirmed on any session-shaped cookie whose follow-up merely
+    wasn't failure-shaped."""
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
+    response = _FakeHttpResponse(status_code=200, text="search results",
+                                  headers={"Set-Cookie": "sessionid=fresh; Path=/"})
+    same_page = _FakeHttpResponse(status_code=200, text="public search form")
+    # WITH-cookie and no-cookie control return the SAME page -> cookie granted nothing.
+    client = _FollowupFakeClient(followup_response=same_page, control_response=same_page)
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "candidate"
+
+
+def test_ldap_bypass_verdict_candidate_when_divergence_is_only_per_request_token_noise():
+    """A page carrying a per-request CSRF token / timestamp / nonce differs
+    byte-for-byte between two fetches even when nothing was authenticated. Strict
+    inequality would let a benign ROTATED session cookie fake a bypass on ANY
+    such dynamic page. Divergence must be authentication-MEANINGFUL (status flip,
+    failure->success, or a substantial size delta) — a few bytes of token churn
+    at the same status/size stays a candidate."""
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized", headers={})
+    response = _FakeHttpResponse(status_code=200, text="search results",
+                                  headers={"Set-Cookie": "sessionid=rotated; Path=/"})
+    # Same status, same size, differ ONLY by a rotating token value.
+    with_cookie = _FakeHttpResponse(status_code=200, text="search page csrf=BBBBBBBBBBBBBBBB")
+    control = _FakeHttpResponse(status_code=200, text="search page csrf=AAAAAAAAAAAAAAAA")
+    client = _FollowupFakeClient(followup_response=with_cookie, control_response=control)
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "candidate"
+
+
+def test_ldap_bypass_verdict_confirmed_when_session_cookie_value_changed_from_baseline():
+    """Over-correction fix (Fix Round 4): 'confirmed' must be reachable even when
+    the baseline probe ALSO set a session cookie (session/CSRF cookies are near-
+    universal on unauth GETs). What matters is the session cookie's VALUE
+    CHANGED on the always-true injection AND replaying it grants a divergent,
+    authenticated view — not that the baseline had zero cookies. The old
+    `not baseline_cookie` gate made confirmed impossible here."""
+    baseline = _FakeHttpResponse(status_code=401, text="unauthorized",
+                                  headers={"Set-Cookie": "sessionid=anon-000; Path=/"})
+    response = _FakeHttpResponse(status_code=200, text="welcome",
+                                  headers={"Set-Cookie": "sessionid=authed-999; Path=/"})
+    followup = _FakeHttpResponse(status_code=200, text="welcome back, admin dashboard")
+    # No-cookie control redirects to login (status flip) -> meaningful divergence.
+    control = _FakeHttpResponse(status_code=302, text="", headers={"Location": "/login"})
+    client = _FollowupFakeClient(followup_response=followup, control_response=control)
+    assert hunt._ldap_bypass_verdict(client, _LOGIN_URL, response, baseline) == "confirmed"
+    with_cookie_calls = [c for c in client.calls if "cookies" in c[1]]
+    assert with_cookie_calls == [(_LOGIN_URL, {"cookies": {"sessionid": "authed-999"}})]
 
 
 def test_ldap_bypass_verdict_candidate_when_session_cookie_followup_still_looks_failed():
@@ -1213,3 +1279,99 @@ def test_saml_xsw_records_waf_block_on_blocked_acs_response_via_real_tls_imperso
     text = waf_path.read_text()
     assert "[WAF-BLOCK-DETECTED]" in text
     assert "product=cloudflare" in text
+
+
+# ── Fix Round 4: SAML empty-protected-resource guard ────────────────────────
+
+_SAML_CAPTURED = (
+    '<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"'
+    ' xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r">'
+    '<saml:Assertion ID="_a"><saml:Subject><saml:NameID>alice@example.com'
+    '</saml:NameID></saml:Subject>'
+    '<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">'
+    '<ds:SignedInfo/><ds:SignatureValue>ZmFrZQ==</ds:SignatureValue>'
+    '</ds:Signature></saml:Assertion></samlp:Response>'
+)
+
+
+def test_run_saml_xsw_skips_gracefully_when_no_protected_resource_url(monkeypatch, tmp_path):
+    """With a captured assertion and a discovered ACS but NO
+    VAPT_SAML_PROTECTED_RESOURCE, run_saml_xsw must complete cleanly (return
+    True) even when the ACS issues a Set-Cookie — confirm_new_session guards the
+    empty-URL case instead of calling client.get('') (which raises in the real
+    HTTP client). End-to-end no-crash guard for the empty-resource path."""
+    import tls_impersonation
+
+    recon_dir = tmp_path / "recon"
+    findings_dir = tmp_path / "findings"
+    saml_dir = findings_dir / "saml"
+    saml_dir.mkdir(parents=True)
+    (saml_dir / "endpoints.txt").write_text("[SAML-ENDPOINT] https://sp.example.com/saml/acs\n")
+    _patch_common(monkeypatch, recon_dir, findings_dir)
+
+    captured = tmp_path / "captured.xml"
+    captured.write_text(_SAML_CAPTURED)
+    monkeypatch.setenv("VAPT_SAML_CAPTURED_RESPONSE", str(captured))
+    monkeypatch.setenv("VAPT_SAML_PROTECTED_RESOURCE", "")
+
+    class _CookieIssuingClient:
+        """ACS issues a session cookie; any GET to an empty URL raises, exactly
+        as a real requests/httpx/curl_cffi client would."""
+        def post(self, url, **kwargs):
+            return _FakeHttpResponse(302, headers={"Set-Cookie": "session=abc123"})
+
+        def get(self, url, **kwargs):
+            if not url:
+                raise ValueError("empty protected-resource URL would crash the real client")
+            return _FakeHttpResponse(200, text="")
+
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: _CookieIssuingClient())
+
+    # Must not raise, and must return True (graceful skip).
+    assert hunt.run_saml_xsw("example.com") is True
+
+
+# ── Fix Round 4: JWT weak-secret crack emits a canonical confirmed finding ───
+
+def test_run_jwt_audit_emits_confirmed_finding_when_weak_secret_cracked(monkeypatch, tmp_path):
+    """When jwt_tool actually cracks a weak signing secret, run_jwt_audit must
+    write a structured [JWT-WEAK-SECRET-CONFIRMED] line to the canonical
+    jwt/jwt_confirmed.txt so the empirically-verified finding survives the
+    reporter's exemption of the per-token narrative dumps (jwt_<N>*.txt).
+    Without this, killing the fabrication would also silently drop the one
+    genuinely-confirmed JWT finding."""
+    import jwt_kid_injection
+    import tls_impersonation
+
+    recon_dir = tmp_path / "recon"
+    findings_dir = tmp_path / "findings"
+    (recon_dir / "live").mkdir(parents=True)
+    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.s5c8Rt0kA1b2C3d4E5f6G7h8I9j0K1"
+    (recon_dir / "live" / "httpx_full.txt").write_text(
+        f"https://t.example.invalid [200] token={token}\n")
+    _patch_common(monkeypatch, recon_dir, findings_dir)
+
+    fake_tool = tmp_path / "jwt_tool.py"
+    fake_tool.write_text("# stub")
+    monkeypatch.setattr(hunt, "_tool_bin", lambda name: str(fake_tool))
+
+    wl_dir = tmp_path / "wordlists"
+    wl_dir.mkdir()
+    (wl_dir / "jwt-secrets.txt").write_text("secret123\n")
+    monkeypatch.setattr(hunt, "WORDLIST_DIR", str(wl_dir))
+
+    def fake_run_cmd(cmd, **kwargs):
+        if "-C" in cmd:  # the weak-secret crack invocation (`-C -d wordlist`)
+            return True, "[+] Testing key: secret123\n[+] SECRET FOUND: secret123\n"
+        return True, "decoded: sub=admin alg=HS256\n"
+
+    monkeypatch.setattr(hunt, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(jwt_kid_injection, "discover_jwks", lambda client, issuer: [])
+    monkeypatch.setattr(jwt_kid_injection, "build_kid_injection_candidates", lambda t: "")
+    monkeypatch.setattr(tls_impersonation, "get_client", lambda **kw: _FakeHttpClient())
+
+    assert hunt.run_jwt_audit("t.example.invalid") is True
+    confirmed = findings_dir / "jwt" / "jwt_confirmed.txt"
+    assert confirmed.is_file(), "cracked weak secret was not written to jwt/jwt_confirmed.txt"
+    text = confirmed.read_text()
+    assert "[JWT-WEAK-SECRET-CONFIRMED]" in text

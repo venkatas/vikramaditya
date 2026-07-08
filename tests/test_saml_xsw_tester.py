@@ -23,6 +23,20 @@ _SAMPLE_RESPONSE = """<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:p
   </saml:Assertion>
 </samlp:Response>"""
 
+# Same assertion but bound to the `saml2:` prefix instead of `saml:` — the
+# form ADFS / Shibboleth / many real IdPs actually emit. XSW7/XSW8 aliasing
+# must work against whatever prefix the captured assertion uses, not only the
+# hardcoded `saml:`.
+_SAMPLE_RESPONSE_SAML2 = """<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+  xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_resp1">
+  <saml2:Assertion ID="_assertion1">
+    <saml2:Subject><saml2:NameID>alice@example.com</saml2:NameID></saml2:Subject>
+    <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+      <ds:SignedInfo/><ds:SignatureValue>ZmFrZQ==</ds:SignatureValue>
+    </ds:Signature>
+  </saml2:Assertion>
+</samlp:Response>"""
+
 _NS = {
     "samlp": "urn:oasis:names:tc:SAML:2.0:protocol",
     "saml": "urn:oasis:names:tc:SAML:2.0:assertion",
@@ -138,6 +152,30 @@ def test_xsw7_and_xsw8_use_alternate_namespace_prefix_for_forged_assertion():
     assert {a.prefix for a in aliased7} == {"s2", "saml"}
 
 
+def test_xsw7_xsw8_alias_prefix_works_when_source_uses_saml2_prefix():
+    """XSW7/XSW8 must alias the forged assertion to s2:/s3: even when the
+    captured assertion uses a non-`saml:` prefix (e.g. `saml2:`, the ADFS/
+    Shibboleth default). The old hardcoded `<saml:` byte-replace no-op'd on
+    such documents, leaving the forged assertion with the SAME prefix as the
+    original — no wrapping at all."""
+    variants = sx.generate_xsw_variants(_SAMPLE_RESPONSE_SAML2)
+
+    assert "<s2:Assertion" in variants["XSW7"]
+    assert 'xmlns:s2="urn:oasis:names:tc:SAML:2.0:assertion"' in variants["XSW7"]
+    assert variants["XSW7"].count("<saml2:Assertion") == 1
+
+    assert "<s3:Assertion" in variants["XSW8"]
+    assert 'xmlns:s3="urn:oasis:names:tc:SAML:2.0:assertion"' in variants["XSW8"]
+    assert variants["XSW8"].count("<saml2:Assertion") == 1
+
+    # Both the original (saml2:) and the aliased forged (s2:) assertion resolve
+    # to the real SAML assertion namespace URI, with genuinely distinct prefixes.
+    root7 = etree.fromstring(variants["XSW7"].encode())
+    aliased7 = root7.findall(".//{urn:oasis:names:tc:SAML:2.0:assertion}Assertion")
+    assert len(aliased7) == 2
+    assert {a.prefix for a in aliased7} == {"s2", "saml2"}
+
+
 class _FakeResponse:
     def __init__(self, status_code, headers=None, text=""):
         self.status_code = status_code
@@ -201,3 +239,25 @@ def test_confirm_new_session_false_when_no_session_cookie_set():
                                      base64.b64encode(b"<forged/>").decode(),
                                      "https://sp.example.com/whoami")
     assert result.confirmed is False
+
+
+def test_confirm_new_session_empty_resource_url_does_not_crash_on_cookie():
+    """If the ACS issues a session cookie but no protected-resource URL was
+    supplied, confirm_new_session must NOT call client.get('') (which raises in
+    the real HTTP client) — it returns unconfirmed with an actionable detail."""
+    acs_resp = _FakeResponse(302, headers={"Set-Cookie": "session=abc123"})
+
+    class _RaisingOnEmptyGetClient:
+        def post(self, url, **kwargs):
+            return acs_resp
+
+        def get(self, url, **kwargs):
+            if not url:
+                raise ValueError("empty URL would crash the real HTTP client")
+            return _FakeResponse(200, text="Welcome")
+
+    result = sx.confirm_new_session(_RaisingOnEmptyGetClient(), "https://sp.example.com/acs",
+                                     base64.b64encode(b"<forged/>").decode(), "")
+    assert result.confirmed is False
+    assert result.response is acs_resp
+    assert "no protected-resource URL" in result.detail

