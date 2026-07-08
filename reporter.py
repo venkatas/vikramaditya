@@ -290,6 +290,26 @@ VULN_TEMPLATES = {
             ("OWASP SSRF", "https://owasp.org/www-community/attacks/Server_Side_Request_Forgery"),
         ],
     },
+    "xxe": {
+        "title": "XML External Entity (XXE) Injection on {host}",
+        "severity": "critical", "cvss": "9.1", "cwe": "CWE-611",
+        "impact": (
+            "An attacker can craft XML input that defines external entities resolved by a "
+            "misconfigured parser, enabling local file disclosure, SSRF against internal "
+            "services and cloud metadata endpoints, denial of service (billion laughs/entity "
+            "expansion), and in some parser/library combinations remote code execution."
+        ),
+        "remediation": (
+            "Disable external entity resolution and DTD processing in the XML parser "
+            "(e.g. disallow-doctype-decl, XMLConstants.FEATURE_SECURE_PROCESSING). Prefer a "
+            "hardened parser or a data format (JSON) that has no entity concept. Keep XML "
+            "libraries patched."
+        ),
+        "references": [
+            ("OWASP XXE Prevention Cheat Sheet",
+             "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"),
+        ],
+    },
     "cors": {
         "title": "CORS Misconfiguration on {host}",
         "severity": "medium", "cvss": "6.5", "cwe": "CWE-942",
@@ -718,6 +738,17 @@ SUBDIR_VTYPE = {
     "jwt": "jwt",                    # hunt.py JWT audit
     "graphql": "graphql",            # upstream graphql findings dir
     "smuggling": "smuggling",        # HTTP request smuggling
+    # recon-skills-adoption batch (Task 9/10) — new hunt.py phases:
+    "xxe": "xxe",                    # xxe_hunt phase — [XXE-CONFIRMED]/[XXE-OOB-CONFIRMED]/
+                                      # [XXE-UPLOAD-CONFIRMED]; the -CANDIDATE variants in the
+                                      # same dir are suppressed via NON_FINDING_PREFIXES above.
+    "redirects": "open_redirect",    # open_redirect_hunt phase — [OPEN-REDIRECT-CONFIRMED]
+    "actuator": "misconfig",         # springboot_actuator_probe phase — [ACTUATOR-ENV-SECRET-
+                                      # CONFIRMED]/[SPEL-CONFIRMED]
+    "ldap": "auth_bypass",           # ldap_injection_tester phase — [LDAP-INJECTION-CONFIRMED]/
+                                      # [LDAP-BYPASS-CONFIRMED]
+    # NOTE: saml_xsw's [SAML-XSW-CONFIRMED] findings land in findings/saml/ — the SAME dir the
+    # "saml" entry above already covers. No separate saml_xsw key is needed.
     # NOTE: email_auth/ is intentionally NOT mapped here. Its findings.json is parsed by
     # the dedicated Method 1d loader (which sets per-finding cvss); routing it through the
     # generic Method-1 .txt scan would mis-score any .txt that appears (parse_custom_line
@@ -843,6 +874,14 @@ def load_findings(findings_dir: str) -> list:
     _CVE_REF_RE = re.compile(r'\bCVE-\d{4}-\d{4,}\b', re.IGNORECASE)
     # cves/*.txt files that ARE confirmed findings (allowlist; fail-closed for the rest).
     _CVES_CONFIRMED_TXT = {"nuclei_cve_confirmed.txt"}
+    # jwt/ per-token NARRATIVE dumps: hunt.py run_jwt_audit writes jwt_<N>.txt
+    # (the raw token) and jwt_<N>_results.txt (jwt_tool decode/alg=none/RS256->
+    # HS256/kid-candidate/crack output). jwt_tool `-X a` only *generates* a
+    # forged token locally (never sends it), so none of these lines prove server
+    # acceptance — they are manual-followup leads, not findings. Pattern-matched
+    # (files are numbered per token). A genuinely CONFIRMED weak-secret crack is
+    # written separately to jwt/jwt_confirmed.txt (no digit -> not exempted).
+    _JWT_NARRATIVE_FILE_RE = re.compile(r'^jwt_\d+(_results)?\.txt$')
 
     # Method 1: Subdirectory-based findings (scanner.sh output)
     for subdir, vtype in SUBDIR_VTYPE.items():
@@ -916,11 +955,40 @@ def load_findings(findings_dir: str) -> list:
                                          # (40x flipped to 2xx/3xx). A strong LEAD the brain/operator verifies
                                          # (behind-the-403 content may be a login page / soft-200), NOT an
                                          # auto-shipped CRITICAL via the auth_bypass template default.
+            "[WAF-BLOCK-DETECTED]",      # misconfig/waf_fingerprint.txt — tls_impersonation.record_waf_block's
+                                         # coverage note: a Cloudflare/Akamai/F5 403/429/503 mid-scan, NOT a
+                                         # client-side misconfiguration. hunt.py's Task-9 phases (xxe/redirect/
+                                         # saml/actuator/ldap) started actually calling this in Fix Round 3 —
+                                         # without this suppression it would ship as a fabricated MEDIUM
+                                         # "misconfig" finding every time a WAF blocked the scanner.
+            "[XXE-CANDIDATE]",           # xxe/ — parser touched the payload (500/XML-error signal) but no
+                                         # in-band file content or OOB callback proven. A manual-followup
+                                         # LEAD, not a confirmed XXE. [XXE-CONFIRMED]/[XXE-OOB-CONFIRMED]
+                                         # are the proven variants (different prefix, not suppressed).
+            "[XXE-UPLOAD-CANDIDATE]",    # xxe/ — same as above for the file-upload XXE vector: the upload
+                                         # was accepted and the parser touched the payload, but no in-band
+                                         # content or OOB proof followed. [XXE-UPLOAD-CONFIRMED] is the
+                                         # proven variant.
+            "[SPEL-CANDIDATE]",          # actuator/ — arithmetic-only SpEL evaluation proven, no
+                                         # system-metadata read confirmed. Reads as theoretical until a
+                                         # benign java.version leak also succeeds ([SPEL-CONFIRMED]).
+            "[JOLOKIA-REACHABLE]",       # actuator/ — springboot_actuator_probe.py's info-only coverage
+                                         # note: the Jolokia JMX-over-HTTP endpoint is reachable, an RCE
+                                         # PRECONDITION, not exploitation. Never escalate this on its own.
+            "[LDAP-FUZZ-CANDIDATE]",     # ldap/ — ldap_injection_tester.py's RFC 4515 special-char probe:
+                                         # the response diverged from baseline, but divergence alone is not
+                                         # proof of exploitability. A manual-followup LEAD only.
+            "[LDAP-BYPASS-CANDIDATE]",   # ldap/ — an always-true LDAP bypass payload looked un-failed, but
+                                         # the strong-proof tier (session-cookie issuance + verified follow-
+                                         # up request) did not confirm. [LDAP-BYPASS-CONFIRMED] is the
+                                         # proven variant.
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
                 continue
             if fn in NON_FINDING_FILES:
+                continue
+            if vtype == "jwt" and _JWT_NARRATIVE_FILE_RE.match(fn):
                 continue
             with open(os.path.join(path, fn), errors="replace") as f:
                 for line in f:
