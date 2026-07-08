@@ -474,3 +474,44 @@ Pre-installed (or auto-installed on first run via `pipx` / `go install`):
 Suggested CLAUDE.md addition documenting each tool's role and install path,
 to match the existing `prowler-cloud==4.5.0` / `principalmapper>=1.1.5`
 stanza.
+
+---
+
+## Addendum 2026-07-08 — from testing the tool on testaspnet.vulnweb.com
+
+Ran `vikramaditya.py testaspnet.vulnweb.com --scope-lock` against the Acunetix authorized
+test site (HTTP-only, IIS 8.5/ASP.NET 2.0, classic error/UNION SQLi on `ReadNews.aspx?id=`
+/ `Comments.aspx?id=`). The tool reported 0 SQLi on a trivially injectable site.
+
+**FIXED in this change:** `run_sqlmap_targeted`'s GET-candidate pass was hardcoded to
+`--level=3 --risk=2` with no `--technique`, so on a slow target one `sqlmap -m` batch
+burned the whole phase budget confirming nothing. Now a fast confirm-first pass
+(`--level=1 --risk=1 --technique=BEU --smart`, mirroring the POST path's v7.1.10 fix) via
+`_build_get_sqlmap_command`; `--technique=BEU` excludes time-based so a WAF timeout is
+never misread as SQLi. Validated end-to-end: 60s → `[CRITICAL] sqli_sqlmap_confirmed`
+(vs 900s → nothing before). Also relabelled scanner.sh `summary.txt` "Verified SQLi PoCs"
+→ "(scanner time-based)".
+
+### P26 — SQLMAP phase must not sit behind slow POST-param enrichment  (M, High)
+GET sqlmap runs AFTER `post_param_discover` (lightpanda 30-page JS render, ~9279-9284) and
+`run_sqlmap_targeted` re-enters post-discovery (6466-6468) even in targeted `--sqlmap`
+mode. Live evidence: the full run was killed at ~30min during lightpanda before sqlmap ran;
+a validation run hung ~2.5min in lightpanda. Run GET sqlmap BEFORE post-params; make POST
+discovery opt-in, not a gate; add a hard per-phase lightpanda time cap.
+
+### P27 — Escalate-on-hit + thread sqlmap tuning flags into run_sqlmap_targeted  (S-M)
+`--sqlmap-level/-risk/-lean/-tamper` only reach `run_sqlmap_request_file`; a silent no-op on
+the main `--sqlmap` path. Thread them in; after a fast BEU confirm, deepen (`deep=True` of
+`_build_get_sqlmap_command`) only on a hit or explicit `--sqlmap-deep`. NB argparse defaults
+`--sqlmap-level=5/--sqlmap-risk=3` — don't thread raw or the default gets HEAVIER.
+
+### P28 — sqlmap phase-status reads results-*.csv but sqlmap wrote --results-file  (XS, Low)
+Confirmed injection landed in `sqlmap_results.txt` (reporter Method 1f picked it up as
+CRITICAL correctly), but hunt.py `injectable_found` reads `results-*.csv` (absent), so the
+phase/brain summary said `injectable=False` — cosmetic status mismatch, not a lost finding.
+
+### P29 — minor  (XS each)
+- vikramaditya.py pre-recon fingerprint probes `https://` only → "Tech: none" on HTTP-only
+  sites (httpx recon later gets it right). Fall back to `http://` on https timeout.
+- scanner.sh:536 log "Advanced SQLi verification on 100 of 12 parameterised URLs" — cap/count
+  inverted.
