@@ -37,6 +37,42 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hunt import _glob_results_csvs
 
 
+class TestGetCandidateSqlmapCommand:
+    """The multi-target GET-candidate pass (run_sqlmap_targeted) must use the
+    SAME fast confirm-first config as the POST/OpenAPI path got in v7.1.10. The
+    old hardcoded ``--level=3 --risk=2`` with NO ``--technique`` burned the whole
+    phase budget on header/param permutations against a slow target and
+    confirmed NOTHING even on a trivial error/UNION SQLi (testaspnet.vulnweb.com
+    ReadNews.aspx?id=). ``--technique`` must exclude T(ime) so a slow/blocking
+    WAF timeout is never misread as SQLi (mirrors scanner.sh's FP posture)."""
+
+    def test_default_get_pass_is_fast_confirm_first(self) -> None:
+        from hunt import _build_get_sqlmap_command
+        cmd = _build_get_sqlmap_command("/t/cand.txt", "/t/sqli", "/t/sqli/out.txt", "")
+        assert "--technique=BEU" in cmd   # Boolean/Error/Union first
+        assert "--smart" in cmd
+        assert "--level=1" in cmd and "--risk=1" in cmd
+        assert "-m " in cmd and "--results-file=" in cmd
+
+    def test_get_pass_never_uses_time_based_technique(self) -> None:
+        from hunt import _build_get_sqlmap_command
+        cmd = _build_get_sqlmap_command("/t/c.txt", "/t/s", "/t/s/o.txt")
+        technique = cmd.split("--technique=")[1].split()[0]
+        assert "T" not in technique, "time-based must be excluded (no timeout-as-evidence)"
+
+    def test_deep_pass_restores_exhaustive_config_without_time_based(self) -> None:
+        from hunt import _build_get_sqlmap_command
+        cmd = _build_get_sqlmap_command("/t/c.txt", "/t/s", "/t/s/o.txt", deep=True)
+        assert "--level=3" in cmd and "--risk=2" in cmd
+        technique = cmd.split("--technique=")[1].split()[0]
+        assert "T" not in technique  # even the deep sweep skips time-based
+
+    def test_cookie_opt_threaded_when_present(self) -> None:
+        from hunt import _build_get_sqlmap_command
+        cmd = _build_get_sqlmap_command("/t/c.txt", "/t/s", "/t/s/o.txt", "--cookie=sid=abc")
+        assert "--cookie=sid=abc" in cmd
+
+
 class TestResultsCSVGlob:
     def test_empty_dir_returns_empty_list(self, tmp_path) -> None:
         assert _glob_results_csvs(str(tmp_path)) == []

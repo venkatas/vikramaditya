@@ -1157,7 +1157,12 @@ log_info "Scan Complete. Consolidating..."
 {
     echo "Scan Date : $(date)"
     echo "Target    : $TARGET"
-    echo "Verified SQLi PoCs   : $({ grep -c "SQLI-POC-VERIFIED" "$FINDINGS_DIR/sqli/timebased_candidates.txt" 2>/dev/null || echo 0; } | head -1)"
+    # This tier is scanner.sh's time-based-blind probe ONLY (linear-scaling
+    # confirmed). Error/boolean/UNION SQLi is confirmed separately by hunt.py's
+    # sqlmap phase into findings/sqlmap/ and folded in by the reporter — so this
+    # counter is NOT the total SQLi coverage. Labelled explicitly to avoid a
+    # misleading "0" reading as "no SQLi" before the sqlmap phase has run.
+    echo "Verified SQLi PoCs (scanner time-based) : $({ grep -c "SQLI-POC-VERIFIED" "$FINDINGS_DIR/sqli/timebased_candidates.txt" 2>/dev/null || echo 0; } | head -1)"
     echo "Verified RCE PoCs    : $(count_vuln "$FINDINGS_DIR/upload/verified_rce_pocs.txt")"
     echo "Verified Upload Only : $(count_vuln "$FINDINGS_DIR/upload/verified_upload_pocs.txt")"
     echo "XSS (dalfox)         : $(count_vuln "$FINDINGS_DIR/xss/dalfox_results.txt")"
