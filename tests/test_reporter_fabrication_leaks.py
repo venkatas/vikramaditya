@@ -122,6 +122,36 @@ def test_verified_markers_are_still_reported(tmp_path):
             f"a VERIFIED marker was over-suppressed (dropped from report): {relpath} :: {line[:50]}")
 
 
+def test_idor_poc_uses_real_evidence_not_invented_pii(tmp_path):
+    """friends full-tool review F10: the autopilot IDOR PoC hard-coded
+    "Alice"/"victim@example.com"/"9000000000" under a "WHAT THE SERVER RETURNS
+    (actual response)" header — invented PII presented as the real server
+    response in a client report. The PoC must render the finding's REAL captured
+    evidence instead."""
+    import json as _json
+    (tmp_path / "finding_001.json").write_text(_json.dumps({
+        "type": "idor", "severity": "high",
+        "url": "https://t.example.invalid/view-profile",
+        "detail": "IDOR on view-profile",
+        "evidence": "id=1 -> email=real1@corp.invalid | id=2 -> email=real2@corp.invalid",
+    }))
+    pocs = " ".join(str(f.get("poc", "")) for f in reporter.load_findings(str(tmp_path)))
+    for invented in ("victim@example.com", "Alice", "9000000000"):
+        assert invented not in pocs, f"IDOR PoC fabricates victim PII: {invented!r}"
+    assert "real1@corp.invalid" in pocs or "id=1" in pocs, (
+        "the PoC must use the finding's real captured evidence")
+
+
+def test_reporter_ships_no_fabricated_victim_constants():
+    """No PoC/narrative block may hard-code specific victim PII or timing values
+    (F10). These were presented as 'ACTUAL DATA LEAKED' / 'ACTUAL TIMING DATA'."""
+    src = open(reporter.__file__).read()
+    for bad in ('victim@example.com', '"first_name": "Alice"', '"email": "victim',
+                '9000000000', '6.6s, 6.1s, 6.4s'):
+        assert bad not in src, (
+            f"fabricated victim constant still hard-coded in reporter.py: {bad!r}")
+
+
 def test_auth_bypass_template_not_shadowed():
     """The auth_bypass template was defined TWICE: a dead ``high/8.1``
     "Authentication Bypass on {host}" literal, silently overwritten by a
