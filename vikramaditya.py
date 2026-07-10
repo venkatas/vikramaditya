@@ -54,6 +54,26 @@ if SCRIPT_DIR not in sys.path:
 from procutil import _fork_safe_spawn, run_capture  # noqa: E402
 
 
+def _dispatch_har_report(output_dir: str) -> int:
+    """Generate the HTML/MD report for a HAR-VAPT run.
+
+    reporter.py's __main__ requires a DIRECTORY and ingests the run's
+    ``har_vapt_*.json`` from INSIDE it via Method 1c. It must therefore be handed
+    ``output_dir`` — NOT the result JSON file. Passing the file made reporter exit
+    1 ("Not a directory: ...") so every HAR report silently produced nothing while
+    the caller still printed "Done" (friends full-tool review F13). A non-zero
+    reporter exit is surfaced, not swallowed. Returns the reporter exit code."""
+    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "reporter.py"), output_dir]
+    # Fork-safe launch: HAR VAPT just did in-process requests I/O, so a bare
+    # subprocess.run() fork() here is the macOS atfork SIGSEGV class. Route through
+    # procutil like every other post-network dispatch (run_hunt / run_report).
+    rc = _run_streaming(cmd, cwd=SCRIPT_DIR)
+    if rc != 0:
+        log("warn", f"HAR report generation failed (reporter exit {rc}) — "
+                    f"no HTML/Markdown report was written for {output_dir}")
+    return rc
+
+
 def _run_streaming(cmd, cwd=None, env=None) -> int:
     """Fork-safe replacement for ``subprocess.run(cmd)`` when output must STREAM
     to the parent console (no capture) — e.g. long hunt.py phases whose markers
@@ -2125,12 +2145,10 @@ def main():
             want_report = autonomous or confirm("Generate HTML report?", default_yes=False)
             if want_report:
                 try:
-                    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "reporter.py"), result_file]
-                    # Fork-safe launch: HAR VAPT just did in-process requests I/O,
-                    # so a bare subprocess.run() fork() here is the macOS atfork
-                    # SIGSEGV class. Route through procutil like every other
-                    # post-network dispatch (run_hunt / run_report).
-                    _run_streaming(cmd, cwd=SCRIPT_DIR)
+                    # Hand reporter.py the output DIRECTORY (it reads har_vapt_*.json
+                    # inside it via Method 1c). Passing the result FILE made reporter
+                    # exit 1 and produce no report — see _dispatch_har_report / F13.
+                    _dispatch_har_report(output_dir)
                 except Exception as e:
                     log("warn", f"Report generation failed: {e}")
         print(f"\n  {D}Done.{N}\n")

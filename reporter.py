@@ -737,6 +737,9 @@ SUBDIR_VTYPE = {
                                       # CONFIRMED]/[SPEL-CONFIRMED]
     "ldap": "auth_bypass",           # ldap_injection_tester phase — [LDAP-INJECTION-CONFIRMED]/
                                       # [LDAP-BYPASS-CONFIRMED]
+    "nextjs_bypass": "auth_bypass",  # whitebox/nextjs_bypass phase — CONFIRMED CVE-2025-29927
+                                      # middleware auth bypass, written as `[CRITICAL] ... url`.
+                                      # Was unmapped → every confirmed bypass silently dropped.
     # NOTE: saml_xsw's [SAML-XSW-CONFIRMED] findings land in findings/saml/ — the SAME dir the
     # "saml" entry above already covers. No separate saml_xsw key is needed.
     # NOTE: email_auth/ is intentionally NOT mapped here. Its findings.json is parsed by
@@ -829,6 +832,8 @@ def load_findings(findings_dir: str) -> list:
                       "cves_custom",   # cves_custom/ is handled by Method 1c below
                       "brain_active",  # brain_active/ is handled by Method 1e below
                       "sqlmap",        # sqlmap/ is handled by Method 1f below
+                      "sqlmap_reqfile",  # --request-file confirmed results — Method 1f below
+                      "sqlmap_post",   # POST-path confirmed results — Method 1f below
                       "email_auth",    # email_auth/findings.json handled by Method 1d below
                       "exposed_credentials",  # handled by Method 1h below
                       "burp",          # burp/findings.json handled by Method 1g below
@@ -1354,18 +1359,31 @@ def load_findings(findings_dir: str) -> list:
     # Safety contract: a header-only file (sqlmap found nothing) yields zero findings, and a
     # row sqlmap itself tagged "false positive or unexploitable" is skipped (mirrors the
     # brain.py candidate filter) so a scanner-rejected row never becomes a CRITICAL finding.
-    sqlmap_dir = os.path.join(findings_dir, "sqlmap")
-    if os.path.isdir(sqlmap_dir):
+    # friends full-tool review: run_sqlmap_request_file (the --request-file path)
+    # writes its confirmed results CSV to sqlmap_reqfile/results.txt, and
+    # run_sqlmap_targeted's POST pass writes to sqlmap_post/ — SIBLING dirs Method
+    # 1f never read, so sqlmap-CONFIRMED SQLi from those paths was silently dropped
+    # from the client report. Read all three dirs (dedup shared across them).
+    _sqlmap_dirs = ("sqlmap", "sqlmap_reqfile", "sqlmap_post")
+    if any(os.path.isdir(os.path.join(findings_dir, _d)) for _d in _sqlmap_dirs):
         import csv as _csv
         import glob as _glob
         from urllib.parse import urlparse as _urlparse, parse_qsl as _parse_qsl
         sqlmap_tmpl = VULN_TEMPLATES.get("sqli_sqlmap_confirmed", {})
         seen_sqlmap = set()
         sqlmap_csvs = []
-        primary = os.path.join(sqlmap_dir, "sqlmap_results.txt")
-        if os.path.isfile(primary):
-            sqlmap_csvs.append(primary)
-        sqlmap_csvs.extend(sorted(_glob.glob(os.path.join(sqlmap_dir, "results-*.csv"))))
+        for _sd in _sqlmap_dirs:
+            sqlmap_dir = os.path.join(findings_dir, _sd)
+            if not os.path.isdir(sqlmap_dir):
+                continue
+            # sqlmap/ uses --results-file=sqlmap_results.txt; the reqfile path uses
+            # results.txt. Both are the same CSV schema; non-CSV files are skipped
+            # by the fieldnames guard below.
+            for _primary_name in ("sqlmap_results.txt", "results.txt"):
+                primary = os.path.join(sqlmap_dir, _primary_name)
+                if os.path.isfile(primary):
+                    sqlmap_csvs.append(primary)
+            sqlmap_csvs.extend(sorted(_glob.glob(os.path.join(sqlmap_dir, "results-*.csv"))))
         for csv_path in sqlmap_csvs:
             try:
                 # utf-8-sig strips a BOM if present (sqlmap-on-Windows / concatenated CSVs)
