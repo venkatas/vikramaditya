@@ -820,8 +820,12 @@ if ! skip_has mfa; then
             # all-ERR/all-000 (curl failures), which carries no rate-limit signal.
             if echo "$STATUS_CODES" | grep -qE '[1-5][0-9]{2}' \
                 && ! echo "$STATUS_CODES" | grep -q "429"; then
-                log_vuln "[MFA] No rate limit detected on OTP endpoint: $BASE"
-                echo "[MFA-NO-RATE-LIMIT] $BASE | codes: $STATUS_CODES" >> "$FINDINGS_DIR/mfa/findings.txt"
+                # A missing 429 is (at most) a MEDIUM rate-limiting gap, NOT a CONFIRMED
+                # authentication bypass. mfa/ maps to the critical auth_bypass template, so
+                # writing it there shipped it as a fabricated CRITICAL 9.8. Route to
+                # manual_review as a lead (reporter also suppresses the prefix, belt+braces).
+                log_info "[MFA] No rate limit on OTP endpoint (manual-review lead): $BASE"
+                echo "[MFA-NO-RATE-LIMIT] $BASE | codes: $STATUS_CODES | missing 429 (medium rate-limit gap — manual review)" >> "$FINDINGS_DIR/manual_review/mfa_candidates.txt"
             fi
 
             # --- Test 2: MFA workflow skip (pre-MFA session to protected page) ---
@@ -865,8 +869,12 @@ if ! skip_has mfa; then
                 -H "Content-Type: application/json" \
                 -d '{"otp":"999999"}' 2>/dev/null || true)
             if echo "$RESP" | grep -qi '"success"\s*:\s*false\|"verified"\s*:\s*false\|"status"\s*:\s*"fail"'; then
-                log_vuln "[MFA] Response manipulation candidate (server sends JSON success flag): $BASE"
-                echo "[MFA-RESPONSE-MANIP] $BASE | change false->true in response" >> "$FINDINGS_DIR/mfa/findings.txt"
+                # INDICATOR ONLY: the server merely REPORTS failure as a JSON flag for a WRONG
+                # OTP — that is SECURE behaviour, nothing was manipulated or bypassed. Writing
+                # it to mfa/findings.txt shipped a fabricated CRITICAL 9.8. It is a manual-review
+                # lead (try actually flipping the flag), not a finding.
+                log_info "[MFA] Response-flag present (manual-review lead — NOT a confirmed bypass): $BASE"
+                echo "[MFA-RESPONSE-MANIP] $BASE | server emits a JSON success flag — manually verify whether flipping false->true bypasses MFA" >> "$FINDINGS_DIR/manual_review/mfa_candidates.txt"
             fi
 
         done <<< "$MFA_ENDPOINTS"
@@ -911,8 +919,12 @@ if ! skip_has saml; then
         [ -z "$url" ] && continue
         RESP=$(curl -sk --max-time 8 "$url" 2>/dev/null || true)
         if echo "$RESP" | grep -qi "EntityDescriptor\|IDPSSODescriptor\|X509Certificate"; then
-            log_vuln "[SAML] Metadata exposed (aids XSW/cert extraction): $url"
-            echo "[SAML-METADATA-EXPOSED] $url" >> "$FINDINGS_DIR/saml/findings.txt"
+            # A public SP/IdP SAML metadata document is public BY DESIGN (that is how
+            # federation works). It is a LEAD for XSW/cert extraction, NOT an auth bypass.
+            # saml/ maps to the critical auth_bypass template, so writing it to
+            # saml/findings.txt shipped a fabricated CRITICAL 9.8. Route to manual_review.
+            log_info "[SAML] Metadata exposed (manual-review lead, aids XSW/cert extraction): $url"
+            echo "[SAML-METADATA-EXPOSED] $url | public metadata (aids XSW) — manual review, not a confirmed bypass" >> "$FINDINGS_DIR/manual_review/saml_candidates.txt"
             # Extract cert if present
             echo "$RESP" | grep -o '<X509Certificate>[^<]*' | head -3 >> "$FINDINGS_DIR/saml/certs.txt" 2>/dev/null || true
         fi

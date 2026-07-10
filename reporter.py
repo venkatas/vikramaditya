@@ -408,21 +408,11 @@ VULN_TEMPLATES = {
             ("OWASP CSRF", "https://owasp.org/www-community/attacks/csrf"),
         ],
     },
-    "auth_bypass": {
-        "title": "Authentication Bypass on {host}",
-        "severity": "high", "cvss": "8.1", "cwe": "CWE-287",
-        "impact": (
-            "An attacker can access protected resources or administrative interfaces "
-            "without valid credentials, potentially leading to account takeover or data exposure."
-        ),
-        "remediation": (
-            "Enforce authentication checks server-side on every protected route, "
-            "remove default credentials, and verify SPA route guards are not relied on alone."
-        ),
-        "references": [
-            ("OWASP Forced Browsing", "https://owasp.org/www-community/attacks/Forced_browsing"),
-        ],
-    },
+    # NOTE: "auth_bypass" is deliberately NOT defined here. It is set once, below,
+    # via `VULN_TEMPLATES["auth_bypass"] = {...}` (critical/9.8, "Broken
+    # Authentication"). A previous stale high/8.1 literal at this position was
+    # silently overwritten by that reassignment — editing it had no runtime effect
+    # (the footgun behind the MFA/SAML markers shipping at 9.8). Keep exactly one.
     "open_redirect": {
         "title": "Open Redirect on {host}",
         "severity": "medium", "cvss": "6.1", "cwe": "CWE-601",
@@ -922,6 +912,11 @@ def load_findings(findings_dir: str) -> list:
             # generation chatter, not a confirmed reflection). Verified XSS comes from dalfox; these
             # raw lines were promoted to MEDIUM XSS findings.
             "xsstrike_results.txt",
+            # saml/ — record_saml_metadata() writes the extracted <X509Certificate> evidence blobs
+            # here, one per line. saml/ maps to the (critical) auth_bypass template, so each raw
+            # cert line was ingested as its OWN CRITICAL "Authentication Bypass". This is evidence
+            # for the [SAML-METADATA-EXPOSED] note (itself suppressed below), not a finding.
+            "certs.txt",
         }
         # Line-prefix markers used by scanner.sh to record state, not findings.
         NON_FINDING_PREFIXES = (
@@ -982,6 +977,22 @@ def load_findings(findings_dir: str) -> list:
                                          # the strong-proof tier (session-cookie issuance + verified follow-
                                          # up request) did not confirm. [LDAP-BYPASS-CONFIRMED] is the
                                          # proven variant.
+            # ── friends full-tool review (Group A): mfa/ and saml/ map to the
+            # (critical) auth_bypass template. Three markers there are NOT a
+            # confirmed bypass and were shipping as CRITICAL 9.8 fabrications.
+            # The genuinely-confirmed siblings ([MFA-WORKFLOW-SKIP],
+            # [SAML-SIG-STRIP]) use different prefixes and are NOT suppressed.
+            "[MFA-RESPONSE-MANIP]",      # mfa/ — server returns a JSON {"success":false} for a WRONG OTP,
+                                         # i.e. SECURE behaviour. scanner.sh's own comment calls it an
+                                         # "indicator only" / "candidate"; nothing was manipulated or
+                                         # bypassed. Pure false positive. (Now also routed to
+                                         # manual_review/ by scanner.sh.)
+            "[MFA-NO-RATE-LIMIT]",       # mfa/ — no 429 seen in a burst of OTP POSTs. A real but at-most
+                                         # MEDIUM rate-limiting gap, NOT a CRITICAL authentication bypass.
+                                         # Re-surfaced as a manual-review lead rather than a fabricated crit.
+            "[SAML-METADATA-EXPOSED]",   # saml/ — a public SP/IdP SAML metadata document (EntityDescriptor
+                                         # / X509Certificate) is public BY DESIGN; it aids XSW/cert
+                                         # extraction as a LEAD but is not itself an auth bypass.
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
