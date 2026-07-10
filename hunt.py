@@ -8408,8 +8408,29 @@ def run_ldap_injection(domain: str) -> bool:
     recon_dir = _resolve_recon_dir(domain)
     techs = cve_module.detect_technologies(domain, recon_dir=recon_dir)
     fingerprint_tags = {name.lower() for name in techs.keys()}
-    if not ldap_injection_tester.looks_like_ldap_backed_auth(fingerprint_tags):
-        log("info", "LDAP injection: stack fingerprint does not suggest LDAP-backed auth — skipping")
+    # friends full-tool review F8: tech tags alone never carry the LDAP markers, so
+    # also feed the gate the crawled URLs — an ADFS/SSO/CAS login path is the signal
+    # a blackbox scan actually observes for AD/LDAP-backed auth.
+    ldap_urls = []
+    try:
+        urls_dir = os.path.join(recon_dir, "urls")
+        if os.path.isdir(urls_dir):
+            for _fn in os.listdir(urls_dir):
+                if not _fn.endswith(".txt"):
+                    continue
+                with open(os.path.join(urls_dir, _fn), errors="replace") as _uf:
+                    for _line in _uf:
+                        _u = _line.strip()
+                        if _u.startswith("http"):
+                            ldap_urls.append(_u)
+                        if len(ldap_urls) >= 5000:
+                            break
+                if len(ldap_urls) >= 5000:
+                    break
+    except OSError:
+        pass
+    if not ldap_injection_tester.looks_like_ldap_backed_auth(fingerprint_tags, urls=ldap_urls):
+        log("info", "LDAP injection: no LDAP/AD signal (stack fingerprint, SSO/ADFS URL, or NTLM) — skipping")
         _brain_phase_complete("LDAP INJECTION", True,
                                detail=f"target={domain} skipped: stack fingerprint does not suggest LDAP-backed auth")
         return True
