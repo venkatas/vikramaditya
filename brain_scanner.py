@@ -441,14 +441,59 @@ def _is_usage_banner(stdout: str) -> bool:
     return True
 
 
-def _verdict_findings(response: str, grounded: bool) -> list:
+# friends full-tool review F9: signals that a grounded stdout actually PROVES
+# exploitation (command output, extracted data, SQL/EL errors, file content,
+# reflected markers) — not merely a passive server banner/version string.
+_EXPLOIT_EVIDENCE_RE = re.compile(
+    r"uid=\d|gid=\d|groups=\d|root:.{0,3}:0:0:|/bin/(ba|z)?sh\b|"      # command exec / /etc/passwd
+    r"SQL syntax|ORA-\d{4,5}|SQLSTATE|PSQLException|"                  # SQL errors
+    r"syntax error at or near|Unclosed quotation|mysql_fetch|"        # SQL errors
+    r"-----BEGIN [A-Z]|<\?php|BEGIN RSA|ssh-rsa AAAA|"                 # file/key content
+    r"HTTP/\d\.\d 500|Traceback \(most recent call last\)|"           # server error / stack
+    r"onerror=|<script>alert|alert\(document|"                        # XSS reflection proof
+    r"\bwin\.ini\b|\[boot loader\]|Directory of ",                    # windows file read
+    re.I)
+# A line that is ONLY a server/version fingerprint (banner) carries no proof.
+_PASSIVE_FINGERPRINT_RE = re.compile(
+    r"^\s*(server\s*:|x-powered-by\s*:|via\s*:|x-aspnet(-mvc)?-version\s*:|"
+    r"x-generator\s*:|set-cookie\s*:|date\s*:|content-type\s*:|"
+    r"[\w./+-]+/\d+(\.\d+)+\s*)$", re.I)
+
+
+def _grounded_output_is_passive_only(text: str) -> bool:
+    """True when the grounded stdout is JUST passive fingerprint/banner data (or
+    empty) — no exploitation evidence — so it cannot corroborate a CONFIRMED
+    verdict (F9). Conservative: if ANY line is substantive-but-unclassified we
+    return False (do NOT downgrade), so a real exploit whose evidence shape we
+    don't recognise is never dropped."""
+    s = (text or "").strip()
+    if not s:
+        return True                              # no evidence at all
+    if _EXPLOIT_EVIDENCE_RE.search(s):
+        return False                             # real exploitation evidence present
+    for line in s.splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        # A non-empty line that is neither a recognised banner nor trivially short
+        # is "substantive content we can't classify" → keep [VERIFIED], don't regress.
+        if not _PASSIVE_FINGERPRINT_RE.match(ln) and len(ln) > 24:
+            return False
+    return True                                  # everything was banner/short/trivial
+
+
+def _verdict_findings(response: str, grounded: bool, grounded_output: str = None) -> list:
     """Findings to record from an ACCEPTED final verdict, so a confirmed result is captured
     in the report (was silently lost as 'Findings: 0' when the severity word and 'CONFIRMED'
     landed on SEPARATE lines).
 
-    A GROUNDED verdict (>=1 script produced real output — guaranteed by the gate that lets a
-    CONFIRMED verdict through) is tagged ``[VERIFIED ...]`` so reporter verification-gating
-    KEEPS it; an ungrounded one stays ``[MODEL CLAIM ...]`` (the reporter drops those at med+).
+    A GROUNDED verdict (>=1 script produced real output) is tagged ``[VERIFIED ...]`` so
+    reporter verification-gating KEEPS it; an ungrounded one stays ``[MODEL CLAIM ...]``
+    (the reporter drops those at med+). friends full-tool review F9: grounding is only
+    trustworthy if the grounded stdout actually corroborates the claim — a passive server
+    banner grounds nothing. When ``grounded_output`` is supplied and is purely passive
+    fingerprint data, the verdict is DOWNGRADED to a model claim. (Omitting grounded_output
+    preserves the legacy grounded==verified behaviour for existing callers.)
     Negated / false-positive lines are skipped. Captures any non-negated line asserting a
     positive verdict even if no severity word shares that line.
     """
@@ -456,7 +501,10 @@ def _verdict_findings(response: str, grounded: bool) -> list:
            "UNABLE TO CONFIRM", "NOTHING CONFIRMED", "NO VULNERABILIT", "NOT CONFIRM",
            "FALSE POSITIVE")
     POS = ("CONFIRMED", "EXPLOITABLE", "VULNERABLE")
-    tag = "[VERIFIED — grounded run]" if grounded else "[MODEL CLAIM — verify PoC]"
+    effective_grounded = grounded
+    if grounded and grounded_output is not None and _grounded_output_is_passive_only(grounded_output):
+        effective_grounded = False
+    tag = "[VERIFIED — grounded run]" if effective_grounded else "[MODEL CLAIM — verify PoC]"
     out, seen = [], set()
     for line in response.split("\n"):
         s = line.strip().lstrip("#>*-• ").strip()
@@ -831,6 +879,9 @@ Then test the most promising attack vectors."""
     findings = []
     iteration = 0
     successful_runs = 0   # scripts that actually executed (no syntax/tooling error)
+    grounded_stdout = ""  # F9: accumulated stdout of grounded runs, so a CONFIRMED
+                          # verdict is only tagged [VERIFIED] when SOME grounded output
+                          # actually corroborates it (not just a passive server banner).
     empty_streak = 0      # consecutive empty provider responses (see MAX_EMPTY_STREAK)
 
     mode_labels = {
@@ -903,7 +954,8 @@ Then test the most promising attack vectors."""
                 # [VERIFIED ...] (reporter keeps it); negated/FP lines are skipped. Fixes the
                 # bug where a grounded confirmation vanished as 'Findings: 0' because the
                 # severity word and 'CONFIRMED' landed on separate lines.
-                findings.extend(_verdict_findings(response, grounded=successful_runs > 0))
+                findings.extend(_verdict_findings(response, grounded=successful_runs > 0,
+                                                  grounded_output=grounded_stdout))
                 break
             else:
                 # Ask brain to write code
@@ -982,6 +1034,10 @@ Then test the most promising attack vectors."""
                 # gate; the verdict logic below refuses to finish while successful_runs==0).
                 if _is_grounded_run(result):
                     successful_runs += 1
+                    # F9: keep the grounded stdout (capped) so the verdict tagger can
+                    # confirm the CONFIRMED claim rests on real evidence, not a banner.
+                    if len(grounded_stdout) < 20000:
+                        grounded_stdout += (result.get("stdout") or "") + "\n"
                 # Grounded findings: only from ACTUAL script stdout. Plain substring
                 # matching records negative lines ("NOT VULNERABLE", "No critical ...")
                 # as findings — skip any line carrying a negation marker. Markers are
