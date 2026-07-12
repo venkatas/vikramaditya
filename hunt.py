@@ -7846,7 +7846,35 @@ def run_jwt_audit(domain: str) -> bool:
             forged = jwt_kid_injection.try_rs256_to_hs256(token, jwks_keys)
             if forged:
                 results.append(f"## JWKS-sourced RS256->HS256 forged token\n{forged}\n")
-                log("info", f"JWT {i+1}: JWKS-sourced HS256-confusion token forged — replay against a live endpoint to confirm")
+                # friends full-tool review F7: actually REPLAY the forged token against
+                # candidate authenticated endpoints (confirm_replay's conservative 3-way
+                # baseline). Only a real acceptance becomes a finding; otherwise it stays
+                # a manual-review lead. Bounded + fail-closed, so no hang / fabrication.
+                replay_targets = []
+                try:
+                    for _un in ("api_endpoints.txt", "with_params.txt"):
+                        _uf = os.path.join(recon_dir, "urls", _un)
+                        if os.path.isfile(_uf):
+                            with open(_uf, errors="replace") as _f:
+                                replay_targets += [l.strip() for l in _f
+                                                   if l.strip().startswith("http")]
+                        if len(replay_targets) >= 15:
+                            break
+                    replay_targets = replay_targets[:15]
+                except OSError:
+                    replay_targets = []
+                hit = jwt_kid_injection.confirm_replay_any(
+                    jwt_client, replay_targets, forged, token) if replay_targets else None
+                if hit:
+                    endpoint, detail = hit
+                    log("crit", f"JWT {i+1}: RS256->HS256 key confusion CONFIRMED on {endpoint} — {detail}")
+                    with open(os.path.join(jwt_dir, "jwt_confirmed.txt"), "a") as _cf:
+                        _cf.write(f"[JWT-KEY-CONFUSION-CONFIRMED] {endpoint} :: "
+                                  f"RS256->HS256 JWKS confusion — forged token accepted ({detail})\n")
+                    results.append(f"## RS256->HS256 CONFIRMED via replay on {endpoint}\n{detail}\n")
+                else:
+                    log("info", f"JWT {i+1}: JWKS-sourced HS256-confusion token forged — "
+                                f"no replay confirmation ({'no candidate endpoints' if not replay_targets else 'not accepted'}); manual replay lead")
         kid_candidates = jwt_kid_injection.build_kid_injection_candidates(token)
         if kid_candidates:
             results.append(f"## kid-header injection candidates\n{kid_candidates}\n")
@@ -8408,8 +8436,29 @@ def run_ldap_injection(domain: str) -> bool:
     recon_dir = _resolve_recon_dir(domain)
     techs = cve_module.detect_technologies(domain, recon_dir=recon_dir)
     fingerprint_tags = {name.lower() for name in techs.keys()}
-    if not ldap_injection_tester.looks_like_ldap_backed_auth(fingerprint_tags):
-        log("info", "LDAP injection: stack fingerprint does not suggest LDAP-backed auth — skipping")
+    # friends full-tool review F8: tech tags alone never carry the LDAP markers, so
+    # also feed the gate the crawled URLs — an ADFS/SSO/CAS login path is the signal
+    # a blackbox scan actually observes for AD/LDAP-backed auth.
+    ldap_urls = []
+    try:
+        urls_dir = os.path.join(recon_dir, "urls")
+        if os.path.isdir(urls_dir):
+            for _fn in os.listdir(urls_dir):
+                if not _fn.endswith(".txt"):
+                    continue
+                with open(os.path.join(urls_dir, _fn), errors="replace") as _uf:
+                    for _line in _uf:
+                        _u = _line.strip()
+                        if _u.startswith("http"):
+                            ldap_urls.append(_u)
+                        if len(ldap_urls) >= 5000:
+                            break
+                if len(ldap_urls) >= 5000:
+                    break
+    except OSError:
+        pass
+    if not ldap_injection_tester.looks_like_ldap_backed_auth(fingerprint_tags, urls=ldap_urls):
+        log("info", "LDAP injection: no LDAP/AD signal (stack fingerprint, SSO/ADFS URL, or NTLM) — skipping")
         _brain_phase_complete("LDAP INJECTION", True,
                                detail=f"target={domain} skipped: stack fingerprint does not suggest LDAP-backed auth")
         return True

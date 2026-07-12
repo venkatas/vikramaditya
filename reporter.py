@@ -408,21 +408,11 @@ VULN_TEMPLATES = {
             ("OWASP CSRF", "https://owasp.org/www-community/attacks/csrf"),
         ],
     },
-    "auth_bypass": {
-        "title": "Authentication Bypass on {host}",
-        "severity": "high", "cvss": "8.1", "cwe": "CWE-287",
-        "impact": (
-            "An attacker can access protected resources or administrative interfaces "
-            "without valid credentials, potentially leading to account takeover or data exposure."
-        ),
-        "remediation": (
-            "Enforce authentication checks server-side on every protected route, "
-            "remove default credentials, and verify SPA route guards are not relied on alone."
-        ),
-        "references": [
-            ("OWASP Forced Browsing", "https://owasp.org/www-community/attacks/Forced_browsing"),
-        ],
-    },
+    # NOTE: "auth_bypass" is deliberately NOT defined here. It is set once, below,
+    # via `VULN_TEMPLATES["auth_bypass"] = {...}` (critical/9.8, "Broken
+    # Authentication"). A previous stale high/8.1 literal at this position was
+    # silently overwritten by that reassignment — editing it had no runtime effect
+    # (the footgun behind the MFA/SAML markers shipping at 9.8). Keep exactly one.
     "open_redirect": {
         "title": "Open Redirect on {host}",
         "severity": "medium", "cvss": "6.1", "cwe": "CWE-601",
@@ -747,6 +737,9 @@ SUBDIR_VTYPE = {
                                       # CONFIRMED]/[SPEL-CONFIRMED]
     "ldap": "auth_bypass",           # ldap_injection_tester phase — [LDAP-INJECTION-CONFIRMED]/
                                       # [LDAP-BYPASS-CONFIRMED]
+    "nextjs_bypass": "auth_bypass",  # whitebox/nextjs_bypass phase — CONFIRMED CVE-2025-29927
+                                      # middleware auth bypass, written as `[CRITICAL] ... url`.
+                                      # Was unmapped → every confirmed bypass silently dropped.
     # NOTE: saml_xsw's [SAML-XSW-CONFIRMED] findings land in findings/saml/ — the SAME dir the
     # "saml" entry above already covers. No separate saml_xsw key is needed.
     # NOTE: email_auth/ is intentionally NOT mapped here. Its findings.json is parsed by
@@ -839,6 +832,8 @@ def load_findings(findings_dir: str) -> list:
                       "cves_custom",   # cves_custom/ is handled by Method 1c below
                       "brain_active",  # brain_active/ is handled by Method 1e below
                       "sqlmap",        # sqlmap/ is handled by Method 1f below
+                      "sqlmap_reqfile",  # --request-file confirmed results — Method 1f below
+                      "sqlmap_post",   # POST-path confirmed results — Method 1f below
                       "email_auth",    # email_auth/findings.json handled by Method 1d below
                       "exposed_credentials",  # handled by Method 1h below
                       "burp",          # burp/findings.json handled by Method 1g below
@@ -922,6 +917,11 @@ def load_findings(findings_dir: str) -> list:
             # generation chatter, not a confirmed reflection). Verified XSS comes from dalfox; these
             # raw lines were promoted to MEDIUM XSS findings.
             "xsstrike_results.txt",
+            # saml/ — record_saml_metadata() writes the extracted <X509Certificate> evidence blobs
+            # here, one per line. saml/ maps to the (critical) auth_bypass template, so each raw
+            # cert line was ingested as its OWN CRITICAL "Authentication Bypass". This is evidence
+            # for the [SAML-METADATA-EXPOSED] note (itself suppressed below), not a finding.
+            "certs.txt",
         }
         # Line-prefix markers used by scanner.sh to record state, not findings.
         NON_FINDING_PREFIXES = (
@@ -982,6 +982,22 @@ def load_findings(findings_dir: str) -> list:
                                          # the strong-proof tier (session-cookie issuance + verified follow-
                                          # up request) did not confirm. [LDAP-BYPASS-CONFIRMED] is the
                                          # proven variant.
+            # ── friends full-tool review (Group A): mfa/ and saml/ map to the
+            # (critical) auth_bypass template. Three markers there are NOT a
+            # confirmed bypass and were shipping as CRITICAL 9.8 fabrications.
+            # The genuinely-confirmed siblings ([MFA-WORKFLOW-SKIP],
+            # [SAML-SIG-STRIP]) use different prefixes and are NOT suppressed.
+            "[MFA-RESPONSE-MANIP]",      # mfa/ — server returns a JSON {"success":false} for a WRONG OTP,
+                                         # i.e. SECURE behaviour. scanner.sh's own comment calls it an
+                                         # "indicator only" / "candidate"; nothing was manipulated or
+                                         # bypassed. Pure false positive. (Now also routed to
+                                         # manual_review/ by scanner.sh.)
+            "[MFA-NO-RATE-LIMIT]",       # mfa/ — no 429 seen in a burst of OTP POSTs. A real but at-most
+                                         # MEDIUM rate-limiting gap, NOT a CRITICAL authentication bypass.
+                                         # Re-surfaced as a manual-review lead rather than a fabricated crit.
+            "[SAML-METADATA-EXPOSED]",   # saml/ — a public SP/IdP SAML metadata document (EntityDescriptor
+                                         # / X509Certificate) is public BY DESIGN; it aids XSW/cert
+                                         # extraction as a LEAD but is not itself an auth bypass.
         )
         for fn in sorted(os.listdir(path)):
             if not fn.endswith(".txt"):
@@ -1343,18 +1359,31 @@ def load_findings(findings_dir: str) -> list:
     # Safety contract: a header-only file (sqlmap found nothing) yields zero findings, and a
     # row sqlmap itself tagged "false positive or unexploitable" is skipped (mirrors the
     # brain.py candidate filter) so a scanner-rejected row never becomes a CRITICAL finding.
-    sqlmap_dir = os.path.join(findings_dir, "sqlmap")
-    if os.path.isdir(sqlmap_dir):
+    # friends full-tool review: run_sqlmap_request_file (the --request-file path)
+    # writes its confirmed results CSV to sqlmap_reqfile/results.txt, and
+    # run_sqlmap_targeted's POST pass writes to sqlmap_post/ — SIBLING dirs Method
+    # 1f never read, so sqlmap-CONFIRMED SQLi from those paths was silently dropped
+    # from the client report. Read all three dirs (dedup shared across them).
+    _sqlmap_dirs = ("sqlmap", "sqlmap_reqfile", "sqlmap_post")
+    if any(os.path.isdir(os.path.join(findings_dir, _d)) for _d in _sqlmap_dirs):
         import csv as _csv
         import glob as _glob
         from urllib.parse import urlparse as _urlparse, parse_qsl as _parse_qsl
         sqlmap_tmpl = VULN_TEMPLATES.get("sqli_sqlmap_confirmed", {})
         seen_sqlmap = set()
         sqlmap_csvs = []
-        primary = os.path.join(sqlmap_dir, "sqlmap_results.txt")
-        if os.path.isfile(primary):
-            sqlmap_csvs.append(primary)
-        sqlmap_csvs.extend(sorted(_glob.glob(os.path.join(sqlmap_dir, "results-*.csv"))))
+        for _sd in _sqlmap_dirs:
+            sqlmap_dir = os.path.join(findings_dir, _sd)
+            if not os.path.isdir(sqlmap_dir):
+                continue
+            # sqlmap/ uses --results-file=sqlmap_results.txt; the reqfile path uses
+            # results.txt. Both are the same CSV schema; non-CSV files are skipped
+            # by the fieldnames guard below.
+            for _primary_name in ("sqlmap_results.txt", "results.txt"):
+                primary = os.path.join(sqlmap_dir, _primary_name)
+                if os.path.isfile(primary):
+                    sqlmap_csvs.append(primary)
+            sqlmap_csvs.extend(sorted(_glob.glob(os.path.join(sqlmap_dir, "results-*.csv"))))
         for csv_path in sqlmap_csvs:
             try:
                 # utf-8-sig strips a BOM if present (sqlmap-on-Windows / concatenated CSVs)
@@ -1782,25 +1811,24 @@ def load_findings(findings_dir: str) -> list:
                     poc_lines.append("1. Login to the application with any valid learner account")
                     poc_lines.append(f"2. Open browser developer tools (F12) → Network tab")
                     poc_lines.append(f"3. Send a POST request to: {url}")
-                    poc_lines.append(f"   with body: id=1  (or id=2, id=3, etc.)")
+                    poc_lines.append(f"   varying the object id (id=1, id=2, id=3, …)")
                     poc_lines.append("")
-                    poc_lines.append("WHAT THE SERVER RETURNS (actual response):")
-                    poc_lines.append('  {')
-                    poc_lines.append('    "status": true,')
-                    poc_lines.append('    "data": {')
-                    poc_lines.append('      "id": 2,')
-                    poc_lines.append('      "first_name": "Alice",          ← OTHER user\'s name')
-                    poc_lines.append('      "email": "victim@example.com",  ← OTHER user\'s email')
-                    poc_lines.append('      "contact_no": "9000000000",       ← OTHER user\'s phone')
-                    poc_lines.append('      "address_line_1": "",')
-                    poc_lines.append('      "pin_code": ""')
-                    poc_lines.append('    }')
-                    poc_lines.append('  }')
+                    # friends full-tool review F10: use the REAL evidence captured by
+                    # this scan — NEVER invent specific victim PII. The old block hard-
+                    # coded a fake name/email/phone under a "WHAT THE SERVER RETURNS
+                    # (actual response)" header, i.e. fabricated data presented as the
+                    # real response in a client report.
+                    poc_lines.append("OBSERVED (from this scan):")
+                    if evidence:
+                        poc_lines.append(f"  {evidence}")
+                    else:
+                        poc_lines.append("  Different id values returned different users' "
+                                         "records (see the finding evidence).")
                     poc_lines.append("")
                     poc_lines.append("EXPECTED BEHAVIOR: Server should return 403 Forbidden when")
                     poc_lines.append("  a user tries to access another user's profile.")
-                    poc_lines.append("ACTUAL BEHAVIOR: Server returns the full profile of ANY user")
-                    poc_lines.append("  by simply changing the 'id' parameter.")
+                    poc_lines.append("ACTUAL BEHAVIOR: Server returns another user's record")
+                    poc_lines.append("  by simply changing the object id parameter.")
                 elif vtype == "score_manipulation" and url != "N/A":
                     poc_lines.append("HOW TO REPRODUCE:")
                     poc_lines.append("1. Login to the application as any learner")
@@ -1861,10 +1889,14 @@ def load_findings(findings_dir: str) -> list:
                     poc_lines.append(f"4. Repeat with: email=nonexistent_fake_user@fake.com")
                     poc_lines.append(f"5. Compare response times")
                     poc_lines.append("")
-                    poc_lines.append("ACTUAL RESULTS:")
-                    poc_lines.append("  Valid email (exists):    6.6s, 6.1s, 6.4s  (average ~6.4 seconds)")
-                    poc_lines.append("  Invalid email (fake):   0.1s, 0.1s, 0.1s  (average ~0.1 seconds)")
-                    poc_lines.append("  Difference: 64x slower for valid emails!")
+                    # friends full-tool review F10: use the real measured evidence,
+                    # never invent specific latencies.
+                    poc_lines.append("MEASURED RESULTS (from this scan):")
+                    if evidence:
+                        poc_lines.append(f"  {evidence}")
+                    else:
+                        poc_lines.append("  Valid emails responded measurably slower than invalid "
+                                         "ones — a consistent, statistically significant gap.")
                     poc_lines.append("")
                     poc_lines.append("WHY THIS IS A PROBLEM:")
                     poc_lines.append("  An attacker can check thousands of email addresses against your system.")
@@ -1936,10 +1968,14 @@ def load_findings(findings_dir: str) -> list:
                         poc_lines.append("     - Full names, email addresses, phone numbers, addresses")
                         poc_lines.append("     of every learner on the platform")
                         poc_lines.append("")
-                        poc_lines.append("ACTUAL DATA LEAKED (example for id=2):")
-                        poc_lines.append('  "first_name": "Alice"')
-                        poc_lines.append('  "email": "victim@example.com"')
-                        poc_lines.append('  "contact_no": "9000000000"')
+                        # friends full-tool review F10: use the real finding evidence,
+                        # never invent specific victim PII.
+                        poc_lines.append("DATA AT RISK (per the IDOR finding evidence):")
+                        if evidence:
+                            poc_lines.append(f"  {evidence}")
+                        else:
+                            poc_lines.append("  Each learner's full name, email, phone and address "
+                                             "(see the IDOR finding).")
                         poc_lines.append("")
                         poc_lines.append("IMPACT: Complete PII breach of all users with persistent access.")
                         poc_lines.append("")
@@ -1969,9 +2005,14 @@ def load_findings(findings_dir: str) -> list:
                         poc_lines.append("  3. Attacker then brute-forces the login for each valid account")
                         poc_lines.append("  4. No rate limit means thousands of passwords can be tried")
                         poc_lines.append("")
-                        poc_lines.append("ACTUAL TIMING DATA:")
-                        poc_lines.append("  victim@example.com → 6.6s, 6.1s, 6.4s (VALID)")
-                        poc_lines.append("  nonexistent@fake.com       → 0.1s, 0.1s, 0.1s (INVALID)")
+                        # friends full-tool review F10: use the real measured timing
+                        # evidence, never invent specific addresses/latencies.
+                        poc_lines.append("TIMING SIGNAL (per the timing-oracle finding evidence):")
+                        if evidence:
+                            poc_lines.append(f"  {evidence}")
+                        else:
+                            poc_lines.append("  Valid emails respond measurably slower than invalid "
+                                             "ones (see the timing-oracle finding).")
                         poc_lines.append("")
                         poc_lines.append("IMPACT: Attacker discovers valid accounts, then brute-forces")
                         poc_lines.append("  passwords with no resistance. Full account takeover.")

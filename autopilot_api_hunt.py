@@ -770,6 +770,13 @@ class IDORScanner:
                         f"were not tested for IDOR."))
         for ep in idor_targets[:_IDOR_CAP]:
             path = ep["path"]
+            # F11 owner-baseline: a single 200-with-PII is NOT proof of IDOR — the
+            # endpoint may ignore the id and return the CALLER's OWN record for every
+            # value (correct behaviour). Real IDOR requires that DIFFERENT ids return
+            # DIFFERENT records. Collect the PII value-set per (request shape, id) and
+            # only confirm when >=2 distinct non-empty PII sets appear across >=2 ids
+            # for the SAME shape. Emit once per endpoint, not once per id.
+            shape_hits: dict = {}   # shape_key -> {test_id: (exposed, sample, url, signature)}
             for test_id in [1, 2, 3, 100]:
                 # Try both FormData and JSON (Django APIs typically use FormData)
                 for payload in [
@@ -778,6 +785,8 @@ class IDORScanner:
                     {"data": {"id": str(test_id), "course_id": str(test_id)}},
                     {"data": {"learner_id": str(test_id)}},
                 ]:
+                    shape_key = tuple(sorted(payload)) + tuple(
+                        sorted(k for v in payload.values() if isinstance(v, dict) for k in v))
                     resp = session.request("POST", path, **payload)
                     if resp["status"] in (200, 201) and isinstance(resp["body"], dict):
                         body = resp["body"]
@@ -790,21 +799,35 @@ class IDORScanner:
                             if not isinstance(data, dict):
                                 continue
                             exposed = {k for k in data.keys() if k.lower() in self.PII_KEYS}
-                            if exposed:
-                                sample = ', '.join(f'{k}={data[k]}' for k in list(exposed)[:3] if data.get(k))
-                                f = {"type": "idor", "severity": HIGH,
-                                     "detail": f"IDOR: id={test_id} exposes PII ({', '.join(exposed)}) on {path}",
-                                     "url": resp["url"],
-                                     "evidence": f"id={test_id} → {sample}"}
-                                findings.append(f)
-                                if saver:
-                                    saver.save(f)
-                                    saver.save_txt(f)
-                                break
-                        if findings and findings[-1]["detail"].startswith(f"IDOR: id={test_id}"):
-                            break  # Found IDOR with this payload format
-                if any(f["detail"].startswith(f"IDOR: id={test_id}") for f in findings):
-                    break  # One confirmed IDOR per endpoint
+                            if not exposed:
+                                continue
+                            signature = frozenset((k, str(data.get(k))) for k in exposed)
+                            sample = ', '.join(f'{k}={data[k]}' for k in list(exposed)[:3] if data.get(k))
+                            shape_hits.setdefault(shape_key, {})[test_id] = (
+                                exposed, sample, resp["url"], signature)
+            # Decide per request shape: IDOR only when >=2 ids returned >=2 DISTINCT
+            # PII records. Identical PII across ids == the caller's own record echoed
+            # (benign) -> no finding. Emit at most ONE finding per endpoint (the first
+            # confirming shape) rather than one per payload variant.
+            for hits in shape_hits.values():
+                distinct_sigs = {h[3] for h in hits.values() if h[3]}
+                if len(hits) < 2 or len(distinct_sigs) < 2:
+                    continue
+                reps = sorted(hits.items())
+                (id1, h1), (id2, h2) = reps[0], reps[1]
+                all_exposed = sorted(set().union(*[h[0] for h in hits.values()]))
+                f = {"type": "idor", "severity": HIGH,
+                     "detail": (f"IDOR on {path}: different ids return different records "
+                                f"(PII: {', '.join(all_exposed)})"),
+                     "url": h1[2],
+                     "evidence": (f"id={id1} → {h1[1]} | id={id2} → {h2[1]} "
+                                  f"— distinct records confirm the id selects another "
+                                  f"user's data")}
+                findings.append(f)
+                if saver:
+                    saver.save(f)
+                    saver.save_txt(f)
+                break  # one confirmed IDOR per endpoint is enough
 
         log("ok", f"  {len(findings)} IDOR findings")
         return findings
@@ -942,18 +965,14 @@ class FileUploadTester:
                 if saver:
                     saver.save(f)
                     saver.save_txt(f)
-                # Extract AWS key
-                url = resp["body"]["uploadUrl"]
-                key_match = re.search(r"Credential=([A-Z0-9]+)%2F", url)
-                bucket_match = re.search(r"https://([^/]+)\.s3\.", url)
-                if key_match:
-                    f2 = {"type": "aws_key_exposed", "severity": HIGH,
-                          "detail": f"AWS Access Key ID exposed: {key_match.group(1)}",
-                          "url": url[:80], "evidence": f"Key in presigned URL"}
-                    findings.append(f2)
-                    if saver:
-                        saver.save(f2)
-                        saver.save_txt(f2)
+                # NOTE (friends full-tool review F12): do NOT report the
+                # ``X-Amz-Credential=AKIA...`` value from the presigned URL as a
+                # credential leak. The AWS Access Key *ID* is a PUBLIC identifier
+                # present in EVERY SigV4 signature by design; the secret key signs
+                # the URL but never appears in it. Flagging the key ID produced a
+                # HIGH ``aws_key_exposed`` false positive on any working S3
+                # presigned-upload API. The real signal (a presigned URL minted for
+                # a dangerous filename/type) is already captured as ``f`` above.
                 break  # One confirmed is enough for S3
 
         # Test profile image upload bypass
