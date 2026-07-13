@@ -131,3 +131,14 @@ logs/
 
 # IDE/agent local config (not part of the tool)
 .antigravitycli/
+
+# ── Operator review-scratch (never commit — codex/grok/agy output may name clients) ─
+.friends_*/
+
+# ── Cloned third-party tools (external repos, not part of Vikramaditya) ────────
+tools/LinkFinder/
+tools/SecretFinder/
+tools/XSStrike/
+tools/graphql-cop/
+tools/nomore403/
+tools/__pycache__/
