@@ -166,6 +166,11 @@ def init_brain(log_errors: bool = True):
     try:
         _brain = Brain()
     except Exception as exc:
+        # BRAIN_REQUIRE_PIN=1 (client/autonomous strict mode): a pinned-but-unavailable model raises
+        # from the selector. That MUST hard-fail the run — NOT be swallowed into "brain disabled" and
+        # continue on a different model (or the agent's own selector). Propagate under strict mode.
+        if os.environ.get("BRAIN_REQUIRE_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
+            raise
         _brain_import_err = exc
         if log_errors and not _brain_warned:
             print(f"\033[1;33m[!] Brain not loaded: {_brain_import_err}\033[0m")

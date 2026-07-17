@@ -75,7 +75,11 @@ paradigm-fit, anti-fabrication over new scanners.
   dnsgen/cero (GPL + redundant). Covered the permissive way via nuclei `-dast` OOB.
 - **mantra/getjs** — regex noise, dominated by jsluice + katana/gau.
 - **Deep Hat V2** — proprietary (Kindo), no open weights → would off-box client data.
-  Keep **RavenX** pinned (no open model beats it on a 30 GB M4 Max as of 2026-07).
+  ~~Keep **RavenX** pinned (no open model beats it on a 30 GB M4 Max as of 2026-07).~~
+  **SUPERSEDED 2026-07-16:** a 73-judge FP-discipline bench over 7 local models found **RavenX
+  INVENTS confirmations** (v5.1 2/5 clean, v6.2 0/2) — retired from triage. Winner =
+  **`openmythos-27b`** (5/5 clean, 0 invented). Triage now pinned to OpenMythos; scanner stays
+  `qwen3-coder:30b`. See [`docs/benchmarks/2026-07-16-triage-fp-discipline.md`](../../benchmarks/2026-07-16-triage-fp-discipline.md).
 - **xOffense** — weights unreleased (paper only). **CAI/HexStrike** — already
   clean-room adopted in PR #9 (egress-guard / tool_router).
 - **Semgrep Secrets** (paid Pro), **agentic-radar / Giskard** (SAST/wrapper, off-paradigm).
