@@ -58,6 +58,18 @@ try:
 except Exception:
     _scopeguard = None
 
+# ONE-TIME (at import): apply ~/.config/vikramaditya/brain.env (file-wins) so a STANDALONE
+# `python3 brain_scanner.py ...` honors the pin vars. brain.py does this at its own import, but
+# brain_scanner imports brain only lazily — without this a direct run would read BRAIN_SCANNER_MODEL /
+# BRAIN_PROVIDER before brain.env is applied. Done ONCE at import (NOT per pick_model call) so a
+# caller/test can still override via process env afterward, and so it can't clobber a deliberate
+# BRAIN_PROVIDER override. Respects BRAIN_ENV_NOLOAD (the loader is a no-op then).
+try:
+    from brain import _load_brain_env as _bootstrap_brain_env
+    _bootstrap_brain_env()
+except Exception:
+    pass
+
 # Colors
 G = "\033[0;32m"
 R = "\033[0;31m"
@@ -184,6 +196,15 @@ def pick_model() -> str:
     coders. Override with BRAIN_SCANNER_MODEL=<name>.
     """
     import os as _os
+
+    def _is_model_not_found(exc) -> bool:
+        """True only if an ollama.show() error means the model is ABSENT (not a network/daemon failure),
+        so a transient outage isn't mislabelled 'pull the model' / doesn't wrongly hard-fail strict mode."""
+        if getattr(exc, "status_code", None) == 404:
+            return True
+        s = str(exc).lower()
+        return any(t in s for t in ("not found", "no such model", "try pulling", "does not exist"))
+
     env = _os.environ.get("BRAIN_SCANNER_MODEL", "").strip()
     prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
     # Cloud / non-ollama provider (gemini/openai/claude/grok/mlx): the model name
@@ -200,9 +221,31 @@ def pick_model() -> str:
             return env or LLMClient.DEFAULT_MODELS.get(prov) or ""
         except Exception:
             return env or ""
+    def _record(model, source, pin=""):
+        try:
+            from brain import _record_selection
+            _record_selection("scanner", model, source, pin)
+        except Exception:
+            pass
     try:
         import ollama
-        candidates = ([env] if env else []) + [
+        # A set-but-uninstalled BRAIN_SCANNER_MODEL must NOT silently fall through to another coder
+        # (friends review 2026-07-16). Check the pin explicitly; warn (or raise under BRAIN_REQUIRE_PIN).
+        pin_missing = ""
+        if env:
+            try:
+                ollama.show(env)
+                _record(env, "pinned", env)
+                return env
+            except Exception as _e:
+                try:
+                    from brain import _pin_unavailable
+                    # not-found -> "pull it"; network/daemon error -> "cannot verify" (don't mislead)
+                    _pin_unavailable("scanner", "BRAIN_SCANNER_MODEL", env, verifiable=_is_model_not_found(_e))
+                except ImportError:
+                    pass
+                pin_missing = env
+        candidates = [
             "devstral-small-2:24b",        # agentic SWE coder (68% SWE-bench) if pulled
             "qwen2.5-coder:14b",           # installed, fast, purpose-built coder
             "qwen3-coder:30b",             # installed, stronger MoE coder
@@ -215,6 +258,7 @@ def pick_model() -> str:
                 continue
             try:
                 ollama.show(m)
+                _record(m, "pin-missing-priority" if pin_missing else "priority", pin_missing)
                 return m
             except Exception:
                 continue

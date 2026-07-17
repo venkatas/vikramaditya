@@ -1060,22 +1060,32 @@ MLX_MODEL_PRIORITY = [
     "mlx-community/Mistral-7B-Instruct-v0.3-4bit",    # 7B fallback
 ]
 
-# Fast triage model priority — phi4:14b first (v9.1.3 benchmark winner)
-# Used by triage_finding() and next_action() where speed > depth
-# 03 May 2026 bench: phi4:14b T1=4.3s vs baron-llm 17s — 4× faster, 100% valid JSON
+# Triage priority — ranked by FALSE-POSITIVE DISCIPLINE (dismiss scanner FPs; never invent/confirm a
+# vuln that isn't there). This objective REVERSES the old "fastest JSON" ordering: speed is secondary.
+# Ranking source: the 2026-07-16 "bench everything" 73-judge FP-discipline panel (5 runs/finalist) on a
+# fixture with 3 known header-sqlmap FALSE-positives. openmythos-27b won 5/5 clean, 0 invented; the
+# RavenX/CyberStrike offensive-tune class INVENTED confirmations; baron-llm (offensive RLHF) is demoted
+# for the same reason. ⚠ PROVISIONAL: that panel had ZERO known TRUE-positives, so it did NOT measure
+# false-NEGATIVES / sensitivity — a model that drops everything scores perfectly here. Re-validate with
+# a true-positive fixture before treating this order as final. See docs/benchmarks/2026-07-16-triage-fp-
+# discipline.md. Note: ~/.config/vikramaditya/brain.env file-WINS, and a set-but-uninstalled TRIAGE_MODEL
+# no longer silently substitutes (see _pin_unavailable). Machine-specific tags below are skipped if absent.
 TRIAGE_MODEL_PRIORITY = [
-    "phi4:14b",                  # ★ v9.1.3 — fastest triage, consistent JSON, no hidden thinking
-    "bugtraceai-apex:latest",       # Zero-refusal security DPO reasoning model
-    "baron-llm:latest",          # BaronLLM — RLHF on offensive security data
-    "aya-expanse:latest",           # Cohere Aya Expanse 8B Multilingual flagship model
-    "gemma4:e4b",                # Gemma 4 4B — fast triage with tool calling
+    "openmythos-27b:latest",     # ★ 2026-07-16 WINNER — 5/5 clean, 0 invented confirmations, reasoning 4.8/5 (dense Qwen3.6-27B, RLVR on vulnerable/fixed code)
+    "nemesis-27b:latest",        # clean alternate (2/2, n small) — dense Qwen3.6-27B offensive QLoRA that KEPT its FP-discipline
+    "devstral-small-2:latest",   # clean alternate (3/3, n small) — coder with strong FP-discipline (coders judge logic, don't assume-vulnerable)
+    "glm47-flash:latest",        # clean alternate (2/2, n small) — non-Qwen MoE, faster than the dense 27Bs
+    "phi4:14b",                  # faithful-narration generic (fast, consistent JSON) — if installed
+    "qwen3:14b",                 # faithful long-context generic — if installed
+    "gemma4:e4b",                # fast small triage with tool calling — if installed
     "vapt-qwen25:latest",        # custom VAPT-tuned fallback
     "vapt-model:latest",
     "qwen3:8b",
+    "baron-llm:latest",          # DEMOTED (was #3): offensive RLHF tune — the 2026-07-16 bench flagged the offensive-tune class for INVENTING confirmations; keep only as a last-ditch triage judge
     "qwen3-coder-64k:latest",    # last resort — big model for triage if nothing else
-    # xploiter/the-xploiter is intentionally NOT in this list — it is WEIGHT-biased
-    # to assert/fabricate vulns (see MODEL_PRIORITY comment) and the 7-Question Gate
-    # is a faithful-evaluation task. It remains an exploit-IDEATION-only fallback.
+    # DROPPED from triage (uninstalled AND not FP-discipline-selected): bugtraceai-apex, aya-expanse.
+    # xploiter/the-xploiter is intentionally NOT in this list — it is WEIGHT-biased to assert/fabricate
+    # vulns (see MODEL_PRIORITY comment) and the 7-Question Gate is a faithful-evaluation task.
 ]
 
 # Token limits — qwen3-coder-64k supports 64K context
@@ -1168,35 +1178,112 @@ def _get_available_models() -> list[str]:
         return []
 
 
+# ── Model-selection provenance + NO silent substitution (friends review 2026-07-16) ─────────────
+# HAZARD (codex+grok): an explicit pin (BRAIN_MODEL / TRIAGE_MODEL / BRAIN_SCANNER_MODEL) that is
+# NOT installed used to be SILENTLY ignored — the picker fell through to the priority list and
+# ultimately available[0]. For a client-facing vuln-triage gate that means "you pinned OpenMythos
+# but you're actually running baron-llm and were never told." A missing pin must be LOUD, and under
+# BRAIN_REQUIRE_PIN=1 (autonomous/client runs) FATAL — never a silent swap. MODEL_SELECTION_LOG
+# records which model+source was actually used so a report can be audited afterwards.
+MODEL_SELECTION_LOG: dict = {}   # role -> {"model", "source", "requested_pin"}
+
+
+def _require_pin() -> bool:
+    return os.environ.get("BRAIN_REQUIRE_PIN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _record_selection(role: str, model, source: str, requested_pin: str = "") -> None:
+    MODEL_SELECTION_LOG[role] = {"model": model, "source": source, "requested_pin": requested_pin or ""}
+
+
+def _match_installed(name: str, available: list) -> str | None:
+    """Resolve a model name against installed tags, honoring Ollama's implicit ``:latest``.
+    So a pin of ``openmythos-27b`` matches an installed ``openmythos-27b:latest`` (and vice-versa).
+    Returns the actual installed tag, or None if genuinely absent."""
+    if not name:
+        return None
+    if name in available:
+        return name
+    if ":" not in name and f"{name}:latest" in available:   # untagged pin -> :latest
+        return f"{name}:latest"
+    if name.endswith(":latest") and name[: -len(":latest")] in available:  # :latest pin -> bare
+        return name[: -len(":latest")]
+    return None
+
+
+# Models that must NEVER be the triage (false-positive) judge even as a last-resort fallback:
+# weight-biased to assert/fabricate vulns, or dropped from triage on evidence. The triage fallback
+# uses this instead of the unrestricted narrator priority (which still contains these).
+_TRIAGE_FALLBACK_EXCLUDE = frozenset({
+    "xploiter/the-xploiter:latest",   # WEIGHT-biased to assert/fabricate — faithful-eval poison
+    "bugtraceai-apex:latest",         # dropped from triage (offensive DPO, not FP-validated)
+    "aya-expanse:latest",             # dropped from triage (multilingual chat, weak judge)
+})
+
+
+def _pin_unavailable(role: str, envvar: str, requested: str, verifiable: bool = True) -> None:
+    """A pin is set but cannot be honored. Warn loudly; raise under BRAIN_REQUIRE_PIN. Never silently swap.
+    verifiable=True  -> the model inventory was read and the pin is genuinely NOT installed.
+    verifiable=False -> the inventory could not be read (Ollama unreachable / empty) — pin UNVERIFIABLE."""
+    if verifiable:
+        state, fix = "is NOT installed", f"`ollama pull {requested}` or correct the pin"
+    else:
+        state, fix = ("could NOT be verified (Ollama returned no models / is unreachable)",
+                      "start Ollama / check OLLAMA_HOST, or correct the pin")
+    msg = (f"PINNED {role} model {requested!r} ({envvar}) {state} — refusing to SILENTLY substitute a "
+           f"different model. Fix: {fix} in ~/.config/vikramaditya/brain.env.")
+    if _require_pin():
+        raise RuntimeError(f"[brain] {msg} (BRAIN_REQUIRE_PIN=1 -> will not run on a fallback model.)")
+    sys.stderr.write(f"{YELLOW}{BOLD}[!] {msg} Falling back — VERIFY the model actually used "
+                     f"(brain.MODEL_SELECTION_LOG) before trusting client output.{NC}\n")
+    sys.stderr.flush()
+
+
 def _pick_model(preferred: str = None) -> str | None:
     """Return the best available model from priority list.
 
     v9.1.4 — env override: BRAIN_MODEL=<name> forces a specific model
     (used by A/B benchmarks, per-engagement model swap without code edits).
+    v10.7 — a set-but-uninstalled BRAIN_MODEL no longer silently substitutes (see _pin_unavailable).
     """
     available = _get_available_models()
+
+    # v9.1.4 env override takes precedence over caller's preferred arg. Check the PIN FIRST — before the
+    # empty-inventory early-return — so a set-but-unhonorable pin is always loud/strict, even if Ollama
+    # returned nothing (the realistic outage case). :latest aliases resolve via _match_installed.
+    env_override = os.environ.get("BRAIN_MODEL", "").strip()
+    pin_missing = ""
+    if env_override:
+        match = _match_installed(env_override, available) if available else None
+        if match:
+            _record_selection("narrator", match, "pinned", env_override)
+            return match
+        _pin_unavailable("narrator", "BRAIN_MODEL", env_override, verifiable=bool(available))
+        pin_missing = env_override
+
     if not available:
+        _record_selection("narrator", None, "no-models", pin_missing)
         return None
 
-    # v9.1.4 env override takes precedence over caller's preferred arg
-    env_override = os.environ.get("BRAIN_MODEL", "").strip()
-    if env_override and env_override in available:
-        return env_override
-
     if preferred:
-        # exact match first
-        if preferred in available:
-            return preferred
+        match = _match_installed(preferred, available)
+        if match:
+            _record_selection("narrator", match, "pin-missing-fallback" if pin_missing else "preferred", pin_missing)
+            return match
         # prefix match (e.g. "qwen3" matches "qwen3:8b")
         matches = [m for m in available if m.startswith(preferred)]
         if matches:
+            _record_selection("narrator", matches[0], "pin-missing-fallback" if pin_missing else "preferred", pin_missing)
             return matches[0]
 
     for candidate in MODEL_PRIORITY:
-        if candidate in available:
-            return candidate
+        match = _match_installed(candidate, available)
+        if match:
+            _record_selection("narrator", match, "pin-missing-priority" if pin_missing else "priority", pin_missing)
+            return match
 
     # Last resort: first available model
+    _record_selection("narrator", available[0], "pin-missing-last-resort" if pin_missing else "last-resort", pin_missing)
     return available[0]
 
 
@@ -1258,22 +1345,45 @@ def _technique_hint(finding_description: str) -> str:
 
 
 def _pick_triage_model(preferred: str = None) -> str | None:
-    """Return the best fast triage model — prefers BaronLLM when installed.
+    """Return the best triage model — ranked by FALSE-POSITIVE DISCIPLINE (see TRIAGE_MODEL_PRIORITY).
 
     v9.1.4 — TRIAGE_MODEL=<name> env var overrides for A/B testing.
+    v10.7 — a set-but-uninstalled TRIAGE_MODEL no longer silently substitutes (see _pin_unavailable).
     """
     available = _get_available_models()
-    if not available:
-        return None
+
     env_override = os.environ.get("TRIAGE_MODEL", "").strip()
-    if env_override and env_override in available:
-        return env_override
-    if preferred and preferred in available:
-        return preferred
+    pin_missing = ""
+    if env_override:
+        match = _match_installed(env_override, available) if available else None
+        if match:
+            _record_selection("triage", match, "pinned", env_override)
+            return match
+        _pin_unavailable("triage", "TRIAGE_MODEL", env_override, verifiable=bool(available))
+        pin_missing = env_override
+
+    if not available:
+        _record_selection("triage", None, "no-models", pin_missing)
+        return None
+
+    if preferred:
+        match = _match_installed(preferred, available)
+        if match:
+            _record_selection("triage", match, "pin-missing-fallback" if pin_missing else "preferred", pin_missing)
+            return match
     for candidate in TRIAGE_MODEL_PRIORITY:
-        if candidate in available:
-            return candidate
-    return _pick_model()  # fall back to analysis model
+        match = _match_installed(candidate, available)
+        if match:
+            _record_selection("triage", match, "pin-missing-priority" if pin_missing else "priority", pin_missing)
+            return match
+    # No configured triage model installed. Fall back to a triage-SAFE available model — NOT the
+    # unrestricted narrator priority (_pick_model), which still contains assert/invent-biased tags
+    # (xploiter/bugtraceai/aya). Disable triage (return None) rather than let a fabrication-biased
+    # model become the false-positive judge. This also avoids clobbering the narrator provenance entry.
+    safe = [m for m in available if m not in _TRIAGE_FALLBACK_EXCLUDE]
+    m = safe[0] if safe else None
+    _record_selection("triage", m, ("pin-missing-" if pin_missing else "") + ("safe-fallback" if m else "none-safe"), pin_missing)
+    return m
 
 
 class Brain:
