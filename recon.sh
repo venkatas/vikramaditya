@@ -77,6 +77,22 @@ export PATH="$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # contains "projectdiscovery" — Python httpx --help does not). Falls back
 # to the bare `httpx` token if no PD binary is found anywhere, so existing
 # CI without PD installed still produces a clear error from PATH.
+# httpx_healthy <bin> — bounded, exit-code-aware SEMANTIC health check.
+# Returns 0 ONLY for a genuinely working ProjectDiscovery httpx: `-version`
+# must exit 0 within the timeout, print the "projectdiscovery" banner, and NOT
+# be the unrelated Python `httpx` CLI. Rejects nonzero exit, timeout (rc=124),
+# segfault (rc=139), empty output, and python-httpx. This is the single gate
+# both binary selection and the Phase-3 probe key on — presence is not health.
+httpx_healthy() {
+    local bin="$1" out rc
+    [ -n "$bin" ] || return 1
+    out=$(timeout 20 "$bin" -version 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || return 1                                  # nonzero / 124 timeout / 139 segfault
+    printf '%s' "$out" | grep -qi "python-httpx" && return 1     # the wrong (Python) httpx
+    printf '%s' "$out" | grep -qi "projectdiscovery" || return 1 # PD banner required
+    return 0
+}
+
 _resolve_pd_httpx() {
     local cand
     for cand in \
@@ -86,7 +102,7 @@ _resolve_pd_httpx() {
         "$(command -v httpx 2>/dev/null)"; do
         [ -z "$cand" ] && continue
         [ -x "$cand" ] || continue
-        if "$cand" -version 2>&1 | grep -qi "projectdiscovery"; then
+        if httpx_healthy "$cand"; then
             echo "$cand"; return 0
         fi
     done
@@ -96,11 +112,18 @@ _resolve_pd_httpx() {
     return 1
 }
 HTTPX_BIN="$(_resolve_pd_httpx || true)"
-if ! "$HTTPX_BIN" -version 2>&1 | grep -qi "projectdiscovery"; then
-    echo -e "[!] WARNING: ProjectDiscovery httpx not found on PATH. Live-host probing will fail." >&2
+# HTTPX_HEALTHY is the fail-closed signal the Phase-3 gate and the .probe.done
+# marker guard both consult. 1 only when the resolved binary passes the bounded
+# semantic health check; 0 otherwise (missing / crashing / hanging / python httpx).
+if httpx_healthy "$HTTPX_BIN"; then
+    HTTPX_HEALTHY=1
+else
+    HTTPX_HEALTHY=0
+    echo -e "[!] WARNING: ProjectDiscovery httpx not found or UNHEALTHY (failed bounded -version/banner check)." >&2
+    echo -e "    Live-host probing FAILS CLOSED — the run will not mark probing complete on a broken binary." >&2
     echo -e "    Install with:  GOBIN=\"\$HOME/go/bin\" go install github.com/projectdiscovery/httpx/cmd/httpx@latest" >&2
 fi
-export HTTPX_BIN
+export HTTPX_BIN HTTPX_HEALTHY
 
 # v9.2.0 (P1-7) — DNS wildcard early-detect. Probe 3 random labels under
 # the apex; if all 3 resolve, the zone has a wildcard A record and any
@@ -1140,13 +1163,26 @@ log_info "Phase 3: HTTP Probing in batches of $BATCH_SIZE (probing: $PROBED_COUN
 # live-host set on --resume (same fix already applied to Phases 1 and 2).
 if phase_done "$RECON_DIR/live/.probe.done"; then true; else
 
-if ! tool_ok httpx; then
-    log_warn "httpx not installed — skipping HTTP probing"
+if [ "${HTTPX_HEALTHY:-0}" != 1 ]; then
+    # P1 fail-closed: a missing / segfaulting / hanging / Python httpx must NOT
+    # be treated as "0 live hosts". Abort the probe phase WITHOUT writing
+    # .probe.done, so --resume re-runs it once httpx is fixed, and signal the
+    # orchestrator via RECON_PROBE_FAILED instead of proceeding on an empty set.
+    RECON_PROBE_FAILED=1; export RECON_PROBE_FAILED
+    mkdir -p "$RECON_DIR/live"
+    echo "httpx unhealthy (failed bounded -version/banner check) — probe phase not run" \
+        > "$RECON_DIR/live/.probe.failed" 2>/dev/null || true
+    log_err "httpx failed semantic health check — Phase-3 HTTP probing ABORTED (NOT marked complete)."
+    log_err "  Fix ProjectDiscovery httpx and re-run (or --resume). Downstream phases would otherwise assess an empty live set as authoritative."
 else
     # Clear previous output
     : > "$RECON_DIR/live/httpx_full.txt"
     : > "$RECON_DIR/live/httpx_all_tech.txt"
 
+    # P1 per-batch crash accounting: PROBE_CRASHES counts batches where httpx
+    # exited abnormally (124 timeout / 139 segfault / any nonzero) AND produced
+    # no new lines. If EVERY batch crashes we must not write a completion marker.
+    PROBE_CRASHES=0
     BATCH_NUM=0
     TOTAL_BATCHES=$(( (PROBED_COUNT + BATCH_SIZE - 1) / BATCH_SIZE ))
 
@@ -1187,12 +1223,19 @@ else
             -rate-limit "$RATE_LIMIT" \
             -timeout 6 \
             -retries 1 \
-            2>/dev/null >> "$RECON_DIR/live/httpx_full.txt" || true
+            2>/dev/null >> "$RECON_DIR/live/httpx_full.txt"
+        BATCH_RC=$?
 
         BATCH_END=$(date +%s)
         BATCH_ELAPSED=$(( BATCH_END - BATCH_START ))
         NEW_LIVE=$(file_lines "$RECON_DIR/live/httpx_full.txt")
         BATCH_FOUND=$(( NEW_LIVE - LIVE_SO_FAR ))
+        # A batch is a CRASH only when httpx exited abnormally AND added no lines
+        # (rc=0 with 0 new lines is a legitimately-empty batch, not a failure).
+        if [ "$BATCH_RC" -ne 0 ] && [ "$BATCH_FOUND" -eq 0 ]; then
+            PROBE_CRASHES=$(( PROBE_CRASHES + 1 ))
+            log_warn "  → Batch $BATCH_NUM httpx exited abnormally (rc=$BATCH_RC) with no output — counted as crashed batch"
+        fi
         log_step "  → Batch $BATCH_NUM done in ${BATCH_ELAPSED}s | found $BATCH_FOUND live hosts this batch | total live: $NEW_LIVE"
 
         rm -f "$BATCH_FILE"
@@ -1332,7 +1375,21 @@ else
     # full batch loop AND downstream URL/IP/status extraction complete; a kill
     # mid-loop leaves no marker, so --resume re-runs the probe instead of locking
     # in a partial live set. MUST stay outside the batch loop.
-    date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/live/.probe.done" 2>/dev/null || true
+    # P1 fail-closed guard: if EVERY batch crashed (0 live AND crashes == batches)
+    # the "0 live hosts" result is a tool failure, not a genuinely empty target —
+    # do NOT write the marker, so --resume re-probes; flag the failure instead.
+    if [ "${LIVE_COUNT:-0}" -eq 0 ] && [ "${TOTAL_BATCHES:-0}" -gt 0 ] \
+       && [ "${PROBE_CRASHES:-0}" -ge "${TOTAL_BATCHES:-0}" ]; then
+        RECON_PROBE_FAILED=1; export RECON_PROBE_FAILED
+        echo "httpx crashed/timed out on all $TOTAL_BATCHES batch(es) — 0 live is a tool failure" \
+            > "$RECON_DIR/live/.probe.failed" 2>/dev/null || true
+        log_err "Phase-3 ABORTED — httpx crashed/timed out on all $TOTAL_BATCHES batch(es); '0 live hosts' is a tool failure, not an empty target."
+        log_err "  .probe.done NOT written — re-run/--resume will re-probe. Do not trust this run's live set."
+    else
+        [ "${PROBE_CRASHES:-0}" -gt 0 ] && log_warn "Phase-3 completed with $PROBE_CRASHES/$TOTAL_BATCHES crashed batch(es) — live set may be partial (degraded)."
+        rm -f "$RECON_DIR/live/.probe.failed" 2>/dev/null || true   # clear any stale failure marker from a prior run
+        date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/live/.probe.done" 2>/dev/null || true
+    fi
 fi
 fi  # end Phase 3 resume skip
 

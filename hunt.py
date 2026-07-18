@@ -1722,6 +1722,53 @@ def check_tools() -> tuple[list, list]:
     return installed, missing
 
 
+def _httpx_readiness_reason(candidates: list[str] | None = None) -> str | None:
+    """Reason string iff an httpx binary is PRESENT but not a healthy ProjectDiscovery
+    httpx (crash / hang / the unrelated Python `httpx`). Returns None when a healthy PD
+    httpx exists, or when no binary is present at all (absence is ``check_tools``' job).
+
+    Mirrors recon.sh ``_resolve_pd_httpx`` candidate order and is BOUNDED — the
+    ``-version`` probe is timed out so a hanging binary can never stall startup.
+    ``candidates`` is injectable for testing; None uses the production search path.
+    """
+    if candidates is None:
+        candidates = [
+            os.path.expanduser("~/go/bin/httpx"),
+            "/opt/homebrew/bin/httpx",
+            "/usr/local/bin/httpx",
+            shutil.which("httpx") or "",
+        ]
+    present_reason: str | None = None
+    seen: set[str] = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
+            continue
+        try:
+            proc = subprocess.run([cand, "-version"], capture_output=True,
+                                  text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            present_reason = f"{cand}: -version timed out (hanging binary) — live-host probing would stall"
+            continue
+        except OSError as exc:
+            present_reason = f"{cand}: failed to execute ({exc})"
+            continue
+        out = ((proc.stdout or "") + (proc.stderr or "")).lower()
+        if proc.returncode != 0:
+            present_reason = f"{cand}: -version exited {proc.returncode} (crash/segfault) — probing silently yields 0 live hosts"
+            continue
+        if "python-httpx" in out:
+            present_reason = f"{cand}: Python HTTP client, not ProjectDiscovery httpx — live-host probing finds 0 hosts"
+            continue
+        if "projectdiscovery" not in out:
+            present_reason = f"{cand}: missing ProjectDiscovery banner — not the expected probing tool"
+            continue
+        return None  # a healthy ProjectDiscovery httpx exists → no readiness gap
+    return present_reason  # None when no binary was present at all
+
+
 def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, str]]:
     """Lightweight readiness layer beyond binary presence (v9.24 audit-fix).
 
@@ -1763,6 +1810,15 @@ def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, s
         if not os.path.isfile(jwt_wl):
             gaps.append({"tool": "jwt_tool",
                          "reason": "no jwt-secrets.txt wordlist — weak-secret cracking disabled (run --setup-wordlists)"})
+
+    # httpx (critical): a present-but-broken httpx (segfault / hang / the Python
+    # `httpx` CLI) passes a bare presence check yet silently zeroes the entire
+    # live-host surface, so downstream phases assess an empty set as authoritative.
+    # Probe it semantically (bounded) so the breakage is a surfaced readiness gap.
+    _hx_reason = _httpx_readiness_reason()
+    if _hx_reason:
+        gaps.append({"tool": "httpx",
+                     "reason": f"broken httpx — live-host probing fails closed to 0 hosts ({_hx_reason})"})
 
     return gaps
 
@@ -4141,6 +4197,19 @@ def run_recon(
         watch_interval=WATCHDOG_INTERVAL,
         watch_max_stale=WATCHDOG_MAX_IDLE,
     )
+    # P1 fail-closed: recon.sh writes live/.probe.failed when httpx was unhealthy
+    # or crashed on every batch — the live-host set is a TOOL FAILURE, not a
+    # genuine empty result. Never let downstream treat it as authoritative.
+    _probe_failed = os.path.join(recon_dir, "live", ".probe.failed")
+    if os.path.isfile(_probe_failed):
+        try:
+            _reason = open(_probe_failed).read().strip() or "httpx probe failed"
+        except OSError:
+            _reason = "httpx probe failed"
+        log("err", f"RECON probe phase FAILED (httpx): {_reason}")
+        log("err", "  Live-host set is untrustworthy — treating RECON as failed (re-run/--resume to re-probe).")
+        _mark_degraded("recon", f"httpx probe failed: {_reason}")
+        ok = False
     _brain_phase_complete(
         "RECON",
         ok,
