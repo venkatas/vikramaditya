@@ -4113,8 +4113,26 @@ def run_recon(
         os.remove(os.path.join(recon_dir, ".recon_truncated"))
     except OSError:
         pass
+    # P0: persist the EXACT-HOST allowlist so recon.sh/scanner.sh filter every phase through it
+    # (fail-closed) under scope-lock. Domain / --targets-file only — IP/CIDR scope is the range itself.
+    _allow_env = ""
+    if scope_lock and (_target_type == "domain" or targets_file):
+        try:
+            _scope_dir = os.path.join(recon_dir, "scope")
+            os.makedirs(_scope_dir, exist_ok=True)
+            _allow_path = os.path.join(_scope_dir, "allow.txt")
+            if targets_file:
+                _allow_hosts = [ln.strip() for ln in open(targets_file)
+                                if ln.strip() and not ln.lstrip().startswith("#")]
+            else:
+                _allow_hosts = [domain]              # apex only — www is NOT auto-scoped
+            with open(_allow_path, "w") as _af:
+                _af.write("\n".join(_allow_hosts) + "\n")
+            _allow_env = f"SCOPE_ALLOW_FILE={shlex.quote(_allow_path)} "
+        except OSError as _e:
+            log("warn", f"scope allowlist persist failed ({_e}) — recon fails closed under scope-lock")
     ok = run_live(
-        f'{adaptive_env}{_scope_env}{_type_env}{_maxurl_env}{_targets_env}'
+        f'{adaptive_env}{_scope_env}{_allow_env}{_type_env}{_maxurl_env}{_targets_env}'
         f'RECON_OUT_DIR="{recon_dir}" RECON_SESSION_ID="{active_session_id or ""}" '
         f'BATCH_SIZE={batch_size} bash "{script}" "{domain}" {quick_flag} {resume_flag}',
         timeout=_dynamic_timeout,

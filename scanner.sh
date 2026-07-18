@@ -67,6 +67,22 @@ if [ -z "$RECON_DIR" ] || [ ! -d "$RECON_DIR" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── P0: scope-lock boundary re-filter (fail-closed) ─────────────────────────────────────────────
+# recon.sh persists scope/allow.txt under scope-lock. scanner.sh has no host discovery of its own but
+# TRUSTS recon's URL corpus — so a stale/partial recon dir (e.g. a prior non-scope-lock run) could feed
+# OFF-SCOPE hosts to active curl/ffuf/nuclei. Re-filter the URL corpora through the EXACT-HOST allowlist
+# once, before any active check reads them. Presence of a non-empty allowlist == scope-lock active.
+_SCOPE_ALLOW="${SCOPE_ALLOW_FILE:-$RECON_DIR/scope/allow.txt}"
+if [ -s "$_SCOPE_ALLOW" ]; then
+    for _f in "$RECON_DIR/live/urls.txt" "$RECON_DIR/urls/all.txt" "$RECON_DIR/urls/with_params.txt" \
+              "$RECON_DIR/urls/api_endpoints.txt" "$RECON_DIR/urls/js_files.txt"; do
+        [ -s "$_f" ] || continue
+        timeout 30 python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-filter \
+            --allow-file "$_SCOPE_ALLOW" --in "$_f" --out "$_f" 2>/dev/null \
+            || : > "$_f"   # filter failure under scope-lock ⇒ fail closed (drop, never scan off-scope)
+    done
+fi
 BASE_DIR="$SCRIPT_DIR"
 SESSION_ID=$(basename "$RECON_DIR")
 # Support two invocation styles:

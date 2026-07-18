@@ -235,6 +235,37 @@ file_lines() {
     wc -l < "$path" 2>/dev/null | tr -d ' ' || echo 0
 }
 tool_ok()    { command -v "$1" &>/dev/null; }
+
+# ── scope-lock EXACT-HOST allowlist shim (P0, fail-closed) ──────────────────────────────────────
+# SCOPE_ALLOW_FILE (set by hunt.py for domain / --targets-file scope-lock) holds the exact allowlist.
+# _host_in_scope: exit 0 iff $1 is EXACTLY an allowed host. Not scope-locked, or no allowlist set
+# (an IP/CIDR run — scope is the range itself, host-header/archive leaks don't apply) → allow.
+# _scope_filter_file: in-place filter a URL/host file. When an allowlist IS set under scope-lock,
+# BOTH FAIL CLOSED (treat as out-of-scope / drop) on empty allowlist, timeout, or any shim failure.
+SCOPE_ALLOW_FILE="${SCOPE_ALLOW_FILE:-}"
+_host_in_scope() {
+    [ "$SCOPE_LOCK" = "1" ] || return 0
+    [ -n "$SCOPE_ALLOW_FILE" ] || return 0          # no hostname allowlist (IP/CIDR) → not host-gated
+    [ -s "$SCOPE_ALLOW_FILE" ] || return 1          # present-but-empty allowlist → fail closed
+    timeout 15 python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-check \
+        --allow-file "$SCOPE_ALLOW_FILE" "$1" 2>/dev/null
+}
+_scope_filter_file() {
+    [ "$SCOPE_LOCK" = "1" ] || return 0
+    [ -n "$SCOPE_ALLOW_FILE" ] || return 0
+    local f="$1"; [ -s "$f" ] || return 0
+    if [ ! -s "$SCOPE_ALLOW_FILE" ]; then
+        : > "$f"; log_warn "SCOPE_LOCK: empty allowlist — dropped all of $(basename "$f") (fail-closed)"; return 0
+    fi
+    local _before; _before=$(file_lines "$f")
+    if timeout 30 python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-filter \
+            --allow-file "$SCOPE_ALLOW_FILE" --in "$f" --out "$f" 2>/dev/null; then
+        local _after; _after=$(file_lines "$f")
+        [ "$_before" != "$_after" ] && log_warn "SCOPE_LOCK: filtered $(basename "$f") ${_before}→${_after} (off-scope dropped)"
+    else
+        : > "$f"; log_warn "SCOPE_LOCK: scope filter FAILED on $(basename "$f") — dropped (fail-closed)"
+    fi
+}
 # In resume mode: returns 0 (true) if the given file exists and is non-empty → skip phase
 phase_done() {
     local f="$1"
@@ -1084,8 +1115,11 @@ fi
 # wildcard / cap / keywords, so the real site is always tested.
 if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     _PROBE_WITH_APEX="$RECON_DIR/subdomains/.probe_with_apex.txt"
-    { echo "$TARGET"; echo "www.$TARGET"; cat "$HTTPX_TARGET_FILE" 2>/dev/null; } \
+    # P0: www is force-added ONLY when in scope — under scope-lock (apex-only allowlist) it is
+    # dropped. In a normal (non-scope-lock) run _host_in_scope always allows, preserving behavior.
+    { echo "$TARGET"; _host_in_scope "www.$TARGET" && echo "www.$TARGET"; cat "$HTTPX_TARGET_FILE" 2>/dev/null; } \
         | awk 'NF && !seen[$0]++' > "$_PROBE_WITH_APEX" 2>/dev/null || true
+    _scope_filter_file "$_PROBE_WITH_APEX"
     if [ -s "$_PROBE_WITH_APEX" ]; then
         HTTPX_TARGET_FILE="$_PROBE_WITH_APEX"
         # PROBED_COUNT tracks the actual probe-set size; RESOLVED_COUNT stays honest.
@@ -1249,7 +1283,11 @@ else
     # leaks the origin IP, then verify each candidate with a Host-header probe.
     # Output: live/cf_origin.json {target:{verified:[{ip,status,title}], bypass}}.
     _CFH="$(dirname "$0")/cf_origin_hunt.py"
-    if [ -s "$RECON_DIR/live/cdn_map.json" ] \
+    # P0: cf_origin_hunt actively probes OFF-SCOPE sibling hosts / candidate origin IPs (WAF bypass) —
+    # that is host-discovery expansion, so it is disabled entirely under scope-lock.
+    if [ "$SCOPE_LOCK" = "1" ]; then
+        log_warn "Origin-IP discovery (cf_origin_hunt) SKIPPED under scope-lock (off-scope host expansion)"
+    elif [ -s "$RECON_DIR/live/cdn_map.json" ] \
        && grep -q '"cdn"\|"waf"' "$RECON_DIR/live/cdn_map.json" 2>/dev/null \
        && [ -f "$_CFH" ] && command -v python3 >/dev/null 2>&1; then
         # Feed the DNS-RESOLVED hosts (dozens), NOT all.txt — which carries thousands of
@@ -1517,6 +1555,7 @@ fi
 
 # Merge all URLs
 cat "$RECON_DIR/urls/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/urls/all.txt" || true
+_scope_filter_file "$RECON_DIR/urls/all.txt"   # P0: drop off-scope archive/crawl URLs (gau/wayback/waymore/katana) under scope-lock
 TOTAL_URLS_RAW=$(file_lines "$RECON_DIR/urls/all.txt")
 log_ok "Total unique URLs (raw): $TOTAL_URLS_RAW"
 
@@ -1809,7 +1848,10 @@ fi  # end Phase 7 resume skip
 # ============================================================
 echo ""
 log_info "Phase 7.5: Virtual Host Discovery (Host header fuzzing)"
-if phase_done "$RECON_DIR/vhosts/found.txt"; then true; else
+if phase_done "$RECON_DIR/vhosts/found.txt"; then true; elif [ "$SCOPE_LOCK" = "1" ]; then
+    log_warn "Phase 7.5: virtual-host fuzzing SKIPPED under scope-lock (no Host: FUZZ.\$TARGET expansion)"
+    mkdir -p "$RECON_DIR/vhosts"; : > "$RECON_DIR/vhosts/found.txt"
+else
 
 mkdir -p "$RECON_DIR/vhosts"
 # Use resolved subdomains as Host header wordlist, fuzz against live IPs
