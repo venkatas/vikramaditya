@@ -1888,6 +1888,13 @@ def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, s
         gaps.append({"tool": "httpx",
                      "reason": f"broken httpx — live-host probing fails closed to 0 hosts ({_hx_reason})"})
 
+    # Required payload wordlists must exist AND be content-valid — a committed
+    # '404: Not Found' blob silently zeroes a whole payload class. Surface each as a gap.
+    for _wl in ("sqli-payloads.txt", "xss-payloads.txt", "ssrf-payloads.txt", "redirect-payloads.txt"):
+        if not _wordlist_content_valid(os.path.join(WORDLIST_DIR, _wl)):
+            gaps.append({"tool": _wl,
+                         "reason": "payload wordlist missing or corrupt (404/HTML/too-small) — run --setup-wordlists"})
+
     return gaps
 
 
@@ -4054,7 +4061,79 @@ def run_autonomous_hunt(
 
 
 # ── Wordlist setup ─────────────────────────────────────────────────────────────
-def setup_wordlists() -> None:
+# P2 — HTTP-error / HTML bodies that a naive `curl` (no -f) saved to disk AS the wordlist.
+# The 14-byte "404: Not Found" blobs that were committed are exactly this class. NOTE these
+# must be specific enough NOT to match legitimate payloads — XSS payload lists routinely
+# contain '<script>', '<html'-like tags, so we do NOT reject on a leading '<' or bare tags;
+# the min_lines guard alone kills the 1-line '404: Not Found' body.
+_WORDLIST_ERROR_SIGNATURES = (
+    "404: not found", "rate limit exceeded", "<!doctype html", "moved permanently",
+    "temporarily unavailable", "502 bad gateway", "503 service", "access denied",
+)
+
+# Payload lists whose silent corruption zeroes a whole vuln class — treated as REQUIRED
+# (a missing/invalid one is a visible coverage failure, not a warning).
+_REQUIRED_WORDLISTS = frozenset({
+    "sqli-payloads.txt", "xss-payloads.txt", "ssrf-payloads.txt",
+    "redirect-payloads.txt", "lfi-payloads.txt", "jwt-secrets.txt",
+})
+
+
+def _wordlist_content_valid(path: str, min_bytes: int = 64, min_lines: int = 5) -> bool:
+    """True only if the file is a plausible wordlist, not an HTTP-error / HTML page.
+
+    Rejects the committed '404: Not Found' bodies, HTML pages (first non-space byte '<'),
+    known error signatures, and anything too small. Shared by the downloader's post-fetch
+    validation and by check_tool_readiness so a corrupt list is surfaced at every run."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < min_bytes:
+            return False
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+        low = head.lower()
+        if any(sig in low for sig in _WORDLIST_ERROR_SIGNATURES):
+            return False
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = sum(1 for ln in fh if ln.strip())
+        return lines >= min_lines
+    except OSError:
+        return False
+
+
+def _download_validated_wordlist(name: str, url: str, *, min_bytes: int = 64,
+                                 min_lines: int = 5, required: bool = False) -> bool:
+    """Download to a TEMP path, VALIDATE, then ``os.replace`` atomically.
+
+    Fail-closed: keep ``-f`` so curl rejects HTTP errors; on any failure the temp file is
+    removed and the existing file is left UNTOUCHED (an invalid list never overwrites a
+    good one). Returns True only when a validated file became the real file."""
+    filepath = os.path.join(WORDLIST_DIR, name)
+    tmp = filepath + ".tmp"
+
+    def _rm_tmp():
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+    ok, _ = run_cmd(
+        f'curl -fsSL --retry 3 --retry-delay 2 --max-time 60 -o "{tmp}" "{url}"',
+        timeout=90)
+    if not ok or not _wordlist_content_valid(tmp, min_bytes, min_lines):
+        _rm_tmp()
+        return False
+    try:
+        os.replace(tmp, filepath)    # atomic — only a validated file becomes the real one
+    except OSError:
+        _rm_tmp()
+        return False
+    return True
+
+
+def setup_wordlists() -> list[str]:
+    """Download/refresh all wordlists. Returns the list of REQUIRED wordlists that are
+    still missing/invalid afterwards (empty == all good) so callers can fail closed."""
     os.makedirs(WORDLIST_DIR, exist_ok=True)
     wordlists = {
         # ── Directory discovery ─────────────────────────────────────────────
@@ -4064,10 +4143,11 @@ def setup_wordlists() -> None:
         "api-words.txt":            "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-seen-in-wild.txt",
         "params.txt":               "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/burp-parameter-names.txt",
         "subdomains-top1m.txt":     "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt",
-        # ── Vulnerability payloads — SecLists (fallback) ───────────────────
-        "lfi-payloads.txt":         "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/LFI/LFI-Jhaddix.txt",
-        "sqli-payloads.txt":        "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/Databases/SQLi/Generic-SQLi.txt",
-        "xss-payloads.txt":         "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
+        # ── Vulnerability payloads — SecLists, pinned to the 2024.3 release tag ─
+        # (master is fragile — a moved/renamed path is exactly what 404'd these before).
+        "lfi-payloads.txt":         "https://raw.githubusercontent.com/danielmiessler/SecLists/2024.3/Fuzzing/LFI/LFI-Jhaddix.txt",
+        "sqli-payloads.txt":        "https://raw.githubusercontent.com/danielmiessler/SecLists/2024.3/Fuzzing/SQLi/Generic-SQLi.txt",
+        "xss-payloads.txt":         "https://raw.githubusercontent.com/danielmiessler/SecLists/2024.3/Fuzzing/XSS/XSS-Jhaddix.txt",
         "redirect-payloads.txt":    "https://raw.githubusercontent.com/cujanovic/Open-Redirect-Payloads/master/Open-Redirect-payloads.txt",
         "jwt-secrets.txt":          "https://raw.githubusercontent.com/wallarm/jwt-secrets/master/jwt.secrets.list",
         "ssrf-payloads.txt":        "https://raw.githubusercontent.com/cujanovic/SSRF-Testing/master/cloud-metadata.txt",
@@ -4086,29 +4166,43 @@ def setup_wordlists() -> None:
         "wooyun_jsp.txt":           "https://raw.githubusercontent.com/gh0stkey/Web-Fuzzing-Box/main/Dir/Wooyun/Jsp.txt",
         "wooyun_php.txt":           "https://raw.githubusercontent.com/gh0stkey/Web-Fuzzing-Box/main/Dir/Wooyun/Php.txt",
     }
-    failed: list[str] = []
+    failed_optional: list[str] = []
     for name, url in wordlists.items():
         filepath = os.path.join(WORDLIST_DIR, name)
-        if os.path.exists(filepath) and os.path.getsize(filepath) > 100:
-            log("ok", f"Wordlist exists: {name}")
-            continue
+        req = name in _REQUIRED_WORDLISTS
+        # Skip only when the PRESENT file is content-valid — a committed '404: Not Found'
+        # blob (>100 bytes or not) must be detected and re-fetched, not trusted by size.
+        if os.path.exists(filepath):
+            if req:
+                if _wordlist_content_valid(filepath):
+                    log("ok", f"Wordlist valid: {name}")
+                    continue
+                log("warn", f"Wordlist {name} present but INVALID (404/HTML/too-small) — re-fetching")
+            elif os.path.getsize(filepath) > 100:
+                log("ok", f"Wordlist exists: {name}")
+                continue
         log("info", f"Downloading {name}...")
-        ok, _ = run_cmd(f'curl -sfL "{url}" -o "{filepath}"', timeout=60)
-        if ok and os.path.exists(filepath) and os.path.getsize(filepath) > 100:
-            lines = sum(1 for _ in open(filepath))
+        if _download_validated_wordlist(name, url, required=req):
+            lines = sum(1 for ln in open(filepath, encoding="utf-8", errors="replace") if ln.strip())
             log("ok", f"Downloaded {name} ({lines} entries)")
+        elif not req:
+            log("err", f"Failed/invalid: {name}")
+            failed_optional.append(name)
         else:
-            try:
-                if os.path.exists(filepath) and os.path.getsize(filepath) <= 100:
-                    os.remove(filepath)
-            except OSError:
-                pass
-            log("err", f"Failed: {name} (404 or empty)")
-            failed.append(name)
-    if failed:
-        log("warn", f"Wordlists ready with {len(failed)} missing: {', '.join(failed)} → {WORDLIST_DIR}")
+            log("err", f"Failed/invalid REQUIRED wordlist: {name}")
+
+    # A required list is a FAILURE if it is still missing or invalid on disk. Because the
+    # regenerated files ship in-repo, this only fires when a payload list is truly broken.
+    still_bad = sorted(n for n in _REQUIRED_WORDLISTS
+                       if not _wordlist_content_valid(os.path.join(WORDLIST_DIR, n)))
+    if still_bad:
+        log("crit", f"REQUIRED wordlists invalid/missing: {', '.join(still_bad)} — "
+                    f"payload coverage is degraded; fix before scanning.")
+    elif failed_optional:
+        log("warn", f"Wordlists ready ({len(failed_optional)} optional missing): {WORDLIST_DIR}")
     else:
         log("ok", f"Wordlists ready: {WORDLIST_DIR}")
+    return still_bad
 
 
 # ── Target selection ───────────────────────────────────────────────────────────
@@ -10282,7 +10376,11 @@ Examples:
         return
 
     if args.setup_wordlists:
-        setup_wordlists()
+        _bad = setup_wordlists()
+        if _bad:
+            log("crit", f"Required wordlists unavailable/invalid: {', '.join(_bad)} — "
+                        f"exiting non-zero (fail closed; payload coverage would be degraded)")
+            sys.exit(1)
         return
 
     installed, missing = check_tools()
@@ -10347,7 +10445,13 @@ Examples:
         return
 
     if not os.path.exists(os.path.join(WORDLIST_DIR, "common.txt")):
-        setup_wordlists()
+        _bad = setup_wordlists()
+        if _bad:
+            # Auto-setup path: a broken required payload list degrades coverage silently —
+            # surface it (a coverage gap; check_tool_readiness also flags it) but don't hard
+            # abort the whole engagement, since recon/scan phases still run usefully.
+            _mark_degraded("wordlists",
+                           f"required payload wordlists missing/invalid: {', '.join(_bad)} — run --setup-wordlists")
 
     if args.target:
         resume_label = resume_session_id or ("latest" if resume_requested else "new")

