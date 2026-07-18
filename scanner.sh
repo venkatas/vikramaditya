@@ -134,6 +134,19 @@ _mark_coverage() {
     echo "[COVERAGE-GAP] ${1:-?}: ${2:-unspecified}" >> "$COVERAGE_MARKER_FILE"
 }
 
+# P1 — record a genuine tool CRASH (hard signal / unexpected non-zero), distinct from an
+# intentional skip/cap. Any crash makes scanner.sh exit non-zero at the end, so hunt.py's
+# run_live marks the SCAN phase degraded instead of rendering a clean 0-findings pass.
+SCAN_CRASHES=0
+_scan_crash() {   # _scan_crash <tool> <rc> [detail]
+    SCAN_CRASHES=$((SCAN_CRASHES + 1))
+    mkdir -p "$FINDINGS_DIR/manual_review" 2>/dev/null || true
+    echo "[SCAN-CRASH] ${1:-?} rc=${2:-?} ${3:-}" >> "$FINDINGS_DIR/manual_review/scanner_crashes.txt"
+    _mark_coverage "${1:-?}" "tool crashed (rc=${2:-?}) — results incomplete for this class"
+}
+# rc 124 (timeout), 134 (SIGABRT), 137 (SIGKILL/OOM), 139 (SIGSEGV) are hard crashes.
+_is_crash_rc() { case "${1:-0}" in 124|134|137|139) return 0;; *) return 1;; esac; }
+
 skip_has() {
     local want="$1"
     if _has_skip "${SKIP_CHECKS:-}" "$want"; then
@@ -519,7 +532,9 @@ if tool_ok nuclei && [ -d "$CUSTOM_NUCLEI_TEMPLATES" ] && [ -n "$(ls -A "$CUSTOM
     log_info "Check 1: Custom nuclei templates (${CUSTOM_NUCLEI_TEMPLATES})"
     nuclei -l "$ORDERED_SCAN" -t "$CUSTOM_NUCLEI_TEMPLATES" \
         -severity low,medium,high,critical -silent \
-        -o "$FINDINGS_DIR/cves_custom/nuclei_custom.txt" 2>/dev/null || true
+        -o "$FINDINGS_DIR/cves_custom/nuclei_custom.txt" 2>/dev/null
+    _nrc=$?
+    _is_crash_rc "$_nrc" && _scan_crash "nuclei-custom" "$_nrc" "custom-template pass"
     CUSTOM_HITS=$(count_vuln "$FINDINGS_DIR/cves_custom/nuclei_custom.txt")
     [ "$CUSTOM_HITS" -gt 0 ] && log_ok "[CUSTOM-NUCLEI] $CUSTOM_HITS finding(s) — review $FINDINGS_DIR/cves_custom/"
 fi
@@ -1193,3 +1208,11 @@ log_info "Scan Complete. Consolidating..."
     echo "Supply Chain         : $(count_vuln "$FINDINGS_DIR/supply_chain/findings.txt")"
 } > "$FINDINGS_DIR/summary.txt"
 cat "$FINDINGS_DIR/summary.txt"
+
+# P1 fail-closed exit: if any invoked tool crashed (hard signal / timeout), exit non-zero
+# so hunt.py's run_live records the SCAN phase as degraded. A clean 0 would hide the loss.
+if [ "${SCAN_CRASHES:-0}" -gt 0 ]; then
+    log_warn "$SCAN_CRASHES tool crash(es) recorded during scan — exiting non-zero (coverage degraded)"
+    exit 2
+fi
+exit 0

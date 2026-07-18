@@ -2354,48 +2354,131 @@ finding maps to them. Resolved IP(s): <code>{ips_str}</code>.</p>
 '''
 
 
-def _render_coverage_limitations_html(report_dir: str) -> str:
-    """Render a "Tooling & Coverage Limitations" chapter.
+def _load_coverage_rows(report_dir: str):
+    """Return ``(rows, inconclusive)`` shared by the HTML and Markdown renderers so BOTH
+    show IDENTICAL degradation info (the Markdown deliverable previously showed none).
 
-    INTEGRATION CONTRACT (v10.0.2): reads ``coverage.json`` under the findings
-    session dir — a JSON list of ``{"tool": ..., "reason": ...}`` entries
-    written by the hunt.py agent describing degraded/skipped capabilities.
-    Degrades gracefully (renders nothing) when the file is absent, empty, or
-    malformed so a normal full-coverage run adds no noise."""
+    ``rows`` is a list of ``(tool_or_phase, reason, source)``. Accepts ``coverage.json`` as a
+    merged list (``{source,tool_or_phase,reason,status}``), a legacy hunt list
+    (``{tool,reason}``), or an api_audit dict — and also folds in scanner.sh's
+    ``manual_review/coverage_gaps.txt`` directly, so the section is populated even if
+    ``merge_coverage`` never ran. ``inconclusive`` comes from the phase manifest."""
     import json as _json
     _, findings_dir = _resolve_recon_findings_dirs(report_dir)
+    rows: list = []
+    seen: set = set()
+
+    def _add(tool, reason, source):
+        reason = " ".join(str(reason or "").split()).strip()
+        tool = str(tool or "").strip()
+        if not reason:
+            return
+        key = (tool, reason, source)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append((tool or "—", reason, source))
+
     cov_path = os.path.join(findings_dir, "coverage.json")
-    if not os.path.isfile(cov_path):
-        return ""
+    data = None
     try:
         with open(cov_path, errors="replace") as fh:
             data = _json.load(fh)
     except (OSError, ValueError):
-        return ""
-    if not isinstance(data, list):
-        return ""
+        data = None
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if "tool_or_phase" in item or "source" in item:      # merged schema
+                _add(item.get("tool_or_phase", ""), item.get("reason", ""), item.get("source", "hunt"))
+            else:                                                # legacy hunt {tool,reason}
+                _add(item.get("tool", ""), item.get("reason", ""), "hunt")
+    elif isinstance(data, dict):                                 # api_audit dict (was silently dropped)
+        deg = data.get("degraded")
+        if isinstance(deg, list):
+            for d in deg:
+                if isinstance(d, dict):
+                    _add(d.get("tool", ""), d.get("reason", ""), "api_audit")
+                elif isinstance(d, str):
+                    _add("", d, "api_audit")
+
+    gaps = os.path.join(findings_dir, "manual_review", "coverage_gaps.txt")
+    try:
+        with open(gaps, errors="replace") as fh:
+            for ln in fh:
+                txt = ln.replace("[COVERAGE-GAP]", "").strip()
+                if not txt:
+                    continue
+                if ":" in txt:
+                    cls, reason = txt.split(":", 1)
+                    _add(cls.strip(), reason.strip(), "scanner.sh")
+                else:
+                    _add("", txt, "scanner.sh")
+    except OSError:
+        pass
+
+    inconclusive = False
+    try:
+        import phase_manifest as _pm
+        inconclusive = _pm.is_inconclusive(findings_dir)
+    except Exception:
+        inconclusive = False
+    return rows, inconclusive
+
+
+_INCONCLUSIVE_MSG = ("ASSESSMENT STATUS: INCONCLUSIVE — one or more phases failed, were "
+                     "aborted, or ran degraded. An absent finding below is NOT a clean bill "
+                     "of health; re-run the affected phases before relying on this report.")
+
+
+def _render_coverage_limitations_html(report_dir: str) -> str:
+    """Render the "Tooling & Coverage Limitations" chapter + an INCONCLUSIVE banner.
+
+    Reads the (merged) ``coverage.json`` and the phase manifest under the findings session
+    dir. Degrades gracefully (renders nothing) when there are no gaps AND the run is
+    conclusive, so a clean full-coverage run adds no noise."""
+    rows_data, inconclusive = _load_coverage_rows(report_dir)
+    banner = ""
+    if inconclusive:
+        banner = ('<div style="background:#7a1020;color:#fff;padding:14px 18px;border-radius:6px;'
+                  'margin-top:30px;font-weight:700">⛔ ' + _INCONCLUSIVE_MSG + '</div>\n')
+    if not rows_data:
+        return banner   # surface the banner even when no per-row detail exists
 
     rows = ""
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        tool = str(item.get("tool", "")).strip() or "—"
-        reason = str(item.get("reason", "")).strip() or "—"
-        rows += f"<tr><td><code>{tool}</code></td><td>{reason}</td></tr>\n"
-    if not rows:
-        return ""
+    for tool, reason, source in rows_data:
+        rows += f"<tr><td><code>{tool}</code></td><td>{reason}</td><td>{source}</td></tr>\n"
 
-    return f'''
+    return banner + f'''
 <h2 id="coverage-limitations" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">
 Tooling &amp; Coverage Limitations</h2>
 <p style="color:#495057">The following capabilities were degraded or skipped during this
 engagement. Findings should be read in light of these gaps — an absent result for a class
 below is <b>inconclusive</b>, not a clean bill of health.</p>
 <table class="tbl">
-  <tr><th style="width:220px">Tool / Capability</th><th>Reason</th></tr>
+  <tr><th style="width:200px">Tool / Capability</th><th>Reason</th><th style="width:110px">Source</th></tr>
   {rows}
 </table>
 '''
+
+
+def _render_coverage_limitations_md(report_dir: str) -> str:
+    """Markdown twin of ``_render_coverage_limitations_html`` — SAME data, so the two
+    deliverables never disagree about what was degraded/skipped."""
+    rows_data, inconclusive = _load_coverage_rows(report_dir)
+    out = ""
+    if inconclusive:
+        out += f"\n> ⛔ **{_INCONCLUSIVE_MSG}**\n"
+    if rows_data:
+        out += ("\n## Tooling & Coverage Limitations\n\n"
+                "The following capabilities were degraded or skipped during this engagement. "
+                "An absent result for a class below is **inconclusive**, not a clean bill of health.\n\n"
+                "| Tool / Capability | Reason | Source |\n|---|---|---|\n")
+        for tool, reason, source in rows_data:
+            _r = reason.replace("|", "\\|")
+            out += f"| `{tool}` | {_r} | {source} |\n"
+    return out
 
 
 def _collect_scan_diagnostics(report_dir: str, target: str) -> dict:
@@ -2878,6 +2961,11 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
     ]
     for s in ("critical", "high", "medium", "low", "info"):
         lines.append(f"| {s.upper()} | {counts[s]} |")
+    # P1 — coverage limitations + INCONCLUSIVE banner. SAME data as the HTML report,
+    # placed up top so an inconclusive run can never read as a clean "N findings" bill.
+    _cov_md = _render_coverage_limitations_md(report_dir)
+    if _cov_md:
+        lines += ["", _cov_md]
     lines += ["", "---", "", "## Vulnerability Summary", "",
               "| ID | Vulnerability | Severity | CVSS | Host |",
               "|----|---------------|----------|------|------|"]

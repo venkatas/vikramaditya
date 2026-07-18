@@ -542,9 +542,10 @@ def write_outputs(
                 f"- Public operations probed: {tested_ops} of {total_probeable_ops} (full)"
             )
 
-    # Persist a machine-readable coverage record + a degradation marker file
-    # so downstream tooling (and the operator) can detect the truncation.
-    (output_dir / "coverage.json").write_text(
+    # Rich api-audit-specific coverage record — kept in its OWN file so it never
+    # collides with the canonical coverage.json list contract that hunt.py writes and
+    # reporter.py renders (a dict here used to silently drop hunt's degraded list).
+    (output_dir / "api_coverage.json").write_text(
         json.dumps(
             {
                 "probed_hosts": probed_hosts,
@@ -559,6 +560,26 @@ def write_outputs(
             indent=2,
         )
     )
+    # APPEND (never overwrite) the api-audit degradation into the canonical coverage.json
+    # list so hunt.py's and api_audit's coverage entries coexist for the reporter.
+    _canon = output_dir / "coverage.json"
+    try:
+        _existing = json.loads(_canon.read_text())
+        if not isinstance(_existing, list):
+            _existing = []
+    except (OSError, ValueError):
+        _existing = []
+    if degraded:
+        _entry = {
+            "source": "api_audit",
+            "tool_or_phase": "api_audit",
+            "reason": (f"surface capped — probed {probed_hosts} of {total_hosts} hosts, "
+                       f"{tested_ops} of {total_probeable_ops} public operations"),
+            "status": "degraded",
+        }
+        if _entry not in _existing:
+            _existing.append(_entry)
+    _canon.write_text(json.dumps(_existing, indent=2))
     if degraded:
         (output_dir / "COVERAGE_CAPPED.marker").write_text("\n".join(coverage_lines) + "\n")
 

@@ -923,6 +923,11 @@ def resolve_assess_creds(cli_assess_creds, autonomous: bool, prompt=None) -> boo
     return bool(prompt()) if prompt else False
 
 
+# P1 — remembers hunt.py's exit code so __main__ can map an inconclusive run (2) to a
+# distinct orchestrator exit code (see the __main__ block below).
+_LAST_HUNT_EXIT = 0
+
+
 def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
              assess_creds: bool = False, max_urls: int = 0,
              allow_destructive: bool = False):
@@ -961,7 +966,15 @@ def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
     env.setdefault("PYTHONUNBUFFERED", "1")
     # Fork-safe launch (this runs AFTER fingerprint_webapp_bounded's in-process
     # HTTP I/O — see _run_streaming / procutil for the macOS atfork SIGSEGV class).
-    _run_streaming(cmd, cwd=SCRIPT_DIR, env=env)
+    _rc = _run_streaming(cmd, cwd=SCRIPT_DIR, env=env)
+    # P1 — propagate hunt.py's inconclusive exit (2) so the orchestrator's own exit
+    # code reflects a degraded/failed run; CI can't mistake it for a clean pass.
+    global _LAST_HUNT_EXIT
+    _LAST_HUNT_EXIT = _rc
+    if _rc == 2:
+        print(f"\n  {Y}[!]{N} hunt.py reported an INCONCLUSIVE assessment "
+              f"(a phase failed / was aborted / ran degraded).\n", flush=True)
+    return _rc
 
 
 def run_legacy_crawl(target_url: str, creds: str, creds_b: str = None,
@@ -2605,5 +2618,9 @@ if __name__ == "__main__":
         raise
     finally:
         _append_run_log(_target_for_log, _started, _exit_code)
+    # P1 — a clean control-flow exit still surfaces an INCONCLUSIVE hunt (exit 2) so a
+    # degraded/failed assessment is never reported to CI/operators as a clean pass.
+    if _exit_code == 0 and _LAST_HUNT_EXIT == 2:
+        _exit_code = 2
     if _exit_code:
         sys.exit(_exit_code)

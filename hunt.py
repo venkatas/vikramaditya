@@ -1292,6 +1292,7 @@ def _brain_phase_complete(phase: str, success: bool, detail: str = "", artifacts
 # Canonical implementation now lives in procutil.py so brain_scanner shares the EXACT
 # same launcher (its exploit commands were still fork()+exec and SIGSEGV'd on macOS).
 from procutil import _POSIX_SPAWN_OK, _PosixSpawnProc, _fork_safe_spawn as _procutil_spawn, run_capture, _terminate_group  # noqa: E402,F401
+import phase_manifest  # noqa: E402
 
 
 # ── P1 process-wide interrupt safety net ──────────────────────────────────────
@@ -1586,6 +1587,13 @@ def run_live(cmd: str, timeout: int = 3600,
         end_level = "ok" if rc == 0 else "warn"
         timeout_note = " (timed out)" if timed_out else ""
         log(end_level, f"END {label}: PID {proc.pid} rc={rc} duration={duration:.1f}s{timeout_note}")
+        # Coverage-honesty (P1): a plain non-zero exit (a tool crash, scanner.sh rc!=0)
+        # was previously NOT recorded — only timeout/SIGKILL were. Mark it degraded so the
+        # phase can never render as a clean run, and persist a manifest record every time.
+        _ph = watch_phase or "subprocess"
+        if rc != 0 and not timed_out:
+            _mark_degraded(_ph, f"exited non-zero (rc={rc}) — partial/failed coverage")
+        _record_phase_manifest(_ph, cmd, rc, timed_out, watch_file)
         return rc == 0
 
     except Exception as exc:
@@ -1893,6 +1901,7 @@ PHASE_STATUS_SKIPPED = "skipped"  # skipped / N/A (tool absent, no candidates)
 PHASE_STATUS_ERROR = "error"    # attempted but errored / produced nothing usable
 PHASE_STATUS_PARTIAL = "partial"  # produced a result, but an optional tool was degraded
 PHASE_STATUS_ABORTED = "aborted"  # interrupted (SIGINT/SIGTERM) — partial/no coverage, NOT complete
+PHASE_STATUS_FAILED = "failed"    # requested, ran, but exited non-zero / crashed — NOT a clean skip
 
 _PHASE_STATUS_GLYPH = {
     PHASE_STATUS_RAN:     "✓",
@@ -1900,6 +1909,7 @@ _PHASE_STATUS_GLYPH = {
     PHASE_STATUS_ERROR:   "✗",
     PHASE_STATUS_PARTIAL: "⚠",
     PHASE_STATUS_ABORTED: "⛔",
+    PHASE_STATUS_FAILED:  "✗",
 }
 
 
@@ -1909,9 +1919,11 @@ def phase_status_glyph(status: str) -> str:
 
 
 def derive_phase_status(requested: bool, ran_truthy: bool,
-                        degraded: bool = False) -> str:
+                        degraded: bool = False, failed: bool = False) -> str:
     """Derive a phase status from the signals hunt_target has.
 
+    * ``failed``  — requested and attempted but HARD-failed (non-zero exit / crash / signal).
+                    Distinct from ``skipped`` so a broken phase never reads as a clean skip.
     * ``error``   — degraded AND produced nothing (tool broken, all candidates dead, import error).
     * ``partial`` — the phase RAN and produced a result, but an OPTIONAL tool was degraded. A
                     producing phase (e.g. JS analysis that extracted secrets) must NOT read as a
@@ -1921,6 +1933,8 @@ def derive_phase_status(requested: bool, ran_truthy: bool,
     """
     if not requested:
         return PHASE_STATUS_SKIPPED
+    if failed:
+        return PHASE_STATUS_FAILED
     if degraded:
         return PHASE_STATUS_PARTIAL if ran_truthy else PHASE_STATUS_ERROR
     return PHASE_STATUS_RAN if ran_truthy else PHASE_STATUS_SKIPPED
@@ -2048,6 +2062,30 @@ def _mark_aborted(phase: str, reason: str) -> None:
     coverage accumulator with an explicit ``ABORTED —`` marker so the reporter and
     resume logic never render an interrupted phase as ran / clean / complete."""
     _mark_degraded(phase or "subprocess", f"ABORTED — {reason}")
+
+
+def _record_phase_manifest(phase: str, command: str, exit_code, timed_out: bool,
+                           watch_file: str | None) -> None:
+    """Best-effort: append a phase record (command, exit code, timeout, artifact counts)
+    to the persistent phase_manifest.json. Uses the last-resolved findings dir; a no-op
+    if none is known yet or the write fails — coverage/success also live in-memory."""
+    fd = _LAST_FINDINGS_DIR
+    if not fd:
+        return
+    counts: dict = {}
+    try:
+        if watch_file and os.path.isdir(watch_file):
+            counts["artifacts"] = sum(len(fs) for _, _, fs in os.walk(watch_file))
+        elif watch_file and os.path.isfile(watch_file):
+            with open(watch_file, encoding="utf-8", errors="replace") as _fh:
+                counts["lines"] = sum(1 for _ in _fh)
+    except OSError:
+        pass
+    try:
+        phase_manifest.record_phase(fd, phase, command=command, exit_code=exit_code,
+                                    timed_out=bool(timed_out), artifact_counts=counts)
+    except Exception:
+        pass
 
 
 def _mark_truncated_recon(watch_file: str | None, watch_phase: str | None) -> None:
@@ -9600,10 +9638,46 @@ def hunt_target(
             bool(_requested), bool(result.get(_phase)), degraded=_degraded
         )
 
+    # ── P1 fail-closed overall status ───────────────────────────────────────
+    # A broken run must never present as a clean pass. Fold phase outcomes into
+    # result["success"] (the sync path never did this — only the autonomous path
+    # did). Inconclusive when: ANY phase hard-failed/aborted (non-zero exit,
+    # signal, timeout — from the manifest), an ABORTED marker exists, or a CORE
+    # phase (recon/scan) is degraded/errored. A phase that RAN and found nothing
+    # stays success — 0 findings is a result, not a failure.
+    _CORE_PHASES = {"recon", "scan"}
+    _core_broken = any(
+        _ph in _CORE_PHASES and _st in (PHASE_STATUS_FAILED, PHASE_STATUS_ABORTED,
+                                        PHASE_STATUS_ERROR, PHASE_STATUS_PARTIAL)
+        for _ph, _st in result["phase_status"].items()
+    )
+    _any_aborted = any(str(d.get("reason", "")).startswith("ABORTED")
+                       for d in _DEGRADED_CAPABILITIES)
+    _manifest_bad = False
+    try:
+        _manifest_bad = any(
+            _p.get("status") in (phase_manifest.PHASE_FAILED, phase_manifest.PHASE_ABORTED)
+            for _p in phase_manifest.read_manifest(findings_dir).get("phases", [])
+        )
+    except Exception:
+        _manifest_bad = False
+    if _core_broken or _any_aborted or _manifest_bad:
+        result["success"] = False
+        result["assessment_status"] = "inconclusive"
+    else:
+        result.setdefault("assessment_status", "complete")
+
     # Persist the degraded-capabilities list for the reporter (integration
     # contract). Always written (even empty) so the reporter can tell
     # "no degradations" from "coverage not measured".
     write_coverage_json(findings_dir)
+    # Consolidate the three historically-separate coverage artifacts (hunt degraded
+    # list + scanner.sh coverage_gaps.txt + vikramaditya coverage_degraded.json)
+    # into the canonical coverage.json so both report renderers show one picture.
+    try:
+        phase_manifest.merge_coverage(findings_dir)
+    except Exception:
+        pass
 
     # ── Phase 13: Reports ───────────────────────────────────────────────────
     if selected_only_mode:
@@ -9826,6 +9900,23 @@ def _verify_authenticated(target: str, cookie: str) -> tuple[bool, str, str]:
     except Exception as e:
         # Never block on a network/parse hiccup — proceed, but say we couldn't verify.
         return True, f"pre-flight could not verify ({str(e)[:50]}) — proceeding unverified", ""
+
+
+def _exit_for_assessment(results) -> None:
+    """Exit 2 (distinct from clean 0) when any target's assessment is inconclusive.
+
+    P1 fail-closed: a run where a phase failed / aborted / a core phase degraded must not
+    be mistakable for a clean pass by CI or an operator reading only the exit code."""
+    try:
+        for r in results or []:
+            if isinstance(r, dict) and (r.get("assessment_status") == "inconclusive"
+                                        or r.get("success") is False):
+                log("warn", "ASSESSMENT STATUS: INCONCLUSIVE — exiting 2 (a phase failed/aborted/degraded)")
+                sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -10280,6 +10371,7 @@ Examples:
                 use_langgraph=getattr(args, "langgraph", False),
             )
             print_dashboard([result])
+            _exit_for_assessment([result])
             return
         elif args.autonomous:
             result = run_autonomous_hunt(
@@ -10331,6 +10423,7 @@ Examples:
                 allow_destructive=args.allow_destructive,
             )
         print_dashboard([result])
+        _exit_for_assessment([result])
         return
 
     # Full pipeline
@@ -10367,6 +10460,7 @@ Examples:
         results.append(result)
 
     print_dashboard(results)
+    _exit_for_assessment(results)
 
 
 def _flush_abort_coverage() -> None:
