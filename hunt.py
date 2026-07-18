@@ -1291,7 +1291,44 @@ def _brain_phase_complete(phase: str, success: bool, detail: str = "", artifacts
 # Fork-safe process spawner (macOS Network.framework atfork SIGSEGV fix, v10.3.3).
 # Canonical implementation now lives in procutil.py so brain_scanner shares the EXACT
 # same launcher (its exploit commands were still fork()+exec and SIGSEGV'd on macOS).
-from procutil import _POSIX_SPAWN_OK, _PosixSpawnProc, _fork_safe_spawn, run_capture  # noqa: E402,F401
+from procutil import _POSIX_SPAWN_OK, _PosixSpawnProc, _fork_safe_spawn as _procutil_spawn, run_capture, _terminate_group  # noqa: E402,F401
+
+
+# ── P1 process-wide interrupt safety net ──────────────────────────────────────
+# Every child is launched setsid-detached, so a Ctrl-C / SIGTERM that lands OUTSIDE
+# a launcher's blocking wait (between phases, in post-processing) would orphan a live
+# scanner tree. We register each spawned proc and tear every live group down from the
+# signal/atexit handlers installed in __main__. _fork_safe_spawn wraps procutil's so
+# no call site changes.
+_ACTIVE_PROCS: list = []
+_LAST_FINDINGS_DIR: str | None = None
+
+
+def _proc_alive(proc) -> bool:
+    try:
+        return proc is not None and proc.poll() is None
+    except Exception:
+        return False
+
+
+def _fork_safe_spawn(*args, **kwargs):
+    proc = _procutil_spawn(*args, **kwargs)
+    try:
+        # prune finished children so the registry stays ~ the live set, then track this one
+        _ACTIVE_PROCS[:] = [p for p in _ACTIVE_PROCS if _proc_alive(p)]
+        _ACTIVE_PROCS.append(proc)
+    except Exception:
+        pass
+    return proc
+
+
+def _terminate_all_active_groups() -> None:
+    """Tear down every still-live registered child group (backstop for interrupts
+    that land outside a launcher). _terminate_group polls first, so exited procs no-op."""
+    for proc in list(_ACTIVE_PROCS):
+        if _proc_alive(proc):
+            _terminate_group(proc)
+    _ACTIVE_PROCS.clear()
 
 
 def run_cmd(
@@ -1385,6 +1422,12 @@ def run_cmd(
                 except Exception:
                     pass
                 stdout = b"".join(chunks).decode("utf-8", "replace")
+            except KeyboardInterrupt:
+                log("warn", f"ABORTED {label}: SIGINT — killing PID {proc.pid} and its process group")
+                _mark_aborted(watch_phase or "subprocess",
+                              "user interrupt (SIGINT) — phase aborted, coverage partial/none")
+                _terminate_group(proc, phase=label)
+                raise
             finally:
                 watchdog.stop()
                 # Surface a watchdog SIGKILL (stuck/no-progress) as degraded —
@@ -1408,6 +1451,10 @@ def run_cmd(
                                 pty_stdin=pty_stdin)
         try:
             stdout, _ = proc.communicate(timeout=timeout)
+        except KeyboardInterrupt:
+            _mark_aborted(watch_phase or "subprocess", "user interrupt (SIGINT) — phase aborted")
+            _terminate_group(proc)
+            raise
         except subprocess.TimeoutExpired:
             # Coverage-honesty (audit-fix): record the truncation. This path has
             # no watch_phase, so attribute it to the phase named by watch_phase
@@ -1439,6 +1486,9 @@ def run_cmd_args(
                                 capture=True, shell=False)
         try:
             out, _ = proc.communicate(timeout=timeout)
+        except KeyboardInterrupt:
+            _terminate_group(proc)
+            raise
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1506,6 +1556,16 @@ def run_live(cmd: str, timeout: int = 3600,
                 proc.wait(timeout=10)  # reap the killed child (no Popen GC to do it)
             except Exception:
                 pass
+        except KeyboardInterrupt:
+            # Ctrl-C lands here (proc.wait blocking). The child is setsid-detached so it
+            # never got the terminal SIGINT — we MUST tear its group down explicitly, or
+            # the whole recon/scan tree orphans to launchd and keeps running.
+            log("warn", f"ABORTED {label}: SIGINT — killing PID {proc.pid} and its process group")
+            _mark_aborted(phase if watch_file is not None else (watch_phase or "subprocess"),
+                          "user interrupt (SIGINT) — phase aborted, coverage partial/none")
+            _mark_truncated_recon(watch_file, watch_phase)  # resume re-runs, never trusts partial
+            _terminate_group(proc, phase=label)
+            raise                                            # abort the run — never continue
         finally:
             if watchdog:
                 watchdog.stop()
@@ -1832,12 +1892,14 @@ PHASE_STATUS_RAN = "ran"        # executed and produced a result
 PHASE_STATUS_SKIPPED = "skipped"  # skipped / N/A (tool absent, no candidates)
 PHASE_STATUS_ERROR = "error"    # attempted but errored / produced nothing usable
 PHASE_STATUS_PARTIAL = "partial"  # produced a result, but an optional tool was degraded
+PHASE_STATUS_ABORTED = "aborted"  # interrupted (SIGINT/SIGTERM) — partial/no coverage, NOT complete
 
 _PHASE_STATUS_GLYPH = {
     PHASE_STATUS_RAN:     "✓",
     PHASE_STATUS_SKIPPED: "∅",
     PHASE_STATUS_ERROR:   "✗",
     PHASE_STATUS_PARTIAL: "⚠",
+    PHASE_STATUS_ABORTED: "⛔",
 }
 
 
@@ -1979,6 +2041,13 @@ def _mark_degraded(tool: str, reason: str) -> None:
     if entry not in _DEGRADED_CAPABILITIES:
         _DEGRADED_CAPABILITIES.append(entry)
         log("warn", f"Degraded capability: {tool} — {reason}")
+
+
+def _mark_aborted(phase: str, reason: str) -> None:
+    """Record a phase aborted by interrupt (SIGINT/SIGTERM). Persisted via the
+    coverage accumulator with an explicit ``ABORTED —`` marker so the reporter and
+    resume logic never render an interrupted phase as ran / clean / complete."""
+    _mark_degraded(phase or "subprocess", f"ABORTED — {reason}")
 
 
 def _mark_truncated_recon(watch_file: str | None, watch_phase: str | None) -> None:
@@ -3221,6 +3290,8 @@ def _resolve_findings_dir(domain: str, session_id: str | None = None, create: bo
         findings_dir = _findings_domain_root(domain)
     if create:
         os.makedirs(findings_dir, exist_ok=True)
+        global _LAST_FINDINGS_DIR
+        _LAST_FINDINGS_DIR = findings_dir   # remember for the interrupt coverage-flush
     return findings_dir
 
 
@@ -10271,5 +10342,36 @@ Examples:
     print_dashboard(results)
 
 
+def _flush_abort_coverage() -> None:
+    """Persist the (aborted) coverage accumulator to disk so an interrupted run leaves
+    an honest record instead of no coverage.json / a stale completion marker."""
+    try:
+        if _LAST_FINDINGS_DIR:
+            write_coverage_json(_LAST_FINDINGS_DIR)
+    except Exception:
+        pass
+
+
+def _sigterm_abort_handler(signum, frame):
+    log("warn", "SIGTERM received — terminating active scanner groups and aborting run")
+    _terminate_all_active_groups()
+    _flush_abort_coverage()
+    raise SystemExit(143)
+
+
 if __name__ == "__main__":
-    main()
+    import atexit as _atexit
+    _atexit.register(_terminate_all_active_groups)   # final backstop: never leave a live group
+    try:
+        signal.signal(signal.SIGTERM, _sigterm_abort_handler)
+    except Exception:
+        pass
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Any SIGINT that escaped a launcher's own teardown ends here — kill every
+        # remaining group, flush the aborted coverage, and exit 130 (never 0).
+        log("warn", "Aborted by user (SIGINT) — terminating active scanner groups")
+        _terminate_all_active_groups()
+        _flush_abort_coverage()
+        sys.exit(130)
