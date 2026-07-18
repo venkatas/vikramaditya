@@ -924,7 +924,8 @@ def resolve_assess_creds(cli_assess_creds, autonomous: bool, prompt=None) -> boo
 
 
 def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
-             assess_creds: bool = False, max_urls: int = 0):
+             assess_creds: bool = False, max_urls: int = 0,
+             allow_destructive: bool = False):
     """Route to hunt.py for domain/IP/CIDR recon + scan.
 
     v9.2.0 — pass PYTHONUNBUFFERED=1 to subprocess so phase markers flush in
@@ -947,6 +948,11 @@ def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
         cmd.append("--scope-lock")
     if assess_creds:
         cmd.append("--assess-creds")
+    # Live Metasploit exploitation is FAIL-CLOSED: only forward --allow-destructive
+    # when the caller explicitly opted in. A bare/default run stays dry-run (hunt.py
+    # writes .rc resource files but never stages a live meterpreter session).
+    if allow_destructive:
+        cmd.append("--allow-destructive")
     # v10.5.0 — always forward the URL cap explicitly so 0 (unlimited, the
     # default) reaches recon.sh and overrides hunt.py's legacy 100 default.
     cmd += ["--max-urls", str(max_urls)]

