@@ -1179,6 +1179,35 @@ else
     : > "$RECON_DIR/live/httpx_full.txt"
     : > "$RECON_DIR/live/httpx_all_tech.txt"
 
+    # ── P1: guaranteed core-hosts probe (apex/www/target), BEFORE the mass loop ──
+    # The mass batch loop can be collateral-killed by CDN/WAF rate-limiting when a
+    # large brute-force/wildcard candidate set floods the edge (real run: a 1502-host
+    # probe of a wildcard-inflated domain → CDN throttled → the live www [200] reported
+    # DEAD → "0 live hosts"), and when enumeration returns 0 only the apex/www are in
+    # scope (WAF-fronted apex). Probe the core hosts in ISOLATION first — browser UA,
+    # low concurrency, retries — so the primary site is captured cleanly, before any
+    # flood-induced throttling, regardless of the mass probe's fate.
+    if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        _CORE_HOSTS="$RECON_DIR/subdomains/.core_hosts.txt"
+        { echo "$TARGET"; _host_in_scope "www.$TARGET" && echo "www.$TARGET"; } \
+            | awk 'NF && !seen[$0]++' > "$_CORE_HOSTS" 2>/dev/null || true
+        _scope_filter_file "$_CORE_HOSTS"
+        if [ -s "$_CORE_HOSTS" ]; then
+            log_step "Core-hosts probe (apex/www, isolated + browser UA) — guarantees the primary site is tested"
+            timeout 150 "$HTTPX_BIN" -l "$_CORE_HOSTS" \
+                -silent -status-code -title -tech-detect -content-length -ip -no-fallback -no-color \
+                -threads 2 -rate-limit 5 -timeout 15 -retries 2 \
+                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+                2>/dev/null >> "$RECON_DIR/live/httpx_full.txt" || true
+            _CORE_N=$(file_lines "$RECON_DIR/live/httpx_full.txt")
+            if [ "$_CORE_N" -gt 0 ]; then
+                log_ok "Core-hosts probe: $_CORE_N live (primary site reachable)"
+            else
+                log_warn "Core-hosts probe: apex/www did not respond — likely WAF/bot-block (host may still be up)"
+            fi
+        fi
+    fi
+
     # P1 per-batch crash accounting: PROBE_CRASHES counts batches where httpx
     # exited abnormally (124 timeout / 139 segfault / any nonzero) AND produced
     # no new lines. If EVERY batch crashes we must not write a completion marker.
@@ -1240,6 +1269,14 @@ else
 
         rm -f "$BATCH_FILE"
     done
+
+    # P1: dedup by URL (first field) keeping FIRST occurrence — the isolated core-hosts
+    # probe wrote first, so its clean result wins over any rate-limited duplicate the
+    # mass loop appended for the same apex/www host.
+    if [ -s "$RECON_DIR/live/httpx_full.txt" ]; then
+        awk '!seen[$1]++' "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/.httpx_dedup.txt" 2>/dev/null \
+            && mv "$RECON_DIR/live/.httpx_dedup.txt" "$RECON_DIR/live/httpx_full.txt"
+    fi
 
     LIVE_COUNT=$(file_lines "$RECON_DIR/live/httpx_full.txt")
 
