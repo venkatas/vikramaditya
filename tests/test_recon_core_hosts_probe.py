@@ -16,7 +16,7 @@ def test_core_hosts_probe_exists_isolated_and_browser_ua():
     assert 'echo "$TARGET"' in seg and 'www.$TARGET' in seg, "core set is not apex/www/target"
     assert "User-Agent: Mozilla" in seg, "core probe lacks a browser User-Agent"
     assert "-rate-limit 5" in seg and "-threads 2" in seg, "core probe is not low-concurrency/isolated"
-    assert "-retries 2" in seg, "core probe has no retries"
+    assert "-retries 1" in seg, "core probe has no retries"
 
 
 def test_core_probe_runs_before_mass_loop():
@@ -34,3 +34,12 @@ def test_core_probe_respects_scope_lock():
     i = RECON.index(".core_hosts.txt")
     seg = RECON[i:i+1400]
     assert '_host_in_scope "www.$TARGET"' in seg and "_scope_filter_file" in seg
+
+
+def test_core_probe_has_curl_fallback():
+    # httpx intermittently trips CDN bot-mitigation; a curl fallback must recover the core hosts
+    i = RECON.index(".core_hosts.txt")
+    seg = RECON[i:i+2200]
+    assert "curl fallback" in seg.lower(), "no curl fallback when httpx core-probe returns empty"
+    assert "curl -sk" in seg and "%{http_code}" in seg, "curl fallback does not synthesize a live line"
+

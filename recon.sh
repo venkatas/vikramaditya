@@ -1194,16 +1194,37 @@ else
         _scope_filter_file "$_CORE_HOSTS"
         if [ -s "$_CORE_HOSTS" ]; then
             log_step "Core-hosts probe (apex/www, isolated + browser UA) — guarantees the primary site is tested"
-            timeout 150 "$HTTPX_BIN" -l "$_CORE_HOSTS" \
+            timeout 45 "$HTTPX_BIN" -l "$_CORE_HOSTS" \
                 -silent -status-code -title -tech-detect -content-length -ip -no-fallback -no-color \
-                -threads 2 -rate-limit 5 -timeout 15 -retries 2 \
+                -threads 2 -rate-limit 5 -timeout 12 -retries 1 \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
                 2>/dev/null >> "$RECON_DIR/live/httpx_full.txt" || true
             _CORE_N=$(file_lines "$RECON_DIR/live/httpx_full.txt")
+            if [ "$_CORE_N" -eq 0 ]; then
+                # httpx intermittently trips Akamai/CDN bot-mitigation (TLS/JA3 or the
+                # -tech-detect probe fingerprint) even when the host is 200 to a browser.
+                # curl is far more forgiving here — fall back to it and synthesize a
+                # minimal live line ("scheme://host [code]") so the primary site is still
+                # captured. Downstream phases re-fetch, so title/tech/ip filled later.
+                log_step "Core-hosts httpx empty — curl fallback (browser UA, retries)"
+                while IFS= read -r _ch; do
+                    [ -z "$_ch" ] && continue
+                    for _sch in https http; do
+                        _cc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 20 --retry 2 --retry-delay 2 \
+                              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+                              "$_sch://$_ch" 2>/dev/null || echo 000)
+                        if [ -n "$_cc" ] && [ "$_cc" != "000" ]; then
+                            echo "$_sch://$_ch [$_cc]" >> "$RECON_DIR/live/httpx_full.txt"
+                            break
+                        fi
+                    done
+                done < "$_CORE_HOSTS"
+                _CORE_N=$(file_lines "$RECON_DIR/live/httpx_full.txt")
+            fi
             if [ "$_CORE_N" -gt 0 ]; then
                 log_ok "Core-hosts probe: $_CORE_N live (primary site reachable)"
             else
-                log_warn "Core-hosts probe: apex/www did not respond — likely WAF/bot-block (host may still be up)"
+                log_warn "Core-hosts probe: apex/www unreachable via httpx AND curl — host may be blocking this source"
             fi
         fi
     fi
