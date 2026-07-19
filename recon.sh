@@ -1212,8 +1212,10 @@ else
                     for _sch in https http; do
                         _cc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 20 --retry 2 --retry-delay 2 \
                               -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-                              "$_sch://$_ch" 2>/dev/null || echo 000)
-                        if [ -n "$_cc" ] && [ "$_cc" != "000" ]; then
+                              "$_sch://$_ch" 2>/dev/null | tail -c 3)
+                        # accept ONLY a real HTTP status (1xx–5xx). 000 / empty = connection
+                        # failed/throttled — do NOT synthesize a fake-live host.
+                        if printf '%s' "$_cc" | grep -qE '^[1-5][0-9][0-9]$'; then
                             echo "$_sch://$_ch [$_cc]" >> "$RECON_DIR/live/httpx_full.txt"
                             break
                         fi
