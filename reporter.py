@@ -800,6 +800,24 @@ def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
             "vtype": default_vtype}
 
 
+# ANTI-FABRICATION: scanner STATE/summary lines that must NEVER become findings.
+# A "Label: <count>" tally ("Confirmed RCE: 0", "Java targets: 2") and SKIPPED/N/A/none
+# markers are probe state, not vulnerabilities — the generic loader used to promote each
+# to a CRITICAL via the subdir's template default (16 fake CVSS-9.8 RCEs, 2026-07-19).
+_STATE_LINE_RE = re.compile(r'^[A-Za-z][A-Za-z0-9 ()/_.-]*:\s*\d+\s*$')
+
+
+def _is_state_line(line: str) -> bool:
+    """True for a scanner state/summary line that is never a finding (fail-closed)."""
+    s = line.strip()
+    if not s:
+        return True
+    u = s.upper()
+    if u.startswith(("SKIPPED", "N/A", "(NONE)", "NONE FOUND", "NO TARGETS", "NO HOSTS")):
+        return True
+    return bool(_STATE_LINE_RE.match(s))   # "Label: <count>" tally
+
+
 def _load_poc_blocks(poc_path: str) -> dict:
     """Load PoC blocks from a .poc file. Format: ### FINDING_TEXT\\n(poc lines)\\n###"""
     pocs = {}
@@ -898,6 +916,10 @@ def load_findings(findings_dir: str) -> list:
         # NOT findings; treating them as such inflates the report (97 fake "Unrestricted
         # File Upload" HIGHs from auth_required.txt during the 03-May clienta run).
         NON_FINDING_FILES = {
+            "summary.txt",                # EVERY subdir's per-phase tally (e.g. rce/summary.txt:
+                                          # "Confirmed RCE: 0", "Java targets: 2") — pure state, never
+                                          # a finding. Its lines were promoted to CRITICAL RCEs (16 fake
+                                          # CVSS-9.8 on a real 2026-07-19 run). Global blacklist.
             "auth_required.txt",          # upload/ — paths protected by auth, not vulnerable
             "auth-required.txt",
             # NOTE: timebased_candidates.txt is deliberately NOT blacklisted — it can carry a
@@ -988,12 +1010,20 @@ def load_findings(findings_dir: str) -> list:
                 continue
             if fn in NON_FINDING_FILES:
                 continue
+            if fn.endswith("_targets.txt"):
+                # candidate/target host LISTS (java_targets.txt, tomcat_targets.txt, …) —
+                # hosts queued for testing, not findings. Their bare-URL lines were rendered
+                # as one CRITICAL finding per host via the subdir template default.
+                continue
             if vtype == "jwt" and _JWT_NARRATIVE_FILE_RE.match(fn):
                 continue
             with open(os.path.join(path, fn), errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith("#"):
+                        continue
+                    if _is_state_line(line):
+                        # scanner state/tally/SKIPPED line — never a finding (fail-closed)
                         continue
                     if any(line.startswith(p) for p in NON_FINDING_PREFIXES):
                         continue
