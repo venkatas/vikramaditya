@@ -451,9 +451,17 @@ if ! skip_has upload; then
     log_step "Probing ${#PROBE_PATHS[@]} upload-candidate paths × hosts..."
 
     # ── Probe loop ───────────────────────────────────────────────────────
+    # P1 time-box: on a large estate this hosts×paths probe (with a POST retry per
+    # 401/403) consumed the ENTIRE scanner batch timeout (2×3600s SIGKILL on a
+    # 75-host WAF-403 target) — SQLi/XSS/SSTI never ran. Bound Check 0 to a budget
+    # so the high-value checks always get time. Set CHECK0_BUDGET=0 to disable.
+    CHECK0_BUDGET="${CHECK0_BUDGET:-600}"
+    _C0_DEADLINE=$(( $(date +%s) + CHECK0_BUDGET ))
+    _C0_TIMEOUT=0
     AUTH_FILE="$FINDINGS_DIR/upload/auth_required.txt"
     while read -r host; do
         [ -z "$host" ] && continue
+        [ "$_C0_TIMEOUT" = 1 ] && break
         # Hard skip: confirmed catchall (both random probes agreed on
         # status+hash) — the baseline body would mask any real upload sink.
         # Whole-token match (same ,token, convention as _has_skip) — an
@@ -466,6 +474,12 @@ if ! skip_has upload; then
         # Format: "<code1>|<hash1>" newline-separated.
         EXPECTED_TUPLES=$(awk -v h="$host" -F '\t' '$1==h{print $2"|"$3}' "$SOFT404_FILE" 2>/dev/null)
         for path in "${PROBE_PATHS[@]}"; do
+            if [ "$CHECK0_BUDGET" != 0 ] && [ "$(date +%s)" -ge "$_C0_DEADLINE" ]; then
+                log_warn "Check 0 (upload discovery) hit its ${CHECK0_BUDGET}s budget — stopping so SQLi/XSS/SSTI get scan time (raise CHECK0_BUDGET to probe more)"
+                _mark_coverage "upload" "upload-surface discovery time-boxed at ${CHECK0_BUDGET}s — not all hosts/paths probed"
+                _C0_TIMEOUT=1
+                break
+            fi
             U="${host%/}${path}"
             RESP=$(curl -sk --max-time 5 -o - -w "\nHTTP_CODE:%{http_code}" "$U" 2>/dev/null)
             CODE=$(echo "$RESP" | tail -1 | sed 's/HTTP_CODE://')

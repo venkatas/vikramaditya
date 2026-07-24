@@ -1052,6 +1052,27 @@ def run_brain_scan(target: str, cookies: str = "", briefing: str = "",
     )
 
 
+def _best_live_target(preferred: str, findings_dir: str) -> str:
+    """Pick a reachable 200-status host from recon for the active scanner instead of a
+    WAF-blocked apex. Real WAF-fronted run: the apex answered a CDN 403 to everything, so the
+    active scan fumbled and 'found nothing' against a dead target. Reads the recon
+    httpx_full.txt (scheme://host [code] ...) and returns the first 200 URL; falls back
+    to the preferred target if none/no recon data."""
+    if not findings_dir:
+        return preferred
+    httpx_full = os.path.join(findings_dir.replace("/findings/", "/recon/"), "live", "httpx_full.txt")
+    try:
+        with open(httpx_full, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "[200]" in line:
+                    u = line.split()[0] if line.split() else ""
+                    if u.startswith("http"):
+                        return u
+    except OSError:
+        pass
+    return preferred
+
+
 def run_report(findings_dir: str, client: str = "", consultant: str = ""):
     """Route to reporter.py for report generation."""
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "reporter.py"), findings_dir]
@@ -2553,6 +2574,9 @@ def main():
                 brain_target = api_base
         except NameError:
             pass
+        # P1 — don't point the active scanner at a WAF-blocked apex; prefer a live
+        # 200 host from recon (real WAF-fronted run: apex was CDN 403 → scan found nothing).
+        brain_target = _best_live_target(brain_target, findings_dir)
         log("info", f"Launching brain active scanner on {brain_target}...")
         # Reuse the existing report root rather than spawning a second session
         # dir the reporter never reads. The brain scanner writes brain_active/

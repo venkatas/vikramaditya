@@ -4736,6 +4736,19 @@ def run_js_analysis(domain: str) -> bool:
     js_count = sum(1 for _ in open(js_urls_file))
     log("info", f"Found {js_count} JS files — analyzing...")
 
+    # P1 — bound the serial per-URL curl loops (jsluice/SecretFinder) to a top-N
+    # subset. On a large estate (5590 JS URLs) the uncapped loops blew the phase
+    # watchdog (1200s/300s SIGKILL, ~15% scanned) and reported partial coverage.
+    # Cap keeps the phase bounded; JS_ANALYSIS_MAX_URLS=0 restores "scan all".
+    _js_max = int(os.environ.get("JS_ANALYSIS_MAX_URLS", "300"))
+    js_scan_file = js_urls_file
+    if _js_max > 0 and js_count > _js_max:
+        js_scan_file = os.path.join(js_dir, "js_urls_scan.txt")
+        run_cmd(f'head -n {_js_max} "{js_urls_file}" > "{js_scan_file}"', timeout=30)
+        log("warn", f"JS analysis capped at {_js_max} of {js_count} JS URLs "
+                    f"(JS_ANALYSIS_MAX_URLS=0 for all) — partial coverage")
+        _mark_degraded("js_analysis", f"URL surface capped: analyzed {_js_max} of {js_count} JS URLs")
+
     jsluice_bin  = _tool_bin("jsluice")
     secretfinder = _tool_bin("secretfinder")
     trufflehog   = _tool_bin("trufflehog")
@@ -4754,13 +4767,13 @@ def run_js_analysis(domain: str) -> bool:
         # must not stall the serial loop until the phase watchdog kills it (real client-b.example
         # hang: jsluice-urls timed out at 1200s rc=-9). IFS= read -r for robust URL handling.
         cmd = (
-            f'cat "{js_urls_file}" | while IFS= read -r url; do '
+            f'cat "{js_scan_file}" | while IFS= read -r url; do '
             f'  curl -sk --connect-timeout 5 --max-time 20 "$url" | {jsluice_bin} secrets -j 2>/dev/null; '
             f'done | sort -u | tee "{jsluice_out}"'
         )
         run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
         cmd2 = (
-            f'cat "{js_urls_file}" | while IFS= read -r url; do '
+            f'cat "{js_scan_file}" | while IFS= read -r url; do '
             f'  curl -sk --connect-timeout 5 --max-time 20 "$url" | {jsluice_bin} urls -j 2>/dev/null; '
             f'done | sort -u | tee "{endpoints_out}"'
         )
@@ -4785,7 +4798,7 @@ def run_js_analysis(domain: str) -> bool:
         # clean "0 matches". Merge stderr into the captured output (per-url so a
         # single broken URL doesn't kill the loop) and assert plausibility.
         cmd = (
-            f'cat "{js_urls_file}" | while read url; do '
+            f'cat "{js_scan_file}" | while read url; do '
             f'  python3 "{secretfinder}" -i "$url" -o cli 2>&1; '
             f'done | tee "{sf_out}"'
         )
@@ -4833,7 +4846,7 @@ def run_js_analysis(domain: str) -> bool:
             # Record a url->file manifest alongside the content-hash-named downloads so a
             # finding (e.g. a verified key in a bundle) can carry its exact public URL without
             # a live re-fetch. (Filename is md5(url+"\n").js — the trailing newline is echo's.)
-            f'cat "{js_urls_file}" | while IFS= read -r url; do '
+            f'cat "{js_scan_file}" | while IFS= read -r url; do '
             f'  name=$(echo "$url" | md5sum | cut -d" " -f1).js; '
             f'  curl -sk --connect-timeout 5 --max-time 20 "$url" -o "{dl_dir}/$name" 2>/dev/null; '
             f'  printf "%s\\t%s\\n" "$name" "$url" >> "{dl_dir}/manifest.tsv"; '
