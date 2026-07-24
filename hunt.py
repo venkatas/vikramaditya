@@ -196,7 +196,7 @@ REPO_TOOLS_DIR = os.path.join(BASE_DIR, "tools")
 # RECON_TIMEOUT is a baseline — hunt_target() scales it up for large targets
 RECON_TIMEOUT      = 7200   # 2h default (was 1h — too short for gov.in-class targets)
 RECON_TIMEOUT_MAX  = 21600  # 6h hard cap
-SCAN_TIMEOUT       = 3600
+SCAN_TIMEOUT       = 5400   # per vuln-scan batch: 3600 was too tight for a WAF-fronted host
 CVE_HUNT_TIMEOUT   = 600
 ZERO_DAY_TIMEOUT   = 900
 JS_SCAN_TIMEOUT    = 1200
@@ -4521,8 +4521,11 @@ def run_vuln_scan(domain: str, quick: bool = False, skip_items: set[str] | None 
         all_hosts = [l.strip() for l in open(priority_file) if l.strip()]
     
     if len(all_hosts) > 50:
-        log("info", f"Large target list ({len(all_hosts)} hosts) — splitting into batches of 50 for stability")
-        batch_size = 50
+        # Batch of 50 WAF-fronted hosts couldn't finish scanner.sh's full check suite in
+        # one SCAN_TIMEOUT window (real run: Batch 2 SIGKILL'd → INCONCLUSIVE). Smaller
+        # batches + the raised SCAN_TIMEOUT let each batch complete.
+        batch_size = 25
+        log("info", f"Large target list ({len(all_hosts)} hosts) — splitting into batches of {batch_size} for stability")
         batches = [all_hosts[i:i + batch_size] for i in range(0, len(all_hosts), batch_size)]
         
         ok = True

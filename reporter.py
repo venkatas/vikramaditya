@@ -839,6 +839,49 @@ def _load_poc_blocks(poc_path: str) -> dict:
     return pocs
 
 
+def _consolidate_repeated_findings(results: list, threshold: int = 4) -> list:
+    """Collapse many near-identical findings (same vtype+severity+reason across DIFFERENT
+    hosts — e.g. 'Missing CSP header' on 71 hosts) into ONE finding with an aggregated host
+    list, so the report shows the issue once instead of flooding N per-host rows (a real run
+    reported 104 findings, 100 of them per-host header dupes). Only groups with >= threshold
+    members collapse; everything else passes through unchanged, so distinct findings and small
+    fixtures are unaffected."""
+    from collections import OrderedDict
+
+    def _host_of(f) -> str:
+        m = re.search(r'https?://([^/\s"\']+)', (f.get("url") or "") + " " + (f.get("raw") or ""))
+        return m.group(1) if m else ""
+
+    def _reason_key(f):
+        # strip URLs/hosts so the same issue on different hosts groups together
+        txt = f.get("raw") or f.get("title") or f.get("description") or ""
+        txt = re.sub(r'https?://\S+', '', txt)
+        txt = re.sub(r'\s+', ' ', txt).strip().lower()
+        return (f.get("vtype", ""), f.get("severity", ""), txt)
+
+    groups = OrderedDict()
+    for f in results:
+        groups.setdefault(_reason_key(f), []).append(f)
+
+    out = []
+    for members in groups.values():
+        if len(members) >= threshold:
+            hosts = []
+            for m in members:
+                h = _host_of(m)
+                if h and h not in hosts:
+                    hosts.append(h)
+            rep = dict(members[0])
+            rep["_affected_hosts"] = hosts
+            rep["_consolidated_count"] = len(members)
+            note = f"  [consolidated: {len(members)} occurrences across {len(hosts)} host(s): {', '.join(hosts[:8])}{' …' if len(hosts) > 8 else ''}]"
+            rep["raw"] = (rep.get("raw", "") or rep.get("title", "")).rstrip() + note
+            out.append(rep)
+        else:
+            out.extend(members)
+    return out
+
+
 def load_findings(findings_dir: str) -> list:
     import json as _json
     results = []
@@ -2075,6 +2118,7 @@ def load_findings(findings_dir: str) -> list:
                       f"{e!r} — this finding may be MISSING from the report")
                 continue
 
+    results = _consolidate_repeated_findings(results)
     results.sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 4))
     return results
 
