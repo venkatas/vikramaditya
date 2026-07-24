@@ -48,3 +48,15 @@ def test_reporter_keeps_below_threshold(tmp_path):
         "[LOW] Missing CSP header — https://h2.example\n")
     findings = reporter.load_findings(str(d))
     assert len([f for f in findings if f.get("vtype") == "misconfig"]) == 2
+
+
+# ── A: SAML/import endpoint checks skip blanket-response hosts + drop 301/403 ──
+def test_saml_import_skip_catchall_and_drop_redirect_forbidden():
+    sc = (REPO / "scanner.sh").read_text()
+    # both loops skip catchall/WAF hosts
+    assert sc.count('case ",$CATCHALL_HOSTS," in *"$_bh"*) continue ;; esac') >= 2
+    # SAML no longer flags 301/403 as "endpoint found"
+    assert "200|301|302|403)" not in sc, "SAML still flags 301/403 as endpoint-found"
+    # import no longer flags the 301/403 flood
+    assert "200|201|301|302|400|403|405|422)" not in sc, "IMPORT still flags 301/403 flood"
+    assert "200|302)" in sc and "200|201|302|400|405|422)" in sc

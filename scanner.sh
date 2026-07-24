@@ -937,13 +937,20 @@ if ! skip_has saml; then
 
     while IFS= read -r host; do
         [ -z "$host" ] && continue
+        # A (fix): skip blanket-response (catchall/WAF) hosts — a host that returns the SAME
+        # code to every path yields a false "endpoint found" for EVERY SAML path (real runs:
+        # 100s of FPs on 403-to-everything WAF hosts).
+        _bh="${host#*://}"; _bh="${_bh%%/*}"
+        case ",$CATCHALL_HOSTS," in *"$_bh"*) continue ;; esac
         for SAML_PATH in "/saml/login" "/sso/saml" "/auth/saml" "/api/auth/saml" \
                          "/login/saml" "/saml/acs" "/saml/metadata" "/adfs/ls" \
                          "/.well-known/openid-configuration"; do
             CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
                 "${host}${SAML_PATH}" 2>/dev/null || echo "0")
+            # A (fix): only a genuinely reachable endpoint (200) or an SSO/IdP redirect (302)
+            # is a real signal. 301 = generic redirect, 401/403 = blocked — NOT "found".
             case "$CODE" in
-                200|301|302|403)
+                200|302)
                     log_vuln "[SAML] Endpoint found (HTTP $CODE): ${host}${SAML_PATH}"
                     echo "[SAML-ENDPOINT] ${host}${SAML_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/saml/endpoints.txt"
                     ;;
@@ -1010,6 +1017,11 @@ if ! skip_has import; then
 
     while IFS= read -r host; do
         [ -z "$host" ] && continue
+        # A (fix): skip blanket-response (catchall/WAF) hosts — a 403/301-to-everything host
+        # otherwise flags EVERY import path as "endpoint exists" (real run: 423 FPs on one
+        # WAF host).
+        _bh="${host#*://}"; _bh="${_bh%%/*}"
+        case ",$CATCHALL_HOSTS," in *"$_bh"*) continue ;; esac
 
         # ── Discover import/export endpoints ──
         # NOTE: loop var is ep_path, NOT PATH — overwriting $PATH here would
@@ -1024,8 +1036,11 @@ if ! skip_has import; then
             "/api/migrate" "/template/import" "/backup/restore"; do
             CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
                 "${host}${ep_path}" 2>/dev/null || echo "0")
+            # A (fix): flag only codes that show the endpoint EXISTS and is reachable/handling
+            # input — 200/201 (accessible), 302 (login redirect), 400/405/422 (exists, rejects
+            # GET/validates). Drop 301 (generic redirect) and 401/403 (blocked flood).
             case "$CODE" in
-                200|201|301|302|400|403|405|422)
+                200|201|302|400|405|422)
                     log_vuln "[IMPORT] Endpoint exists (HTTP $CODE): ${host}${ep_path}"
                     echo "[IMPORT-ENDPOINT] ${host}${ep_path} | HTTP $CODE" >> "$FINDINGS_DIR/import_export/endpoints.txt"
                     ;;
