@@ -77,3 +77,20 @@ def test_cred_file_check_rejects_html_soft404():
     assert re.search(r"grep -qiE\s+['\"]<!doctype html\|<html", block, re.I), \
         "cred-file check must skip HTML/soft-404 bodies before flagging [CRED-FILE]"
     assert "continue" in block, "HTML guard must skip the path (continue), not fall through"
+
+
+# ── G (#4): CSP/header check must evaluate the FINAL page, not the http->https redirect ──
+def test_csp_check_follows_redirects():
+    """2026-07-25 engagement: 'Missing CSP' shipped for hosts that DO set CSP on https. The
+    check did `curl -I "$host"` (HEAD, no -L) against the http:// URL, reading the 301
+    redirect response (which carries no CSP) instead of the final https page. Follow redirects
+    (and use GET, since some servers omit CSP on HEAD) so the header seen matches a browser."""
+    import re
+    sc = (REPO / "scanner.sh").read_text()
+    i = sc.index("Analysing Content-Security-Policy")
+    block = sc[i:i + 2400]
+    m = re.search(r"HDR=\$\(curl[^\n]*\)", block)
+    assert m, "CSP header-fetch curl not found in the CSP block"
+    line = m.group(0)
+    assert "-L" in line, f"CSP fetch must follow redirects (-L) to read the final page; got: {line}"
+    assert "-I " not in line, f"CSP fetch must not use HEAD (-I) — some servers omit CSP on HEAD; got: {line}"

@@ -708,7 +708,12 @@ PYEOF
     else
     while IFS= read -r host; do
         [ -z "$host" ] && continue
-        HDR=$(curl -sk --max-time 8 -I "$host" 2>/dev/null | tr -d '\r')
+        # Follow redirects (-L) and use GET (-o /dev/null -D -), not HEAD: recon feeds http://
+        # URLs, so `curl -I "$host"` read the 301 http->https redirect response — which carries
+        # no CSP — and flagged "Missing CSP" on hosts whose FINAL https page sets a full CSP
+        # (a false positive on well-hardened sites). Following to the final hop and reading its
+        # headers as a browser would (GET; some servers omit CSP on HEAD) fixes that.
+        HDR=$(curl -sk -L --max-time 8 -o /dev/null -D - "$host" 2>/dev/null | tr -d '\r')
         CSP=$(echo "$HDR" | grep -i "^content-security-policy:" | cut -d: -f2-)
         if [ -z "$CSP" ]; then
             log_warn "[CSP-MISSING] No CSP header: $host"

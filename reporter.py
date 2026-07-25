@@ -816,6 +816,70 @@ _STATE_LINE_RE = re.compile(r'^[A-Za-z][A-Za-z0-9 ()/_.-]*:\s*\d+\s*$')
 # each from a [302] probe echo, while the phase's own tally said "Confirmed RCE: 0".)
 _PROBE_STATUS_LINE_RE = re.compile(r'^\[\d{3}\]\s')
 
+# ── Fail-closed confirmation gate (v10.7) ───────────────────────────────────────────────
+# The generic Method-1 loader is fail-OPEN: it stamps every surviving line in findings/<vtype>/
+# with that vtype's template severity. For the ACTIVE-EXPLOITATION classes a Medium+/Critical
+# claim REQUIRES a proof-of-concept by definition — a probe echo, a discovery hit, or a tool log
+# line is NOT a confirmed exploit. So a line in one of these dirs keeps its parsed Medium+
+# severity ONLY if it is producer-verified per _is_verified_finding_line() (a leading confirmation
+# marker, a leading [SEVERITY] prefix, or the nuclei result grammar); otherwise it is CAPPED to
+# LOW and relabelled a "lead" — kept visible, never dropped (hiding a real finding is worse than
+# demoting an unproven one). This kills the whole fabrication class instead of deny-listing each
+# new probe/state/log shape one at a time. Loaders that carry their OWN verification (sqlmap CSV,
+# nuclei-confirmed, Burp confidence gate, brain-active grounding gate, email_auth JSON) do not
+# pass through here.
+_ACTIVE_EXPLOIT_VTYPES = frozenset({
+    "rce", "sqli", "xxe", "ssti", "lfi", "idor", "ssrf", "auth_bypass",
+    "upload", "upload_type_bypass", "deserialization", "business_logic",
+    "smuggling", "oauth", "race_condition", "exploit_chain",
+})
+# A line keeps its parsed Medium+ severity only if it matches one of THREE producer grammars
+# that mean "verified", each anchored to line-START (a trailing/quoted marker in captured console
+# output must NOT count — friends-review, codex):
+#   1. a LEADING confirmation marker — [X-CONFIRMED] / [X-VERIFIED] / [..POC..] / [VULN] /
+#      [EXPLOITED]. The (?<!UN) guard stops [..-UNVERIFIED] (an explicit NON-finding) counting.
+#   2. a LEADING severity prefix — [CRITICAL]/[HIGH]/[MEDIUM]/[LOW]/[INFO]. This is the
+#      auth_utils.FindingSaver.save_txt() convention the API scanners (idor/oauth/auth_bypass/
+#      business_logic/upload/exploit_chain) use to persist findings they already assessed. The raw
+#      infra scanner (scanner.sh/hunt.py) never leads an active-exploit line with a bare severity
+#      tag (it uses named markers), so trusting this prefix keeps real API findings without
+#      re-opening the probe/state/log fabrication path.
+#   3. a nuclei result line — [template-id] [proto] [severity] URL (three leading brackets).
+_LEADING_CONFIRMED_RE = re.compile(
+    r'^\s*\[[A-Z0-9_-]*(?:CONFIRMED|(?<!UN)VERIFIED|EXPLOITED)\]'
+    r'|^\s*\[[A-Z0-9_-]*POC[A-Z0-9_-]*\]'
+    r'|^\s*\[VULN\]',
+    re.I)
+_SEVERITY_PREFIX_RE = re.compile(
+    r'^\s*\[(?:CRITICAL|HIGH|MEDIUM|LOW|INFO|INFORMATIONAL)\]', re.I)
+_NUCLEI_LINE_RE = re.compile(
+    r'^\s*\[[^\]]+\]\s*\[[a-z0-9-]+\]\s*\[(?:critical|high|medium|low|info)\]', re.I)
+
+
+def _is_verified_finding_line(line: str) -> bool:
+    """True when a findings/<active-exploit>/ line is producer-verified and may keep its parsed
+    Medium+ severity — it matches a leading confirmation marker, a leading severity prefix
+    (FindingSaver), or the nuclei result grammar. Everything else is an unproven lead."""
+    return bool(_LEADING_CONFIRMED_RE.match(line)
+                or _SEVERITY_PREFIX_RE.match(line)
+                or _NUCLEI_LINE_RE.match(line))
+
+
+def _demote_to_lead(finding: dict, note: str) -> dict:
+    """Fail-closed: cap an UNCONFIRMED active-exploit finding to LOW and relabel it a lead, so it
+    stays visible for manual verification instead of shipping as a fabricated Medium+/Critical."""
+    orig = finding.get("severity")
+    if orig and str(orig).lower() != "low":
+        finding["original_severity"] = orig
+    finding["severity"] = "low"
+    finding["cvss"] = CVSS_DEFAULT.get("low", "3.1")
+    finding["_unconfirmed_lead"] = True
+    finding["title"] = f"Unconfirmed {note} lead — manual verification required"
+    finding["detail"] = ((finding.get("detail") or finding.get("raw") or "").rstrip()
+                         + "  [NOT a confirmed PoC: no confirmation marker in the scanner output "
+                           "for this active-exploitation class — verify before reporting]")
+    return finding
+
 
 def _is_state_line(line: str) -> bool:
     """True for a scanner state/summary line that is never a finding (fail-closed)."""
@@ -1096,6 +1160,18 @@ def load_findings(findings_dir: str) -> list:
                         unconfirmed_cves.append((line.upper(), "", ""))
                         continue
                     finding = parse_custom_line(line, vtype)
+                    # Fail-closed confirmation gate: an active-exploitation line without a
+                    # confirmation / structural-exposure marker is a LEAD, not a Medium+ finding.
+                    if vtype in _ACTIVE_EXPLOIT_VTYPES and not _is_verified_finding_line(line):
+                        _demote_to_lead(finding, vtype)
+                    # #5 dalfox executability: dalfox tags each PoC — [V]=verified via headless
+                    # browser (executes), [R]=reflected only, [G]=grep match. Only [V] is a
+                    # confirmed XSS; [R]/[G] reflect into an unproven context (an attribute, or a
+                    # JS file served as application/x-javascript) — demote to a LOW lead.
+                    elif vtype == "xss":
+                        _dfx = re.match(r'\[POC\]\[([VRG])\]', line, re.I)
+                        if _dfx and _dfx.group(1).upper() != "V":
+                            _demote_to_lead(finding, "reflected XSS (dalfox, executable context unproven)")
                     for poc_key, poc_text in all_pocs.items():
                         if poc_key in line or line[:60] in poc_key:
                             finding["poc"] = poc_text

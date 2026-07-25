@@ -118,6 +118,61 @@ def test_sqlmap_log_level_lines_do_not_ship_critical(tmp_path):
     assert _worst(tmp_path, "brain_active/iteration_1.json", grounded) == "critical"
 
 
+def test_active_exploit_line_without_marker_is_demoted(tmp_path):
+    """Fail-closed inversion: a bare/unknown line in an active-exploit dir (no confirmation
+    marker) must NOT ship at the template's Medium+/Critical severity — it caps to a LOW lead.
+    This is the durable guard against the next unknown probe/discovery/log shape."""
+    assert _worst(tmp_path, "rce/newprobe.txt",
+                  "POST /api/exec reached 200 at https://t.example.invalid/x") not in _MEDPLUS
+    assert _worst(tmp_path, "idor/hits.txt",
+                  "id=1001 returned another user's record at https://t.example.invalid/u") not in _MEDPLUS
+    assert _worst(tmp_path, "sqli/notes.txt",
+                  "param id looks injectable at https://t.example.invalid/x?id=1") not in _MEDPLUS
+    assert _worst(tmp_path, "auth_bypass/x.txt",
+                  "admin panel loaded at https://t.example.invalid/admin") not in _MEDPLUS
+
+
+def test_confirmed_active_exploit_markers_survive(tmp_path):
+    """No over-suppression — the three producer 'verified' grammars keep full severity:
+    (1) a leading confirmation marker, (2) a leading [SEVERITY] prefix (auth_utils.FindingSaver,
+    used by the API scanners for findings they already assessed), (3) a nuclei result line."""
+    # (1) leading confirmation markers
+    assert _worst(tmp_path, "rce/c.txt",
+                  "[POC-RCE-CONFIRMED] uid=0(root) at https://t.example.invalid/s.jsp") == "critical"
+    assert _worst(tmp_path, "xxe/c.txt",
+                  "[XXE-OOB-CONFIRMED] callback from https://t.example.invalid/x") == "critical"
+    assert _worst(tmp_path, "auth_bypass/c.txt",
+                  "[LDAP-BYPASS-CONFIRMED] logged in as admin at https://t.example.invalid") == "critical"
+    # (2) FindingSaver [SEVERITY]-prefixed API findings (idor/oauth/auth_bypass) must NOT be demoted
+    assert _worst(tmp_path, "idor/findings.txt",
+                  "[HIGH] Cross-user IDOR: read user 1001 record https://t.example.invalid/u/1001") in _MEDPLUS
+    assert _worst(tmp_path, "auth_bypass/findings.txt",
+                  "[CRITICAL] Endpoint accessible without auth https://t.example.invalid/admin") in _MEDPLUS
+    assert _worst(tmp_path, "oauth/findings.txt",
+                  "[HIGH] redirect_uri_bypass https://t.example.invalid/cb") in _MEDPLUS
+    # (3) nuclei result grammar ([template-id] [proto] [severity] URL) must survive
+    assert _worst(tmp_path, "rce/nuclei_rce.txt",
+                  "[apache-struts-rce] [http] [critical] https://t.example.invalid/x") in _MEDPLUS
+
+
+def test_bare_structural_marker_without_severity_is_a_lead(tmp_path):
+    """A bracket MARKER that is neither a confirmation, a [SEVERITY] prefix, nor nuclei output
+    (e.g. [SAML-METADATA-EXPOSED] mapped to the auth_bypass CRITICAL template) must NOT ship at
+    CRITICAL — it caps to a LOW lead (public SAML metadata is not an auth bypass). Producers that
+    want a real severity emit the FindingSaver [SEVERITY] convention."""
+    assert _worst(tmp_path, "saml/x.txt",
+                  "[SAML-METADATA-EXPOSED] https://t.example.invalid/saml/metadata") not in _MEDPLUS
+
+
+def test_dalfox_reflected_not_verified_is_demoted(tmp_path):
+    """#5: dalfox [R]/[G] = reflection with unproven executable context -> LOW lead; [V] =
+    browser-verified stays a real XSS."""
+    assert _worst(tmp_path, "xss/dalfox_results.txt",
+                  "[POC][R][GET][inHTML-URL] https://t.example.invalid/p?q=x") not in _MEDPLUS
+    assert _worst(tmp_path, "xss/dalfox_results.txt",
+                  "[POC][V][GET][inHTML] https://t.example.invalid/p?q=x") in _MEDPLUS
+
+
 def test_exposed_config_is_surfaced_not_dropped(tmp_path):
     # over-suppression: exposed_configs.txt was blacklisted with no loader -> real exposures lost
     assert _worst(tmp_path, "cves/exposed_configs.txt", "https://t.example.invalid/.git/config") == "medium"
