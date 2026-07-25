@@ -852,14 +852,26 @@ _LEADING_CONFIRMED_RE = re.compile(
     re.I)
 _SEVERITY_PREFIX_RE = re.compile(
     r'^\s*\[(?:CRITICAL|HIGH|MEDIUM|LOW|INFO|INFORMATIONAL)\]', re.I)
+# nuclei result grammar: [template-id] [proto] [severity] <matched-URL>. The trailing URL is
+# REQUIRED — a three-bracket LOG line with no URL ("[probe-log] [http] [critical] request failed")
+# is not a hit (codex pass-2).
 _NUCLEI_LINE_RE = re.compile(
-    r'^\s*\[[^\]]+\]\s*\[[a-z0-9-]+\]\s*\[(?:critical|high|medium|low|info)\]', re.I)
+    r'^\s*\[[^\]]+\]\s*\[[a-z0-9-]+\]\s*\[(?:critical|high|medium|low|info)\]\S*\s.*https?://', re.I)
+# A leading marker that LOOKS positive but is explicitly NEGATIVE — [UNCONFIRMED]/[NOT-CONFIRMED]/
+# [NO-POC]/[POC-FAILED]/[NOT-VERIFIED]/[UN-VERIFIED] — must NOT count as verified even though it
+# syntactically contains CONFIRMED/VERIFIED/POC. Checked FIRST, wins over the positive grammars.
+_NEGATIVE_MARKER_RE = re.compile(
+    r'^\s*\[[^\]]*(?:UN-?CONFIRMED|UN-?VERIFIED|NOT-?CONFIRMED|NOT-?VERIFIED'
+    r'|NO-?POC|POC-?FAILED|FAILED|INVALID|NEGATIVE)[^\]]*\]', re.I)
 
 
 def _is_verified_finding_line(line: str) -> bool:
     """True when a findings/<active-exploit>/ line is producer-verified and may keep its parsed
     Medium+ severity — it matches a leading confirmation marker, a leading severity prefix
-    (FindingSaver), or the nuclei result grammar. Everything else is an unproven lead."""
+    (FindingSaver), or the nuclei result grammar. An explicit NEGATIVE marker never counts.
+    Everything else is an unproven lead."""
+    if _NEGATIVE_MARKER_RE.match(line):
+        return False
     return bool(_LEADING_CONFIRMED_RE.match(line)
                 or _SEVERITY_PREFIX_RE.match(line)
                 or _NUCLEI_LINE_RE.match(line))

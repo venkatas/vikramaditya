@@ -155,6 +155,23 @@ def test_confirmed_active_exploit_markers_survive(tmp_path):
                   "[apache-struts-rce] [http] [critical] https://t.example.invalid/x") in _MEDPLUS
 
 
+def test_negative_and_malformed_markers_do_not_survive(tmp_path):
+    """codex pass-2: markers that LOOK positive but are explicitly NEGATIVE
+    ([UNCONFIRMED]/[NOT-CONFIRMED]/[NO-POC]/[POC-FAILED]/[NOT-VERIFIED]/[UN-VERIFIED]) must NOT
+    count as verified (they syntactically contain CONFIRMED/VERIFIED/POC); and a nuclei-shaped
+    three-bracket LOG line with NO matched URL is not a nuclei hit."""
+    for neg in ("[UNCONFIRMED]", "[NOT-CONFIRMED]", "[NO-POC]", "[POC-FAILED]",
+                "[NOT-VERIFIED]", "[UN-VERIFIED]"):
+        assert _worst(tmp_path, "rce/n.txt",
+                      f"{neg} probe only at https://t.example.invalid/x") not in _MEDPLUS, neg
+    # nuclei grammar with no URL after the severity bracket = a log line, not a hit
+    assert _worst(tmp_path, "rce/n2.txt",
+                  "[probe-log] [http] [critical] request failed") not in _MEDPLUS
+    # a genuine nuclei hit (matched URL present) still survives at full severity
+    assert _worst(tmp_path, "rce/n3.txt",
+                  "[cve-2021-0001] [http] [critical] https://t.example.invalid/x") in _MEDPLUS
+
+
 def test_bare_structural_marker_without_severity_is_a_lead(tmp_path):
     """A bracket MARKER that is neither a confirmation, a [SEVERITY] prefix, nor nuclei output
     (e.g. [SAML-METADATA-EXPOSED] mapped to the auth_bypass CRITICAL template) must NOT ship at
