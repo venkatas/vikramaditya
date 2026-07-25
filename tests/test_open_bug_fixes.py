@@ -60,3 +60,20 @@ def test_saml_import_skip_catchall_and_drop_redirect_forbidden():
     # import no longer flags the 301/403 flood
     assert "200|201|301|302|400|403|405|422)" not in sc, "IMPORT still flags 301/403 flood"
     assert "200|302)" in sc and "200|201|302|400|405|422)" in sc
+
+
+# ── F: cred-file check must reject HTML soft-404s (SPA/CDN catch-all) ─────────
+def test_cred_file_check_rejects_html_soft404():
+    """2026-07-25 engagement: a fake HIGH '[CRED-FILE] .../Dockerfile' shipped from a SPA/CDN
+    that serves 200 + index.html for ANY path. These cred/config files (Dockerfile, .npmrc,
+    lockfiles, docker-compose.yml, settings.xml) are ALL plaintext — never HTML — so the check
+    must drop an HTML body (soft-404) BEFORE the loose keyword filter ('auth'/'key' match
+    ordinary markup) reaches the [CRED-FILE] emit."""
+    import re
+    sc = (REPO / "scanner.sh").read_text()
+    i_loop = sc.index("for CRED_PATH in")
+    i_echo = sc.index("[CRED-FILE]", i_loop)
+    block = sc[i_loop:i_echo]                       # the cred-file loop, up to the emit
+    assert re.search(r"grep -qiE\s+['\"]<!doctype html\|<html", block, re.I), \
+        "cred-file check must skip HTML/soft-404 bodies before flagging [CRED-FILE]"
+    assert "continue" in block, "HTML guard must skip the path (continue), not fall through"

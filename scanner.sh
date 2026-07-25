@@ -1197,6 +1197,15 @@ if ! skip_has supplychain; then
                 "${host}${CRED_PATH}" 2>/dev/null || echo "0")
             if [ "$CODE" = "200" ]; then
                 RESP=$(curl -sk --max-time 5 "${host}${CRED_PATH}" 2>/dev/null || true)
+                # Soft-404 / SPA guard: these cred/config files (Dockerfile, .npmrc, lockfiles,
+                # docker-compose.yml, settings.xml) are ALL plaintext — never HTML. A SPA/CDN
+                # catch-all that serves index.html with HTTP 200 for ANY path (e.g. /Dockerfile)
+                # otherwise satisfied the loose keyword filter below ("auth"/"key"/"token" appear
+                # in ordinary markup / CSRF metas) and shipped a fabricated HIGH "cred file
+                # exposed" for a file that does not exist. Drop HTML bodies before keyword-match.
+                if echo "$RESP" | head -c 512 | grep -qiE "<!doctype html|<html|<head|<body|<script"; then
+                    continue
+                fi
                 if echo "$RESP" | grep -qiE "password|token|secret|auth|key|credential|registry_url|//npm|@scope"; then
                     log_vuln "[SUPPLY-CHAIN] Credential file exposed: ${host}${CRED_PATH}"
                     echo "[CRED-FILE] ${host}${CRED_PATH}" >> "$FINDINGS_DIR/supply_chain/findings.txt"
