@@ -124,6 +124,15 @@ def _access_claim_unproven(line: str, stdout: str) -> bool:
 # being mistaken for a grounded read.
 _STATUS_NOISE_RE = re.compile(
     r"^\s*(?:\[[*+\-!#]\]"                                  # [*] [+] [-] [!] [#]
+    r"|\[\d{1,2}:\d{2}:\d{2}\]"                             # [HH:MM:SS] tool-logger timestamp
+                                                            # (sqlmap et al.): the whole line is
+                                                            # operational logging — "[21:11:15]
+                                                            # [CRITICAL] WAF/IPS identified" is a
+                                                            # log LEVEL, not a vuln severity. Keys
+                                                            # on the timestamp, NOT on [CRITICAL],
+                                                            # so a brain self-tag "[CRITICAL] RCE
+                                                            # confirmed uid=0" (no timestamp) is
+                                                            # untouched.
     r"|\[(?:watchdog|info|warn|error|debug|brain|phase|status)\b"   # [Watchdog/..]
     r"|[>$#]\s"                                             # '> ' '$ ' '# '
     r"|\.{3,}"                                              # '...'

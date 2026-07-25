@@ -806,6 +806,16 @@ def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
 # to a CRITICAL via the subdir's template default (16 fake CVSS-9.8 RCEs, 2026-07-19).
 _STATE_LINE_RE = re.compile(r'^[A-Za-z][A-Za-z0-9 ()/_.-]*:\s*\d+\s*$')
 
+# A line whose LEADING bracket is a bare HTTP status code ("[302] https://h | header=User-Agent",
+# "[401] https://h/admin — auth required") is a PROBE-RESPONSE echo, never a confirmation.
+# hunt.py's Log4Shell/JBoss RCE probes append one such line per request; the real signal is
+# written elsewhere — the "# OOB CALLBACKS" section, JBOSS_EXPOSED_*.txt, or a NAMED marker
+# ([POC-RCE-CONFIRMED]/[VULN]). Every genuine confirmation across the codebase uses a NAMED
+# bracket ([POC], [VULN], [CVE-...], nuclei [template-id]), so a pure-numeric leading bracket is
+# safe to suppress fail-closed. (2026-07-25 engagement: 10 fake CVSS-9.8 RCEs on one host,
+# each from a [302] probe echo, while the phase's own tally said "Confirmed RCE: 0".)
+_PROBE_STATUS_LINE_RE = re.compile(r'^\[\d{3}\]\s')
+
 
 def _is_state_line(line: str) -> bool:
     """True for a scanner state/summary line that is never a finding (fail-closed)."""
@@ -1067,6 +1077,10 @@ def load_findings(findings_dir: str) -> list:
                         continue
                     if _is_state_line(line):
                         # scanner state/tally/SKIPPED line — never a finding (fail-closed)
+                        continue
+                    if _PROBE_STATUS_LINE_RE.match(line):
+                        # "[302] https://h | header=…" — an HTTP-status probe-response echo
+                        # (Log4Shell/JBoss RCE probes), not a confirmation. Fail-closed.
                         continue
                     if any(line.startswith(p) for p in NON_FINDING_PREFIXES):
                         continue
@@ -1740,6 +1754,13 @@ def load_findings(findings_dir: str) -> list:
                 if line.startswith("[MODEL CLAIM"):
                     # Strip the marker prefix for the collapsed context item.
                     model_claims.append(re.sub(r"^\[MODEL CLAIM[^\]]*\]\s*", "", line))
+                    continue
+                # Tool progress/logger line captured into findings_so_far — e.g. sqlmap
+                # "[HH:MM:SS] [CRITICAL] WAF/IPS identified" / "... content is heavily dynamic
+                # ... retry", where [CRITICAL] is a LOG LEVEL, not a vuln severity. Operational
+                # logging is never a finding (and not even a model claim). Fail-closed drop.
+                # (2026-07-25 engagement: two such sqlmap log lines shipped as CRITICAL rows.)
+                if _STATUS_NOISE_RE is not None and _STATUS_NOISE_RE.search(line):
                     continue
                 # Defence-in-depth: drop a self-declared file-access/traversal claim
                 # that NO iteration's output actually proves (no file content) — a

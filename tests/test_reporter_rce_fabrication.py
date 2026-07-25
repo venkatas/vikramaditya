@@ -58,6 +58,31 @@ def test_confirmed_rce_is_still_reported(tmp_path):
     assert _rce_findings(findings), "a genuinely CONFIRMED RCE was suppressed by the fix"
 
 
+def test_probe_status_lines_do_not_fabricate_rce(tmp_path):
+    """Real engagement (2026-07-25): log4shell.txt / jboss_admin.txt hold HTTP-status
+    PROBE-RESPONSE echoes ("[302] https://h | header=User-Agent"), not confirmations.
+    hunt.py writes the real signal elsewhere (the '# OOB CALLBACKS' section /
+    JBOSS_EXPOSED_*.txt / named [POC-RCE-CONFIRMED] markers). The reporter promoted each
+    [NNN]-prefixed probe echo to a CRITICAL 9.8 RCE — 10 fake criticals on one host —
+    despite the phase's own 'Confirmed RCE: 0' / 'Log4Shell OOB callbacks: 0'."""
+    d = tmp_path / "findings"
+    rce = d / "rce"
+    rce.mkdir(parents=True)
+    (rce / "log4shell.txt").write_text(
+        "# Log4Shell (CVE-2021-44228) — x.example\n# OOB: ldap://x.oast.invalid\n\n"
+        "[302] https://helpdesk.x.example | header=User-Agent\n"
+        "[302] https://helpdesk.x.example | header=X-Forwarded-For\n"
+        "[404] https://helpdesk.x.example/login | POST body log4shell\n"
+        "[200] https://helpdesk.x.example/j_security_check | POST body log4shell\n")
+    (rce / "jboss_admin.txt").write_text(
+        "# JBoss Admin Console Exposure — x.example\n"
+        "[200] https://helpdesk.x.example/web-console/\n"
+        "[401] https://helpdesk.x.example/admin-console/ — auth required (try default creds)\n")
+    findings = reporter.load_findings(str(d))
+    fab = _rce_findings(findings)
+    assert fab == [], f"fabricated {len(fab)} RCE findings from probe-status echoes: {[f.get('raw') for f in fab]}"
+
+
 def test_summary_txt_never_a_finding_any_subdir(tmp_path):
     # summary.txt is a per-phase tally in EVERY subdir — never a finding
     d = tmp_path / "findings"

@@ -94,6 +94,30 @@ def test_brain_single_line_real_proof_is_not_over_suppressed(tmp_path):
     assert _worst(tmp_path, "brain_active/iteration_1.json", ungrounded) not in _MEDPLUS
 
 
+def test_sqlmap_log_level_lines_do_not_ship_critical(tmp_path):
+    """2026-07-25 engagement: sqlmap emits '[HH:MM:SS] [CRITICAL] ...' LOG lines where
+    [CRITICAL] is a log LEVEL, not a vuln severity. Two such lines ('WAF/IPS identified',
+    'content is heavily dynamic ... retry') were captured into findings_so_far and shipped as
+    CRITICAL findings (severity CRITICAL but CVSS 5.3 / URL N/A — the tell). A tool-logger line
+    is never a finding, even when the iteration ALSO produced substantive grounding output."""
+    data = {
+        "findings_so_far": [
+            "[21:11:15] [CRITICAL] WAF/IPS identified as 'AWS WAF (Amazon)'",
+            "[21:11:16] [CRITICAL] target URL content appears to be heavily dynamic. "
+            "sqlmap is going to retry the request(s)",
+        ],
+        # substantive output → the grounding gate is satisfied, proving the log lines are
+        # suppressed on their OWN merits (they are noise), not merely for lack of grounding.
+        "results": "GET /Home.aspx HTTP/1.1\nServer: Microsoft-IIS/10.0\nX-AspNet-Version: 4.0.30319\n",
+    }
+    assert _worst(tmp_path, "brain_active/iteration_1.json", data) not in _MEDPLUS
+    # regression guard: a brain self-tagged '[CRITICAL] ...' (NO timestamp) that IS grounded
+    # must still survive — the fix keys on the [HH:MM:SS] logger prefix, not on '[CRITICAL]'.
+    grounded = {"findings_so_far": ["[CRITICAL] RCE confirmed uid=0"],
+                "results": "uid=0(root) gid=0(root) groups=0(root)\n[*] done"}
+    assert _worst(tmp_path, "brain_active/iteration_1.json", grounded) == "critical"
+
+
 def test_exposed_config_is_surfaced_not_dropped(tmp_path):
     # over-suppression: exposed_configs.txt was blacklisted with no loader -> real exposures lost
     assert _worst(tmp_path, "cves/exposed_configs.txt", "https://t.example.invalid/.git/config") == "medium"
