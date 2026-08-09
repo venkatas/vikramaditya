@@ -172,6 +172,24 @@ def test_negative_and_malformed_markers_do_not_survive(tmp_path):
                   "[cve-2021-0001] [http] [critical] https://t.example.invalid/x") in _MEDPLUS
 
 
+def test_propagated_marker_is_not_a_high_exposure(tmp_path):
+    """a 2026-08-09 engagement: a soft-404 SPA (an SPA host) served index.html for /openapi.json,
+    the scanner emitted [PROPAGATED] (path returns 200 + textual), and the reporter promoted it to
+    HIGH 7.5 'Sensitive Data Exposure'. [PROPAGATED] is a path-DISCOVERY lead (a path found
+    reachable, propagated from another host) — NOT a content-confirmed exposure. It must not ship
+    as a Medium+ finding. (Real, confirmed exposures come from verified_sensitive.txt / [EXPOSED]
+    magika hits, which are untouched.)"""
+    d = tmp_path / "findings"
+    exp = d / "exposure"
+    exp.mkdir(parents=True)
+    (exp / "propagated_config_hits.txt").write_text(
+        "[PROPAGATED] path=/openapi.json url=https://app.example.invalid/openapi.json "
+        "sources=https://a.example.invalid\n")
+    findings = reporter.load_findings(str(d))
+    fab = [f for f in findings if f.get("vtype") == "exposure"]
+    assert fab == [], f"[PROPAGATED] discovery promoted to a finding: {[f.get('raw') for f in fab]}"
+
+
 def test_bare_structural_marker_without_severity_is_a_lead(tmp_path):
     """A bracket MARKER that is neither a confirmation, a [SEVERITY] prefix, nor nuclei output
     (e.g. [SAML-METADATA-EXPOSED] mapped to the auth_bypass CRITICAL template) must NOT ship at

@@ -79,6 +79,25 @@ def test_cred_file_check_rejects_html_soft404():
     assert "continue" in block, "HTML guard must skip the path (continue), not fall through"
 
 
+# ── H (#b): [PROPAGATED] soft-404 guard in hunt.py (config path + text/html = SPA index, not the file) ──
+def test_propagated_soft404_guard():
+    """a 2026-08-09 engagement: hunt.py emitted [PROPAGATED] for an SPA host/openapi.json because
+    the SPA returned 200 + text/html (index.html) for every path. A config/data path that answers
+    with text/html is a soft-404, not the actual file — the guard must reject it so it can't become
+    a fabricated 'Sensitive Data Exposure'."""
+    import hunt
+    # config/data path returning text/html = SPA soft-404 -> reject
+    assert hunt._propagated_soft404("/openapi.json", "text/html; charset=utf-8") is True
+    assert hunt._propagated_soft404("/.env", "text/html") is True
+    assert hunt._propagated_soft404("/config.yaml", "text/html") is True
+    assert hunt._propagated_soft404("/app/settings.xml", "text/html") is True
+    # real file served with the correct (non-HTML) type -> keep
+    assert hunt._propagated_soft404("/openapi.json", "application/json") is False
+    assert hunt._propagated_soft404("/.env", "text/plain") is False
+    # a non-structured path (an actual HTML page) is not this guard's business -> don't reject here
+    assert hunt._propagated_soft404("/admin", "text/html") is False
+
+
 # ── G (#4): CSP/header check must evaluate the FINAL page, not the http->https redirect ──
 def test_csp_check_follows_redirects():
     """2026-07-25 engagement: 'Missing CSP' shipped for hosts that DO set CSP on https. The

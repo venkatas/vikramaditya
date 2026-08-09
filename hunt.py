@@ -2818,6 +2818,24 @@ def _looks_textual_content_type(content_type: str, body: bytes = b"") -> bool:
     return False
 
 
+# A path whose extension implies a structured/config/data file (.json/.env/.yaml/...) whose kind is
+# NOT HTML. If such a path answers with a text/html body it is an SPA/CDN soft-404 (index.html served
+# for every path), not the actual file — so it must not be reported as a propagated sensitive
+# exposure. (a 2026-08-09 engagement: an SPA host served index.html for /openapi.json, which
+# satisfied 200 + textual content-type and became a fabricated HIGH "Sensitive Data Exposure".)
+_STRUCTURED_FILE_EXT_RE = re.compile(
+    r'\.(?:json|ya?ml|env|xml|ini|toml|conf|config|cfg|properties|sql|bak|dump|pem|key|npmrc|htpasswd)'
+    r'(?:$|[?#/])', re.I)
+
+
+def _propagated_soft404(path_value: str, content_type: str) -> bool:
+    """True when a config/data path (.json/.env/.yaml/…) answered with a text/html body — an
+    SPA/CDN catch-all soft-404, not the real file. Such a hit must not become a [PROPAGATED]
+    exposure finding."""
+    return bool(_STRUCTURED_FILE_EXT_RE.search(path_value or "")) and \
+        "html" in (content_type or "").lower()
+
+
 def _probe_url_headers(url: str, timeout: int = 6) -> tuple[int, str]:
     try:
         # Fork-safe (macOS Network.framework atfork SIGSEGV): posix_spawn, not run() fork().
@@ -3121,6 +3139,8 @@ def _propagate_exposed_paths(domain: str, session_id: str | None = None, limit_p
         path_value, _base, url, sources = item
         status, content_type = _probe_url_headers(url)
         if status == 200 and _looks_textual_content_type(content_type):
+            if _propagated_soft404(path_value, content_type):
+                return None   # SPA/CDN soft-404: index.html served for a config path, not the file
             return f"[PROPAGATED] path={path_value} url={url} sources={sources}"
         # Magika deep-classify: detect exposed executables/webshells
         if status == 200:

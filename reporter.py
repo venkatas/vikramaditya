@@ -1093,6 +1093,15 @@ def load_findings(findings_dir: str) -> list:
             "[CONVERTER-ENDPOINT",       # import_export/ — converter endpoint guess (bare 200/405), not exploited.
             "[SAML-ENDPOINT",            # saml/ — endpoint DISCOVERY (HTTP 200/302), NOT an exploited auth
                                          # bypass; shipped CRITICAL via the auth_bypass template default.
+            "[PROPAGATED]",              # exposure/ — a config/data PATH found reachable (200+textual) and
+                                         # "propagated" from another host: a DISCOVERY lead, NOT a content-
+                                         # confirmed exposure. The reporter promoted it to HIGH 7.5 "Sensitive
+                                         # Data Exposure" — but an SPA/CDN soft-404 (index.html for any path)
+                                         # trivially satisfies 200+text/html (a 2026-08-09 engagement: an SPA served
+                                         # index.html for /openapi.json). Real exposures come from
+                                         # verified_sensitive.txt / [EXPOSED] magika hits (different markers,
+                                         # unaffected). hunt.py now also refuses to EMIT [PROPAGATED] for a
+                                         # config path that returns text/html (soft-404 guard at the source).
             "[JAVA-DESER]",              # deserialize/ — Content-Type fingerprint only (no gadget sent).
             "[PHP-DESER]",               # deserialize/ — unserialize-error reflection heuristic, not exploited.
             "[SQLI-CANDIDATE]",          # unverified time-based candidate, needs follow-up
