@@ -195,7 +195,7 @@ def pick_model() -> str:
     import os as _os
     env = _os.environ.get("BRAIN_SCANNER_MODEL", "").strip()
     prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
-    # Cloud / non-ollama provider (gemini/openai/claude/grok/mlx): the model name
+    # Cloud / non-ollama provider (gemini/openai/claude/grok/mlx/mlx_vlm): the model name
     # is the BRAIN_SCANNER_MODEL override or the provider's default — no local
     # pull. MLX has no DEFAULT_MODELS entry (the model is loaded internally and
     # the name arg is ignored), so resolve a truthy id from MLX_MODEL/default
@@ -206,6 +206,10 @@ def pick_model() -> str:
             from brain import LLMClient, MLX_DEFAULT_MODEL
             if prov == "mlx":
                 return env or _os.environ.get("MLX_MODEL") or MLX_DEFAULT_MODEL
+            if prov == "mlx_vlm":
+                if env or _os.environ.get("MLX_VLM_MODEL"):
+                    return env or _os.environ.get("MLX_VLM_MODEL")
+                return LLMClient("mlx_vlm").default_model()
             return env or LLMClient.DEFAULT_MODELS.get(prov) or ""
         except Exception:
             return env or ""
@@ -248,7 +252,8 @@ def _get_scanner_llm():
     import os as _os, hashlib as _hashlib
     prov = _os.environ.get("BRAIN_PROVIDER", "").strip().lower()
     key_env = {"gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
-               "claude": "ANTHROPIC_API_KEY", "grok": "XAI_API_KEY"}.get(prov, "")
+               "claude": "ANTHROPIC_API_KEY", "grok": "XAI_API_KEY",
+               "mlx_vlm": "MLX_VLM_MODEL"}.get(prov, "")
     key_val = _os.environ.get(key_env, "") if key_env else ""
     sig = (prov, _hashlib.sha256(key_val.encode()).hexdigest()[:12] if key_val else "")
     if _SCANNER_LLM is None or _SCANNER_LLM_SIG != sig:
