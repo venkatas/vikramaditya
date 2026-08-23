@@ -373,10 +373,22 @@ run_phase5_port_scanning() {
     fi
 
     if tool_ok nmap; then
+        PORT_TARGET_FILE="$RECON_DIR/ports/targets.txt"
+        if [ -s "$RECON_DIR/subdomains/resolved.txt" ]; then
+            sed -E 's#^[a-zA-Z]+://##; s#/.*$##; s/:([0-9]{1,5})$//' \
+                "$RECON_DIR/subdomains/resolved.txt" \
+                | sed '/^$/d' | sort -u > "$PORT_TARGET_FILE"
+        else
+            printf '%s\n' "$TARGET" > "$PORT_TARGET_FILE"
+        fi
+        PORT_TARGET_COUNT=$(file_lines "$PORT_TARGET_FILE")
+
         if tool_ok naabu; then
-            log_step "naabu top-1000 on $TARGET..."
-            naabu -host "$TARGET" -top-ports 1000 -silent \
+            log_step "naabu top-1000 on $PORT_TARGET_COUNT scoped target(s)..."
+            naabu -list "$PORT_TARGET_FILE" -top-ports 1000 -silent \
                 -o "$RECON_DIR/ports/naabu_results.txt" 2>/dev/null || true
+            cp "$RECON_DIR/ports/naabu_results.txt" \
+                "$RECON_DIR/ports/open_host_ports.txt" 2>/dev/null || true
             if [ -f "$RECON_DIR/ports/naabu_results.txt" ]; then
                 awk -F: 'NF>1 {print $2"/open"}' "$RECON_DIR/ports/naabu_results.txt" \
                     | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
@@ -396,19 +408,19 @@ run_phase5_port_scanning() {
 
             if [ -s "$RECON_DIR/ports/open_ports.txt" ]; then
                 PORT_CSV="$(cut -d/ -f1 "$RECON_DIR/ports/open_ports.txt" | paste -sd, -)"
-                log_step "nmap service fingerprinting on naabu-discovered ports: ${PORT_CSV:-none}"
-                nmap -Pn -sV -p "$PORT_CSV" -T4 --open "$TARGET" \
+                log_step "nmap service fingerprinting across $PORT_TARGET_COUNT target(s) on naabu-discovered ports: ${PORT_CSV:-none}"
+                nmap -Pn -sV -p "$PORT_CSV" -T4 --open -iL "$PORT_TARGET_FILE" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
                     -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
             else
                 log_warn "naabu found no open ports — falling back to nmap top-1000"
-                nmap -Pn -sV --top-ports 1000 -T4 --open "$TARGET" \
+                nmap -Pn -sV --top-ports 1000 -T4 --open -iL "$PORT_TARGET_FILE" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
                     -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
             fi
         else
-            log_step "nmap top-1000 on $TARGET..."
-            nmap -Pn -sV --top-ports 1000 -T4 --open "$TARGET" \
+            log_step "nmap top-1000 on $PORT_TARGET_COUNT scoped target(s)..."
+            nmap -Pn -sV --top-ports 1000 -T4 --open -iL "$PORT_TARGET_FILE" \
                 -oN "$RECON_DIR/ports/nmap_results.txt" \
                 -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
         fi
@@ -895,28 +907,44 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
     ALL_COUNT=$(file_lines "$RECON_DIR/subdomains/all.txt")
     DNS_VALIDATED=0                         # 1 only if dnsx actually resolved >0
     DNSX_FAILED_CHUNKS=0                    # >0 if any dnsx pass timed out/segfaulted
+    # An explicit multi-host scope may contain literal public IP addresses.
+    # dnsx is a DNS-name resolver and emits nothing for those inputs, which used
+    # to silently remove every IP before HTTP and port scanning.  Resolve names
+    # only, then union the already-addressed IP targets back into the probe set.
+    DNSX_IP_LITERALS="$RECON_DIR/subdomains/.explicit_ip_literals.txt"
+    DNSX_INPUT="$RECON_DIR/subdomains/.dns_name_candidates.txt"
+    grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?$' \
+        "$RECON_DIR/subdomains/all.txt" > "$DNSX_IP_LITERALS" 2>/dev/null || true
+    grep -Ev '^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?$' \
+        "$RECON_DIR/subdomains/all.txt" > "$DNSX_INPUT" 2>/dev/null || true
+    DNSX_IP_COUNT=$(file_lines "$DNSX_IP_LITERALS")
+    DNSX_NAME_COUNT=$(file_lines "$DNSX_INPUT")
     # v10.6.0 — treat a non-positive cap as UNCAPPED (route to the single-pass
     # branch) instead of chunking with a bogus `split -l 0/-N` that errors out.
     if [ "${DNSX_CAP:-0}" -le 0 ] 2>/dev/null; then
         DNSX_CAP="$ALL_COUNT"
         [ "$DNSX_CAP" -le 0 ] && DNSX_CAP=1
     fi
-    if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
-        if [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
-            log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
+    if [ "$DNSX_NAME_COUNT" -eq 0 ] && [ "$DNSX_IP_COUNT" -gt 0 ]; then
+        cp "$DNSX_IP_LITERALS" "$RECON_DIR/subdomains/resolved.txt"
+        DNS_VALIDATED=1
+        log_done "DNS resolution not applicable: preserved $DNSX_IP_COUNT explicit IP target(s)"
+    elif tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] && [ -s "$DNSX_INPUT" ]; then
+        if [ "$DNSX_NAME_COUNT" -le "$DNSX_CAP" ]; then
+            log_step "dnsx resolving $DNSX_NAME_COUNT DNS name(s); preserving $DNSX_IP_COUNT explicit IP target(s)..."
             # v10.6.0 (FIX) — capture the exit status instead of swallowing it with
             # `|| true`. On timeout/segfault/rc!=0, resolved.txt holds only the partial
             # set dnsx flushed before dying; mirror the chunked branch: mark the pass
             # FAILED (so DNS_VALIDATED is NOT set and the wildcard dig-filter still
             # runs) and UNION the full candidate set back (fail-OPEN — httpx probes them).
-            if timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
+            if timeout -k 30 300 dnsx -silent -a -l "$DNSX_INPUT" </dev/null \
                 > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null; then
                 :
             else
                 DNSX_FAILED_CHUNKS=1
-                cat "$RECON_DIR/subdomains/all.txt" >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+                cat "$DNSX_INPUT" >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
                 sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
-                log_warn "dnsx single-pass FAILED (timeout/segfault) — $ALL_COUNT candidates kept UNVALIDATED (httpx will filter); resolution is NOT marked DNS-validated"
+                log_warn "dnsx single-pass FAILED (timeout/segfault) — $DNSX_NAME_COUNT DNS names kept UNVALIDATED (httpx will filter); resolution is NOT marked DNS-validated"
             fi
         else
             # CRITICAL FIX: a candidate list LARGER than the cap must STILL be resolved. The old
@@ -928,7 +956,7 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
             # ceiling; the DEFAULT 2-char suffix caps at 676 and SILENTLY truncates everything past
             # 13.52M lines (split exits 65 but set -e is off, so the loop just runs on the partial set).
             DEDUP="$RECON_DIR/subdomains/.all_dedup.txt"
-            sort -u "$RECON_DIR/subdomains/all.txt" > "$DEDUP"
+            sort -u "$DNSX_INPUT" > "$DEDUP"
             UNIQ_COUNT=$(file_lines "$DEDUP")
             CHUNK_DIR="$RECON_DIR/subdomains/.dnsx_chunks"
             rm -rf "$CHUNK_DIR"; mkdir -p "$CHUNK_DIR"
@@ -964,6 +992,10 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
             rm -f "$DNSX_FAILED_LIST"
             sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
         fi
+        if [ "$DNSX_IP_COUNT" -gt 0 ]; then
+            cat "$DNSX_IP_LITERALS" >> "$RECON_DIR/subdomains/resolved.txt"
+            sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
+        fi
         RES_N=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
         # dnsx now ACTUALLY runs (single-pass or chunked), so non-empty output is real resolution.
         # (The old "resolved.txt == all.txt unfiltered" failure was a `cp` no-op that can no longer
@@ -989,6 +1021,7 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
             log_warn "dnsx skipped (DNSX_SKIP=1) — $ALL_COUNT candidates UNRESOLVED (httpx will filter live)"
         fi
     fi
+    rm -f "$DNSX_IP_LITERALS" "$DNSX_INPUT" 2>/dev/null || true
     # v9.2.0 (P1-7) — when DNS wildcard was detected, every brute-forced
     # candidate "resolves" to the same dead IP. Filter the resolved list
     # using the wildcard IP we captured during _detect_dns_wildcard so
@@ -1605,25 +1638,75 @@ log_info "Phase 6: URL Collection"
 # before the merge previously looked "done" to phase_done and skipped the rest.
 if phase_done "$RECON_DIR/urls/.urls.done"; then true; else
 
+# Archive tools accept hostnames, not IP literals. Build the input from the
+# resolved scope so a --targets-file run does not silently query only $TARGET.
+ARCHIVE_TARGETS="$RECON_DIR/urls/archive_targets.txt"
+python3 - "$RECON_DIR/subdomains/resolved.txt" "$ARCHIVE_TARGETS" "$TARGET" <<'PY' 2>/dev/null || true
+import ipaddress
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+source, destination, fallback = sys.argv[1:]
+seen = set()
+targets = []
+
+def add(raw):
+    value = raw.strip()
+    if not value or value.startswith("#"):
+        return
+    try:
+        if "://" in value:
+            host = urlsplit(value).hostname or ""
+        else:
+            candidate = value.strip("[]")
+            if candidate.count(":") == 1:
+                left, right = candidate.rsplit(":", 1)
+                candidate = left if right.isdigit() else candidate
+            host = candidate
+        host = host.rstrip(".").lower()
+        ipaddress.ip_address(host)
+        return
+    except ValueError:
+        pass
+    if host and host not in seen:
+        seen.add(host)
+        targets.append(host)
+
+path = Path(source)
+if path.is_file():
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        add(line)
+add(fallback)
+Path(destination).write_text("".join(f"{host}\n" for host in targets), encoding="utf-8")
+PY
+log_step "archive target list: $(file_lines "$ARCHIVE_TARGETS") hostname(s)"
+
 # gau — historical URLs from multiple sources
 if tool_ok gau; then
     log_step "gau (historical URLs)..."
-    echo "$TARGET" | timeout -k 15 "$GAU_TIMEOUT" gau --threads 5 \
+    timeout -k 15 "$GAU_TIMEOUT" gau --threads 5 \
+        < "$ARCHIVE_TARGETS" \
         --o "$RECON_DIR/urls/gau.txt" 2>/dev/null || \
-    echo "$TARGET" | timeout -k 15 "$GAU_TIMEOUT" gau > "$RECON_DIR/urls/gau.txt" 2>/dev/null || true
+    timeout -k 15 "$GAU_TIMEOUT" gau \
+        < "$ARCHIVE_TARGETS" > "$RECON_DIR/urls/gau.txt" 2>/dev/null || true
     log_done "gau: $(file_lines "$RECON_DIR/urls/gau.txt") URLs"
 else
     log_warn "gau not installed — using Wayback fallback"
-    curl -s --max-time 30 \
-        "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey&limit=10000" \
-        > "$RECON_DIR/urls/wayback.txt" 2>/dev/null || true
+    : > "$RECON_DIR/urls/wayback.txt"
+    while IFS= read -r _archive_host; do
+        [ -n "$_archive_host" ] || continue
+        curl -s --max-time 30 \
+            "https://web.archive.org/cdx/search/cdx?url=*.$_archive_host/*&output=text&fl=original&collapse=urlkey&limit=10000" \
+            >> "$RECON_DIR/urls/wayback.txt" 2>/dev/null || true
+    done < "$ARCHIVE_TARGETS"
     log_done "wayback: $(file_lines "$RECON_DIR/urls/wayback.txt") URLs"
 fi
 
 # waybackurls — extra coverage (timeout-bounded; the Wayback API can hang forever)
 if tool_ok waybackurls; then
     log_step "waybackurls..."
-    echo "$TARGET" | timeout -k 15 "$WAYBACK_TIMEOUT" waybackurls \
+    timeout -k 15 "$WAYBACK_TIMEOUT" waybackurls < "$ARCHIVE_TARGETS" \
         > "$RECON_DIR/urls/waybackurls.txt" 2>/dev/null || true
     log_done "waybackurls: $(file_lines "$RECON_DIR/urls/waybackurls.txt") URLs"
 fi
@@ -1646,7 +1729,15 @@ if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
     # priority ORDER (the old `sort -u | head -50` alphabetised first, so the
     # cap kept a-z-sorted hosts and dropped lower-alphabet criticals). The cap is
     # now env-controllable: KATANA_HOST_CAP (default 50, 0 = uncapped).
-    KATANA_HOST_CAP="${KATANA_HOST_CAP:-50}"
+    # A hunt.py --full run sends FULL_RECON=1 and must not silently retain the
+    # bounded 50-host default. An explicitly supplied KATANA_HOST_CAP still wins.
+    if [ -z "${KATANA_HOST_CAP+x}" ]; then
+        if [ "${FULL_RECON:-0}" = "1" ]; then
+            KATANA_HOST_CAP=0
+        else
+            KATANA_HOST_CAP=50
+        fi
+    fi
     {
         [ -s "$RECON_DIR/priority/critical_hosts.txt" ] && cat "$RECON_DIR/priority/critical_hosts.txt"
         [ -s "$RECON_DIR/priority/high_hosts.txt" ]     && cat "$RECON_DIR/priority/high_hosts.txt"
@@ -1666,7 +1757,7 @@ if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
     timeout 300 katana -list "$RECON_DIR/urls/katana_targets.txt" \
         -d 3 -silent -jc \
         -crawl-duration 300 \
-        -o "$RECON_DIR/urls/katana.txt" 2>/dev/null || true
+        -o "$RECON_DIR/urls/katana.txt" >/dev/null 2>&1 || true
     log_done "katana: $(file_lines "$RECON_DIR/urls/katana.txt") URLs (5 min cap)"
 fi
 

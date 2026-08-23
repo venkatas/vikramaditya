@@ -78,6 +78,16 @@ def test_assess_unreachable_is_graceful(monkeypatch):
     assert r["severity"] in ("info", "low") and r["pii_indicators"] == []
 
 
+def test_login_page_validator_word_is_not_pii(monkeypatch):
+    login = """<!doctype html><html><head><title>phpMyAdmin</title></head>
+    <body><form><script>creditcard: 'Please enter a valid credit card number'</script></form></body></html>"""
+    monkeypatch.setattr(edp, "_fetch", lambda url, timeout=15: (200, login))
+    result = edp.assess_exposed_url("https://victim.example/phpmyadmin/")
+    assert result["is_listing"] is False
+    assert result["pii_indicators"] == []
+    assert result["severity"] == "info"
+
+
 # ── hunt.py wiring: write CRITICAL/HIGH exposed-data findings for the reporter ──
 
 def test_hunt_writes_exposed_data_pii_findings(tmp_path):
@@ -107,7 +117,10 @@ def test_hunt_writes_exposed_data_pii_findings(tmp_path):
 
 def test_hunt_write_exposed_data_pii_noop_when_clean(tmp_path):
     import hunt
+    stale = tmp_path / "findings" / "exposure" / "exposed_data_pii.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("[HIGH] stale false positive\n")
     results = [{"url": "http://x/img/", "severity": "low", "backups": [], "pii_indicators": []}]
     n = hunt._write_exposed_data_pii_findings(results, str(tmp_path / "findings"))
     assert n == 0
-    assert not (tmp_path / "findings" / "exposure" / "exposed_data_pii.txt").exists()
+    assert not stale.exists()

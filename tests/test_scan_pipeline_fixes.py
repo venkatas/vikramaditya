@@ -26,11 +26,44 @@ def test_check0_is_time_boxed():
     assert "time-boxed" in SC
 
 
-def test_js_analysis_is_capped():
+def test_js_analysis_uses_selected_corpus():
     assert "JS_ANALYSIS_MAX_URLS" in HU and "js_scan_file" in HU
-    # the per-URL loops must read the capped file, not the full js_urls_file
-    assert 'cat "{js_scan_file}"' in HU
+    # The selected file is the only URL source for the one-time parallel download.
+    assert "_download_js_corpus(js_scan_file, dl_dir)" in HU
     assert 'cat "{js_urls_file}"' not in HU
+
+
+def test_run_vuln_scan_forwards_extended_scanner_skip_names(tmp_path, monkeypatch):
+    import hunt
+
+    recon_dir = tmp_path / "recon" / "example.com" / "sessions" / "s1"
+    (recon_dir / "live").mkdir(parents=True)
+    (recon_dir / "priority").mkdir()
+    (recon_dir / "live" / "httpx_full.txt").write_text("https://example.com [200]\n")
+    (recon_dir / "priority" / "prioritized_hosts.txt").write_text("https://example.com\n")
+
+    commands = []
+    monkeypatch.setattr(hunt, "_resolve_recon_dir", lambda domain: str(recon_dir))
+    monkeypatch.setattr(hunt, "_resolve_findings_dir", lambda *a, **k: str(tmp_path / "findings"))
+    monkeypatch.setattr(hunt, "_adaptive_runtime_overrides", lambda domain: {})
+    monkeypatch.setattr(hunt, "_shell_env_prefix", lambda env: "")
+    monkeypatch.setattr(hunt, "run_prioritize", lambda domain: True)
+    monkeypatch.setattr(hunt, "run_live", lambda cmd, **kwargs: commands.append(cmd) or True)
+    monkeypatch.setattr(hunt, "_brain_phase_complete", lambda *a, **k: None)
+    monkeypatch.setattr(hunt, "_update_target_state_from_artifacts", lambda *a, **k: None)
+    monkeypatch.setattr(hunt, "_propagate_exposed_paths", lambda *a, **k: 0)
+    monkeypatch.setattr(hunt, "_scan_exposed_data_pii", lambda *a, **k: None)
+    monkeypatch.setattr(hunt, "_runtime_session_id", lambda domain: None)
+    monkeypatch.setattr(hunt, "_active_recon_session_id", lambda domain: None)
+
+    assert hunt.run_vuln_scan(
+        "example.com",
+        full=True,
+        skip_items={"mfa", "saml", "import", "deserialization", "supply_chain", "upload"},
+    )
+
+    assert commands, "scanner command was not invoked"
+    assert '--skip "deserialize,import,mfa,saml,supplychain,upload"' in commands[0]
 
 
 def test_brain_target_prefers_live_host(tmp_path, monkeypatch):

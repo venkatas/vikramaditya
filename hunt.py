@@ -37,6 +37,7 @@ Usage:
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import platform
@@ -192,6 +193,14 @@ GOBIN        = os.path.join(HOME, "go", "bin")
 TOOLS_DIR    = os.path.join(HOME, "tools")
 REPO_TOOLS_DIR = os.path.join(BASE_DIR, "tools")
 
+# ProjectDiscovery tools installed with ``go install`` must win over unrelated
+# Homebrew/Python commands with the same name (notably ``httpx``) and stale brew
+# copies (observed with nuclei v3.7.1 while ~/go/bin held v3.11.1).  Keep every
+# other PATH entry, but make the engagement runtime deterministic.
+if os.path.isdir(GOBIN):
+    _path_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    os.environ["PATH"] = os.pathsep.join([GOBIN] + [part for part in _path_parts if part != GOBIN])
+
 # Timeouts (seconds)
 # RECON_TIMEOUT is a baseline — hunt_target() scales it up for large targets
 RECON_TIMEOUT      = 7200   # 2h default (was 1h — too short for gov.in-class targets)
@@ -243,11 +252,11 @@ TOOL_REGISTRY = [
     # ── Core recon ──────────────────────────────────────────────────────────
     ("subfinder",         "subfinder",                                  "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"),
     ("assetfinder",       "assetfinder",                                "go install github.com/tomnomnom/assetfinder@latest"),
-    ("httpx",             "httpx",                                      "go install github.com/projectdiscovery/httpx/cmd/httpx@latest"),
+    ("httpx",             f"{GOBIN}/httpx",                             "go install github.com/projectdiscovery/httpx/cmd/httpx@latest"),
     ("dnsx",              "dnsx",                                       "go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest"),
     ("naabu",             "naabu",                                      "go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"),
     ("cdncheck",          "cdncheck",                                   "go install github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest"),
-    ("nuclei",            "nuclei",                                     "go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"),
+    ("nuclei",            f"{GOBIN}/nuclei",                            "go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"),
     ("ffuf",              "ffuf",                                       "go install github.com/ffuf/ffuf/v2@latest"),
     ("katana",            "katana",                                     "go install github.com/projectdiscovery/katana/cmd/katana@latest"),
     ("gau",               "gau",                                        "go install github.com/lc/gau/v2/cmd/gau@latest"),
@@ -306,6 +315,8 @@ SKIP_ALIASES = {
     "jwt": "jwt_audit",
     "cve": "cve_hunt",
     "browser": "browser_scan",
+    "deserialization": "deserialize",
+    "supply_chain": "supplychain",
     "report": "reports",
 }
 
@@ -1518,7 +1529,7 @@ def run_live(cmd: str, timeout: int = 3600,
     """
     try:
         label = watch_phase or "SUBPROCESS"
-        started_at = datetime.now()
+        started_at = datetime.now().astimezone()
         started_label = started_at.strftime("%Y-%m-%d %H:%M:%S")
         env = _tool_env()
 
@@ -1581,7 +1592,7 @@ def run_live(cmd: str, timeout: int = 3600,
                                    "watchdog SIGKILL (stuck/no progress) — partial coverage")
                     _mark_truncated_recon(watch_file, watch_phase)
 
-        finished_at = datetime.now()
+        finished_at = datetime.now().astimezone()
         duration = (finished_at - started_at).total_seconds()
         rc = proc.returncode if proc.returncode is not None else -1
         end_level = "ok" if rc == 0 else "warn"
@@ -1593,7 +1604,15 @@ def run_live(cmd: str, timeout: int = 3600,
         _ph = watch_phase or "subprocess"
         if rc != 0 and not timed_out:
             _mark_degraded(_ph, f"exited non-zero (rc={rc}) — partial/failed coverage")
-        _record_phase_manifest(_ph, cmd, rc, timed_out, watch_file)
+        _record_phase_manifest(
+            _ph,
+            cmd,
+            rc,
+            timed_out,
+            watch_file,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
         return rc == 0
 
     except Exception as exc:
@@ -2072,7 +2091,8 @@ def _mark_aborted(phase: str, reason: str) -> None:
 
 
 def _record_phase_manifest(phase: str, command: str, exit_code, timed_out: bool,
-                           watch_file: str | None) -> None:
+                           watch_file: str | None, *, started_at: datetime | None = None,
+                           finished_at: datetime | None = None) -> None:
     """Best-effort: append a phase record (command, exit code, timeout, artifact counts)
     to the persistent phase_manifest.json. Uses the last-resolved findings dir; a no-op
     if none is known yet or the write fails — coverage/success also live in-memory."""
@@ -2089,8 +2109,16 @@ def _record_phase_manifest(phase: str, command: str, exit_code, timed_out: bool,
     except OSError:
         pass
     try:
-        phase_manifest.record_phase(fd, phase, command=command, exit_code=exit_code,
-                                    timed_out=bool(timed_out), artifact_counts=counts)
+        phase_manifest.record_phase(
+            fd,
+            phase,
+            command=command,
+            exit_code=exit_code,
+            timed_out=bool(timed_out),
+            start=started_at.isoformat() if started_at else None,
+            end=finished_at.isoformat() if finished_at else None,
+            artifact_counts=counts,
+        )
     except Exception:
         pass
 
@@ -2836,6 +2864,18 @@ def _propagated_soft404(path_value: str, content_type: str) -> bool:
         "html" in (content_type or "").lower()
 
 
+def _propagatable_exposed_path(path_value: str) -> bool:
+    """Only propagate exact file-like exposure paths, never generic admin directories."""
+    path = (path_value or "").split("?", 1)[0].split("#", 1)[0]
+    if not path or path.endswith("/"):
+        return False
+    name = path.rsplit("/", 1)[-1].lower()
+    return bool(_STRUCTURED_FILE_EXT_RE.search(path)) or name in {
+        ".env", ".git", ".npmrc", ".htaccess", ".htpasswd", "web.config",
+        "dockerfile", "id_rsa", "authorized_keys",
+    }
+
+
 def _probe_url_headers(url: str, timeout: int = 6) -> tuple[int, str]:
     try:
         # Fork-safe (macOS Network.framework atfork SIGSEGV): posix_spawn, not run() fork().
@@ -3023,9 +3063,13 @@ def _write_exposed_data_pii_findings(results, findings_dir) -> int:
             if inds:
                 parts.append("PII indicators: " + ", ".join(inds))
         lines.append(" — ".join(parts))
-    if not lines:
-        return 0
     out = os.path.join(findings_dir, "exposure", "exposed_data_pii.txt")
+    if not lines:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        return 0
     os.makedirs(os.path.dirname(out), exist_ok=True)
     try:
         import storage
@@ -3106,6 +3150,8 @@ def _propagate_exposed_paths(domain: str, session_id: str | None = None, limit_p
         for url in _extract_urls(content):
             parsed = urlsplit(url)
             if not parsed.path or parsed.path == "/":
+                continue
+            if not _propagatable_exposed_path(parsed.path):
                 continue
             source_paths.setdefault(parsed.path, set()).add(_normalize_base_url(url))
 
@@ -3923,6 +3969,7 @@ def run_autonomous_hunt(
         recon_ok = run_recon(
             domain,
             quick=quick,
+            full=full,
             batch_size=batch_size,
             resume=resume,
             session_id=session_id,
@@ -4297,6 +4344,7 @@ def _derive_targets_label(hosts: list[str]) -> str:
 def run_recon(
     domain: str,
     quick: bool = False,
+    full: bool = False,
     batch_size: int = 10,
     resume: bool = False,
     session_id: str | None = None,
@@ -4381,6 +4429,7 @@ def run_recon(
     _scope_env  = "SCOPE_LOCK=1 " if scope_lock else ""
     _type_env   = f'TARGET_TYPE="{_target_type}" '
     _maxurl_env = f"MAX_URLS={max_urls} " if max_urls > 0 else "MAX_URLS=0 "
+    _full_env   = "FULL_RECON=1 " if full else "FULL_RECON=0 "
     if scope_lock and _target_type == "domain":
         log("info", f"Scope-lock ON — subdomain enum skipped, testing {domain} only")
     if max_urls > 0:
@@ -4413,7 +4462,7 @@ def run_recon(
         except OSError as _e:
             log("warn", f"scope allowlist persist failed ({_e}) — recon fails closed under scope-lock")
     ok = run_live(
-        f'{adaptive_env}{_scope_env}{_allow_env}{_type_env}{_maxurl_env}{_targets_env}'
+        f'{adaptive_env}{_scope_env}{_allow_env}{_type_env}{_maxurl_env}{_full_env}{_targets_env}'
         f'RECON_OUT_DIR="{recon_dir}" RECON_SESSION_ID="{active_session_id or ""}" '
         f'BATCH_SIZE={batch_size} bash "{script}" "{domain}" {quick_flag} {resume_flag}',
         timeout=_dynamic_timeout,
@@ -4521,6 +4570,8 @@ def run_vuln_scan(domain: str, quick: bool = False, skip_items: set[str] | None 
         "cve_hunt": "cves",
         "auth": "auth_bypass",
         "takeovers": "takeover",
+        "deserialization": "deserialize",
+        "supply_chain": "supplychain",
     }
     skip_values = sorted({
         scan_skip_aliases.get(item, item) for item in skip_items
@@ -4529,6 +4580,8 @@ def run_vuln_scan(domain: str, quick: bool = False, skip_items: set[str] | None 
             "misconfig", "jwt", "graphql", "smuggling", "redirects", "idor",
             "auth_bypass", "host_header", "exposure", "cloud", "cms", "sqlmap",
             "jwt_audit", "redirect", "cms_exploit", "cve_hunt", "auth", "takeovers",
+            "mfa", "saml", "import", "deserialize", "deserialization", "supplychain",
+            "supply_chain",
         }
     })
     skip_flag = f'--skip "{",".join(skip_values)}"' if skip_values else ""
@@ -4714,7 +4767,382 @@ def _count_json_findings(path):
     return n
 
 
+_JS_MANAGED_NAME_RE = re.compile(r"(?:[0-9a-f]{32}|[0-9a-f]{64})\.js\Z")
+_JS_MANIFEST_HEADER = "file\turl\treturncode\ttimed_out\tbytes\tsha256"
+_CURL_TRANSIENT_CODES = {5, 6, 7, 18, 28, 35, 47, 52, 55, 56, 92}
+_SECRETFINDER_STATUS_FILE = "secretfinder.status.json"
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_write_text(path: str, content: str) -> None:
+    """Publish a managed text artifact atomically, without shell redirection."""
+    temporary = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def _quarantine_managed_file(path: str, quarantine_dir: str) -> str | None:
+    """Move a known managed artifact aside; never sweep unrelated files."""
+    if not os.path.lexists(path):
+        return None
+    os.makedirs(quarantine_dir, exist_ok=True)
+    destination = os.path.join(quarantine_dir, os.path.basename(path))
+    if os.path.lexists(destination):
+        destination += f".{time.time_ns()}"
+    try:
+        os.replace(path, destination)
+    except OSError:
+        return None
+    return destination
+
+
+def _manifest_managed_names(manifest: str) -> set[str]:
+    """Read only generated bundle names from a current or legacy manifest."""
+    names: set[str] = set()
+    try:
+        with open(manifest, encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                name = raw.rstrip("\n").split("\t", 1)[0]
+                if _JS_MANAGED_NAME_RE.fullmatch(name):
+                    names.add(name)
+    except OSError:
+        pass
+    return names
+
+
+def _curl_http_status(result: dict) -> int:
+    stdout = str(result.get("stdout") or "").strip()
+    if stdout.isdigit() and len(stdout) == 3:
+        return int(stdout)
+    combined = stdout + "\n" + str(result.get("stderr") or "")
+    matches = re.findall(r"(?<!\d)([1-5]\d\d)(?!\d)", combined)
+    return int(matches[-1]) if matches else 0
+
+
+def _curl_failure_is_transient(result: dict, status: int, *, empty: bool) -> bool:
+    if result.get("timed_out") or empty:
+        return True
+    if status in {408, 425, 429} or 500 <= status <= 599:
+        return True
+    try:
+        return int(result.get("returncode", -1)) in _CURL_TRANSIENT_CODES
+    except (TypeError, ValueError):
+        return False
+
+
+def _safe_capture(spec: list[str], *, timeout: int, merge_stderr: bool = False) -> dict:
+    """Use the fork-safe runner while normalizing spawn failures for callers."""
+    try:
+        return run_capture(
+            spec,
+            shell=False,
+            merge_stderr=merge_stderr,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return {
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {exc}",
+            "returncode": -1,
+            "timed_out": isinstance(exc, subprocess.TimeoutExpired),
+        }
+
+
+def _download_js_corpus(js_scan_file: str, dl_dir: str) -> tuple[int, int]:
+    """Fetch a fresh, manifested JS corpus with bounded transient retries."""
+    os.makedirs(dl_dir, exist_ok=True)
+    try:
+        with open(js_scan_file, errors="ignore") as handle:
+            urls = list(dict.fromkeys(line.strip() for line in handle if line.strip()))
+    except OSError:
+        urls = []
+
+    workers = max(1, min(int(os.environ.get("JS_DOWNLOAD_WORKERS", "16")), 32))
+    max_bytes = max(1024, int(os.environ.get("JS_MAX_FILE_BYTES", str(10 * 1024 * 1024))))
+    retries = max(0, min(int(os.environ.get("JS_DOWNLOAD_RETRIES", "3")), 5))
+    backoff = max(0.0, min(float(os.environ.get("JS_DOWNLOAD_BACKOFF_SECONDS", "1")), 10.0))
+
+    manifest = os.path.join(dl_dir, "manifest.tsv")
+    previous_names = _manifest_managed_names(manifest)
+    quarantine_dir = os.path.join(dl_dir, "stale", str(time.time_ns()))
+    if os.path.isfile(manifest):
+        _quarantine_managed_file(manifest, quarantine_dir)
+
+    def fetch(url: str) -> dict:
+        name = hashlib.sha256(url.encode("utf-8", "surrogatepass")).hexdigest() + ".js"
+        destination = os.path.join(dl_dir, name)
+        temporary = destination + f".part.{threading.get_ident()}"
+        result: dict = {"returncode": -1, "timed_out": False, "stdout": "", "stderr": ""}
+        size = 0
+        for attempt in range(retries + 1):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            result = _safe_capture(
+                [
+                    "curl", "-fskSL", "--connect-timeout", "5", "--max-time", "20",
+                    "--max-filesize", str(max_bytes), "--write-out", "%{http_code}",
+                    "-o", temporary, url,
+                ],
+                timeout=25,
+            )
+            try:
+                size = os.path.getsize(temporary) if result.get("returncode") == 0 else 0
+            except OSError:
+                size = 0
+            if result.get("returncode") == 0 and size > 0:
+                break
+            status = _curl_http_status(result)
+            if attempt >= retries or not _curl_failure_is_transient(
+                    result, status, empty=result.get("returncode") == 0 and size == 0):
+                break
+            time.sleep(min(backoff * (2 ** attempt), 10.0))
+
+        content_sha256 = ""
+        if result.get("returncode") == 0 and size > 0:
+            try:
+                content_sha256 = _sha256_file(temporary)
+                os.replace(temporary, destination)
+            except OSError:
+                size = 0
+                content_sha256 = ""
+        if size == 0:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        return {
+            "file": name if size else "",
+            "url": url,
+            "returncode": result.get("returncode", -1),
+            "timed_out": bool(result.get("timed_out")),
+            "bytes": size,
+            "sha256": content_sha256,
+        }
+
+    rows: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        rows.extend(pool.map(fetch, urls))
+
+    manifest_lines = [_JS_MANIFEST_HEADER]
+    for row in rows:
+        manifest_lines.append(
+            f"{row['file']}\t{row['url']}\t{row['returncode']}\t"
+            f"{int(row['timed_out'])}\t{row['bytes']}\t{row['sha256']}"
+        )
+    _atomic_write_text(manifest, "\n".join(manifest_lines) + "\n")
+
+    current_names = {str(row["file"]) for row in rows if row["file"]}
+    for stale_name in sorted(previous_names - current_names):
+        _quarantine_managed_file(os.path.join(dl_dir, stale_name), quarantine_dir)
+    return len(urls), len(current_names)
+
+
+def _current_js_manifest_files(dl_dir: str) -> list[str]:
+    """Return only files whose size and hash match the freshly written manifest."""
+    manifest = os.path.join(dl_dir, "manifest.tsv")
+    verified: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(manifest, encoding="utf-8", errors="replace") as handle:
+            if handle.readline().rstrip("\n") != _JS_MANIFEST_HEADER:
+                return []
+            for raw in handle:
+                parts = raw.rstrip("\n").split("\t")
+                if len(parts) != 6:
+                    continue
+                name, _url, returncode, timed_out, byte_count, expected_hash = parts
+                if (name in seen or not re.fullmatch(r"[0-9a-f]{64}\.js", name)
+                        or returncode != "0" or timed_out != "0"
+                        or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)):
+                    continue
+                try:
+                    expected_size = int(byte_count)
+                except ValueError:
+                    continue
+                path = os.path.join(dl_dir, name)
+                try:
+                    if expected_size <= 0 or os.path.getsize(path) != expected_size:
+                        continue
+                    if _sha256_file(path) != expected_hash:
+                        continue
+                except OSError:
+                    continue
+                seen.add(name)
+                verified.append(path)
+    except OSError:
+        return []
+    return verified
+
+
 # ── NEW: JS Analysis ───────────────────────────────────────────────────────────
+def _secretfinder_dependency_check() -> tuple[bool, str]:
+    """Verify SecretFinder's declared imports in the active Python runtime."""
+    completed = _safe_capture(
+        [
+            sys.executable,
+            "-c",
+            "import jsbeautifier, lxml, requests, requests_file",
+        ],
+        timeout=15,
+    )
+    if completed.get("timed_out"):
+        return False, "dependency preflight timed out after 15s"
+    detail = str(completed.get("stderr") or completed.get("stdout") or "").strip()
+    return completed.get("returncode") == 0, detail[:500]
+
+
+def _capture_failure_detail(result: dict) -> str:
+    if result.get("timed_out"):
+        return "timed out"
+    detail = str(result.get("stderr") or result.get("stdout") or "").strip()
+    return f"rc={result.get('returncode', -1)}" + (f": {detail[:300]}" if detail else "")
+
+
+def _write_capture_diagnostic(path: str, result: dict, spec: list[str]) -> None:
+    content = (
+        f"command={shlex.join(spec)}\n"
+        f"returncode={result.get('returncode', -1)}\n"
+        f"timed_out={bool(result.get('timed_out'))}\n\n"
+        f"{result.get('stdout') or ''}{result.get('stderr') or ''}"
+    )
+    try:
+        _atomic_write_text(path, content)
+    except OSError:
+        pass
+
+
+def _run_jsluice_files(jsluice: str, mode: str, files: list[str], output: str,
+                       *, workers: int, timeout: int) -> tuple[bool, str]:
+    """Run jsluice directly over the manifest-proven file list."""
+    spec = [jsluice, mode, "-c", str(workers), *files]
+    result = _safe_capture(spec, timeout=timeout)
+    if result.get("returncode") != 0 or result.get("timed_out"):
+        _write_capture_diagnostic(output + ".error.txt", result, spec)
+        return False, _capture_failure_detail(result)
+    lines = sorted({line for line in str(result.get("stdout") or "").splitlines() if line})
+    try:
+        _atomic_write_text(output, "\n".join(lines) + ("\n" if lines else ""))
+    except OSError as exc:
+        return False, f"could not publish output: {exc}"
+    return True, ""
+
+
+def _secretfinder_runtime_error(output: str) -> bool:
+    low = output.lower()
+    return any(signal_text in low for signal_text in (
+        "traceback (most recent call last)",
+        "modulenotfounderror",
+        "importerror",
+        "syntaxerror",
+        "command not found",
+        "no such file or directory",
+    ))
+
+
+def _run_secretfinder_files(secretfinder: str, files: list[str], output: str,
+                            *, workers: int, timeout: int) -> tuple[int, int, str]:
+    """Run one direct SecretFinder argv call per proven local file."""
+    def scan(path: str) -> tuple[str, list[str], dict, bool]:
+        spec = [sys.executable, secretfinder, "-i", path, "-o", "cli"]
+        result = _safe_capture(spec, timeout=timeout)
+        combined = str(result.get("stdout") or "") + str(result.get("stderr") or "")
+        ok = (result.get("returncode") == 0 and not result.get("timed_out")
+              and not _secretfinder_runtime_error(combined))
+        return path, spec, result, ok
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(scan, files))
+
+    successful = [item for item in results if item[3]]
+    failed = [item for item in results if not item[3]]
+    if successful:
+        combined_output = "".join(str(item[2].get("stdout") or "") for item in successful)
+        try:
+            _atomic_write_text(output, combined_output)
+        except OSError as exc:
+            return 0, len(results), f"could not publish output: {exc}"
+    if failed:
+        diagnostics = []
+        for path, spec, result, _ok in failed:
+            diagnostics.append(
+                f"file={path}\ncommand={shlex.join(spec)}\n"
+                f"{_capture_failure_detail(result)}\n"
+                f"{result.get('stdout') or ''}{result.get('stderr') or ''}\n"
+            )
+        try:
+            _atomic_write_text(output + ".error.txt", "\n".join(diagnostics))
+        except OSError:
+            pass
+    detail = f"{len(failed)} of {len(results)} file scan(s) failed" if failed else ""
+    return len(successful), len(failed), detail
+
+
+def _set_secretfinder_status(js_dir: str, *, valid: bool, reason: str,
+                             manifest: str = "", output: str = "") -> None:
+    status = {"valid": bool(valid), "reason": reason}
+    if valid:
+        status["manifest_sha256"] = _sha256_file(manifest)
+        status["output_sha256"] = _sha256_file(output)
+    _atomic_write_text(
+        os.path.join(js_dir, _SECRETFINDER_STATUS_FILE),
+        json.dumps(status, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _secretfinder_artifact_is_current(js_dir: str) -> bool:
+    """Require provenance for manifest-era SecretFinder output; allow legacy sessions."""
+    output = os.path.join(js_dir, "secretfinder.txt")
+    if not os.path.isfile(output):
+        return False
+    manifest = os.path.join(js_dir, "downloaded", "manifest.tsv")
+    status_path = os.path.join(js_dir, _SECRETFINDER_STATUS_FILE)
+    if not os.path.isfile(status_path):
+        return not os.path.isfile(manifest)
+    try:
+        with open(status_path, encoding="utf-8") as handle:
+            status = json.load(handle)
+        return bool(status.get("valid")) and (
+            status.get("manifest_sha256") == _sha256_file(manifest)
+            and status.get("output_sha256") == _sha256_file(output)
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _run_trufflehog_files(trufflehog: str, files: list[str], output: str,
+                          *, timeout: int) -> tuple[bool, str]:
+    """Scan only manifest-proven paths and preserve the real tool exit status."""
+    spec = [
+        trufflehog, "filesystem", "--json", "--no-update",
+        "--fail-on-scan-errors", *files,
+    ]
+    result = _safe_capture(spec, timeout=timeout)
+    if result.get("returncode") != 0 or result.get("timed_out"):
+        _write_capture_diagnostic(output + ".error.txt", result, spec)
+        return False, _capture_failure_detail(result)
+    try:
+        _atomic_write_text(output, str(result.get("stdout") or ""))
+    except OSError as exc:
+        return False, f"could not publish output: {exc}"
+    return True, ""
+
+
 def run_js_analysis(domain: str) -> bool:
     """
     Phase: JS Analysis
@@ -4730,6 +5158,19 @@ def run_js_analysis(domain: str) -> bool:
     if _brain and _brain.enabled:
         _brain.phase_start("JS ANALYSIS", f"target={domain}")
 
+    jsluice_out = os.path.join(js_dir, "jsluice_secrets.txt")
+    endpoints_out = os.path.join(js_dir, "jsluice_endpoints.txt")
+    sf_out = os.path.join(js_dir, "secretfinder.txt")
+    sf_status = os.path.join(js_dir, _SECRETFINDER_STATUS_FILE)
+    tf_out = os.path.join(js_dir, "trufflehog.json")
+    output_quarantine = os.path.join(js_dir, "stale-evidence", str(time.time_ns()))
+    for managed_output in (jsluice_out, endpoints_out, sf_out, sf_status, tf_out):
+        _quarantine_managed_file(managed_output, output_quarantine)
+    try:
+        _set_secretfinder_status(js_dir, valid=False, reason="JS analysis has no current output")
+    except OSError as exc:
+        _mark_degraded("secretfinder", f"could not invalidate stale output: {exc}")
+
     # Prefer the JS list recon already produced (recon.sh populates
     # urls/js_files.txt from katana/wayback). Fall back to greping
     # live/urls.txt only if that's missing — live/urls.txt typically
@@ -4739,24 +5180,40 @@ def run_js_analysis(domain: str) -> bool:
     recon_js_file = os.path.join(recon_dir, "urls", "js_files.txt")
     urls_file = os.path.join(recon_dir, "live", "urls.txt")
 
-    if os.path.isfile(recon_js_file) and os.path.getsize(recon_js_file) > 0:
-        run_cmd(f'sort -u "{recon_js_file}" > "{js_urls_file}"', timeout=30)
+    source_file = ""
+    filter_js = False
+    if _file_nonempty(recon_js_file):
+        source_file = recon_js_file
     elif os.path.isfile(urls_file):
-        run_cmd(
-            f'grep -iE "\\.js(\\?|$)" "{urls_file}" | sort -u > "{js_urls_file}"',
-            timeout=30
-        )
-    else:
+        source_file = urls_file
+        filter_js = True
+    if not source_file:
         log("warn", f"No urls source for {domain} — run recon first")
         _brain_phase_complete("JS ANALYSIS", False, detail=f"target={domain} missing urls source")
         return False
 
-    if not os.path.isfile(js_urls_file) or os.path.getsize(js_urls_file) == 0:
+    try:
+        with open(source_file, encoding="utf-8", errors="replace") as handle:
+            selected_urls = sorted({
+                line.strip() for line in handle
+                if line.strip() and (not filter_js or re.search(r"\.js(?:\?|$)", line.strip(), re.I))
+            })
+        _atomic_write_text(
+            js_urls_file,
+            "\n".join(selected_urls) + ("\n" if selected_urls else ""),
+        )
+    except OSError as exc:
+        log("err", f"Could not build JS URL corpus: {exc}")
+        _mark_degraded("js_download", f"could not build URL corpus: {exc}")
+        _brain_phase_complete("JS ANALYSIS", False, detail=f"target={domain} URL corpus error")
+        return False
+
+    if not selected_urls:
         log("warn", "No JS files found in URLs")
         _brain_phase_complete("JS ANALYSIS", False, detail=f"target={domain} no JS URLs found")
         return False
 
-    js_count = sum(1 for _ in open(js_urls_file))
+    js_count = len(selected_urls)
     log("info", f"Found {js_count} JS files — analyzing...")
 
     # P1 — bound the serial per-URL curl loops (jsluice/SecretFinder) to a top-N
@@ -4767,7 +5224,7 @@ def run_js_analysis(domain: str) -> bool:
     js_scan_file = js_urls_file
     if _js_max > 0 and js_count > _js_max:
         js_scan_file = os.path.join(js_dir, "js_urls_scan.txt")
-        run_cmd(f'head -n {_js_max} "{js_urls_file}" > "{js_scan_file}"', timeout=30)
+        _atomic_write_text(js_scan_file, "\n".join(selected_urls[:_js_max]) + "\n")
         log("warn", f"JS analysis capped at {_js_max} of {js_count} JS URLs "
                     f"(JS_ANALYSIS_MAX_URLS=0 for all) — partial coverage")
         _mark_degraded("js_analysis", f"URL surface capped: analyzed {_js_max} of {js_count} JS URLs")
@@ -4776,32 +5233,63 @@ def run_js_analysis(domain: str) -> bool:
     secretfinder = _tool_bin("secretfinder")
     trufflehog   = _tool_bin("trufflehog")
 
+    dl_dir = os.path.join(js_dir, "downloaded")
+    try:
+        requested, reported_downloads = _download_js_corpus(js_scan_file, dl_dir)
+    except Exception as exc:
+        _mark_degraded("js_download", f"corpus download failed: {type(exc).__name__}: {exc}")
+        _brain_phase_complete("JS ANALYSIS", False, detail=f"target={domain} download failure")
+        return False
+    manifest = os.path.join(dl_dir, "manifest.tsv")
+    current_files = _current_js_manifest_files(dl_dir)
+    downloaded = len(current_files)
+    log("info", f"JS corpus fetched once: {downloaded}/{requested} bundle(s) "
+                f"with provenance manifest -> {manifest}")
+    if reported_downloads != downloaded:
+        _mark_degraded(
+            "js_download",
+            f"manifest/download count mismatch: reported={reported_downloads} verified={downloaded}",
+        )
+    if downloaded == 0:
+        reason = f"downloaded 0 of {requested} selected JS URLs; no fresh corpus to analyze"
+        _mark_degraded("js_download", reason)
+        try:
+            _set_secretfinder_status(js_dir, valid=False, reason=reason)
+        except OSError:
+            pass
+        _brain_phase_complete(
+            "JS ANALYSIS",
+            False,
+            detail=f"target={domain} requested={requested} downloaded=0",
+            artifacts={"js_manifest": manifest},
+        )
+        return False
+    if requested and downloaded < requested:
+        _mark_degraded("js_download",
+                       f"downloaded {downloaded} of {requested} selected JS URLs")
+    local_jobs = max(1, min(int(os.environ.get("JS_LOCAL_WORKERS", "8")), 16))
+    dynamic_timeout = max(JS_SCAN_TIMEOUT, min(7200, max(requested, 1) * 3))
+
     # ── jsluice: endpoints + secrets ──
     # v9.23 — the installed BishopFox jsluice has NO --input-format flag; raw stdin
     # is -j/--raw-input. The old `secrets --input-format=js` made jsluice print
     # "unknown flag: --input-format" to STDOUT (not stderr, so 2>/dev/null did not
     # hide it); tee captured those error lines and the counter reported them as
-    # "secrets" (e.g. "5 secrets found" = 5 error lines). Use -j, dedup, and count
-    # only valid JSON objects.
+    # "secrets" (e.g. "5 secrets found" = 5 error lines). Pass proven files as
+    # argv, de-duplicate in Python, and count only valid JSON objects.
     if _which(jsluice_bin):
-        jsluice_out = os.path.join(js_dir, "jsluice_secrets.txt")
-        endpoints_out = os.path.join(js_dir, "jsluice_endpoints.txt")
-        # --connect-timeout/--max-time: a single non-responding JS host (TCP SYN black-hole)
-        # must not stall the serial loop until the phase watchdog kills it (real client-b.example
-        # hang: jsluice-urls timed out at 1200s rc=-9). IFS= read -r for robust URL handling.
-        cmd = (
-            f'cat "{js_scan_file}" | while IFS= read -r url; do '
-            f'  curl -sk --connect-timeout 5 --max-time 20 "$url" | {jsluice_bin} secrets -j 2>/dev/null; '
-            f'done | sort -u | tee "{jsluice_out}"'
+        secrets_ok, secrets_detail = _run_jsluice_files(
+            jsluice_bin, "secrets", current_files, jsluice_out,
+            workers=local_jobs, timeout=dynamic_timeout,
         )
-        run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
-        cmd2 = (
-            f'cat "{js_scan_file}" | while IFS= read -r url; do '
-            f'  curl -sk --connect-timeout 5 --max-time 20 "$url" | {jsluice_bin} urls -j 2>/dev/null; '
-            f'done | sort -u | tee "{endpoints_out}"'
+        urls_ok, urls_detail = _run_jsluice_files(
+            jsluice_bin, "urls", current_files, endpoints_out,
+            workers=local_jobs, timeout=dynamic_timeout,
         )
-        run_cmd(cmd2, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
-        if os.path.exists(jsluice_out):
+        if not secrets_ok or not urls_ok:
+            detail = "; ".join(item for item in (secrets_detail, urls_detail) if item)
+            _mark_degraded("jsluice", f"local analyzer failed: {detail or 'unknown error'}")
+        if secrets_ok:
             count = _count_json_findings(jsluice_out)
             log("ok", f"jsluice: {count} secret(s) found → {jsluice_out}")
     else:
@@ -4813,100 +5301,77 @@ def run_js_analysis(domain: str) -> bool:
     # lines using a tab->tab separator. The old counter counted every non-blank
     # line, so N URLs => "N hits". Count only the separator lines, and mark them
     # unverified (most raw regex matches are noise: CSS, GUIDs, asset URLs).
-    if os.path.isfile(secretfinder):
-        sf_out = os.path.join(js_dir, "secretfinder.txt")
-        # v9.24 — do NOT blanket-suppress stderr. When SecretFinder's deps break
-        # (jsbeautifier/lxml import error, etc.) the old ``2>/dev/null`` hid the
-        # traceback, the tool exited ~0 in 0.1s with 0 bytes, and we reported a
-        # clean "0 matches". Merge stderr into the captured output (per-url so a
-        # single broken URL doesn't kill the loop) and assert plausibility.
-        cmd = (
-            f'cat "{js_scan_file}" | while read url; do '
-            f'  python3 "{secretfinder}" -i "$url" -o cli 2>&1; '
-            f'done | tee "{sf_out}"'
+    sf_exists = os.path.isfile(secretfinder)
+    sf_dependencies_ok, sf_dependency_error = (
+        _secretfinder_dependency_check() if sf_exists else (False, "")
+    )
+    if sf_exists and sf_dependencies_ok:
+        sf_file_timeout = max(
+            5,
+            min(int(os.environ.get("SECRETFINDER_FILE_TIMEOUT", "60")), 300),
         )
-        run_cmd(cmd, timeout=JS_SCAN_TIMEOUT, watch_file=js_dir, watch_phase="JS ANALYSIS")
-        if os.path.exists(sf_out):
+        sf_successes, sf_failures, sf_detail = _run_secretfinder_files(
+            secretfinder, current_files, sf_out,
+            workers=local_jobs, timeout=sf_file_timeout,
+        )
+        if sf_successes:
+            try:
+                _set_secretfinder_status(
+                    js_dir,
+                    valid=True,
+                    reason=("partial current run" if sf_failures else "current run complete"),
+                    manifest=manifest,
+                    output=sf_out,
+                )
+            except OSError as exc:
+                _mark_degraded("secretfinder", f"could not publish provenance: {exc}")
             count = 0
-            tb_signal = False
-            with open(sf_out, errors="ignore") as fh:
-                for ln in fh:
-                    if "\t->\t" in ln:
-                        count += 1
-                    low = ln.lower()
-                    # finding J: degrade ONLY on an explicit error signal — a
-                    # traceback, a missing-module / import error, a "command not
-                    # found" / "no such file" from the shell, or a SyntaxError.
-                    # The old fast+empty heuristic (js_count>0 && bytes==0 &&
-                    # dur<2.0) false-positived on a legit single-URL no-secrets
-                    # target that finishes <2s empty.
-                    if ("traceback (most recent call last)" in low
-                            or "modulenotfounderror" in low
-                            or "importerror" in low
-                            or "syntaxerror" in low
-                            or "command not found" in low
-                            or "no such file or directory" in low):
-                        tb_signal = True
-            # SecretFinder that printed an import/runtime error did not actually
-            # run — flag it instead of reporting "0 matches". An empty-but-clean
-            # file (no error markers) is a legitimate "no secrets found" result,
-            # even when the run finished quickly over a single JS URL.
-            if tb_signal:
-                _mark_degraded("secretfinder",
-                               "import/runtime error in output — dependency broken (see secretfinder.txt)")
-            else:
-                log("ok", f"SecretFinder: {count} raw match(es) [unverified] → {sf_out}")
+            with open(sf_out, errors="ignore") as handle:
+                count = sum(1 for line in handle if "\t->\t" in line)
+            log("ok", f"SecretFinder: {count} raw match(es) [unverified] → {sf_out}")
+        if sf_failures:
+            _mark_degraded("secretfinder", sf_detail)
+        if not sf_successes:
+            reason = sf_detail or "no SecretFinder file scan completed"
+            try:
+                _set_secretfinder_status(js_dir, valid=False, reason=reason)
+            except OSError:
+                pass
+    elif sf_exists:
+        log("warn", "SecretFinder dependencies are unavailable in the active Python runtime")
+        reason = f"dependency preflight failed: {sf_dependency_error or 'unknown import error'}"
+        _mark_degraded(
+            "secretfinder",
+            reason,
+        )
+        try:
+            _set_secretfinder_status(js_dir, valid=False, reason=reason)
+        except OSError:
+            pass
     else:
         log("warn", "SecretFinder not found at ~/tools/SecretFinder/")
+        try:
+            _set_secretfinder_status(js_dir, valid=False, reason="SecretFinder not installed")
+        except OSError:
+            pass
 
     # ── trufflehog: scan fetched JS content ──
     if _which(trufflehog):
-        tf_out = os.path.join(js_dir, "trufflehog.json")
-        # Download JS files to a temp dir and scan
-        dl_dir = os.path.join(js_dir, "downloaded")
-        os.makedirs(dl_dir, exist_ok=True)
-        run_cmd(
-            # Record a url->file manifest alongside the content-hash-named downloads so a
-            # finding (e.g. a verified key in a bundle) can carry its exact public URL without
-            # a live re-fetch. (Filename is md5(url+"\n").js — the trailing newline is echo's.)
-            f'cat "{js_scan_file}" | while IFS= read -r url; do '
-            f'  name=$(echo "$url" | md5sum | cut -d" " -f1).js; '
-            f'  curl -sk --connect-timeout 5 --max-time 20 "$url" -o "{dl_dir}/$name" 2>/dev/null; '
-            f'  printf "%s\\t%s\\n" "$name" "$url" >> "{dl_dir}/manifest.tsv"; '
-            f'done',
-            timeout=300,
-            watch_file=dl_dir,
-            watch_phase="JS ANALYSIS"
+        ok, detail = _run_trufflehog_files(
+            trufflehog, current_files, tf_out, timeout=SECRET_TIMEOUT,
         )
-        # audit-fix (finding 3): the old ``head -50`` capped trufflehog to the
-        # first 50 JS bundles in file order — silently skipping the rest of the
-        # attack surface. The per-curl ``--max-time 20`` + run_cmd ``timeout=300``
-        # already bound runtime, so the cap is gone. If the loop was nonetheless
-        # cut short by the wall-clock timeout, surface partial coverage rather
-        # than over-reporting.
-        try:
-            _downloaded = sum(1 for n in os.listdir(dl_dir) if n.endswith(".js"))
-        except OSError:
-            _downloaded = 0
-        if js_count and _downloaded < js_count:
-            _mark_degraded("trufflehog",
-                           f"JS download bounded by timeout: scanned {_downloaded} of {js_count} bundles")
-        ok, output = run_cmd(
-            f'{trufflehog} filesystem "{dl_dir}" --json --no-update 2>/dev/null | tee "{tf_out}"',
-            timeout=SECRET_TIMEOUT,
-            watch_file=js_dir,
-            watch_phase="JS ANALYSIS"
-        )
-        if os.path.exists(tf_out):
+        if ok:
             hits = _count_json_findings(tf_out)
             log("ok", f"TruffleHog: {hits} secrets → {tf_out}")
+        else:
+            _mark_degraded("trufflehog", f"local analyzer failed: {detail}")
     else:
         log("warn", "trufflehog not found")
 
     _brain_phase_complete(
         "JS ANALYSIS",
         True,
-        detail=f"target={domain} js_urls={js_count}",
+        detail=f"target={domain} js_urls={js_count} downloaded={downloaded}",
         artifacts={"js": js_dir},
     )
     return True
@@ -6783,6 +7248,96 @@ def _seed_urls_into_recon(recon_dir: str, seeds: list) -> int:
     return len(new)
 
 
+def _scope_seed_urls(
+    seeds: list[str],
+    domain: str,
+    *,
+    scope_lock: bool = False,
+    targets_file: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return (allowed, rejected) seed URLs for the active engagement scope.
+
+    ``--targets-file`` accepts URLs but intentionally normalizes them to hosts for
+    recon.  The original paths must therefore be supplied through ``--seed-urls``.
+    This guard prevents that second input from becoming a scope escape: an exact
+    multi-host allowlist wins, exact-host scope-lock is fail closed, and a normal
+    domain hunt permits only the apex and its subdomains.
+    """
+    allowed_hosts: set[str] = set()
+    if targets_file and os.path.isfile(targets_file):
+        for item in _read_targets_file(targets_file):
+            allowed_hosts.add(item.rsplit(":", 1)[0] if item.rsplit(":", 1)[-1].isdigit() else item)
+
+    domain_host = domain.lower().rstrip(".").rsplit(":", 1)[0]
+    allowed: list[str] = []
+    rejected: list[str] = []
+    for url in seeds:
+        try:
+            host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        except Exception:
+            host = ""
+        if allowed_hosts:
+            in_scope = host in allowed_hosts
+        elif scope_lock:
+            in_scope = host == domain_host
+        else:
+            in_scope = host == domain_host or host.endswith("." + domain_host)
+        (allowed if in_scope else rejected).append(url)
+    return allowed, rejected
+
+
+def _seed_urls_into_recon_corpus(recon_dir: str, seeds: list[str]) -> dict[str, int]:
+    """Make operator-supplied routes visible to all downstream scan phases.
+
+    Before this hook, ``--seed-urls`` was written only when the late SQLmap phase
+    started.  Route-only applications and exact API Gateway paths were therefore
+    absent from JS, API, CORS, nuclei, and scanner coverage.  Append the bounded,
+    scope-checked corpus to the canonical recon files while preserving each
+    file's role and returning auditable per-file write counts.
+    """
+    if not seeds:
+        return {}
+
+    urls_dir = os.path.join(recon_dir, "urls")
+    live_dir = os.path.join(recon_dir, "live")
+    os.makedirs(urls_dir, exist_ok=True)
+    os.makedirs(live_dir, exist_ok=True)
+
+    api_seeds: list[str] = []
+    js_seeds: list[str] = []
+    for url in seeds:
+        parsed = urlsplit(url)
+        path = parsed.path.lower()
+        host = (parsed.hostname or "").lower()
+        if "/api/" in path or host.endswith(".execute-api.ap-south-1.amazonaws.com"):
+            api_seeds.append(url)
+        if path.endswith((".js", ".mjs")):
+            js_seeds.append(url)
+
+    def _append_unique(path: str, values: list[str]) -> int:
+        existing: set[str] = set()
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                existing = {line.strip() for line in fh if line.strip()}
+        new = [value for value in values if value not in existing]
+        if new:
+            with open(path, "a", encoding="utf-8") as fh:
+                for value in new:
+                    fh.write(value + "\n")
+        return len(new)
+
+    counts = {
+        "urls/all.txt": _append_unique(os.path.join(urls_dir, "all.txt"), seeds),
+        "live/urls.txt": _append_unique(os.path.join(live_dir, "urls.txt"), seeds),
+        "urls/api_endpoints.txt": _append_unique(
+            os.path.join(urls_dir, "api_endpoints.txt"), api_seeds
+        ),
+        "urls/js_files.txt": _append_unique(os.path.join(urls_dir, "js_files.txt"), js_seeds),
+    }
+    counts["urls/with_params.txt"] = _seed_urls_into_recon(recon_dir, seeds)
+    return counts
+
+
 # ── NEW: sqlmap targeted scan ───────────────────────────────────────────────────
 def _build_get_sqlmap_command(cand_file: str, sqli_dir: str, sqli_out: str,
                               cookie_opt: str = "", *, deep: bool = False) -> str:
@@ -8091,6 +8646,19 @@ def _check_waf_block(findings_dir: str, url: str, response, already_recorded: bo
     return already_recorded
 
 
+def _jwt_artifact_search_paths(recon_dir: str, findings_dir: str) -> list[str]:
+    """Return JWT evidence sources, excluding unproven SecretFinder output."""
+    js_dir = os.path.join(recon_dir, "js")
+    paths = [
+        os.path.join(recon_dir, "live", "httpx_full.txt"),
+        os.path.join(findings_dir, "nuclei_findings.txt"),
+        os.path.join(js_dir, "jsluice_secrets.txt"),
+    ]
+    if _secretfinder_artifact_is_current(js_dir):
+        paths.append(os.path.join(js_dir, "secretfinder.txt"))
+    return paths
+
+
 def run_jwt_audit(domain: str) -> bool:
     """
     Collect JWTs from recon artifacts and run jwt_tool:
@@ -8119,12 +8687,10 @@ def run_jwt_audit(domain: str) -> bool:
     jwt_pattern = re.compile(r'(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})')
     found_jwts  = {}
 
-    search_paths = [
-        os.path.join(recon_dir, "live", "httpx_full.txt"),
-        os.path.join(findings_dir, "nuclei_findings.txt"),
-        os.path.join(recon_dir, "js", "jsluice_secrets.txt"),
-        os.path.join(recon_dir, "js", "secretfinder.txt"),
-    ]
+    search_paths = _jwt_artifact_search_paths(recon_dir, findings_dir)
+    secretfinder_path = os.path.join(recon_dir, "js", "secretfinder.txt")
+    if os.path.isfile(secretfinder_path) and secretfinder_path not in search_paths:
+        log("warn", "Ignoring stale/unproven secretfinder.txt during JWT collection")
 
     for fpath in search_paths:
         if os.path.isfile(fpath):
@@ -9472,6 +10038,7 @@ def hunt_target(
         result["recon"] = run_recon(
             domain,
             quick=quick,
+            full=full,
             batch_size=batch_size,
             resume=resume,
             session_id=resume_session_id,
@@ -9492,6 +10059,32 @@ def hunt_target(
         if _brain and _brain.enabled and os.path.isdir(recon_dir) and not selected_only_mode:
             log("info", "Brain: post-recon hook (analyze + scan plan)...")
             _brain.post_recon_hook(recon_dir, findings_dir_early)
+
+        if _SEED_URLS:
+            _allowed_seeds, _rejected_seeds = _scope_seed_urls(
+                _SEED_URLS,
+                domain,
+                scope_lock=scope_lock,
+                targets_file=targets_file,
+            )
+            _seed_counts = _seed_urls_into_recon_corpus(recon_dir, _allowed_seeds)
+            log(
+                "ok",
+                "--seed-urls: "
+                f"{len(_allowed_seeds)} in-scope route(s) added to the canonical recon corpus",
+            )
+            if _rejected_seeds:
+                _mark_degraded(
+                    "seed_urls_scope",
+                    f"rejected {len(_rejected_seeds)} off-scope seed URL(s)",
+                )
+                log("warn", f"--seed-urls: rejected {len(_rejected_seeds)} off-scope route(s)")
+            if _seed_counts:
+                log(
+                    "info",
+                    "--seed-urls writes: "
+                    + ", ".join(f"{name}={count}" for name, count in _seed_counts.items()),
+                )
     elif not scan_only:
         if selected_only_mode and (resume or resume_session_id):
             log("info", f"Targeted phase mode: reusing existing recon for {domain}")
@@ -9704,7 +10297,7 @@ def hunt_target(
     # capability was recorded for one of its tools during this run.
     _degraded_tools = {d["tool"] for d in _DEGRADED_CAPABILITIES}
     _phase_tool_map = {
-        "js_analysis":     {"secretfinder", "jsluice", "trufflehog"},
+        "js_analysis":     {"js_analysis", "js_download", "secretfinder", "jsluice", "trufflehog"},
         "secret_hunt":     {"git-hound", "trufflehog"},
         "sqlmap":          {"sqlmap"},
         "jwt_audit":       {"jwt_tool"},
@@ -10212,6 +10805,9 @@ Examples:
     # balancer) otherwise reports false-negative "0 findings" for the protected app. Verify
     # up-front, pin any LB stickiness cookie, FLAG (not abort) so a heuristic miss never
     # blocks a legitimate scan while the report records the coverage as unreliable.
+    _authed = False
+    _why = "no authenticated cookie supplied"
+    _stick = ""
     if getattr(args, "cookie", "") and getattr(args, "target", ""):
         _authed, _why, _stick = _verify_authenticated(args.target, args.cookie)
         if _stick:
@@ -10221,11 +10817,6 @@ Examples:
         # authenticated authz/IDOR/PII audit without threading the cookie through the pipeline.
         global _AUTHED_COOKIE
         _AUTHED_COOKIE = args.cookie
-    # --seed-urls: parse once; run_sqlmap_targeted seeds them into the session's candidate set.
-    global _SEED_URLS
-    _SEED_URLS = _parse_seed_urls(getattr(args, "seed_urls", ""))
-    if _SEED_URLS:
-        log("info", f"--seed-urls: {len(_SEED_URLS)} URL(s) will be added to the sqli/param test set")
         if _authed:
             log("ok", f"Auth pre-flight: {_why}")
         else:
@@ -10235,6 +10826,11 @@ Examples:
                         "valid session cookie and re-run.")
             _mark_degraded("auth", f"--cookie session not authenticated ({_why}); authenticated "
                            "coverage is UNRELIABLE — do NOT read '0 findings' as a clean result")
+    # --seed-urls: parse once; run_sqlmap_targeted seeds them into the session's candidate set.
+    global _SEED_URLS
+    _SEED_URLS = _parse_seed_urls(getattr(args, "seed_urls", ""))
+    if _SEED_URLS:
+        log("info", f"--seed-urls: {len(_SEED_URLS)} URL(s) will be added to the sqli/param test set")
 
     # SECURITY GATE: the brain's AUTONOMOUS exploit loop (auto_triage_and_exploit, reached via
     # post_scan_hook on every confirmed SQLi) issues model-driven --os-shell/--file-write at the

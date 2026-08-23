@@ -27,8 +27,8 @@ def test_large_lists_resolved_in_chunks():
 
 def test_dedup_before_resolve():
     # 24M dup-heavy all.txt must be deduped before chunking (else ~23M wasted lookups)
-    assert re.search(r'sort -u "\$RECON_DIR/subdomains/all\.txt"\s*>\s*"\$DEDUP"', _t()), \
-        "all.txt is not deduped before chunked resolution"
+    assert re.search(r'sort -u "\$DNSX_INPUT"\s*>\s*"\$DEDUP"', _t()), \
+        "DNS-name candidates are not deduped before chunked resolution"
 
 
 def test_empty_chunk_glob_guarded():
@@ -75,3 +75,14 @@ def test_passive_merge_is_source_restricted():
     # the blind glob form must be gone from the authoritative merge
     assert 'cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null \\\n    | tr' not in t, \
         "authoritative merge still globs all *.txt (re-ingests derived artefacts)"
+
+
+def test_explicit_ip_targets_survive_dns_resolution():
+    """dnsx resolves names; literal IPs must bypass it and rejoin the probe set."""
+    t = _t()
+    assert ".explicit_ip_literals.txt" in t
+    assert ".dns_name_candidates.txt" in t
+    assert 'dnsx -silent -a -l "$DNSX_INPUT"' in t
+    assert 'dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt"' not in t
+    assert 'cat "$DNSX_IP_LITERALS" >> "$RECON_DIR/subdomains/resolved.txt"' in t
+    assert "preserved $DNSX_IP_COUNT explicit IP target(s)" in t

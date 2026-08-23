@@ -98,6 +98,14 @@ def test_propagated_soft404_guard():
     assert hunt._propagated_soft404("/admin", "text/html") is False
 
 
+def test_propagation_rejects_generic_admin_directory_paths():
+    import hunt
+    assert hunt._propagatable_exposed_path("/phpmyadmin/") is False
+    assert hunt._propagatable_exposed_path("/admin") is False
+    assert hunt._propagatable_exposed_path("/.env") is True
+    assert hunt._propagatable_exposed_path("/openapi.json") is True
+
+
 # ── G (#4): CSP/header check must evaluate the FINAL page, not the http->https redirect ──
 def test_csp_check_follows_redirects():
     """2026-07-25 engagement: 'Missing CSP' shipped for hosts that DO set CSP on https. The
