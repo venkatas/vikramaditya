@@ -78,3 +78,23 @@ MIT License — Copyright (c) Microsoft Corporation
 
   markitdown_helper.py         <- thin CLI wrapper around MarkItDown
 
+-----------------------------------------------------------------------
+projectdiscovery/uncover — https://github.com/projectdiscovery/uncover
+projectdiscovery/tlsx — https://github.com/projectdiscovery/tlsx
+MIT License — Copyright (c) ProjectDiscovery, Inc.
+-----------------------------------------------------------------------
+
+  recon.sh                 <- optional/ subprocess invoke of uncover (UNCOVER=1)
+                              and tlsx (Phase 3.5 SAN harvest). Vikramaditya does
+                              not vendor uncover/tlsx sources.
+
+-----------------------------------------------------------------------
+xnl-h4ck3r/waymore — https://github.com/xnl-h4ck3r/waymore
+xnl-h4ck3r/xnLinkFinder — https://github.com/xnl-h4ck3r/xnLinkFinder
+MIT License — Copyright (c) xnl-h4ck3r
+-----------------------------------------------------------------------
+
+  recon.sh                 <- subprocess invoke of waymore (archive URLs) and
+                              xnLinkFinder (JS/SPA endpoint mining) when installed.
+                              Not vendored; install via pip (setup.sh).
+
