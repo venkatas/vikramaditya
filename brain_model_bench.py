@@ -215,6 +215,7 @@ def run_one_model(model: str, findings: Path, recon: Path,
         try:
             with open(log, "w") as fh:
                 rc = subprocess.run(cmd, env=env, cwd=str(REPO),
+                                    stdin=subprocess.DEVNULL,
                                     stdout=fh, stderr=subprocess.STDOUT,
                                     timeout=3600).returncode
         except subprocess.TimeoutExpired:

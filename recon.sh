@@ -77,6 +77,22 @@ export PATH="$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # contains "projectdiscovery" — Python httpx --help does not). Falls back
 # to the bare `httpx` token if no PD binary is found anywhere, so existing
 # CI without PD installed still produces a clear error from PATH.
+# httpx_healthy <bin> — bounded, exit-code-aware SEMANTIC health check.
+# Returns 0 ONLY for a genuinely working ProjectDiscovery httpx: `-version`
+# must exit 0 within the timeout, print the "projectdiscovery" banner, and NOT
+# be the unrelated Python `httpx` CLI. Rejects nonzero exit, timeout (rc=124),
+# segfault (rc=139), empty output, and python-httpx. This is the single gate
+# both binary selection and the Phase-3 probe key on — presence is not health.
+httpx_healthy() {
+    local bin="$1" out rc
+    [ -n "$bin" ] || return 1
+    out=$(timeout 20 "$bin" -version 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || return 1                                  # nonzero / 124 timeout / 139 segfault
+    printf '%s' "$out" | grep -qi "python-httpx" && return 1     # the wrong (Python) httpx
+    printf '%s' "$out" | grep -qi "projectdiscovery" || return 1 # PD banner required
+    return 0
+}
+
 _resolve_pd_httpx() {
     local cand
     for cand in \
@@ -86,7 +102,7 @@ _resolve_pd_httpx() {
         "$(command -v httpx 2>/dev/null)"; do
         [ -z "$cand" ] && continue
         [ -x "$cand" ] || continue
-        if "$cand" -version 2>&1 | grep -qi "projectdiscovery"; then
+        if httpx_healthy "$cand"; then
             echo "$cand"; return 0
         fi
     done
@@ -96,11 +112,18 @@ _resolve_pd_httpx() {
     return 1
 }
 HTTPX_BIN="$(_resolve_pd_httpx || true)"
-if ! "$HTTPX_BIN" -version 2>&1 | grep -qi "projectdiscovery"; then
-    echo -e "[!] WARNING: ProjectDiscovery httpx not found on PATH. Live-host probing will fail." >&2
+# HTTPX_HEALTHY is the fail-closed signal the Phase-3 gate and the .probe.done
+# marker guard both consult. 1 only when the resolved binary passes the bounded
+# semantic health check; 0 otherwise (missing / crashing / hanging / python httpx).
+if httpx_healthy "$HTTPX_BIN"; then
+    HTTPX_HEALTHY=1
+else
+    HTTPX_HEALTHY=0
+    echo -e "[!] WARNING: ProjectDiscovery httpx not found or UNHEALTHY (failed bounded -version/banner check)." >&2
+    echo -e "    Live-host probing FAILS CLOSED — the run will not mark probing complete on a broken binary." >&2
     echo -e "    Install with:  GOBIN=\"\$HOME/go/bin\" go install github.com/projectdiscovery/httpx/cmd/httpx@latest" >&2
 fi
-export HTTPX_BIN
+export HTTPX_BIN HTTPX_HEALTHY
 
 # v9.2.0 (P1-7) — DNS wildcard early-detect. Probe 3 random labels under
 # the apex; if all 3 resolve, the zone has a wildcard A record and any
@@ -235,6 +258,37 @@ file_lines() {
     wc -l < "$path" 2>/dev/null | tr -d ' ' || echo 0
 }
 tool_ok()    { command -v "$1" &>/dev/null; }
+
+# ── scope-lock EXACT-HOST allowlist shim (P0, fail-closed) ──────────────────────────────────────
+# SCOPE_ALLOW_FILE (set by hunt.py for domain / --targets-file scope-lock) holds the exact allowlist.
+# _host_in_scope: exit 0 iff $1 is EXACTLY an allowed host. Not scope-locked, or no allowlist set
+# (an IP/CIDR run — scope is the range itself, host-header/archive leaks don't apply) → allow.
+# _scope_filter_file: in-place filter a URL/host file. When an allowlist IS set under scope-lock,
+# BOTH FAIL CLOSED (treat as out-of-scope / drop) on empty allowlist, timeout, or any shim failure.
+SCOPE_ALLOW_FILE="${SCOPE_ALLOW_FILE:-}"
+_host_in_scope() {
+    [ "$SCOPE_LOCK" = "1" ] || return 0
+    [ -n "$SCOPE_ALLOW_FILE" ] || return 0          # no hostname allowlist (IP/CIDR) → not host-gated
+    [ -s "$SCOPE_ALLOW_FILE" ] || return 1          # present-but-empty allowlist → fail closed
+    timeout 15 python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-check \
+        --allow-file "$SCOPE_ALLOW_FILE" "$1" 2>/dev/null
+}
+_scope_filter_file() {
+    [ "$SCOPE_LOCK" = "1" ] || return 0
+    [ -n "$SCOPE_ALLOW_FILE" ] || return 0
+    local f="$1"; [ -s "$f" ] || return 0
+    if [ ! -s "$SCOPE_ALLOW_FILE" ]; then
+        : > "$f"; log_warn "SCOPE_LOCK: empty allowlist — dropped all of $(basename "$f") (fail-closed)"; return 0
+    fi
+    local _before; _before=$(file_lines "$f")
+    if timeout 30 python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-filter \
+            --allow-file "$SCOPE_ALLOW_FILE" --in "$f" --out "$f" 2>/dev/null; then
+        local _after; _after=$(file_lines "$f")
+        [ "$_before" != "$_after" ] && log_warn "SCOPE_LOCK: filtered $(basename "$f") ${_before}→${_after} (off-scope dropped)"
+    else
+        : > "$f"; log_warn "SCOPE_LOCK: scope filter FAILED on $(basename "$f") — dropped (fail-closed)"
+    fi
+}
 # In resume mode: returns 0 (true) if the given file exists and is non-empty → skip phase
 phase_done() {
     local f="$1"
@@ -319,10 +373,22 @@ run_phase5_port_scanning() {
     fi
 
     if tool_ok nmap; then
+        PORT_TARGET_FILE="$RECON_DIR/ports/targets.txt"
+        if [ -s "$RECON_DIR/subdomains/resolved.txt" ]; then
+            sed -E 's#^[a-zA-Z]+://##; s#/.*$##; s/:([0-9]{1,5})$//' \
+                "$RECON_DIR/subdomains/resolved.txt" \
+                | sed '/^$/d' | sort -u > "$PORT_TARGET_FILE"
+        else
+            printf '%s\n' "$TARGET" > "$PORT_TARGET_FILE"
+        fi
+        PORT_TARGET_COUNT=$(file_lines "$PORT_TARGET_FILE")
+
         if tool_ok naabu; then
-            log_step "naabu top-1000 on $TARGET..."
-            naabu -host "$TARGET" -top-ports 1000 -silent \
+            log_step "naabu top-1000 on $PORT_TARGET_COUNT scoped target(s)..."
+            naabu -list "$PORT_TARGET_FILE" -top-ports 1000 -silent \
                 -o "$RECON_DIR/ports/naabu_results.txt" 2>/dev/null || true
+            cp "$RECON_DIR/ports/naabu_results.txt" \
+                "$RECON_DIR/ports/open_host_ports.txt" 2>/dev/null || true
             if [ -f "$RECON_DIR/ports/naabu_results.txt" ]; then
                 awk -F: 'NF>1 {print $2"/open"}' "$RECON_DIR/ports/naabu_results.txt" \
                     | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
@@ -342,19 +408,19 @@ run_phase5_port_scanning() {
 
             if [ -s "$RECON_DIR/ports/open_ports.txt" ]; then
                 PORT_CSV="$(cut -d/ -f1 "$RECON_DIR/ports/open_ports.txt" | paste -sd, -)"
-                log_step "nmap service fingerprinting on naabu-discovered ports: ${PORT_CSV:-none}"
-                nmap -Pn -sV -p "$PORT_CSV" -T4 --open "$TARGET" \
+                log_step "nmap service fingerprinting across $PORT_TARGET_COUNT target(s) on naabu-discovered ports: ${PORT_CSV:-none}"
+                nmap -Pn -sV -p "$PORT_CSV" -T4 --open -iL "$PORT_TARGET_FILE" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
                     -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
             else
                 log_warn "naabu found no open ports — falling back to nmap top-1000"
-                nmap -Pn -sV --top-ports 1000 -T4 --open "$TARGET" \
+                nmap -Pn -sV --top-ports 1000 -T4 --open -iL "$PORT_TARGET_FILE" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
                     -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
             fi
         else
-            log_step "nmap top-1000 on $TARGET..."
-            nmap -Pn -sV --top-ports 1000 -T4 --open "$TARGET" \
+            log_step "nmap top-1000 on $PORT_TARGET_COUNT scoped target(s)..."
+            nmap -Pn -sV --top-ports 1000 -T4 --open -iL "$PORT_TARGET_FILE" \
                 -oN "$RECON_DIR/ports/nmap_results.txt" \
                 -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
         fi
@@ -841,28 +907,44 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
     ALL_COUNT=$(file_lines "$RECON_DIR/subdomains/all.txt")
     DNS_VALIDATED=0                         # 1 only if dnsx actually resolved >0
     DNSX_FAILED_CHUNKS=0                    # >0 if any dnsx pass timed out/segfaulted
+    # An explicit multi-host scope may contain literal public IP addresses.
+    # dnsx is a DNS-name resolver and emits nothing for those inputs, which used
+    # to silently remove every IP before HTTP and port scanning.  Resolve names
+    # only, then union the already-addressed IP targets back into the probe set.
+    DNSX_IP_LITERALS="$RECON_DIR/subdomains/.explicit_ip_literals.txt"
+    DNSX_INPUT="$RECON_DIR/subdomains/.dns_name_candidates.txt"
+    grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?$' \
+        "$RECON_DIR/subdomains/all.txt" > "$DNSX_IP_LITERALS" 2>/dev/null || true
+    grep -Ev '^([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]{1,5})?$' \
+        "$RECON_DIR/subdomains/all.txt" > "$DNSX_INPUT" 2>/dev/null || true
+    DNSX_IP_COUNT=$(file_lines "$DNSX_IP_LITERALS")
+    DNSX_NAME_COUNT=$(file_lines "$DNSX_INPUT")
     # v10.6.0 — treat a non-positive cap as UNCAPPED (route to the single-pass
     # branch) instead of chunking with a bogus `split -l 0/-N` that errors out.
     if [ "${DNSX_CAP:-0}" -le 0 ] 2>/dev/null; then
         DNSX_CAP="$ALL_COUNT"
         [ "$DNSX_CAP" -le 0 ] && DNSX_CAP=1
     fi
-    if tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
-        if [ "$ALL_COUNT" -le "$DNSX_CAP" ]; then
-            log_step "dnsx resolving $ALL_COUNT candidates (A records)..."
+    if [ "$DNSX_NAME_COUNT" -eq 0 ] && [ "$DNSX_IP_COUNT" -gt 0 ]; then
+        cp "$DNSX_IP_LITERALS" "$RECON_DIR/subdomains/resolved.txt"
+        DNS_VALIDATED=1
+        log_done "DNS resolution not applicable: preserved $DNSX_IP_COUNT explicit IP target(s)"
+    elif tool_ok dnsx && [ "${DNSX_SKIP:-0}" != "1" ] && [ -s "$DNSX_INPUT" ]; then
+        if [ "$DNSX_NAME_COUNT" -le "$DNSX_CAP" ]; then
+            log_step "dnsx resolving $DNSX_NAME_COUNT DNS name(s); preserving $DNSX_IP_COUNT explicit IP target(s)..."
             # v10.6.0 (FIX) — capture the exit status instead of swallowing it with
             # `|| true`. On timeout/segfault/rc!=0, resolved.txt holds only the partial
             # set dnsx flushed before dying; mirror the chunked branch: mark the pass
             # FAILED (so DNS_VALIDATED is NOT set and the wildcard dig-filter still
             # runs) and UNION the full candidate set back (fail-OPEN — httpx probes them).
-            if timeout -k 30 300 dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt" </dev/null \
+            if timeout -k 30 300 dnsx -silent -a -l "$DNSX_INPUT" </dev/null \
                 > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null; then
                 :
             else
                 DNSX_FAILED_CHUNKS=1
-                cat "$RECON_DIR/subdomains/all.txt" >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
+                cat "$DNSX_INPUT" >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null || true
                 sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
-                log_warn "dnsx single-pass FAILED (timeout/segfault) — $ALL_COUNT candidates kept UNVALIDATED (httpx will filter); resolution is NOT marked DNS-validated"
+                log_warn "dnsx single-pass FAILED (timeout/segfault) — $DNSX_NAME_COUNT DNS names kept UNVALIDATED (httpx will filter); resolution is NOT marked DNS-validated"
             fi
         else
             # CRITICAL FIX: a candidate list LARGER than the cap must STILL be resolved. The old
@@ -874,7 +956,7 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
             # ceiling; the DEFAULT 2-char suffix caps at 676 and SILENTLY truncates everything past
             # 13.52M lines (split exits 65 but set -e is off, so the loop just runs on the partial set).
             DEDUP="$RECON_DIR/subdomains/.all_dedup.txt"
-            sort -u "$RECON_DIR/subdomains/all.txt" > "$DEDUP"
+            sort -u "$DNSX_INPUT" > "$DEDUP"
             UNIQ_COUNT=$(file_lines "$DEDUP")
             CHUNK_DIR="$RECON_DIR/subdomains/.dnsx_chunks"
             rm -rf "$CHUNK_DIR"; mkdir -p "$CHUNK_DIR"
@@ -910,6 +992,10 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
             rm -f "$DNSX_FAILED_LIST"
             sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
         fi
+        if [ "$DNSX_IP_COUNT" -gt 0 ]; then
+            cat "$DNSX_IP_LITERALS" >> "$RECON_DIR/subdomains/resolved.txt"
+            sort -u -o "$RECON_DIR/subdomains/resolved.txt" "$RECON_DIR/subdomains/resolved.txt"
+        fi
         RES_N=$(file_lines "$RECON_DIR/subdomains/resolved.txt")
         # dnsx now ACTUALLY runs (single-pass or chunked), so non-empty output is real resolution.
         # (The old "resolved.txt == all.txt unfiltered" failure was a `cp` no-op that can no longer
@@ -935,6 +1021,7 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
             log_warn "dnsx skipped (DNSX_SKIP=1) — $ALL_COUNT candidates UNRESOLVED (httpx will filter live)"
         fi
     fi
+    rm -f "$DNSX_IP_LITERALS" "$DNSX_INPUT" 2>/dev/null || true
     # v9.2.0 (P1-7) — when DNS wildcard was detected, every brute-forced
     # candidate "resolves" to the same dead IP. Filter the resolved list
     # using the wildcard IP we captured during _detect_dns_wildcard so
@@ -1084,8 +1171,11 @@ fi
 # wildcard / cap / keywords, so the real site is always tested.
 if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     _PROBE_WITH_APEX="$RECON_DIR/subdomains/.probe_with_apex.txt"
-    { echo "$TARGET"; echo "www.$TARGET"; cat "$HTTPX_TARGET_FILE" 2>/dev/null; } \
+    # P0: www is force-added ONLY when in scope — under scope-lock (apex-only allowlist) it is
+    # dropped. In a normal (non-scope-lock) run _host_in_scope always allows, preserving behavior.
+    { echo "$TARGET"; _host_in_scope "www.$TARGET" && echo "www.$TARGET"; cat "$HTTPX_TARGET_FILE" 2>/dev/null; } \
         | awk 'NF && !seen[$0]++' > "$_PROBE_WITH_APEX" 2>/dev/null || true
+    _scope_filter_file "$_PROBE_WITH_APEX"
     if [ -s "$_PROBE_WITH_APEX" ]; then
         HTTPX_TARGET_FILE="$_PROBE_WITH_APEX"
         # PROBED_COUNT tracks the actual probe-set size; RESOLVED_COUNT stays honest.
@@ -1106,13 +1196,78 @@ log_info "Phase 3: HTTP Probing in batches of $BATCH_SIZE (probing: $PROBED_COUN
 # live-host set on --resume (same fix already applied to Phases 1 and 2).
 if phase_done "$RECON_DIR/live/.probe.done"; then true; else
 
-if ! tool_ok httpx; then
-    log_warn "httpx not installed — skipping HTTP probing"
+if [ "${HTTPX_HEALTHY:-0}" != 1 ]; then
+    # P1 fail-closed: a missing / segfaulting / hanging / Python httpx must NOT
+    # be treated as "0 live hosts". Abort the probe phase WITHOUT writing
+    # .probe.done, so --resume re-runs it once httpx is fixed, and signal the
+    # orchestrator via RECON_PROBE_FAILED instead of proceeding on an empty set.
+    RECON_PROBE_FAILED=1; export RECON_PROBE_FAILED
+    mkdir -p "$RECON_DIR/live"
+    echo "httpx unhealthy (failed bounded -version/banner check) — probe phase not run" \
+        > "$RECON_DIR/live/.probe.failed" 2>/dev/null || true
+    log_err "httpx failed semantic health check — Phase-3 HTTP probing ABORTED (NOT marked complete)."
+    log_err "  Fix ProjectDiscovery httpx and re-run (or --resume). Downstream phases would otherwise assess an empty live set as authoritative."
 else
     # Clear previous output
     : > "$RECON_DIR/live/httpx_full.txt"
     : > "$RECON_DIR/live/httpx_all_tech.txt"
 
+    # ── P1: guaranteed core-hosts probe (apex/www/target), BEFORE the mass loop ──
+    # The mass batch loop can be collateral-killed by CDN/WAF rate-limiting when a
+    # large brute-force/wildcard candidate set floods the edge (real run: a 1502-host
+    # probe of a wildcard-inflated domain → CDN throttled → the live www [200] reported
+    # DEAD → "0 live hosts"), and when enumeration returns 0 only the apex/www are in
+    # scope (WAF-fronted apex). Probe the core hosts in ISOLATION first — browser UA,
+    # low concurrency, retries — so the primary site is captured cleanly, before any
+    # flood-induced throttling, regardless of the mass probe's fate.
+    if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        _CORE_HOSTS="$RECON_DIR/subdomains/.core_hosts.txt"
+        { echo "$TARGET"; _host_in_scope "www.$TARGET" && echo "www.$TARGET"; } \
+            | awk 'NF && !seen[$0]++' > "$_CORE_HOSTS" 2>/dev/null || true
+        _scope_filter_file "$_CORE_HOSTS"
+        if [ -s "$_CORE_HOSTS" ]; then
+            log_step "Core-hosts probe (apex/www, isolated + browser UA) — guarantees the primary site is tested"
+            timeout 45 "$HTTPX_BIN" -l "$_CORE_HOSTS" \
+                -silent -status-code -title -tech-detect -content-length -ip -no-fallback -no-color \
+                -threads 2 -rate-limit 5 -timeout 12 -retries 1 \
+                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+                2>/dev/null >> "$RECON_DIR/live/httpx_full.txt" || true
+            _CORE_N=$(file_lines "$RECON_DIR/live/httpx_full.txt")
+            if [ "$_CORE_N" -eq 0 ]; then
+                # httpx intermittently trips Akamai/CDN bot-mitigation (TLS/JA3 or the
+                # -tech-detect probe fingerprint) even when the host is 200 to a browser.
+                # curl is far more forgiving here — fall back to it and synthesize a
+                # minimal live line ("scheme://host [code]") so the primary site is still
+                # captured. Downstream phases re-fetch, so title/tech/ip filled later.
+                log_step "Core-hosts httpx empty — curl fallback (browser UA, retries)"
+                while IFS= read -r _ch; do
+                    [ -z "$_ch" ] && continue
+                    for _sch in https http; do
+                        _cc=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 20 --retry 2 --retry-delay 2 \
+                              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+                              "$_sch://$_ch" 2>/dev/null | tail -c 3)
+                        # accept ONLY a real HTTP status (1xx–5xx). 000 / empty = connection
+                        # failed/throttled — do NOT synthesize a fake-live host.
+                        if printf '%s' "$_cc" | grep -qE '^[1-5][0-9][0-9]$'; then
+                            echo "$_sch://$_ch [$_cc]" >> "$RECON_DIR/live/httpx_full.txt"
+                            break
+                        fi
+                    done
+                done < "$_CORE_HOSTS"
+                _CORE_N=$(file_lines "$RECON_DIR/live/httpx_full.txt")
+            fi
+            if [ "$_CORE_N" -gt 0 ]; then
+                log_ok "Core-hosts probe: $_CORE_N live (primary site reachable)"
+            else
+                log_warn "Core-hosts probe: apex/www unreachable via httpx AND curl — host may be blocking this source"
+            fi
+        fi
+    fi
+
+    # P1 per-batch crash accounting: PROBE_CRASHES counts batches where httpx
+    # exited abnormally (124 timeout / 139 segfault / any nonzero) AND produced
+    # no new lines. If EVERY batch crashes we must not write a completion marker.
+    PROBE_CRASHES=0
     BATCH_NUM=0
     TOTAL_BATCHES=$(( (PROBED_COUNT + BATCH_SIZE - 1) / BATCH_SIZE ))
 
@@ -1153,16 +1308,31 @@ else
             -rate-limit "$RATE_LIMIT" \
             -timeout 6 \
             -retries 1 \
-            2>/dev/null >> "$RECON_DIR/live/httpx_full.txt" || true
+            2>/dev/null >> "$RECON_DIR/live/httpx_full.txt"
+        BATCH_RC=$?
 
         BATCH_END=$(date +%s)
         BATCH_ELAPSED=$(( BATCH_END - BATCH_START ))
         NEW_LIVE=$(file_lines "$RECON_DIR/live/httpx_full.txt")
         BATCH_FOUND=$(( NEW_LIVE - LIVE_SO_FAR ))
+        # A batch is a CRASH only when httpx exited abnormally AND added no lines
+        # (rc=0 with 0 new lines is a legitimately-empty batch, not a failure).
+        if [ "$BATCH_RC" -ne 0 ] && [ "$BATCH_FOUND" -eq 0 ]; then
+            PROBE_CRASHES=$(( PROBE_CRASHES + 1 ))
+            log_warn "  → Batch $BATCH_NUM httpx exited abnormally (rc=$BATCH_RC) with no output — counted as crashed batch"
+        fi
         log_step "  → Batch $BATCH_NUM done in ${BATCH_ELAPSED}s | found $BATCH_FOUND live hosts this batch | total live: $NEW_LIVE"
 
         rm -f "$BATCH_FILE"
     done
+
+    # P1: dedup by URL (first field) keeping FIRST occurrence — the isolated core-hosts
+    # probe wrote first, so its clean result wins over any rate-limited duplicate the
+    # mass loop appended for the same apex/www host.
+    if [ -s "$RECON_DIR/live/httpx_full.txt" ]; then
+        awk '!seen[$1]++' "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/.httpx_dedup.txt" 2>/dev/null \
+            && mv "$RECON_DIR/live/.httpx_dedup.txt" "$RECON_DIR/live/httpx_full.txt"
+    fi
 
     LIVE_COUNT=$(file_lines "$RECON_DIR/live/httpx_full.txt")
 
@@ -1249,7 +1419,11 @@ else
     # leaks the origin IP, then verify each candidate with a Host-header probe.
     # Output: live/cf_origin.json {target:{verified:[{ip,status,title}], bypass}}.
     _CFH="$(dirname "$0")/cf_origin_hunt.py"
-    if [ -s "$RECON_DIR/live/cdn_map.json" ] \
+    # P0: cf_origin_hunt actively probes OFF-SCOPE sibling hosts / candidate origin IPs (WAF bypass) —
+    # that is host-discovery expansion, so it is disabled entirely under scope-lock.
+    if [ "$SCOPE_LOCK" = "1" ]; then
+        log_warn "Origin-IP discovery (cf_origin_hunt) SKIPPED under scope-lock (off-scope host expansion)"
+    elif [ -s "$RECON_DIR/live/cdn_map.json" ] \
        && grep -q '"cdn"\|"waf"' "$RECON_DIR/live/cdn_map.json" 2>/dev/null \
        && [ -f "$_CFH" ] && command -v python3 >/dev/null 2>&1; then
         # Feed the DNS-RESOLVED hosts (dozens), NOT all.txt — which carries thousands of
@@ -1294,7 +1468,21 @@ else
     # full batch loop AND downstream URL/IP/status extraction complete; a kill
     # mid-loop leaves no marker, so --resume re-runs the probe instead of locking
     # in a partial live set. MUST stay outside the batch loop.
-    date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/live/.probe.done" 2>/dev/null || true
+    # P1 fail-closed guard: if EVERY batch crashed (0 live AND crashes == batches)
+    # the "0 live hosts" result is a tool failure, not a genuinely empty target —
+    # do NOT write the marker, so --resume re-probes; flag the failure instead.
+    if [ "${LIVE_COUNT:-0}" -eq 0 ] && [ "${TOTAL_BATCHES:-0}" -gt 0 ] \
+       && [ "${PROBE_CRASHES:-0}" -ge "${TOTAL_BATCHES:-0}" ]; then
+        RECON_PROBE_FAILED=1; export RECON_PROBE_FAILED
+        echo "httpx crashed/timed out on all $TOTAL_BATCHES batch(es) — 0 live is a tool failure" \
+            > "$RECON_DIR/live/.probe.failed" 2>/dev/null || true
+        log_err "Phase-3 ABORTED — httpx crashed/timed out on all $TOTAL_BATCHES batch(es); '0 live hosts' is a tool failure, not an empty target."
+        log_err "  .probe.done NOT written — re-run/--resume will re-probe. Do not trust this run's live set."
+    else
+        [ "${PROBE_CRASHES:-0}" -gt 0 ] && log_warn "Phase-3 completed with $PROBE_CRASHES/$TOTAL_BATCHES crashed batch(es) — live set may be partial (degraded)."
+        rm -f "$RECON_DIR/live/.probe.failed" 2>/dev/null || true   # clear any stale failure marker from a prior run
+        date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/live/.probe.done" 2>/dev/null || true
+    fi
 fi
 fi  # end Phase 3 resume skip
 
@@ -1450,25 +1638,75 @@ log_info "Phase 6: URL Collection"
 # before the merge previously looked "done" to phase_done and skipped the rest.
 if phase_done "$RECON_DIR/urls/.urls.done"; then true; else
 
+# Archive tools accept hostnames, not IP literals. Build the input from the
+# resolved scope so a --targets-file run does not silently query only $TARGET.
+ARCHIVE_TARGETS="$RECON_DIR/urls/archive_targets.txt"
+python3 - "$RECON_DIR/subdomains/resolved.txt" "$ARCHIVE_TARGETS" "$TARGET" <<'PY' 2>/dev/null || true
+import ipaddress
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+source, destination, fallback = sys.argv[1:]
+seen = set()
+targets = []
+
+def add(raw):
+    value = raw.strip()
+    if not value or value.startswith("#"):
+        return
+    try:
+        if "://" in value:
+            host = urlsplit(value).hostname or ""
+        else:
+            candidate = value.strip("[]")
+            if candidate.count(":") == 1:
+                left, right = candidate.rsplit(":", 1)
+                candidate = left if right.isdigit() else candidate
+            host = candidate
+        host = host.rstrip(".").lower()
+        ipaddress.ip_address(host)
+        return
+    except ValueError:
+        pass
+    if host and host not in seen:
+        seen.add(host)
+        targets.append(host)
+
+path = Path(source)
+if path.is_file():
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        add(line)
+add(fallback)
+Path(destination).write_text("".join(f"{host}\n" for host in targets), encoding="utf-8")
+PY
+log_step "archive target list: $(file_lines "$ARCHIVE_TARGETS") hostname(s)"
+
 # gau — historical URLs from multiple sources
 if tool_ok gau; then
     log_step "gau (historical URLs)..."
-    echo "$TARGET" | timeout -k 15 "$GAU_TIMEOUT" gau --threads 5 \
+    timeout -k 15 "$GAU_TIMEOUT" gau --threads 5 \
+        < "$ARCHIVE_TARGETS" \
         --o "$RECON_DIR/urls/gau.txt" 2>/dev/null || \
-    echo "$TARGET" | timeout -k 15 "$GAU_TIMEOUT" gau > "$RECON_DIR/urls/gau.txt" 2>/dev/null || true
+    timeout -k 15 "$GAU_TIMEOUT" gau \
+        < "$ARCHIVE_TARGETS" > "$RECON_DIR/urls/gau.txt" 2>/dev/null || true
     log_done "gau: $(file_lines "$RECON_DIR/urls/gau.txt") URLs"
 else
     log_warn "gau not installed — using Wayback fallback"
-    curl -s --max-time 30 \
-        "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey&limit=10000" \
-        > "$RECON_DIR/urls/wayback.txt" 2>/dev/null || true
+    : > "$RECON_DIR/urls/wayback.txt"
+    while IFS= read -r _archive_host; do
+        [ -n "$_archive_host" ] || continue
+        curl -s --max-time 30 \
+            "https://web.archive.org/cdx/search/cdx?url=*.$_archive_host/*&output=text&fl=original&collapse=urlkey&limit=10000" \
+            >> "$RECON_DIR/urls/wayback.txt" 2>/dev/null || true
+    done < "$ARCHIVE_TARGETS"
     log_done "wayback: $(file_lines "$RECON_DIR/urls/wayback.txt") URLs"
 fi
 
 # waybackurls — extra coverage (timeout-bounded; the Wayback API can hang forever)
 if tool_ok waybackurls; then
     log_step "waybackurls..."
-    echo "$TARGET" | timeout -k 15 "$WAYBACK_TIMEOUT" waybackurls \
+    timeout -k 15 "$WAYBACK_TIMEOUT" waybackurls < "$ARCHIVE_TARGETS" \
         > "$RECON_DIR/urls/waybackurls.txt" 2>/dev/null || true
     log_done "waybackurls: $(file_lines "$RECON_DIR/urls/waybackurls.txt") URLs"
 fi
@@ -1491,7 +1729,15 @@ if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
     # priority ORDER (the old `sort -u | head -50` alphabetised first, so the
     # cap kept a-z-sorted hosts and dropped lower-alphabet criticals). The cap is
     # now env-controllable: KATANA_HOST_CAP (default 50, 0 = uncapped).
-    KATANA_HOST_CAP="${KATANA_HOST_CAP:-50}"
+    # A hunt.py --full run sends FULL_RECON=1 and must not silently retain the
+    # bounded 50-host default. An explicitly supplied KATANA_HOST_CAP still wins.
+    if [ -z "${KATANA_HOST_CAP+x}" ]; then
+        if [ "${FULL_RECON:-0}" = "1" ]; then
+            KATANA_HOST_CAP=0
+        else
+            KATANA_HOST_CAP=50
+        fi
+    fi
     {
         [ -s "$RECON_DIR/priority/critical_hosts.txt" ] && cat "$RECON_DIR/priority/critical_hosts.txt"
         [ -s "$RECON_DIR/priority/high_hosts.txt" ]     && cat "$RECON_DIR/priority/high_hosts.txt"
@@ -1505,18 +1751,20 @@ if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
         cp "$RECON_DIR/urls/.katana_targets.all" "$RECON_DIR/urls/katana_targets.txt"
     fi
     rm -f "$RECON_DIR/urls/.katana_targets.all"
+    _scope_filter_file "$RECON_DIR/urls/katana_targets.txt"
     _KATANA_TGT_N=$(file_lines "$RECON_DIR/urls/katana_targets.txt")
     log_step "katana target list: $_KATANA_TGT_N hosts (cap=${KATANA_HOST_CAP}; 0=uncapped, priority-ordered)"
 
     timeout 300 katana -list "$RECON_DIR/urls/katana_targets.txt" \
         -d 3 -silent -jc \
         -crawl-duration 300 \
-        -o "$RECON_DIR/urls/katana.txt" 2>/dev/null || true
+        -o "$RECON_DIR/urls/katana.txt" >/dev/null 2>&1 || true
     log_done "katana: $(file_lines "$RECON_DIR/urls/katana.txt") URLs (5 min cap)"
 fi
 
 # Merge all URLs
 cat "$RECON_DIR/urls/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/urls/all.txt" || true
+_scope_filter_file "$RECON_DIR/urls/all.txt"   # P0: drop off-scope archive/crawl URLs (gau/wayback/waymore/katana) under scope-lock
 TOTAL_URLS_RAW=$(file_lines "$RECON_DIR/urls/all.txt")
 log_ok "Total unique URLs (raw): $TOTAL_URLS_RAW"
 
@@ -1809,7 +2057,10 @@ fi  # end Phase 7 resume skip
 # ============================================================
 echo ""
 log_info "Phase 7.5: Virtual Host Discovery (Host header fuzzing)"
-if phase_done "$RECON_DIR/vhosts/found.txt"; then true; else
+if phase_done "$RECON_DIR/vhosts/found.txt"; then true; elif [ "$SCOPE_LOCK" = "1" ]; then
+    log_warn "Phase 7.5: virtual-host fuzzing SKIPPED under scope-lock (no Host: FUZZ.\$TARGET expansion)"
+    mkdir -p "$RECON_DIR/vhosts"; : > "$RECON_DIR/vhosts/found.txt"
+else
 
 mkdir -p "$RECON_DIR/vhosts"
 # Use resolved subdomains as Host header wordlist, fuzz against live IPs

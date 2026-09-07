@@ -54,3 +54,25 @@ def test_normal_scanner_findings_pass_through():
           _f(severity="critical", raw="sqlmap: boolean-blind SQLi confirmed")]
     kept = reporter._apply_verification_gating(fs)
     assert len(kept) == 3, "real tool findings must all be kept"
+
+
+def test_posture_configuration_observed_is_kept():
+    f = _f(severity="medium", raw="", vtype="email_auth",
+           finding_kind="posture", verification_method="configuration_observed")
+    kept = reporter._apply_verification_gating([f])
+    assert len(kept) == 1
+
+
+def test_explicit_unknown_verification_method_is_fail_closed():
+    # Producer set a field — do not stamp EXPLOITED; unknown => UNVERIFIED.
+    # Medium+ UNVERIFIED is droppable.
+    f = _f(severity="high", raw="nuclei: something", verification_method="not_a_real_method")
+    assert reporter._apply_verification_gating([f]) == []
+
+
+def test_explicit_reflected_method_is_honored():
+    f = _f(severity="high", raw="xss reflected", verification_method="reflected")
+    kept = reporter._apply_verification_gating([f])
+    assert len(kept) == 1
+    # reflected is weak proof — severity may be adjusted downward
+    assert kept[0]["severity"] in ("high", "medium", "low")

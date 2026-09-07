@@ -131,3 +131,19 @@ logs/
 
 # IDE/agent local config (not part of the tool)
 .antigravitycli/
+
+# Local LLM weights (multi-GB MLX/GGUF model downloads — never commit)
+models/
+
+# Third-party tool clones (installed at runtime via setup, not vendored source)
+/tools/LinkFinder/
+/tools/SecretFinder/
+/tools/XSStrike/
+/tools/graphql-cop/
+/tools/nomore403/
+
+# Friends (codex/grok) review scratch — engagement/session artifacts
+.friends_*/
+
+# Saved target pages / scan evidence — client data, never commit
+/homepage.html

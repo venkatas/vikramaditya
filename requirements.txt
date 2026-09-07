@@ -26,6 +26,8 @@ ollama>=0.4.0
 httpx>=0.27.0
 requests>=2.32.4
 python-dateutil>=2.8.2
+# URL normalization used by recon.sh.  uro is a Python CLI, not a Go module.
+uro>=1.0.2
 
 # ── Email auth audit (SPF/DMARC/DKIM/MTA-STS/BIMI/DNSSEC) ────────────────────
 # email_audit.py was ported in v7.2.0 from venkatas/subspace-sentinel (MIT).
@@ -44,9 +46,8 @@ magika>=0.6.0
 # ── Whitebox VAPT (AWS cloud integration) ────────────────────────────────────
 boto3>=1.34.0,<1.36
 botocore>=1.34.0,<1.36
-# prowler-cloud is hard-pinned because OCSF JSON output schema is parser-coupled (see audit/normalizer.py).
-prowler-cloud==4.5.0
-principalmapper>=1.1.5
+# Prowler and PrincipalMapper have separate, isolated requirement files. Their
+# dependency pins conflict with the main scanner environment.
 PyYAML>=6.0
 # Test-only (already in dev environments, but pinned here for whitebox)
 moto[all]>=5.0.0,<6
@@ -56,9 +57,13 @@ moto[all]>=5.0.0,<6
 curl_cffi>=0.7.0    # graceful-degrades to stock httpx if the native wheel is unavailable
 lxml>=5.0.0
 PyJWT>=2.12.0
-cryptography>=42.0.0    # jwt_kid_injection.py: derives a real RSA public-key PEM from a
+cryptography>=45.0.1,<49  # joserfc>=1.6.4 needs >=45.0.1; msal 1.36 needs <49.
+                        # jwt_kid_injection.py derives a real RSA public-key PEM from a
                         # JWKS JWK (via jwt.algorithms.RSAAlgorithm.from_jwk) for the
                         # RS256->HS256 confusion HMAC secret — must be the actual key
                         # bytes a real verifier holds, not the JWK's raw encoded text.
 ldap3>=2.9.1
 h2>=4.1.0
+# openapi-spec-validator>=0.8.5 requires this range.  Pin it directly so
+# installation cannot leave the environment in a pip-check-inconsistent state.
+jsonschema>=4.24.0,<5

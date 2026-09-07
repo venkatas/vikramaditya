@@ -184,7 +184,11 @@ def test_check_tool_readiness_satisfied_when_config_present(tmp_path, monkeypatc
     (tmp_path / "config.yml").write_text("github_access_tokens: [abc]\n")
     (wl / "api-endpoints.txt").write_text("/api\n")
     (wl / "jwt-secrets.txt").write_text("secret\n")
+    # P2 — required payload lists must be present-and-valid or check_tool_readiness flags them
+    for _n in ("sqli-payloads.txt", "xss-payloads.txt", "ssrf-payloads.txt", "redirect-payloads.txt"):
+        (wl / _n).write_text("\n".join(f"payload-entry-{i}" for i in range(10)) + "\n")
     monkeypatch.setattr(hunt, "WORDLIST_DIR", str(wl))
+    monkeypatch.setattr(hunt, "_httpx_readiness_reason", lambda *a, **k: None)  # healthy httpx
     gaps = hunt.check_tool_readiness(["git-hound", "kiterunner", "jwt_tool"])
     assert gaps == []
 
@@ -192,7 +196,12 @@ def test_check_tool_readiness_satisfied_when_config_present(tmp_path, monkeypatc
 def test_check_tool_readiness_ignores_absent_tools(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(hunt, "HOME", str(tmp_path))
-    monkeypatch.setattr(hunt, "WORDLIST_DIR", str(tmp_path / "wordlists"))
+    wl = tmp_path / "wordlists"
+    wl.mkdir()
+    for _n in ("sqli-payloads.txt", "xss-payloads.txt", "ssrf-payloads.txt", "redirect-payloads.txt"):
+        (wl / _n).write_text("\n".join(f"payload-entry-{i}" for i in range(10)) + "\n")
+    monkeypatch.setattr(hunt, "WORDLIST_DIR", str(wl))
+    monkeypatch.setattr(hunt, "_httpx_readiness_reason", lambda *a, **k: None)  # healthy httpx
     # git-hound NOT in the installed list -> not flagged.
     gaps = hunt.check_tool_readiness(["nmap", "sqlmap"])
     assert gaps == []

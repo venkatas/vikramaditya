@@ -57,11 +57,78 @@ log_ok "Activated virtual environment: $VENV_DIR"
 # Install core dependencies from requirements.txt
 if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
     echo "[*] Installing core dependencies from requirements.txt..."
-    if pip3 install --quiet -r "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
+    if "$VENV_DIR/bin/python" -m pip install --quiet -r "$SCRIPT_DIR/requirements.txt"; then
         log_ok "Core dependencies installed successfully"
     else
-        log_err "Failed to install some dependencies from requirements.txt"
+        log_err "Core dependency installation failed; setup cannot continue with a partial Python environment"
+        exit 1
     fi
+    if "$VENV_DIR/bin/python" -m pip check; then
+        log_ok "Python dependency consistency check passed"
+    else
+        log_err "Python dependency consistency check failed after requirements installation"
+        exit 1
+    fi
+fi
+
+# Prowler 4.5 and PrincipalMapper are required for AWS whitebox coverage but
+# cannot share the main venv. Prowler pins cryptography 43 and pydantic 1 while
+# the main scanner requires newer cryptography and pydantic. Install and verify
+# both tools in isolated environments instead of leaving requirements.txt
+# impossible to resolve.
+VIKRAMADITYA_ISOLATED_ROOT="${VIKRAMADITYA_ISOLATED_ROOT:-$HOME/.venvs}"
+ISOLATED_PYTHON="$(command -v python3.11 2>/dev/null || command -v python3)"
+
+install_isolated_python_tool() {
+    local label="$1"
+    local venv_dir="$2"
+    local requirements_file="$3"
+    local binary_name="$4"
+
+    if [ ! -f "$requirements_file" ]; then
+        log_err "$label requirements file missing: $requirements_file"
+        return 1
+    fi
+    if [ ! -x "$venv_dir/bin/python" ]; then
+        log_warn "Creating isolated $label environment at $venv_dir..."
+        if ! "$ISOLATED_PYTHON" -m venv "$venv_dir"; then
+            log_err "$label isolated environment creation failed"
+            return 1
+        fi
+    fi
+    if ! "$venv_dir/bin/python" -m pip install --quiet -r "$requirements_file"; then
+        log_err "$label dependency installation failed"
+        return 1
+    fi
+    if ! "$venv_dir/bin/python" -m pip check; then
+        log_err "$label dependency consistency check failed"
+        return 1
+    fi
+    if [ ! -x "$venv_dir/bin/$binary_name" ]; then
+        log_err "$label command missing after installation: $venv_dir/bin/$binary_name"
+        return 1
+    fi
+    if ! "$venv_dir/bin/$binary_name" --help >/dev/null 2>&1; then
+        log_err "$label command failed its readiness probe"
+        return 1
+    fi
+    log_ok "$label isolated environment is ready: $venv_dir/bin/$binary_name"
+}
+
+if ! install_isolated_python_tool \
+    "Prowler" \
+    "$VIKRAMADITYA_ISOLATED_ROOT/prowler" \
+    "$SCRIPT_DIR/requirements-prowler.txt" \
+    "prowler"; then
+    exit 1
+fi
+
+if ! install_isolated_python_tool \
+    "PrincipalMapper" \
+    "$VIKRAMADITYA_ISOLATED_ROOT/pmapper" \
+    "$SCRIPT_DIR/requirements-pmapper.txt" \
+    "pmapper"; then
+    exit 1
 fi
 
 # Propagate Go Path to running session
@@ -127,7 +194,6 @@ GO_TOOLS=(
     "github.com/projectdiscovery/mapcidr/cmd/mapcidr@latest"
     "github.com/projectdiscovery/alterx/cmd/alterx@latest"
     "github.com/projectdiscovery/urlfinder/cmd/urlfinder@latest"
-    "github.com/s0md3v/uro@latest"
     "github.com/KathanP19/Gxss@latest"
     # v10.7.0 — recon binaries recon.sh already calls but setup.sh never installed
     "github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
@@ -156,7 +222,6 @@ GO_TOOL_NAMES=(
     "mapcidr"
     "alterx"
     "urlfinder"
-    "uro"
     "Gxss"
     "tlsx"
     "shuffledns"
@@ -522,34 +587,49 @@ MISSING=0
 for tool in "${ALL_TOOLS[@]}"; do
     if command -v "$tool" &>/dev/null; then
         log_ok "$tool: $(which "$tool")"
-        ((INSTALLED++))
+        ((++INSTALLED))
     else
         log_err "$tool: NOT FOUND"
-        ((MISSING++))
+        ((++MISSING))
     fi
 done
 
 if [ -f "$REPO_TOOLS_DIR/drupalgeddon2.py" ]; then
     log_ok "drupalgeddon2.py: $REPO_TOOLS_DIR/drupalgeddon2.py"
-    ((INSTALLED++))
+    ((++INSTALLED))
 else
     log_err "drupalgeddon2.py: NOT FOUND"
-    ((MISSING++))
+    ((++MISSING))
 fi
 
 for local_tool in "LinkFinder/linkfinder.py" "SecretFinder/SecretFinder.py" "XSStrike/xsstrike.py"; do
     tool_name="${local_tool%%/*}"
     if [ -d "$REPO_TOOLS_DIR/$tool_name" ]; then
         log_ok "$tool_name: $REPO_TOOLS_DIR/$tool_name/"
-        ((INSTALLED++))
+        ((++INSTALLED))
     else
         log_err "$tool_name: NOT FOUND in $REPO_TOOLS_DIR/"
-        ((MISSING++))
+        ((++MISSING))
     fi
 done
+
+READINESS_FAILED=0
+if "$VENV_DIR/bin/python" "$SCRIPT_DIR/environment_readiness.py"; then
+    log_ok "Environment readiness checks passed"
+else
+    log_err "Environment readiness checks failed"
+    READINESS_FAILED=1
+fi
 
 echo ""
 echo "============================================="
 echo "  Installed: $INSTALLED / $((${#ALL_TOOLS[@]} + 4)) tools"
 [ "$MISSING" -gt 0 ] && echo "  Missing: $MISSING (check errors above)"
 echo "============================================="
+
+if [ "$MISSING" -gt 0 ] || [ "$READINESS_FAILED" -ne 0 ]; then
+    log_err "Installation is incomplete; required tools or dependencies are not ready"
+    exit 1
+fi
+
+log_ok "Installation complete and ready"

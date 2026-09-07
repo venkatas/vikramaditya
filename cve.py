@@ -301,10 +301,23 @@ AMBIGUOUS_BARE_TECHS = {
 }
 
 
+def _looks_like_ip(s: str) -> bool:
+    """True if the token is an IPv4/IPv6 literal (httpx records the resolved IP as a
+    'tech' tag; a CVE keyword search on an IP is meaningless and floods parse errors)."""
+    import ipaddress
+    try:
+        ipaddress.ip_address(s.strip().strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
 def _is_searchable_tech(tech_name: str) -> bool:
     """Gate which detected tech tokens are worth a CVE-database keyword search."""
     tl = (tech_name or "").lower().strip()
     if not tl or len(tl) < 2:
+        return False
+    if _looks_like_ip(tl):
         return False
     if tl in NON_PRODUCT_TECHS:
         return False

@@ -23,6 +23,7 @@ Coverage narrows ONLY behind an explicit flag (v10.5.0):
 | `--no-scope-lock` | Force full subdomain enum (override the interactive prompt) |
 | `--max-urls N` | Cap the crawled URL surface at N (default `0` = unlimited) |
 | `--focused` | Run the focused (high-yield) checklist instead of the full one |
+| `--allow-destructive` | Authorize **LIVE msfconsole** exploitation (meterpreter reverse_tcp staging) on confirmed-vulnerable Drupal/WordPress/Tomcat/JBoss hosts. **Fail-closed:** without it — including a bare/default or `--full` run — exploit phases only WRITE `.rc` resource files for review; no reverse shell is ever staged. Applies to default, `--full`, and `--autonomous` alike. |
 
 (Active third-party calls stay opt-in: `--assess-creds` for cloud-credential
 blast-radius, and the whitebox `autonomous_default` config gate.)

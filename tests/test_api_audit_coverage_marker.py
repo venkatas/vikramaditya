@@ -78,10 +78,16 @@ def test_write_outputs_emits_capped_markers(tmp_path):
     assert "20 of 47 probed (CAPPED by --max-hosts=20, 27 untested)" in summary
     assert "60 of 400 (CAPPED by --max-ops=60, 340 untested)" in summary
 
-    cov = json.loads((out / "coverage.json").read_text())
+    # Rich api-audit record now lives in its own file (coverage.json is the canonical list).
+    cov = json.loads((out / "api_coverage.json").read_text())
     assert cov["degraded"] is True
     assert cov["total_hosts"] == 47 and cov["probed_hosts"] == 20
     assert cov["total_probeable_public_operations"] == 400
+
+    # coverage.json is the canonical list and carries the api_audit degradation (append, not overwrite)
+    canon = json.loads((out / "coverage.json").read_text())
+    assert isinstance(canon, list)
+    assert any(e.get("source") == "api_audit" and "capped" in e.get("reason", "").lower() for e in canon)
 
     marker = out / "COVERAGE_CAPPED.marker"
     assert marker.is_file(), "a degradation marker file must exist when capped"
@@ -102,7 +108,7 @@ def test_write_outputs_no_marker_when_full(tmp_path):
     summary = (out / "summary.md").read_text()
     assert "CAPPED" not in summary
     assert not (out / "COVERAGE_CAPPED.marker").is_file()
-    cov = json.loads((out / "coverage.json").read_text())
+    cov = json.loads((out / "api_coverage.json").read_text())
     assert cov["degraded"] is False
 
 
@@ -121,5 +127,5 @@ def test_discover_only_suppresses_op_cap_marker(tmp_path):
     api_audit.write_outputs(out, [], [], [], raw_specs=[], coverage=coverage)
     summary = (out / "summary.md").read_text()
     assert "Public operations probed" not in summary
-    cov = json.loads((out / "coverage.json").read_text())
+    cov = json.loads((out / "api_coverage.json").read_text())
     assert cov["degraded"] is False
