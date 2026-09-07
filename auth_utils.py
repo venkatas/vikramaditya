@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -258,6 +259,13 @@ class AuthSession:
         self._creds = None
         self._login_url = None
         self.token = None
+        # friends full-tool review F14: count transport failures (TLS/timeout/conn
+        # reset) separately from real HTTP responses. request() used to collapse
+        # every exception to status:0, which downstream 'status in (200,201)' checks
+        # treat as a benign non-hit — so a systematic transport failure produced a
+        # clean-looking 0-finding run with no coverage-loss signal.
+        self.transport_errors = 0
+        self.total_requests = 0
         # Cookie name carrying the auth token for explicit-token requests. Defaults to
         # 'cf_at' but is overwritten in auto_login() with whichever cookie the server
         # actually set the JWT in (cf_at/access_token/jwt/token/session), so cookie-only
@@ -568,6 +576,7 @@ class AuthSession:
                 body = resp.json()
             except Exception:
                 body = resp.text[:2000]
+            self.total_requests += 1
             return {
                 "status": resp.status_code,
                 "headers": dict(resp.headers),
@@ -576,7 +585,17 @@ class AuthSession:
                 "method": method,
             }
         except Exception as e:
-            return {"status": 0, "headers": {}, "body": str(e), "url": url, "method": method}
+            # F14: a transport failure is NOT an absent endpoint. Mark it distinctly
+            # and count it so a systematic failure (bad token, TLS, proxy outage)
+            # surfaces as lost coverage instead of a benign 0-finding run.
+            self.total_requests += 1
+            self.transport_errors += 1
+            if self.transport_errors in (1, 5, 25) or self.transport_errors % 100 == 0:
+                print(f"[auth_utils] WARNING: transport failure #{self.transport_errors} "
+                      f"({type(e).__name__}) on {method} {url} — these are COVERAGE LOSS, "
+                      f"not clean non-hits: {str(e)[:120]}", file=sys.stderr)
+            return {"status": 0, "headers": {}, "body": str(e), "url": url,
+                    "method": method, "transport_error": True, "error": str(e)}
 
 
 class FindingSaver:

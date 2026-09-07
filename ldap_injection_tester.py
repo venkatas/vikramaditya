@@ -19,9 +19,40 @@ _LDAP_STACK_MARKERS = {
     "samba-ad", "389-ds",
 }
 
+# friends full-tool review F8: tech-fingerprint names alone never carry the
+# markers above, so the gate always skipped. These are the LDAP/AD signals a
+# blackbox scan actually observes — enterprise SSO/ADFS/CAS login URL paths, and
+# NTLM/Negotiate/Kerberos WWW-Authenticate challenges (the classic AD tell).
+_LDAP_URL_PATTERNS = (
+    "/adfs", "/sso", "/cas/login", "/cas/", "/simplesaml", "/openam", "/nidp",
+    "/oam/", "/siteminder", "/ldap", "/openidm", "/nds",
+)
+_NTLM_AUTH_MARKERS = ("negotiate", "ntlm", "kerberos")
 
-def looks_like_ldap_backed_auth(fingerprint_tags: set[str]) -> bool:
-    return bool(fingerprint_tags & _LDAP_STACK_MARKERS)
+
+def looks_like_ldap_backed_auth(fingerprint_tags: set[str], urls=None,
+                                www_authenticate=None) -> bool:
+    """True when the target's auth is plausibly LDAP/AD-backed.
+
+    Signals (any one suffices):
+      - a tech tag in _LDAP_STACK_MARKERS;
+      - an enterprise SSO/ADFS/CAS login URL path (F8 — the common blackbox tell);
+      - an NTLM/Negotiate/Kerberos WWW-Authenticate challenge (AD-integrated auth).
+    """
+    if fingerprint_tags & _LDAP_STACK_MARKERS:
+        return True
+    if urls:
+        blob = " ".join(str(u).lower() for u in urls)
+        if any(p in blob for p in _LDAP_URL_PATTERNS):
+            return True
+    if www_authenticate:
+        if isinstance(www_authenticate, (list, set, tuple)):
+            vals = " ".join(str(v).lower() for v in www_authenticate)
+        else:
+            vals = str(www_authenticate).lower()
+        if any(m in vals for m in _NTLM_AUTH_MARKERS):
+            return True
+    return False
 
 
 def build_rfc4515_fuzz_payloads() -> list[str]:

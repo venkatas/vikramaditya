@@ -396,25 +396,69 @@ class HARVAPTEngine:
                                           evidence=ctx, param=param, payload=payload)
                                 results['vulnerable'].append(url)
                                 break
-                        # SSTI
-                        if payload == '{{7*7}}' and '49' in body:
-                            self._log('critical', 'SSTI', url,
-                                      f"Template expression evaluated in param '{param}'",
-                                      param=param, payload=payload)
-                            results['vulnerable'].append(url)
-                            break
-                        if payload == '${7*7}' and '49' in body:
-                            self._log('critical', 'SSTI (EL)', url,
-                                      f"EL expression evaluated in param '{param}'",
-                                      param=param, payload=payload)
-                            results['vulnerable'].append(url)
-                            break
                     except Exception:
                         pass
+                # SSTI is confirmed by a dedicated evaluation probe (NOT the '49 in
+                # body' substring heuristic, which fired on any page containing 49 —
+                # friends full-tool review F4). Run once per param.
+                if self._probe_ssti(url, method, base_params, param):
+                    results['vulnerable'].append(url)
             results['tested'] += 1
-
         self.test_results['xss'] = results
         return results
+
+    def _probe_ssti(self, url: str, method: str, base_params: dict, param: str) -> bool:
+        """Confirm server-side template / EL injection by EVALUATION, not substring.
+
+        friends full-tool review F4: the old check flagged CRITICAL SSTI whenever
+        ``49`` appeared in the body after injecting ``{{7*7}}`` — so any page with
+        a price/id/"49 results" was a fabricated CRITICAL. This probe instead:
+          1. uses a DISTINCTIVE arithmetic canary whose product is improbable in
+             normal content (coincidental substring match is negligible);
+          2. confirms the product is ABSENT from a baseline (un-injected) response,
+             so dynamic content that already contains the number can't false-fire;
+          3. requires the raw expression NOT to be reflected verbatim — a template
+             that is echoed unevaluated is reflection, not SSTI.
+        Returns True and logs a CRITICAL finding on confirmation.
+        """
+        base = url.split('?')[0]
+        # Distinctive operands (computed, so no manual-arithmetic risk).
+        a, b = 91193, 90007
+        product = str(a * b)
+
+        def _fetch(value):
+            params = {**base_params, param: value}
+            try:
+                if method == 'POST':
+                    r = self.session.post(base, data=params, timeout=15)
+                else:
+                    r = self.session.get(base, params=params, timeout=15)
+                return r.text or ""
+            except Exception:
+                return None
+
+        baseline = _fetch("vapt_ssti_baseline")
+        if baseline is None or product in baseline:
+            # Request failed, or the number already appears un-injected — cannot
+            # attribute a later match to evaluation. Do NOT fire (anti-fabrication).
+            return False
+
+        for expr_tmpl, label in (("{{%d*%d}}", "SSTI"), ("${%d*%d}", "SSTI (EL)")):
+            expr = expr_tmpl % (a, b)
+            body = _fetch(expr)
+            if body is None:
+                continue
+            # Evaluated: product present, AND neither the wrapped expression nor the
+            # bare "a*b" echoed back (those would be reflection, not evaluation).
+            if product in body and expr not in body and f"{a}*{b}" not in body:
+                idx = body.find(product)
+                self._log('critical', label, url,
+                          f"Template expression evaluated in param '{param}' "
+                          f"({a}*{b} rendered as {product})",
+                          evidence=body[max(0, idx - 40):idx + len(product) + 40],
+                          param=param, payload=expr)
+                return True
+        return False
 
     # ── Command Injection ─────────────────────────────────────────────────
 

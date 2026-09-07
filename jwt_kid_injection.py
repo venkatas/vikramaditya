@@ -211,3 +211,26 @@ def confirm_replay(client, endpoint: str, forged_token: str, original_token: str
             detail="forged token response was 2xx but its body looks error-shaped — not a confirmed forgery",
         )
     return ReplayResult(confirmed=True, detail="forged token accepted with original-token-shaped response")
+
+
+def confirm_replay_any(client, endpoints, forged_token: str, original_token: str,
+                       cap: int = 15):
+    """Replay a forged token against up to ``cap`` candidate authenticated
+    endpoints; return ``(endpoint, detail)`` for the FIRST that confirms
+    acceptance, else ``None``.
+
+    friends full-tool review F7: confirm_replay was orphaned — hunt.py's JWT
+    audit generated forged tokens but never replayed them, so a genuinely
+    accepted RS256->HS256 / kid forgery produced no finding. This bounds the
+    replay and FAILS CLOSED (an endpoint whose replay raises is skipped), so it
+    can be wired into the audit without risking a hang or a fabricated finding —
+    only confirm_replay's conservative 3-way baseline can confirm.
+    """
+    for endpoint in list(endpoints)[:cap]:
+        try:
+            res = confirm_replay(client, endpoint, forged_token, original_token)
+        except Exception:
+            continue
+        if getattr(res, "confirmed", False):
+            return endpoint, res.detail
+    return None
