@@ -1,5 +1,21 @@
 # Changelog
 
+## Hadrian API authz (on-demand) — Praetorian Hadrian wrapper
+
+Optional API **authorization** step via [Praetorian Hadrian](https://github.com/praetorian-inc/hadrian) (Apache-2.0). Role-permutation BOLA/BFLA/BOPLA across REST (OpenAPI), GraphQL, and gRPC. Complements Schemathesis (schema conformance) and RESTler (stateful fuzz) — does **not** change default scan aggression or `ALLOW_STATE_CHANGES`.
+
+- `hadrian_audit.py` — thin CLI wrapper (`HADRIAN_BIN` / PATH); emits `findings/<label>/hadrian/{report,findings,summary}.json`
+- `tool_parsers.parse_hadrian_json` — normalize Hadrian JSON → Vik finding dicts (`status=suspected`)
+- CLI: `--hadrian SPEC --hadrian-roles PATH --hadrian-auth PATH` (`--hadrian-protocol`, `--hadrian-dry-run`, …)
+- `templates/hadrian/{roles,auth}.example.yaml` + README — how to supply roles/tokens/templates
+- `skills/web/api-authz-hadrian` — on-demand skill pack (skill_loader)
+- `setup.sh` — `go install github.com/praetorian-inc/hadrian/cmd/hadrian@latest`
+
+```bash
+python3 vikramaditya.py --hadrian openapi.yaml \
+  --hadrian-roles roles.yaml --hadrian-auth auth.yaml --hadrian-dry-run
+```
+
 ## v10.6.0 — xalgorix-port batch: native HTTP probe, auth re-auth resilience, API playbooks (2026-06-17)
 
 Second-pass adoption from the peer AI-VAPT tool (xalgorix, MIT). A capability-mining sweep flagged
