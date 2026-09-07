@@ -58,6 +58,16 @@ try:
 except Exception:
     _scopeguard = None
 
+try:
+    import skill_loader
+except Exception:
+    skill_loader = None  # type: ignore
+
+try:
+    from jwt_analyze import analyze_token, extract_jwts, format_text as _jwt_format_text
+except Exception:
+    analyze_token = extract_jwts = _jwt_format_text = None  # type: ignore
+
 # ONE-TIME (at import): apply ~/.config/vikramaditya/brain.env (file-wins) so a STANDALONE
 # `python3 brain_scanner.py ...` honors the pin vars. brain.py does this at its own import, but
 # brain_scanner imports brain only lazily — without this a direct run would read BRAIN_SCANNER_MODEL /
@@ -444,6 +454,28 @@ def _maybe_record_vector_attempt(code: str, result: dict, output_dir: str | None
         pass
 
 
+
+def _maybe_summarize_jwt(text: str) -> str:
+    """If stdout/code contains a JWT-shaped string, offer a static parse summary."""
+    if extract_jwts is None or analyze_token is None or _jwt_format_text is None:
+        return ""
+    found = extract_jwts(text or "")
+    if not found:
+        return ""
+    try:
+        summary = _jwt_format_text(analyze_token(found[0]))
+    except Exception as exc:
+        return f"\n[jwt_analyze offer failed: {exc}]\n"
+    note = (
+        "\n--- jwt_analyze (auto, static; first JWT-shaped string) ---\n"
+        + summary
+        + "For full control run: python3 jwt_analyze.py --json '<token>'\n"
+    )
+    if len(found) > 1:
+        note += f"({len(found)} JWT-shaped strings seen; summarized the first)\n"
+    return note
+
+
 def _maybe_parse_tool_stdout(stdout: str) -> str:
     """If stdout looks like nuclei/sqlmap/ffuf output, append a short parse summary."""
     if _tool_parsers is None or not (stdout or "").strip():
@@ -736,6 +768,16 @@ Write a ```bash block with:
   nuclei -u "URL" -severity critical,high,medium -silent
   nuclei -u "URL" -tags sqli,xss,lfi,rce,ssrf -silent
 
+
+*** JWT testing: YOU MUST USE python3 jwt_analyze.py — NEVER hand-roll base64/HMAC scripts. ***
+Write a ```bash block with:
+  python3 jwt_analyze.py "<token>"
+  python3 jwt_analyze.py --json "<token>"
+  python3 jwt_analyze.py --file /path/to/token.txt
+jwt_analyze.py is deterministic (stdlib+hmac): alg:none, weak HMAC secrets, missing exp/iat/iss,
+jku/x5u, admin-ish claims. STATIC analysis — high_confidence hits (alg:none / verified weak secret)
+are strong; other weaknesses still need live verification. DO NOT invent custom JWT parsers.
+
 *** Directory discovery: USE ffuf — wordlists SHIP IN THIS REPO (paths are relative to cwd);
     /usr/share/seclists is NOT installed here, so do NOT use it (ffuf will error on a missing list) ***
   ffuf -u "URL/FUZZ" -w wordlists/common.txt -mc 200,301,302,403 -rate 10
@@ -759,7 +801,7 @@ SSTI → use Python requests with math canary payloads:
 IDOR → use Python requests to iterate IDs and compare responses.
 
 ONLY write custom Python for: IDOR testing, business logic, timing oracles,
-token analysis, and tests where no specialized tool exists.
+and tests where no specialized tool exists. For JWT use python3 jwt_analyze.py (not custom).
 """
 
 SPA_WARNING = """
@@ -1030,9 +1072,25 @@ TASK: Perform a comprehensive vulnerability assessment. Test for:
 Start with reconnaissance — find forms, parameters, JS files, API endpoints.
 Then test the most promising attack vectors."""
 
+    # On-demand vuln skill packs (VIK_SKILLS=0 disables)
+    skills_ctx = ""
+    if skill_loader is not None and getattr(skill_loader, "skills_enabled", lambda: False)():
+        try:
+            matched = skill_loader.skills_for_findings(briefing or "")
+            skills_ctx = skill_loader.format_skills_context(matched, max_chars=12000)
+            if skills_ctx:
+                log("info", "Injecting skill packs: " + ", ".join(matched))
+        except Exception as exc:
+            log("warn", f"skill_loader failed: {exc}")
+            skills_ctx = ""
+
+    user_content = briefing
+    if skills_ctx:
+        user_content = (briefing or "").rstrip() + "\n\n" + skills_ctx
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": briefing},
+        {"role": "user", "content": user_content},
     ]
 
     findings = []
@@ -1187,6 +1245,11 @@ Then test the most promising attack vectors."""
                 _parse_sum = _maybe_parse_tool_stdout(result.get("stdout") or "")
                 if _parse_sum:
                     all_results += _parse_sum + "\n"
+                _jwt_sum = _maybe_summarize_jwt(
+                    (result.get("stdout") or "") + "\n" + (code or "")
+                )
+                if _jwt_sum:
+                    all_results += _jwt_sum
                 # A script that ran (rc 0, or non-zero but not a syntax error) counts
                 # as a real test the model may reason from. Exclude TIMEOUT (-9) and
                 # internal/tooling errors (-1), which did NOT produce target evidence.

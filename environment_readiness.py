@@ -69,12 +69,15 @@ def check_environment_readiness(
 
     for tool in required_tools:
         if not which(tool):
-            gaps.append(
-                {
-                    "tool": tool,
-                    "reason": f"required runtime command not found on PATH: {tool}",
-                }
-            )
+            if tool == "uro":
+                reason = (
+                    "required runtime command not found on PATH: uro — "
+                    "install via .venv (`pip install uro`) or "
+                    "`python3 -m pip install --user --break-system-packages uro`"
+                )
+            else:
+                reason = f"required runtime command not found on PATH: {tool}"
+            gaps.append({"tool": tool, "reason": reason})
 
     return gaps
 

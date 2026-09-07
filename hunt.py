@@ -214,7 +214,8 @@ os.environ["PATH"] = os.pathsep.join(
 # RECON_TIMEOUT is a baseline — hunt_target() scales it up for large targets
 RECON_TIMEOUT      = 7200   # 2h default (was 1h — too short for gov.in-class targets)
 RECON_TIMEOUT_MAX  = 21600  # 6h hard cap
-SCAN_TIMEOUT       = 5400   # per vuln-scan batch: 3600 was too tight for a WAF-fronted host
+# Env override: VIK_SCAN_TIMEOUT (preferred) or SCAN_TIMEOUT. Raised 5400→7200 for Cloudflare/WAF.
+SCAN_TIMEOUT       = int(os.environ.get("VIK_SCAN_TIMEOUT") or os.environ.get("SCAN_TIMEOUT") or "7200")
 CVE_HUNT_TIMEOUT   = 600
 ZERO_DAY_TIMEOUT   = 900
 JS_SCAN_TIMEOUT    = 1200
@@ -1896,7 +1897,7 @@ def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, s
         # both make git-hound crash; flag either as "not configured".
         if not _githound_config_ready(_githound_config_candidates()):
             gaps.append({"tool": "git-hound",
-                         "reason": "no usable config.yml credential (GitHub creds missing or placeholder) — GitHub secret scan cannot authenticate"})
+                         "reason": "no usable config.yml credential (GitHub creds missing or placeholder) — GitHub secret scan skipped; cannot invent tokens (set ~/.githound/config.yml)"})
 
     # Kiterunner needs an API-route wordlist; without one it bruteforces nothing.
     if "kiterunner" in installed_set:
@@ -5392,6 +5393,83 @@ def _run_trufflehog_files(trufflehog: str, files: list[str], output: str,
     return True, ""
 
 
+
+def _js_download_failure_summary(dl_dir: str, requested: int, downloaded: int) -> str:
+    """Summarize why JS corpus fetch under-delivered (no fake success).
+
+    Reads the provenance manifest written by `_download_js_corpus`. When every
+    fetch fails behind Cloudflare/WAF (403/503/challenge HTML), surface that as
+    the degrade reason instead of a bare "0 of N" line.
+    """
+    base = f"downloaded {downloaded} of {requested} selected JS URLs"
+    if requested <= 0:
+        return base
+    manifest = os.path.join(dl_dir, "manifest.tsv")
+    status_counts: dict[str, int] = {}
+    timed_out = 0
+    empty_ok = 0
+    curl_fail = 0
+    try:
+        with open(manifest, encoding="utf-8", errors="replace") as handle:
+            header = handle.readline().rstrip("\n")
+            if header != _JS_MANIFEST_HEADER:
+                return base + "; manifest unreadable — check network/WAF"
+            for raw in handle:
+                parts = raw.rstrip("\n").split("\t")
+                if len(parts) < 5:
+                    continue
+                _name, _url, returncode, timed_flag, byte_count = parts[:5]
+                if timed_flag == "1":
+                    timed_out += 1
+                try:
+                    rc = int(returncode)
+                    size = int(byte_count)
+                except ValueError:
+                    curl_fail += 1
+                    continue
+                if rc == 0 and size == 0:
+                    empty_ok += 1
+                elif rc != 0:
+                    # curl -w %{http_code} lands in stdout; we only stored rc.
+                    # Map common curl exit codes to human reasons.
+                    if rc == 22:  # HTTP error (403/404/5xx with -f)
+                        status_counts["http_error(curl_22)"] = status_counts.get("http_error(curl_22)", 0) + 1
+                    elif rc == 28:
+                        status_counts["timeout(curl_28)"] = status_counts.get("timeout(curl_28)", 0) + 1
+                    elif rc == 6:
+                        status_counts["dns_fail(curl_6)"] = status_counts.get("dns_fail(curl_6)", 0) + 1
+                    elif rc == 7:
+                        status_counts["connect_fail(curl_7)"] = status_counts.get("connect_fail(curl_7)", 0) + 1
+                    elif rc == 35:
+                        status_counts["tls_fail(curl_35)"] = status_counts.get("tls_fail(curl_35)", 0) + 1
+                    else:
+                        status_counts[f"curl_rc_{rc}"] = status_counts.get(f"curl_rc_{rc}", 0) + 1
+                    curl_fail += 1
+    except OSError:
+        return base + "; could not read download manifest"
+
+    bits = [base]
+    if timed_out:
+        bits.append(f"timed_out={timed_out}")
+    if empty_ok:
+        bits.append(f"empty_body={empty_ok}")
+    if status_counts:
+        top = ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items(), key=lambda kv: -kv[1])[:6])
+        bits.append(f"failures: {top}")
+    # Heuristic: curl exit 22 on most URLs → likely WAF/Cloudflare challenge or 403.
+    http_err = status_counts.get("http_error(curl_22)", 0)
+    if downloaded == 0 and http_err >= max(1, requested // 2):
+        bits.append(
+            "likely Cloudflare/WAF or HTTP block on JS hosts "
+            "(not a local tool bug; raise JS_DOWNLOAD_RETRIES or fetch via authenticated session)"
+        )
+    elif downloaded == 0 and timed_out >= max(1, requested // 2):
+        bits.append("majority timed out — target slow or dropping connections")
+    elif downloaded == 0:
+        bits.append("no fresh corpus to analyze")
+    return "; ".join(bits)
+
+
 def run_js_analysis(domain: str) -> bool:
     """
     Phase: JS Analysis
@@ -5469,7 +5547,7 @@ def run_js_analysis(domain: str) -> bool:
     # subset. On a large estate (5590 JS URLs) the uncapped loops blew the phase
     # watchdog (1200s/300s SIGKILL, ~15% scanned) and reported partial coverage.
     # Cap keeps the phase bounded; JS_ANALYSIS_MAX_URLS=0 restores "scan all".
-    _js_max = int(os.environ.get("JS_ANALYSIS_MAX_URLS", "300"))
+    _js_max = int(os.environ.get("JS_ANALYSIS_MAX_URLS", "800"))
     js_scan_file = js_urls_file
     if _js_max > 0 and js_count > _js_max:
         js_scan_file = os.path.join(js_dir, "js_urls_scan.txt")
@@ -5500,7 +5578,8 @@ def run_js_analysis(domain: str) -> bool:
             f"manifest/download count mismatch: reported={reported_downloads} verified={downloaded}",
         )
     if downloaded == 0:
-        reason = f"downloaded 0 of {requested} selected JS URLs; no fresh corpus to analyze"
+        reason = _js_download_failure_summary(dl_dir, requested, downloaded)
+        log("warn", f"JS download degraded: {reason}")
         _mark_degraded("js_download", reason)
         try:
             _set_secretfinder_status(js_dir, valid=False, reason=reason)
@@ -5514,8 +5593,9 @@ def run_js_analysis(domain: str) -> bool:
         )
         return False
     if requested and downloaded < requested:
-        _mark_degraded("js_download",
-                       f"downloaded {downloaded} of {requested} selected JS URLs")
+        partial = _js_download_failure_summary(dl_dir, requested, downloaded)
+        log("warn", f"JS download partial: {partial}")
+        _mark_degraded("js_download", partial)
     local_jobs = max(1, min(int(os.environ.get("JS_LOCAL_WORKERS", "8")), 16))
     dynamic_timeout = max(JS_SCAN_TIMEOUT, min(7200, max(requested, 1) * 3))
 
@@ -5669,7 +5749,7 @@ def run_secret_hunt(domain: str) -> bool:
         # running it into a crash whose stack trace looks like "results".
         _mark_degraded("git-hound",
                        "config.yml missing or placeholder creds — GitHub secret scan SKIPPED")
-        log("warn", "git-hound: no usable config.yml credential — skipping (would crash)")
+        log("warn", "git-hound: no usable GitHub creds in config.yml — skipping (cannot invent tokens; provide ~/.githound/config.yml)")
     elif _which(git_hound):
         gh_out = os.path.join(secret_dir, "githound.txt")
         # v9.24 — capture stderr too: GitHound prints "[!] config.yml was not
@@ -6444,7 +6524,7 @@ def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
         run_cmd(
             f'{nuclei_bin} -l "{nuclei_targets}" -tags drupal,wordpress,joomla,cms '
             f'-severity critical,high,medium -silent -o "{nuclei_cms_out}" 2>/dev/null',
-            timeout=600,
+            timeout=int(os.environ.get("VIK_CMS_NUCLEI_TIMEOUT", "900")),
             watch_file=exploit_dir,
             watch_phase="CMS EXPLOIT"
         )
@@ -6567,7 +6647,7 @@ def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
                 ok, out = run_cmd(
                     f'{nuclei_bin} -u "{host}" -tags drupal,cms '
                     f'-severity medium,high,critical -silent -o "{droop_out}"',
-                    timeout=300,
+                    timeout=int(os.environ.get("VIK_CMS_HOST_TIMEOUT", "600")),
                     watch_file=exploit_dir,
                     watch_phase="CMS EXPLOIT"
                 )
@@ -6929,7 +7009,7 @@ def run_rce_scan(domain: str, allow_destructive: bool = False) -> bool:
             f'-tags tomcat,jboss,log4shell,rce,cve '
             f'-severity critical,high,medium '
             f'-silent -o "{nuclei_rce_out}" 2>/dev/null',
-            timeout=600,
+            timeout=int(os.environ.get("VIK_RCE_NUCLEI_TIMEOUT", "900")),
             watch_file=rce_dir,
             watch_phase="RCE SCAN"
         )
@@ -6947,7 +7027,7 @@ def run_rce_scan(domain: str, allow_destructive: bool = False) -> bool:
             f'{nuclei_bin} -l "{targets_file}" '
             f'-id "CVE-2017-12615,CVE-2019-0232,CVE-2020-1938,CVE-2021-44228,CVE-2021-45046" '
             f'-silent -o "{nuclei_tomcat_out}" 2>/dev/null',
-            timeout=300,
+            timeout=int(os.environ.get("VIK_RCE_CVE_TIMEOUT", "600")),
             watch_file=rce_dir,
             watch_phase="RCE SCAN"
         )
