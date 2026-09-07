@@ -78,3 +78,14 @@ MIT License — Copyright (c) Microsoft Corporation
 
   markitdown_helper.py         <- thin CLI wrapper around MarkItDown
 
+-----------------------------------------------------------------------
+CAI (Cybersecurity AI) — https://github.com/aliasrobotics/CAI
+Alias Robotics — dual-license / AGPL network-copyleft for the full runtime
+-----------------------------------------------------------------------
+
+Vikramaditya does **not** vendor or execute the CAI agent runtime. The portable
+skill packs under skills/recon/, skills/web/{http-security-headers,api-authz-matrix}/,
+and skills/cloud/ are clean-room checklist adaptations of publicly described
+recon/web/cloud methodology ideas only (same approach as other skill ports).
+No CAI source, prompts, or tooling were copied.
+
