@@ -3466,6 +3466,19 @@ def main() -> None:
     parser.add_argument("--consultant", default="")
     parser.add_argument("--title",      default="Vulnerability Assessment & Penetration Test Report")
     parser.add_argument("--target",     default="", help="Target domain name (overrides auto-detect from dir name)")
+    # Opt-in SARIF / MITRE SAF export (never default)
+    parser.add_argument("--export-sarif", nargs="?", const="", default=None,
+                        help="Also write SARIF 2.1.0 (optional path; default under report/export)")
+    parser.add_argument("--export-hdf", action="store_true",
+                        help="Also convert SARIF to HDF via MITRE SAF CLI (requires saf on PATH)")
+    parser.add_argument("--export-asff", action="store_true",
+                        help="Also convert HDF to ASFF via MITRE SAF CLI (implies --export-hdf)")
+    parser.add_argument("--asff-account", default="", help="AWS account id for ASFF export")
+    parser.add_argument("--asff-region", default="", help="AWS region for ASFF / Security Hub")
+    parser.add_argument("--asff-target", default="", help="ASFF target name (tracks findings over time)")
+    parser.add_argument("--asff-upload", action="store_true",
+                        help="Upload ASFF to Security Hub (requires AWS creds; default local files)")
+    parser.add_argument("--saf-bin", default="", help="Path to saf binary (default: PATH lookup)")
     args = parser.parse_args()
 
     if args.manual:
@@ -3498,7 +3511,7 @@ def main() -> None:
         print(f"[!] Not a directory: {args.findings_dir}", file=sys.stderr)
         sys.exit(1)
 
-    count, _, report_dir, html, md = process_findings_dir(
+    count, findings, report_dir, html, md = process_findings_dir(
         args.findings_dir, args.client, args.consultant, args.title,
         target_override=args.target)
 
@@ -3513,6 +3526,35 @@ def main() -> None:
     print(f"[+] {count} finding(s) — {os.path.basename(report_dir)}")
     print(f"[+] HTML : {html_path}")
     print(f"[+] MD   : {md_path}")
+
+    want_asff = bool(getattr(args, "export_asff", False))
+    want_hdf = bool(getattr(args, "export_hdf", False)) or want_asff
+    want_sarif = args.export_sarif is not None or want_hdf or want_asff
+    if want_sarif:
+        try:
+            import saf_export
+            export_dir = os.path.join(report_dir, "export")
+            sarif_path = args.export_sarif if isinstance(args.export_sarif, str) and args.export_sarif else None
+            produced = saf_export.export_findings(
+                findings,
+                export_dir,
+                target=args.target or "",
+                want_sarif=True,
+                want_hdf=want_hdf,
+                want_asff=want_asff,
+                sarif_path=sarif_path,
+                asff_account=args.asff_account,
+                asff_region=args.asff_region,
+                asff_target=args.asff_target,
+                asff_upload=args.asff_upload,
+                saf_bin=args.saf_bin or None,
+            )
+            for label, path in produced.items():
+                print(f"[+] {label.upper():5s}: {path}")
+        except FileNotFoundError as exc:
+            print(f"[!] SAF export skipped: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[!] SAF/SARIF export failed: {exc}", file=sys.stderr)
 
     if shutil.which("wkhtmltopdf"):
         pdf = html_path.replace(".html", ".pdf")

@@ -1,5 +1,21 @@
 # Changelog
 
+## Opt-in SARIF / HDF / ASFF export (MITRE SAF) (2026-09-07)
+
+Fill the machine-readable export gap next to custom HTML + `finding_schema`:
+
+- **`saf_export.py`** — in-repo SARIF 2.1.0 writer from validated findings; optional
+  MITRE SAF CLI (`saf convert sarif2hdf` / `hdf2asff`) for HDF and Security Hub ASFF.
+- **Opt-in flags only** — `python3 saf_export.py <findings.json|dir> -o out.sarif [--hdf|--asff]`,
+  `reporter.py --export-sarif|--export-hdf|--export-asff`, and
+  `vikramaditya.py --export-sarif <findings_dir|json>` (+ `--saf-hdf` / `--saf-asff`).
+  Default scan path unchanged.
+- **Docs** — `docs/saf-export.md`, `setup.sh` optional note, NOTICE attribution
+  (Apache-2.0 CLI invoke; not vendored).
+- **Tests** — `tests/test_saf_export.py` (9: SARIF mapping + mocked MITRE CLI).
+
+
+
 ## v10.6.0 — xalgorix-port batch: native HTTP probe, auth re-auth resilience, API playbooks (2026-06-17)
 
 Second-pass adoption from the peer AI-VAPT tool (xalgorix, MIT). A capability-mining sweep flagged

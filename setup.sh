@@ -639,6 +639,15 @@ for local_tool in "LinkFinder/linkfinder.py" "SecretFinder/SecretFinder.py" "XSS
     fi
 done
 
+# Optional: MITRE SAF CLI for SARIF→HDF→ASFF export (saf_export.py).
+# Not required for core VAPT; install separately when you need HDF/ASFF
+# (NPM package @mitre/saf, or Homebrew mitre/saf/saf-cli). See docs/saf-export.md
+if command -v saf >/dev/null 2>&1; then
+    log_ok "MITRE SAF CLI on PATH: $(command -v saf)"
+else
+    log_warn "MITRE SAF CLI (saf) not installed — optional for --saf-hdf/--saf-asff"
+fi
+
 READINESS_FAILED=0
 if "$VENV_DIR/bin/python" "$SCRIPT_DIR/environment_readiness.py"; then
     log_ok "Environment readiness checks passed"
