@@ -66,8 +66,11 @@ def test_burp_tentative_is_downgraded_to_info(tmp_path):
     tentative = [{"severity": "High", "confidence": "Tentative", "type": "sqli",
                   "title": "SQLi", "url": "https://t.example.invalid/x", "source": "burp"}]
     assert _worst(tmp_path, "burp/findings.json", tentative) not in _MEDPLUS
+    # Scanner confidence alone is not proof.  Preserve a High only when the
+    # normalized issue also carries an explicit recognized verification method.
     certain = [{"severity": "High", "confidence": "Certain", "type": "sqli",
-                "title": "SQLi", "url": "https://t.example.invalid/x", "source": "burp"}]
+                "title": "SQLi", "url": "https://t.example.invalid/x", "source": "burp",
+                "verification_method": "manual_verified"}]
     assert _worst(tmp_path, "burp/findings.json", certain) == "high"
 
 

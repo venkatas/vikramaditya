@@ -60,9 +60,12 @@ VTYPE_DEFAULT_SEVERITY = {
     "ssti": "critical",
     "lfi": "high",
     "idor": "high",
+    "auth_bypass": "high",
+    "business_logic": "high",
     "ssrf": "high",
     "takeover": "high",
     "upload": "high",
+    "upload_type_bypass": "high",
     "oauth": "high",
     "cves": "high",
     "xss": "medium",
@@ -174,7 +177,10 @@ def validate_findings_dir(findings_dir: str, strict: bool = False) -> dict:
         "lfi": "lfi", "idor": "idor", "ssrf": "ssrf", "cors": "cors",
         "takeover": "takeover", "exposure": "exposure", "cves": "cves",
         "misconfig": "misconfig", "redirects": "redirect",
-        "upload": "upload", "race": "race", "oauth": "oauth",
+        "upload": "upload", "upload_type_bypass": "upload_type_bypass",
+        "race": "race", "race_condition": "race",
+        "oauth": "oauth", "auth_bypass": "auth_bypass",
+        "business_logic": "business_logic",
     }
     for subdir, vtype in subdir_vtype.items():
         path = os.path.join(findings_dir, subdir)

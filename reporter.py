@@ -359,9 +359,13 @@ VULN_TEMPLATES = {
         ],
     },
     "email_auth": {
-        "title": "Email Authentication Weakness on {host}",
+        "title": "Email Authentication Posture on {host}",
         "severity": "medium", "cvss": "5.3", "cwe": "CWE-290",
-        "impact": "Missing or weak email authentication (SPF/DKIM/DMARC) lets an attacker spoof mail from this domain, enabling phishing and business-email-compromise against staff, customers, and partners.",
+        "impact": (
+            "Missing or weak email authentication (SPF/DKIM/DMARC) can increase "
+            "the risk that receivers accept spoofed mail. A DNS posture observation "
+            "does not, by itself, prove successful spoofing or mail delivery."
+        ),
         "remediation": "Publish a DMARC record (start p=none with rua reporting, then move to quarantine/reject), tighten SPF toward -all once all senders are covered, and ensure DKIM signing on all sending sources.",
         "references": [
             ("DMARC.org", "https://dmarc.org/"),
@@ -477,15 +481,16 @@ VULN_TEMPLATES["oauth"] = {
 }
 VULN_TEMPLATES["auth_bypass"] = {
     "title": "Broken Authentication on {host}",
-    "severity": "critical", "cvss": "9.8", "cwe": "CWE-287",
+    "severity": "high", "cvss": "8.1", "cwe": "CWE-287",
     "impact": (
-        "An attacker can access protected API endpoints without valid authentication, "
-        "potentially reading or modifying all data in the system including PII, credentials, "
-        "and administrative functions."
+        "An attacker can access protected resources or state-changing workflows without "
+        "a valid authorization decision, potentially leading to account takeover, data "
+        "exposure, or unauthorized record changes."
     ),
     "remediation": (
-        "Enforce server-side JWT validation on every endpoint. Verify signature, expiry, "
-        "issuer, and audience claims. Reject tokens with alg=none or tampered signatures."
+        "Enforce server-side authorization on every protected route and sensitive object. "
+        "Use signed, short-lived tokens for link workflows, and verify ownership or role "
+        "before reading or changing data."
     ),
     "references": [
         ("OWASP Broken Authentication", "https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/"),
@@ -1181,9 +1186,16 @@ def load_findings(findings_dir: str) -> list:
                         unconfirmed_cves.append((line.upper(), "", ""))
                         continue
                     finding = parse_custom_line(line, vtype)
+                    # Source-audit output proves what the reviewed source contains, not that
+                    # the deployed application is reachable or exploitable. In particular,
+                    # a source-only row with no affected URL must remain a manual-review lead
+                    # even when its static rule carries a HIGH priority label.
+                    if "[SOURCE-AUDIT]" in line.upper() and finding.get("url") == "N/A":
+                        _demote_to_lead(finding, "source-audit")
+                        finding["verification_method"] = "source_review"
                     # Fail-closed confirmation gate: an active-exploitation line without a
                     # confirmation / structural-exposure marker is a LEAD, not a Medium+ finding.
-                    if vtype in _ACTIVE_EXPLOIT_VTYPES and not _is_verified_finding_line(line):
+                    elif vtype in _ACTIVE_EXPLOIT_VTYPES and not _is_verified_finding_line(line):
                         _demote_to_lead(finding, vtype)
                     # #5 dalfox executability: dalfox tags each PoC — [V]=verified via headless
                     # browser (executes), [R]=reflected only, [G]=grep match. Only [V] is a
@@ -1423,11 +1435,19 @@ def load_findings(findings_dir: str) -> list:
             with open(email_auth_path, errors="replace") as f:
                 ea_data = _json.load(f)
             for item in (ea_data if isinstance(ea_data, list) else []):
-                sev = str(item.get("severity", "low")).lower()
+                declared_sev = str(item.get("severity", "low")).strip().lower()
+                sev = declared_sev
                 if sev in ("informational", "information"):
                     sev = "info"
                 if sev not in SEVERITY_ORDER:
                     sev = "low"
+                # This loader records observed DNS and mail-control posture. It does not
+                # perform or prove a successful spoofing/delivery exploit. Cap a producer's
+                # HIGH/CRITICAL posture score at MEDIUM and label the evidence level plainly.
+                # A separately verified exploit belongs in a dedicated exploit finding.
+                posture_was_capped = sev in ("critical", "high")
+                if posture_was_capped:
+                    sev = "medium"
                 # v10.0.1 — per-finding CVSS so a LOW/INFO posture item no longer inherits
                 # the email_auth template's fixed MEDIUM 5.3 (previously EVERY email_auth
                 # finding rendered 5.3 because the loader set severity but not cvss and the
@@ -1436,24 +1456,34 @@ def load_findings(findings_dir: str) -> list:
                 # authored score (so MEDIUM stays 5.3 — no needless drift, no split with peer
                 # MEDIUM templates) → otherwise the canonical severity→score map.
                 _ea_tmpl = VULN_TEMPLATES.get("email_auth", {})
-                if item.get("cvss") is not None:
+                if posture_was_capped:
+                    _ea_cvss = _ea_tmpl.get("cvss", CVSS_DEFAULT.get("medium", "N/A"))
+                elif item.get("cvss") is not None:
                     _ea_cvss = str(item["cvss"])
                 elif sev == _ea_tmpl.get("severity"):
                     _ea_cvss = _ea_tmpl.get("cvss", CVSS_DEFAULT.get(sev, "N/A"))
                 else:
                     _ea_cvss = CVSS_DEFAULT.get(sev, "N/A")
-                results.append({
+                raw_title = item.get("title", "Email authentication weakness")
+                finding = {
                     "severity": sev,
                     "cvss": _ea_cvss,
                     "vtype": "email_auth",
-                    "title": item.get("title", "Email authentication weakness"),
+                    "title": f"Email security posture: {raw_title}",
                     "detail": item.get("notes", ""),
                     "url": item.get("endpoint", "N/A"),
                     "poc": (f"Class : {item.get('vuln_class','')}\n"
                             f"Area  : {item.get('area','')}\n"
                             f"Result: {item.get('result','')}\n\n"
-                            f"{item.get('notes','')}"),
-                })
+                            f"{item.get('notes','')}\n\n"
+                            "Evidence classification: observed configuration posture. "
+                            "No spoofing or delivery exploit was performed or confirmed."),
+                    "finding_kind": "posture",
+                    "verification_method": "configuration_observed",
+                }
+                if posture_was_capped:
+                    finding["original_severity"] = declared_sev
+                results.append(finding)
         except Exception as e:
             print(f"[reporter] WARNING: failed to load "
                   f"{os.path.relpath(email_auth_path, findings_dir)}: {e!r} — "
@@ -1661,6 +1691,7 @@ def load_findings(findings_dir: str) -> list:
                     "detail": item.get("detail", ""),
                     "url": item.get("url", "N/A"),
                     "poc": item.get("poc", ""),
+                    "verification_method": item.get("verification_method", "unverified"),
                 }
                 # Honor an explicit per-finding cvss if Burp/normalizer provided one;
                 # otherwise the renderer falls back to the vtype template / severity band.
@@ -1705,6 +1736,10 @@ def load_findings(findings_dir: str) -> list:
                     "detail": item.get("detail", ""),
                     "url": item.get("url", "N/A"),
                     "poc": item.get("poc", ""),
+                    "verification_method": item.get(
+                        "verification_method",
+                        "authenticated" if confidence == "confirmed" else "unverified",
+                    ),
                 }
                 if item.get("cvss"):
                     finding["cvss"] = str(item["cvss"])
@@ -1933,6 +1968,7 @@ def load_findings(findings_dir: str) -> list:
                         "poc": f"Parameter: {vuln.get('parameter','')}\n"
                                f"Payload: {vuln.get('payload','')}\n"
                                f"Evidence: {vuln.get('evidence','')}",
+                        "verification_method": vuln.get("verification_method", "unverified"),
                     })
             except Exception as e:
                 print(f"[reporter] WARNING: failed to load {fn}: {e!r} — "
@@ -2207,6 +2243,16 @@ def load_findings(findings_dir: str) -> list:
                         poc_lines.append("")
                         poc_lines.append("See individual findings above for reproduction steps.")
 
+                # Never invent an observed response, victim record, timing, or
+                # attack result. Flat findings may supply their own exact PoC;
+                # otherwise preserve only the source fields that were recorded.
+                poc_lines = [
+                    f"Finding: {detail}",
+                    f"URL: {url}",
+                    f"Evidence: {evidence or 'No evidence supplied'}",
+                ]
+                if data.get("poc"):
+                    poc_lines.extend(["", str(data["poc"])])
                 poc_text = "\n".join(poc_lines)
                 raw_line = f"[{sev.upper()}] {detail} {url}"
 
@@ -2226,6 +2272,7 @@ def load_findings(findings_dir: str) -> list:
                     "description": tmpl.get("description", detail),
                     "impact": tmpl.get("impact", ""),
                     "attack_id": "",
+                    "verification_method": data.get("verification_method", "unverified"),
                 }
                 key = (vtype, url, detail)
                 if key not in _seen_m2:
@@ -2855,9 +2902,37 @@ Scan Diagnostics</h2>
 '''
 
 
+_SESSION_TIMESTAMP_RE = re.compile(
+    r"^(20\d{6})_(\d{6})(?:_[A-Za-z0-9][A-Za-z0-9.-]*)?$"
+)
+
+
+def _assessment_session_date(path: str) -> str:
+    """Return the assessment date encoded in a session directory.
+
+    Report generation can happen long after evidence collection. Deriving this
+    field only from the durable session identifier avoids silently presenting
+    today's report-generation date as the assessment date. Unknown layouts fail
+    closed to "Not recorded" instead of inventing a date from mutable file mtimes.
+    """
+    for component in reversed(os.path.normpath(path or "").split(os.sep)):
+        match = _SESSION_TIMESTAMP_RE.fullmatch(component)
+        if not match:
+            continue
+        try:
+            session_dt = datetime.strptime(
+                "".join(match.groups()[:2]), "%Y%m%d%H%M%S"
+            )
+        except ValueError:
+            continue
+        return session_dt.strftime("%d %B %Y")
+    return "Not recorded"
+
+
 def render_html_report(findings: list, target: str, report_dir: str,
                        client: str, consultant: str, title: str) -> str:
-    date_str = datetime.now().strftime("%d %B %Y")
+    generated_date_str = datetime.now().strftime("%d %B %Y")
+    session_date_str = _assessment_session_date(report_dir)
     counts   = _severity_counts(findings)
     total    = len(findings)
     # v10.6.0 — weighted overall risk score + label (report_synthesis)
@@ -2981,7 +3056,8 @@ a{{color:#0d6efd}}code{{background:#f8f9fa;padding:1px 5px;border-radius:3px;fon
   <table style="border-collapse:collapse;max-width:480px">
     <tr><td style="padding:5px 20px 5px 0;color:#adb5bd;width:140px">Client</td><td style="color:#fff;font-weight:600">{client or "—"}</td></tr>
     <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Consultant</td><td style="color:#fff;font-weight:600">{consultant or "—"}</td></tr>
-    <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Date</td><td style="color:#fff;font-weight:600">{date_str}</td></tr>
+    <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Assessment session date</td><td style="color:#fff;font-weight:600">{session_date_str}</td></tr>
+    <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Report generated</td><td style="color:#fff;font-weight:600">{generated_date_str}</td></tr>
     <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Total Findings</td><td style="color:#fff;font-weight:600">{total}</td></tr>
     <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Classification</td><td style="color:#e05252;font-weight:700">CONFIDENTIAL</td></tr>
   </table>
@@ -3024,9 +3100,11 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
   <tr><td>Target</td><td><code>{target}</code></td></tr>
   <tr><td>Assessment Type</td><td>Black-box / Grey-box VAPT</td></tr>
   <tr><td>Methodology</td><td>PTES, OWASP Testing Guide v4.2</td></tr>
-  <tr><td>Date</td><td>{date_str}</td></tr>
+  <tr><td>Assessment session date</td><td>{session_date_str}</td></tr>
+  <tr><td>Report generated</td><td>{generated_date_str}</td></tr>
   <tr><td>Consultant</td><td>{consultant or "—"}</td></tr>
 </table>
+<p style="color:#6c757d;font-size:.9em">The assessment session date comes from the session identifier. Report generation does not refresh the session evidence.</p>
 <ol>
   <li><b>Reconnaissance</b> — Subdomain enumeration, port scanning, tech fingerprinting</li>
   <li><b>Vulnerability Identification</b> — Automated and manual testing</li>
@@ -3067,7 +3145,7 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 </ul>
 
 <hr style="margin-top:50px;border-color:#dee2e6">
-<p style="color:#6c757d;font-size:.85em;text-align:center">Generated by <a href="https://github.com/venkatas/vikramaditya" style="color:#6c757d">Vikramaditya</a> — Autonomous VAPT Platform &nbsp;|&nbsp; {date_str} &nbsp;|&nbsp; CONFIDENTIAL</p>
+<p style="color:#6c757d;font-size:.85em;text-align:center">Generated by <a href="https://github.com/venkatas/vikramaditya" style="color:#6c757d">Vikramaditya</a> — Autonomous VAPT Platform &nbsp;|&nbsp; {generated_date_str} &nbsp;|&nbsp; CONFIDENTIAL</p>
 </div>
 </body></html>"""
 
@@ -3131,13 +3209,18 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 
 def render_markdown_report(findings: list, target: str, report_dir: str,
                            client: str, consultant: str, title: str) -> str:
-    date_str = datetime.now().strftime("%d %B %Y")
+    generated_date_str = datetime.now().strftime("%d %B %Y")
+    session_date_str = _assessment_session_date(report_dir)
     counts   = _severity_counts(findings)
     lines    = [
         f"# {title}",
         f"**Target:** {target}  \n**Client:** {client or '—'}  \n"
-        f"**Consultant:** {consultant or '—'}  \n**Date:** {date_str}  \n"
+        f"**Consultant:** {consultant or '—'}  \n"
+        f"**Assessment session date:** {session_date_str}  \n"
+        f"**Report generated:** {generated_date_str}  \n"
         "**Classification:** CONFIDENTIAL",
+        "", ("The assessment session date comes from the session identifier. "
+             "Report generation does not refresh the session evidence."),
         "", "---", "", "## Executive Summary", "",
     ]
     # v10.6.0 — weighted overall risk score + label (report_synthesis)
@@ -3201,7 +3284,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
             f"**Remediation:** {_finding_remediation(f, tmpl)}", "",
             "**References:**", refs, "", "---", "",
         ]
-    lines.append(f"*Generated by [Vikramaditya](https://github.com/venkatas/vikramaditya) — Autonomous VAPT Platform | {date_str}*")
+    lines.append(f"*Generated by [Vikramaditya](https://github.com/venkatas/vikramaditya) — Autonomous VAPT Platform | {generated_date_str}*")
     return "\n".join(lines)
 
 
@@ -3220,14 +3303,27 @@ def _apply_verification_gating(findings: list) -> list:
     for f in findings:
         raw = (f.get("raw") or "").lstrip().upper()
         explicit = (f.get("verification_method") or "").strip().lower()
+        # An observed configuration is valid posture evidence, but it is not an
+        # exploited vulnerability. The email-auth loader caps it at MEDIUM and
+        # marks it explicitly, so keep it as posture without converting the
+        # evidence classification into a false exploitation claim.
+        if (f.get("finding_kind") == "posture"
+                and explicit == "configuration_observed"):
+            kept.append(f)
+            continue
         # FAIL OPEN: only an EXPLICIT model-generated claim is unverified-and-droppable.
         # We anchor on the brain_scanner marker PREFIX (not a substring-anywhere match) so a
         # real scanner finding whose evidence text merely contains "UNVERIFIED"/"PENDING"
         # (e.g. a leaked token "AKIAUNVERIFIED...") is NOT mistaken for a model claim.
         is_model_claim = (raw.startswith("[MODEL CLAIM")
                           or raw.startswith("[UNVERIFIED]")
-                          or explicit in ("model_claim", "unverified"))
-        method = VerificationMethod.UNVERIFIED if is_model_claim else VerificationMethod.EXPLOITED
+                          or explicit == "model_claim")
+        # Legacy scanner rows without a verification field retain the prior
+        # compatibility path. Once a producer sets the field, however, parse it
+        # fail-closed: an unknown label is UNVERIFIED, never EXPLOITED.
+        method = (VerificationMethod.UNVERIFIED if is_model_claim
+                  else VerificationMethod.from_string(explicit)
+                  if explicit else VerificationMethod.EXPLOITED)
         sev = f.get("severity", "medium")
         new_sev = adjust_severity(sev, method)
         if new_sev != sev:

@@ -1,0 +1,2 @@
+# Keep PrincipalMapper isolated from the main scanner environment.
+principalmapper>=1.1.5

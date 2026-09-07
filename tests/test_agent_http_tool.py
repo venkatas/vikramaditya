@@ -54,14 +54,30 @@ def test_http_request_scope_lock_blocks_offsite(tmp_path, monkeypatch):
     assert "scope" in obs.lower() or "BLOCKED" in obs   # refused, probe never called
 
 
-def test_http_request_scope_lock_allows_subdomain(tmp_path, monkeypatch):
-    import agent_http
-    seen = {}
-    monkeypatch.setattr(agent_http, "probe", lambda method, url, **k: seen.update(url=url) or {
-        "status": 200, "headers": {}, "body": "ok", "bytes": 2, "truncated": False,
-        "is_binary": False, "content_type": "", "elapsed_ms": 1, "url": url,
-        "final_url": url, "method": method, "error": ""})
+def test_http_request_scope_lock_blocks_subdomain(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        agent_http,
+        "probe",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("probe should NOT run")),
+    )
     d = _dispatcher(tmp_path)
     obs = d.dispatch("http_request", {"url": "https://api.victim.example/v1", "method": "GET"})
-    assert seen.get("url") == "https://api.victim.example/v1"   # subdomain allowed
-    assert "200" in obs
+    assert "BLOCKED" in obs
+    assert "exact host victim.example" in obs
+
+
+def test_model_cannot_disable_operator_scope_lock(tmp_path, monkeypatch):
+    seen = {}
+
+    class FakeHunt:
+        @staticmethod
+        def run_recon(domain, scope_lock=False, max_urls=0):
+            seen.update(domain=domain, scope_lock=scope_lock, max_urls=max_urls)
+            return True
+
+    d = _dispatcher(tmp_path)
+    monkeypatch.setattr(agent, "_h", lambda: FakeHunt)
+    monkeypatch.setattr(d, "_summarize_recon", lambda domain, ok: "ok")
+
+    assert d.dispatch("run_recon", {"scope_lock": False, "max_urls": "lots"}).startswith("ok")
+    assert seen == {"domain": "victim.example", "scope_lock": True, "max_urls": 10}

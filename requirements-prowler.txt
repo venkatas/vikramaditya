@@ -1,0 +1,4 @@
+# Keep isolated from requirements.txt. Prowler 4.5.0 hard-pins
+# cryptography==43.0.1 and pydantic==1.10.18, which conflict with the main
+# Vikramaditya environment. The OCSF parser is coupled to this Prowler release.
+prowler-cloud==4.5.0

@@ -381,6 +381,7 @@ def _new_fingerprint_result(url: str) -> dict:
         "login_paths": [],
         "api_detected": False,
         "api_base": None,
+        "cross_origin_api_candidates": [],
         "js_chunks": 0,
         "js_endpoints": 0,
         "openapi_found": False,
@@ -561,24 +562,19 @@ def fingerprint_webapp(url: str, _result: dict | None = None) -> dict:
                 js_text, re.IGNORECASE)
             for api_url in cross_origin_apis:
                 api_url = api_url.rstrip("/")
-                if api_url and parsed.netloc not in api_url:
-                    # Cross-origin API found
-                    result["api_detected"] = True
-                    result["api_base"] = api_url
-                    log("info", f"Cross-origin API found in JS: {api_url}")
-                    # Check if this API has a login endpoint
-                    for lp in ["login-view/", "login/", "auth/login/"]:
-                        try:
-                            lp_resp = requests.post(f"{api_url}/{lp}",
-                                                     data={"email": "", "password": ""},
-                                                     verify=False, timeout=8)
-                            if lp_resp.status_code not in (404, 405, 0):
-                                result["login_detected"] = True
-                                result["login_paths"].append(f"{api_url}/{lp}")
-                                break
-                        except Exception:
-                            continue
-                    break
+                try:
+                    api_host = (urlparse(api_url).hostname or "").lower().rstrip(".")
+                except Exception:
+                    api_host = ""
+                target_host = (parsed.hostname or "").lower().rstrip(".")
+                if api_host and api_host != target_host:
+                    # JavaScript is target-controlled evidence, not scope authority.
+                    # Never probe or route credentials to another host merely because
+                    # a bundle names it. Keep it for a separately authorised run.
+                    candidates = result.setdefault("cross_origin_api_candidates", [])
+                    if api_url not in candidates:
+                        candidates.append(api_url)
+                    log("info", f"Cross-origin API candidate found in JS (not probed): {api_url}")
 
             # Also detect login-view in JS fetch/post calls
             if not result["login_detected"]:
@@ -606,8 +602,8 @@ def fingerprint_webapp(url: str, _result: dict | None = None) -> dict:
                         "v1/auth/login", "api/login"]
         for lp in login_probes:
             try:
-                lp_resp = requests.post(f"{base}/{lp}", json={"email": "", "password": ""},
-                                         verify=False, timeout=8)
+                lp_resp = requests.get(f"{base}/{lp}", verify=False, timeout=8,
+                                       allow_redirects=False)
                 # If we get anything other than 404/405, a login endpoint exists
                 if lp_resp.status_code not in (404, 405, 0):
                     result["login_detected"] = True
@@ -630,21 +626,16 @@ def fingerprint_webapp(url: str, _result: dict | None = None) -> dict:
         except Exception:
             continue
 
-    # Also check subdomain api.*
+    # Record the conventional api.* hostname as a candidate only. A related
+    # name is not scope authority, so an exact-host fingerprint must not probe it.
     host_parts = parsed.netloc.split(".")
     if host_parts[0] != "api" and len(host_parts) >= 2:
         api_host = "api." + ".".join(
             host_parts[1:] if host_parts[0] in ("app", "www") else host_parts)
-        try:
-            probe_resp = requests.get(f"{parsed.scheme}://{api_host}/",
-                                       verify=False, timeout=8)
-            if probe_resp.status_code not in (0, 502, 503):
-                ct = probe_resp.headers.get("Content-Type", "")
-                if "application/json" in ct or probe_resp.status_code == 200:
-                    result["api_detected"] = True
-                    result["api_base"] = f"{parsed.scheme}://{api_host}"
-        except Exception:
-            pass
+        candidate = f"{parsed.scheme}://{api_host}"
+        candidates = result.setdefault("cross_origin_api_candidates", [])
+        if candidate not in candidates:
+            candidates.append(candidate)
 
     # If no explicit API base but JS has endpoints, API is same-origin
     if not result["api_detected"] and result["js_endpoints"] > 3:

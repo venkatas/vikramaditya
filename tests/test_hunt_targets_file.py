@@ -80,7 +80,9 @@ def test_derive_targets_label_is_shell_safe():
 
 
 def test_is_safe_target_accepts_real_targets_rejects_injection():
-    for ok in ("example.com", "app.example.com", "192.168.1.1", "10.0.0.0/24", "asn:123456"):
+    for ok in ("example.com", "app.example.com", "192.168.1.1", "10.0.0.0/24", "asn:123456", "AS64512", "example.com:8443", "2001:db8::1", "2001:db8::/64"):
         assert hunt._is_safe_target(ok), ok
-    for bad in ("$(whoami).com", "a;rm -rf ~", "`id`", "a.com|nc evil 1", "x y", "", None):
+    for bad in ("$(whoami).com", "a;rm -rf ~", "`id`", "a.com|nc evil 1", "x y", "", None,
+                "/tmp/abs", "../../tmp/pwn", "::::", "999.999.999.999", "10.0.0.0/99",
+                "example.com:0", "example.com:65536", "https://example.com"):
         assert not hunt._is_safe_target(bad), bad

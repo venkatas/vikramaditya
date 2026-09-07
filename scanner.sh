@@ -49,6 +49,10 @@ RECON_DIR=""
 QUICK_MODE=""
 FULL_MODE=""
 SKIP_CHECKS=""
+# State-changing probes are fail-closed. hunt.py sets this to 1 only after the
+# operator supplies --allow-destructive; direct scanner.sh users must opt in
+# explicitly with VAPT_ALLOW_STATE_CHANGES=1.
+ALLOW_STATE_CHANGES="${VAPT_ALLOW_STATE_CHANGES:-0}"
 
 while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -233,6 +237,11 @@ verify_sqli_poc() {
 
 verify_upload_poc() {
     local upload_url="$1"; local base_url=$(echo "$upload_url" | cut -d'/' -f1-3); local ts=$(date +%s)
+
+    if [ "$ALLOW_STATE_CHANGES" != "1" ]; then
+        _mark_coverage "upload-verification" "executable upload and execution probe skipped; explicit state-change authorization was not supplied"
+        return 2
+    fi
     
     # Tech Detection
     local ext="php"; local payload='<?php echo "RCE-VAL-".(7*7); ?>'
@@ -308,6 +317,13 @@ for f in "$PRIORITY_DIR/critical_hosts.txt" "$PRIORITY_DIR/high_hosts.txt" "$PRI
 done
 # Clean and uniqify
 awk '!seen[$0]++' "$ORDERED_SCAN" > "${ORDERED_SCAN}.tmp" && mv "${ORDERED_SCAN}.tmp" "$ORDERED_SCAN"
+# Priority files can outlive the scoped recon corpus. Re-apply the canonical
+# exact-host allowlist to the final active target list immediately before use.
+if [ -s "$_SCOPE_ALLOW" ]; then
+    timeout 30 python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-filter \
+        --allow-file "$_SCOPE_ALLOW" --in "$ORDERED_SCAN" --out "$ORDERED_SCAN" 2>/dev/null \
+        || : > "$ORDERED_SCAN"
+fi
 [ ! -s "$ORDERED_SCAN" ] && log_err "No scan targets found" && exit 1
 
 # ── Check 0: Upload Surface Discovery ──────────────────────────────────
@@ -516,6 +532,10 @@ if ! skip_has upload; then
             # 401/403 → endpoint exists but auth-gated.
             # 415 → unsupported media type (endpoint exists, expects different content).
             if [ "$CODE" = "405" ] || [ "$CODE" = "401" ] || [ "$CODE" = "403" ] || [ "$CODE" = "415" ]; then
+                if [ "$ALLOW_STATE_CHANGES" != "1" ]; then
+                    echo "[UPLOAD-ENDPOINT-CANDIDATE] $U (GET=$CODE; POST not sent without explicit state-change authorization)" >> "$FINDINGS_DIR/manual_review/upload_candidates.txt"
+                    continue
+                fi
                 POST_CODE=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
                     -X POST -F "file=@/dev/null;filename=test.txt;type=text/plain" "$U" 2>/dev/null)
                 # 200/201/202 = upload accepted (high-value).
@@ -854,13 +874,14 @@ if ! skip_has mfa; then
             BASE=$(echo "$url" | cut -d'?' -f1)
 
             # --- Test 1: Rate limit on OTP endpoint ---
-            log_step "Rate limit probe: $BASE"
-            STATUS_CODES=$(for i in $(seq 1 15); do
-                curl -sk -o /dev/null -w "%{http_code}\n" --max-time 5 \
-                    -X POST "$BASE" \
-                    -H "Content-Type: application/json" \
-                    -d '{"otp":"000000"}' 2>/dev/null || echo "ERR"
-            done | sort | uniq -c | sort -rn | head -5)
+            if [ "$ALLOW_STATE_CHANGES" = "1" ]; then
+                log_step "Rate limit probe: $BASE"
+                STATUS_CODES=$(for i in $(seq 1 15); do
+                    curl -sk -o /dev/null -w "%{http_code}\n" --max-time 5 \
+                        -X POST "$BASE" \
+                        -H "Content-Type: application/json" \
+                        -d '{"otp":"000000"}' 2>/dev/null || echo "ERR"
+                done | sort | uniq -c | sort -rn | head -5)
             # Fire only when the endpoint actually responded with real HTTP
             # codes AND none of them is 429. The old `grep -qv "429\|ERR"`
             # matched if ANY single line was not 429, which is almost always
@@ -868,10 +889,13 @@ if ! skip_has mfa; then
             # positive even when rate limiting works. Requiring a 3-digit code
             # also suppresses a dead/unreachable endpoint whose histogram is
             # all-ERR/all-000 (curl failures), which carries no rate-limit signal.
-            if echo "$STATUS_CODES" | grep -qE '[1-5][0-9]{2}' \
-                && ! echo "$STATUS_CODES" | grep -q "429"; then
-                log_vuln "[MFA] No rate limit detected on OTP endpoint: $BASE"
-                echo "[MFA-NO-RATE-LIMIT] $BASE | codes: $STATUS_CODES" >> "$FINDINGS_DIR/mfa/findings.txt"
+                if echo "$STATUS_CODES" | grep -qE '[1-5][0-9]{2}' \
+                    && ! echo "$STATUS_CODES" | grep -q "429"; then
+                    log_vuln "[MFA] No rate limit detected on OTP endpoint: $BASE"
+                    echo "[MFA-NO-RATE-LIMIT] $BASE | codes: $STATUS_CODES" >> "$FINDINGS_DIR/mfa/findings.txt"
+                fi
+            else
+                _mark_coverage "mfa-rate-limit" "OTP POST burst skipped; explicit state-change authorization was not supplied"
             fi
 
             # --- Test 2: MFA workflow skip (pre-MFA session to protected page) ---
@@ -911,12 +935,14 @@ if ! skip_has mfa; then
 
             # --- Test 3: Response manipulation canary ---
             # Check if server returns JSON with a success/failure flag (indicator only)
-            RESP=$(curl -sk --max-time 5 -X POST "$BASE" \
-                -H "Content-Type: application/json" \
-                -d '{"otp":"999999"}' 2>/dev/null || true)
-            if echo "$RESP" | grep -qi '"success"\s*:\s*false\|"verified"\s*:\s*false\|"status"\s*:\s*"fail"'; then
-                log_vuln "[MFA] Response manipulation candidate (server sends JSON success flag): $BASE"
-                echo "[MFA-RESPONSE-MANIP] $BASE | change false->true in response" >> "$FINDINGS_DIR/mfa/findings.txt"
+            if [ "$ALLOW_STATE_CHANGES" = "1" ]; then
+                RESP=$(curl -sk --max-time 5 -X POST "$BASE" \
+                    -H "Content-Type: application/json" \
+                    -d '{"otp":"999999"}' 2>/dev/null || true)
+                if echo "$RESP" | grep -qi '"success"\s*:\s*false\|"verified"\s*:\s*false\|"status"\s*:\s*"fail"'; then
+                    log_vuln "[MFA] Response manipulation candidate (server sends JSON success flag): $BASE"
+                    echo "[MFA-RESPONSE-MANIP] $BASE | change false->true in response" >> "$FINDINGS_DIR/mfa/findings.txt"
+                fi
             fi
 
         done <<< "$MFA_ENDPOINTS"
@@ -984,7 +1010,7 @@ if ! skip_has saml; then
     # Set-Cookie) AND any redirect target is NOT the login/error flow; otherwise
     # downgrade to a manual-verification candidate.
     ACS_URL=$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | grep "saml/acs\|saml/login" | head -1 | awk '{print $2}' || true)
-    if [ -n "$ACS_URL" ]; then
+    if [ -n "$ACS_URL" ] && [ "$ALLOW_STATE_CHANGES" = "1" ]; then
         # Minimal stripped SAMLResponse (no Signature element, synthetic NameID)
         STRIPPED_SAML=$(echo '<?xml version="1.0"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>admin@example.invalid</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>' | base64 | tr -d '\n')
         SS_HDRS=$(curl -sk -D - -o /dev/null --max-time 8 \
@@ -1004,6 +1030,8 @@ if ! skip_has saml; then
             fi
             ;;
         esac
+    elif [ -n "$ACS_URL" ]; then
+        _mark_coverage "saml-signature-strip" "synthetic assertion POST skipped; explicit state-change authorization was not supplied"
     fi
 
     SAML_FINDINGS=$(count_vuln "$FINDINGS_DIR/saml/findings.txt")

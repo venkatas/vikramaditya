@@ -64,6 +64,41 @@ def test_run_vuln_scan_forwards_extended_scanner_skip_names(tmp_path, monkeypatc
 
     assert commands, "scanner command was not invoked"
     assert '--skip "deserialize,import,mfa,saml,supplychain,upload"' in commands[0]
+    assert "VAPT_ALLOW_STATE_CHANGES=0" in commands[0]
+
+
+def test_destructive_opt_in_is_forwarded_to_scanner(tmp_path, monkeypatch):
+    import hunt
+
+    recon_dir = tmp_path / "recon" / "example.com" / "sessions" / "s1"
+    (recon_dir / "live").mkdir(parents=True)
+    (recon_dir / "priority").mkdir()
+    (recon_dir / "live" / "httpx_full.txt").write_text("https://example.com [200]\n")
+    (recon_dir / "priority" / "prioritized_hosts.txt").write_text("https://example.com\n")
+    commands = []
+    monkeypatch.setattr(hunt, "_resolve_recon_dir", lambda domain: str(recon_dir))
+    monkeypatch.setattr(hunt, "_resolve_findings_dir", lambda *a, **k: str(tmp_path / "findings"))
+    monkeypatch.setattr(hunt, "_adaptive_runtime_overrides", lambda domain: {})
+    monkeypatch.setattr(hunt, "_shell_env_prefix", lambda env: "")
+    monkeypatch.setattr(hunt, "run_prioritize", lambda domain: True)
+    monkeypatch.setattr(hunt, "run_live", lambda cmd, **kwargs: commands.append(cmd) or True)
+    monkeypatch.setattr(hunt, "_brain_phase_complete", lambda *a, **k: None)
+    monkeypatch.setattr(hunt, "_update_target_state_from_artifacts", lambda *a, **k: None)
+    monkeypatch.setattr(hunt, "_propagate_exposed_paths", lambda *a, **k: 0)
+    monkeypatch.setattr(hunt, "_scan_exposed_data_pii", lambda *a, **k: None)
+    monkeypatch.setattr(hunt, "_runtime_session_id", lambda domain: None)
+    monkeypatch.setattr(hunt, "_active_recon_session_id", lambda domain: None)
+
+    assert hunt.run_vuln_scan("example.com", full=True, allow_destructive=True)
+    assert "VAPT_ALLOW_STATE_CHANGES=1" in commands[0]
+
+
+def test_scanner_fail_closed_state_change_and_scope_gates_are_wired():
+    assert 'ALLOW_STATE_CHANGES="${VAPT_ALLOW_STATE_CHANGES:-0}"' in SC
+    assert 'if [ "$ALLOW_STATE_CHANGES" != "1" ]; then' in SC
+    assert 'if [ -s "$_SCOPE_ALLOW" ]; then' in SC
+    assert '--in "$ORDERED_SCAN" --out "$ORDERED_SCAN"' in SC
+    assert "synthetic assertion POST skipped" in SC
 
 
 def test_brain_target_prefers_live_host(tmp_path, monkeypatch):

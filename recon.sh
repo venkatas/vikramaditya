@@ -1751,6 +1751,7 @@ if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
         cp "$RECON_DIR/urls/.katana_targets.all" "$RECON_DIR/urls/katana_targets.txt"
     fi
     rm -f "$RECON_DIR/urls/.katana_targets.all"
+    _scope_filter_file "$RECON_DIR/urls/katana_targets.txt"
     _KATANA_TGT_N=$(file_lines "$RECON_DIR/urls/katana_targets.txt")
     log_step "katana target list: $_KATANA_TGT_N hosts (cap=${KATANA_HOST_CAP}; 0=uncapped, priority-ordered)"
 
