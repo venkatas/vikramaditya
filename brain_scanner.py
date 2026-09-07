@@ -82,6 +82,11 @@ except Exception:
 
 # Resolved-vector ledger + tool parsers (PentestCode-inspired; optional/no-op if unused)
 try:
+    from stop_after_no_new import StopAfterNoNew as _StopAfterNoNew
+except Exception:
+    _StopAfterNoNew = None  # type: ignore
+
+try:
     import resolved_vectors as _resolved_vectors
 except Exception:
     _resolved_vectors = None
@@ -1095,7 +1100,15 @@ Then test the most promising attack vectors."""
 
     findings = []
     iteration = 0
-    successful_runs = 0   # scripts that actually executed (no syntax/tooling error)
+    successful_runs = 0
+    _stop_sat = None
+    if _StopAfterNoNew is not None:
+        try:
+            _lim = int(os.environ.get("VIK_BRAIN_STOP_AFTER_NO_NEW", "3"))
+        except ValueError:
+            _lim = 3
+        _stop_sat = _StopAfterNoNew(limit=max(1, _lim))
+    _round_fps: set[str] = set()
     grounded_stdout = ""  # F9: accumulated stdout of grounded runs, so a CONFIRMED
                           # verdict is only tagged [VERIFIED] when SOME grounded output
                           # actually corroborates it (not just a passive server banner).
@@ -1296,6 +1309,11 @@ Then test the most promising attack vectors."""
                                         f"content in output): {line.strip()[:80]}")
                             continue
                         findings.append(line.strip())
+                        try:
+                            import hashlib as _hl
+                            _round_fps.add(_hl.sha256(line.strip().encode()).hexdigest()[:16])
+                        except Exception:
+                            pass
                 if _unproven_access:
                     all_results += (
                         "\nNOTE: a file-access/traversal claim was printed WITHOUT the "
@@ -1304,6 +1322,15 @@ Then test the most promising attack vectors."""
                         "`root:x:0:0:` line from /etc/passwd). Re-test and show the file "
                         "content to confirm, or drop the claim. Note that `echo X || echo Y` "
                         "does NOT make X conditional — echo always succeeds.\n")
+
+        # Saturate: stopAfterNoNew rounds with no novel finding fingerprints
+        if _stop_sat is not None:
+            if _stop_sat.observe(_round_fps):
+                log("warn", f"Brain saturated: {_stop_sat.consecutive} rounds with no new "
+                            f"finding fingerprints (VIK_BRAIN_STOP_AFTER_NO_NEW="
+                            f"{_stop_sat.limit}) — ending active loop")
+                break
+            _round_fps = set()
 
         # Feed results back to brain
         had_syntax_error = any(b for b in code_blocks) and "SCRIPT DID NOT RUN" in all_results

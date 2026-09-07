@@ -73,3 +73,6 @@ h2>=4.1.0
 # openapi-spec-validator>=0.8.5 requires this range.  Pin it directly so
 # installation cannot leave the environment in a pip-check-inconsistent state.
 jsonschema>=4.24.0,<5
+
+# Office/PDF/HTML → Markdown for LLM ingest (optional helper)
+markitdown[all]>=0.1.0

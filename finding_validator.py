@@ -6,6 +6,9 @@ Finding Validator — 7-Question Gate + Never-Submit List.
 Filters scan findings before report generation. Kills weak findings,
 downgrades uncertain ones, and flags chain opportunities.
 
+Severity inflation / high-critical acceptance aligns with
+policies/severity_rubric.md (codex-security inspired).
+
 Includes PentestCode-inspired severity-inflation critic (clean-room):
 scanner hits / banners / admin panels without proven impact are killed
 or hard-downgraded. See assess_severity_inflation().

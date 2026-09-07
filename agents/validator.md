@@ -141,3 +141,7 @@ Kill or hard-downgrade to INFO when impact is **not proven**. Scanner hits are l
 - cross-user data (other account's PII/session) in the response
 
 A scanner template hit, banner string, or "version matches CPE" alone = **lead**, not proof. Use `/validator` after every PoC before report writing.
+
+## Severity rubric
+
+See `policies/severity_rubric.md` for high/critical acceptance and what must not stay high without proof.
