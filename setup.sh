@@ -77,6 +77,14 @@ if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
     # rich pin note: requirements keep rich>=13.9.4,<14 (schemathesis 4.17).
     # semgrep wants rich~=13.5.2 — both resolve on the 13.9.x line. Do NOT install
     # rich 15 into the main .venv or semgrep breaks.
+
+    # markitdown: office/PDF → Markdown helper (optional but recommended)
+    if ! "$VENV_DIR/bin/python" -c "import markitdown" 2>/dev/null; then
+        log_warn "Installing markitdown[all] into .venv for doc ingest..."
+        "$VENV_DIR/bin/pip" install --quiet 'markitdown[all]' || log_warn "markitdown install failed — markitdown_helper.py unavailable"
+    else
+        log_ok "markitdown available in .venv"
+    fi
     else
         log_err "Core dependency installation failed; setup cannot continue with a partial Python environment"
         exit 1

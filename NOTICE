@@ -59,3 +59,22 @@ Ideas adapted (clean-room Python; not a TypeScript copy) into:
   skills/web/*/SKILL.md    <- focused SSRF/SQLi/SSTI/LFI/IDOR/XXE/upload/deser packs
 
 Full MIT license text applies as quoted above for xalgorix.
+
+-----------------------------------------------------------------------
+openai/codex-security — https://github.com/openai/codex-security
+Apache License 2.0 — Copyright (c) OpenAI
+-----------------------------------------------------------------------
+
+Ideas adapted (clean-room Python; not a fork of their CLI/SDK):
+
+  policies/severity_rubric.md   <- severity/policy guidance patterns
+  findings_dedupe.py           <- fingerprint / duplicate grouping idea
+  stop_after_no_new.py         <- stopAfterNoNew saturation pattern
+
+-----------------------------------------------------------------------
+microsoft/markitdown — https://github.com/microsoft/markitdown
+MIT License — Copyright (c) Microsoft Corporation
+-----------------------------------------------------------------------
+
+  markitdown_helper.py         <- thin CLI wrapper around MarkItDown
+
