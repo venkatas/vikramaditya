@@ -15,13 +15,384 @@ and the BrowserAgent class, and assert hunt.py's own decision logic.
 """
 
 import http.server
+import hashlib
+import json
 import os
 import threading
 import contextlib
+from datetime import datetime, timezone
 
 import pytest
 
 import hunt
+
+
+def test_secretfinder_dependency_preflight_reports_import_error(monkeypatch):
+    monkeypatch.setattr(hunt, "run_capture", lambda *args, **kwargs: {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "ModuleNotFoundError: No module named 'requests_file'",
+        "timed_out": False,
+    })
+    ready, detail = hunt._secretfinder_dependency_check()
+    assert ready is False
+    assert "requests_file" in detail
+
+
+def test_secretfinder_dependency_preflight_catches_spawn_error(monkeypatch):
+    def fail_spawn(*args, **kwargs):
+        raise OSError("posix_spawn failed")
+
+    monkeypatch.setattr(hunt, "run_capture", fail_spawn)
+    ready, detail = hunt._secretfinder_dependency_check()
+    assert ready is False
+    assert "posix_spawn failed" in detail
+
+
+def test_secretfinder_dependency_preflight_catches_timeout(monkeypatch):
+    monkeypatch.setattr(hunt, "run_capture", lambda *args, **kwargs: {
+        "returncode": -9,
+        "stdout": "",
+        "stderr": "TIMEOUT after 15s",
+        "timed_out": True,
+    })
+    ready, detail = hunt._secretfinder_dependency_check()
+    assert ready is False
+    assert "timed out" in detail
+
+
+def test_phase_manifest_records_start_and_end(tmp_path, monkeypatch):
+    started = datetime(2026, 8, 23, 5, 0, tzinfo=timezone.utc)
+    finished = datetime(2026, 8, 23, 5, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(hunt, "_LAST_FINDINGS_DIR", str(tmp_path))
+
+    hunt._record_phase_manifest(
+        "TEST PHASE",
+        "true",
+        0,
+        False,
+        None,
+        started_at=started,
+        finished_at=finished,
+    )
+
+    manifest = hunt.phase_manifest.read_manifest(str(tmp_path))
+    phase = manifest["phases"][-1]
+    assert phase["start"] == started.isoformat()
+    assert phase["end"] == finished.isoformat()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# JS corpus freshness, retry, provenance, and failure signaling
+# ════════════════════════════════════════════════════════════════════════════
+def _make_js_recon(tmp_path, urls):
+    recon = tmp_path / "recon"
+    (recon / "urls").mkdir(parents=True)
+    (recon / "urls" / "js_files.txt").write_text("\n".join(urls) + "\n")
+    return recon
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_js_download_retries_transient_http_status_with_backoff(
+        tmp_path, monkeypatch, status):
+    urls = tmp_path / "urls.txt"
+    urls.write_text("https://example.test/app.js\n")
+    calls = []
+    sleeps = []
+    monkeypatch.setenv("JS_DOWNLOAD_WORKERS", "1")
+    monkeypatch.setenv("JS_DOWNLOAD_RETRIES", "2")
+    monkeypatch.setenv("JS_DOWNLOAD_BACKOFF_SECONDS", "0.01")
+    monkeypatch.setattr(hunt.time, "sleep", lambda delay: sleeps.append(delay))
+
+    def fake_run_capture(spec, **kwargs):
+        calls.append((list(spec), dict(kwargs)))
+        if len(calls) < 3:
+            return {
+                "stdout": str(status), "stderr": "", "returncode": 22,
+                "timed_out": False,
+            }
+        destination = spec[spec.index("-o") + 1]
+        with open(destination, "w") as handle:
+            handle.write("console.log('fresh');")
+        return {"stdout": "200", "stderr": "", "returncode": 0, "timed_out": False}
+
+    monkeypatch.setattr(hunt, "run_capture", fake_run_capture)
+    requested, downloaded = hunt._download_js_corpus(
+        str(urls), str(tmp_path / "downloaded"))
+
+    assert (requested, downloaded) == (1, 1)
+    assert len(calls) == 3
+    assert sleeps == [0.01, 0.02]
+    assert all(call[1]["shell"] is False for call in calls)
+    assert len(hunt._current_js_manifest_files(str(tmp_path / "downloaded"))) == 1
+
+
+def test_js_download_retry_exhaustion_is_bounded_and_has_no_current_files(
+        tmp_path, monkeypatch):
+    urls = tmp_path / "urls.txt"
+    urls.write_text("https://example.test/app.js\n")
+    calls = []
+    monkeypatch.setenv("JS_DOWNLOAD_WORKERS", "1")
+    monkeypatch.setenv("JS_DOWNLOAD_RETRIES", "2")
+    monkeypatch.setenv("JS_DOWNLOAD_BACKOFF_SECONDS", "0")
+
+    def always_500(spec, **kwargs):
+        calls.append(spec)
+        return {"stdout": "500", "stderr": "", "returncode": 22, "timed_out": False}
+
+    monkeypatch.setattr(hunt, "run_capture", always_500)
+    requested, downloaded = hunt._download_js_corpus(
+        str(urls), str(tmp_path / "downloaded"))
+
+    assert (requested, downloaded) == (1, 0)
+    assert len(calls) == 3
+    assert hunt._current_js_manifest_files(str(tmp_path / "downloaded")) == []
+
+
+def test_js_download_quarantines_only_previous_manifest_files(tmp_path, monkeypatch):
+    url = "https://example.test/old.js"
+    urls = tmp_path / "urls.txt"
+    urls.write_text(url + "\n")
+    dl_dir = tmp_path / "downloaded"
+    dl_dir.mkdir()
+    old_name = hashlib.sha256(url.encode()).hexdigest() + ".js"
+    old_content = "window.STALE = true;"
+    old_file = dl_dir / old_name
+    old_file.write_text(old_content)
+    old_hash = hashlib.sha256(old_content.encode()).hexdigest()
+    (dl_dir / "manifest.tsv").write_text(
+        hunt._JS_MANIFEST_HEADER + "\n"
+        f"{old_name}\t{url}\t0\t0\t{len(old_content)}\t{old_hash}\n"
+    )
+    unrelated = dl_dir / "manual-evidence.js"
+    unrelated.write_text("keep me")
+    monkeypatch.setenv("JS_DOWNLOAD_WORKERS", "1")
+    monkeypatch.setenv("JS_DOWNLOAD_RETRIES", "0")
+    monkeypatch.setattr(hunt, "run_capture", lambda *args, **kwargs: {
+        "stdout": "404", "stderr": "", "returncode": 22, "timed_out": False,
+    })
+
+    assert hunt._download_js_corpus(str(urls), str(dl_dir)) == (1, 0)
+    assert unrelated.read_text() == "keep me"
+    assert not old_file.exists()
+    quarantined = list((dl_dir / "stale").rglob(old_name))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text() == old_content
+    assert hunt._current_js_manifest_files(str(dl_dir)) == []
+
+
+def test_current_js_manifest_rejects_untracked_and_tampered_files(tmp_path, monkeypatch):
+    url = "https://example.test/current.js"
+    urls = tmp_path / "urls.txt"
+    urls.write_text(url + "\n")
+    dl_dir = tmp_path / "downloaded"
+    dl_dir.mkdir()
+    untracked = dl_dir / "manual-evidence.js"
+    untracked.write_text("unrelated")
+    monkeypatch.setenv("JS_DOWNLOAD_WORKERS", "1")
+    monkeypatch.setenv("JS_DOWNLOAD_RETRIES", "0")
+
+    def successful_download(spec, **kwargs):
+        destination = spec[spec.index("-o") + 1]
+        with open(destination, "w") as handle:
+            handle.write("console.log('current');")
+        return {"stdout": "200", "stderr": "", "returncode": 0, "timed_out": False}
+
+    monkeypatch.setattr(hunt, "run_capture", successful_download)
+    assert hunt._download_js_corpus(str(urls), str(dl_dir)) == (1, 1)
+    current = hunt._current_js_manifest_files(str(dl_dir))
+    assert len(current) == 1
+    assert str(untracked) not in current
+    assert untracked.read_text() == "unrelated"
+
+    with open(current[0], "a") as handle:
+        handle.write("// tampered")
+    assert hunt._current_js_manifest_files(str(dl_dir)) == []
+
+
+def test_run_js_analysis_uses_only_manifest_proven_argv_paths(tmp_path, monkeypatch):
+    recon = _make_js_recon(tmp_path, ["https://example.test/app.js"])
+    dl_dir = recon / "js" / "downloaded"
+    dl_dir.mkdir(parents=True)
+    stale = dl_dir / "manual-evidence.js"
+    stale.write_text("window.STALE_TOKEN = 'do-not-scan';")
+    secretfinder = tmp_path / "SecretFinder.py"
+    secretfinder.write_text("# test marker\n")
+    calls = []
+
+    monkeypatch.setenv("JS_DOWNLOAD_WORKERS", "1")
+    monkeypatch.setenv("JS_DOWNLOAD_RETRIES", "0")
+    monkeypatch.setattr(hunt, "_brain", None, raising=False)
+    monkeypatch.setattr(hunt, "_brain_phase_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hunt, "_resolve_recon_dir", lambda domain: str(recon))
+    tool_paths = {
+        "jsluice": "/tools/jsluice",
+        "secretfinder": str(secretfinder),
+        "trufflehog": "/tools/trufflehog",
+    }
+    monkeypatch.setattr(hunt, "_tool_bin", lambda name: tool_paths[name])
+    monkeypatch.setattr(
+        hunt, "_which", lambda binary: binary in {tool_paths["jsluice"], tool_paths["trufflehog"]})
+
+    def fake_run_capture(spec, **kwargs):
+        calls.append((list(spec), dict(kwargs)))
+        if spec[0] == "curl":
+            destination = spec[spec.index("-o") + 1]
+            with open(destination, "w") as handle:
+                handle.write("console.log('fresh');")
+            return {"stdout": "200", "stderr": "", "returncode": 0, "timed_out": False}
+        if spec[:2] == [hunt.sys.executable, "-c"]:
+            return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
+        if spec[0] == tool_paths["jsluice"]:
+            return {"stdout": "{}\n", "stderr": "", "returncode": 0, "timed_out": False}
+        if spec[:2] == [hunt.sys.executable, str(secretfinder)]:
+            return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
+        if spec[0] == tool_paths["trufflehog"]:
+            return {"stdout": "", "stderr": "", "returncode": 0, "timed_out": False}
+        raise AssertionError(f"unexpected command: {spec}")
+
+    monkeypatch.setattr(hunt, "run_capture", fake_run_capture)
+    assert hunt.run_js_analysis("example.test") is True
+
+    current_files = hunt._current_js_manifest_files(str(dl_dir))
+    assert len(current_files) == 1
+    analyzer_calls = [call for call in calls if call[0][0] != "curl" and "-c" not in call[0][:2]]
+    assert analyzer_calls
+    assert all(call[1]["shell"] is False for call in analyzer_calls)
+    assert all(str(stale) not in call[0] for call in analyzer_calls)
+    assert all(current_files[0] in call[0] for call in analyzer_calls)
+
+
+def test_analyzer_nonzero_exit_is_not_masked_by_output(tmp_path, monkeypatch):
+    source = tmp_path / "current.js"
+    source.write_text("console.log('x');")
+    monkeypatch.setattr(hunt, "run_capture", lambda *args, **kwargs: {
+        "stdout": '{"looks":"like a finding"}\n',
+        "stderr": "analyzer crashed",
+        "returncode": 9,
+        "timed_out": False,
+    })
+
+    jsluice_out = tmp_path / "jsluice.json"
+    jsluice_ok, _ = hunt._run_jsluice_files(
+        "/tools/jsluice", "secrets", [str(source)], str(jsluice_out),
+        workers=1, timeout=5,
+    )
+    trufflehog_out = tmp_path / "trufflehog.json"
+    trufflehog_ok, _ = hunt._run_trufflehog_files(
+        "/tools/trufflehog", [str(source)], str(trufflehog_out), timeout=5,
+    )
+
+    assert jsluice_ok is False
+    assert trufflehog_ok is False
+    assert not jsluice_out.exists()
+    assert not trufflehog_out.exists()
+    assert (tmp_path / "jsluice.json.error.txt").is_file()
+    assert (tmp_path / "trufflehog.json.error.txt").is_file()
+
+
+def test_run_js_analysis_zero_fresh_download_fails_and_degrades(tmp_path, monkeypatch):
+    recon = _make_js_recon(tmp_path, ["https://example.test/app.js"])
+    monkeypatch.setenv("JS_DOWNLOAD_WORKERS", "1")
+    monkeypatch.setenv("JS_DOWNLOAD_RETRIES", "0")
+    monkeypatch.setattr(hunt, "_brain", None, raising=False)
+    monkeypatch.setattr(hunt, "_brain_phase_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hunt, "_resolve_recon_dir", lambda domain: str(recon))
+    monkeypatch.setattr(hunt, "_tool_bin", lambda name: f"/missing/{name}")
+    monkeypatch.setattr(hunt, "_which", lambda binary: False)
+    monkeypatch.setattr(hunt, "run_capture", lambda *args, **kwargs: {
+        "stdout": "404", "stderr": "", "returncode": 22, "timed_out": False,
+    })
+    hunt._reset_degraded()
+
+    result = hunt.run_js_analysis("example.test")
+    tools = {entry["tool"] for entry in hunt._DEGRADED_CAPABILITIES}
+    assert result is False
+    assert "js_download" in tools
+    assert hunt.derive_phase_status(True, result, degraded=True) == hunt.PHASE_STATUS_ERROR
+    status = json.loads((recon / "js" / hunt._SECRETFINDER_STATUS_FILE).read_text())
+    assert status["valid"] is False
+
+
+def test_partial_js_download_is_explicitly_partial(tmp_path, monkeypatch):
+    urls = ["https://example.test/good.js", "https://example.test/missing.js"]
+    recon = _make_js_recon(tmp_path, urls)
+    monkeypatch.setenv("JS_DOWNLOAD_WORKERS", "1")
+    monkeypatch.setenv("JS_DOWNLOAD_RETRIES", "0")
+    monkeypatch.setattr(hunt, "_brain", None, raising=False)
+    monkeypatch.setattr(hunt, "_brain_phase_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hunt, "_resolve_recon_dir", lambda domain: str(recon))
+    monkeypatch.setattr(hunt, "_tool_bin", lambda name: f"/missing/{name}")
+    monkeypatch.setattr(hunt, "_which", lambda binary: False)
+
+    def one_success(spec, **kwargs):
+        if spec[-1].endswith("good.js"):
+            destination = spec[spec.index("-o") + 1]
+            with open(destination, "w") as handle:
+                handle.write("console.log('good');")
+            return {"stdout": "200", "stderr": "", "returncode": 0, "timed_out": False}
+        return {"stdout": "404", "stderr": "", "returncode": 22, "timed_out": False}
+
+    monkeypatch.setattr(hunt, "run_capture", one_success)
+    hunt._reset_degraded()
+    result = hunt.run_js_analysis("example.test")
+    tools = {entry["tool"] for entry in hunt._DEGRADED_CAPABILITIES}
+    assert result is True
+    assert "js_download" in tools
+    assert hunt.derive_phase_status(True, result, degraded=True) == hunt.PHASE_STATUS_PARTIAL
+
+
+def test_failed_secretfinder_preflight_quarantines_stale_jwt_evidence(
+        tmp_path, monkeypatch):
+    recon = _make_js_recon(tmp_path, ["https://example.test/app.js"])
+    js_dir = recon / "js"
+    js_dir.mkdir(exist_ok=True)
+    stale_token = "eyJaaaaaaaaaaa.eyJbbbbbbbbbbb.ccccccccccccc"
+    stale_output = js_dir / "secretfinder.txt"
+    stale_output.write_text(stale_token + "\n")
+    secretfinder = tmp_path / "SecretFinder.py"
+    secretfinder.write_text("# test marker\n")
+    findings = tmp_path / "findings"
+    findings.mkdir()
+
+    monkeypatch.setenv("JS_DOWNLOAD_WORKERS", "1")
+    monkeypatch.setenv("JS_DOWNLOAD_RETRIES", "0")
+    monkeypatch.setattr(hunt, "_brain", None, raising=False)
+    monkeypatch.setattr(hunt, "_brain_phase_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hunt, "_resolve_recon_dir", lambda domain: str(recon))
+    tool_paths = {
+        "jsluice": "/missing/jsluice",
+        "secretfinder": str(secretfinder),
+        "trufflehog": "/missing/trufflehog",
+    }
+    monkeypatch.setattr(hunt, "_tool_bin", lambda name: tool_paths[name])
+    monkeypatch.setattr(hunt, "_which", lambda binary: False)
+
+    def download_then_preflight_failure(spec, **kwargs):
+        if spec[0] == "curl":
+            destination = spec[spec.index("-o") + 1]
+            with open(destination, "w") as handle:
+                handle.write("console.log('fresh');")
+            return {"stdout": "200", "stderr": "", "returncode": 0, "timed_out": False}
+        if spec[:2] == [hunt.sys.executable, "-c"]:
+            return {
+                "stdout": "", "stderr": "ModuleNotFoundError: requests_file",
+                "returncode": 1, "timed_out": False,
+            }
+        raise AssertionError(f"SecretFinder scan should not run: {spec}")
+
+    monkeypatch.setattr(hunt, "run_capture", download_then_preflight_failure)
+    hunt._reset_degraded()
+    assert hunt.run_js_analysis("example.test") is True
+
+    assert not stale_output.exists()
+    quarantined = list((js_dir / "stale-evidence").rglob("secretfinder.txt"))
+    assert len(quarantined) == 1
+    assert stale_token in quarantined[0].read_text()
+    status = json.loads((js_dir / hunt._SECRETFINDER_STATUS_FILE).read_text())
+    assert status["valid"] is False
+    assert str(stale_output) not in hunt._jwt_artifact_search_paths(str(recon), str(findings))
+    assert "secretfinder" in {entry["tool"] for entry in hunt._DEGRADED_CAPABILITIES}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -275,7 +646,7 @@ def _stub_sqlmap_env(monkeypatch, tmp_path, *, run_cmd_ok, sqli_lines=""):
     # one reachable GET candidate, no POST endpoints
     monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
-                        lambda r, limit=15: [])
+                        lambda r, limit=15, **kwargs: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file",
                         lambda *a, **k: ["http://victim.example/p?id=1"])
     monkeypatch.setattr(hunt, "_filter_reachable_candidates",
@@ -347,7 +718,7 @@ def test_sqlmap_post_only_failure_returns_false(monkeypatch, tmp_path):
     monkeypatch.setattr(hunt, "_collect_urls_from_file", lambda *a, **k: [])
     # no GET candidates, one POST endpoint
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
-                        lambda r, limit=15: [{"url": "http://victim.example/api/x",
+                        lambda r, limit=15, **kwargs: [{"url": "http://victim.example/api/x",
                                               "method": "POST",
                                               "json_body": {"id": "1"}}])
     monkeypatch.setattr(hunt, "_glob_results_csvs", lambda d: [])
@@ -380,7 +751,7 @@ def test_sqlmap_post_only_success_returns_true(monkeypatch, tmp_path):
     monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file", lambda *a, **k: [])
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
-                        lambda r, limit=15: [{"url": "http://victim.example/api/x",
+                        lambda r, limit=15, **kwargs: [{"url": "http://victim.example/api/x",
                                               "method": "POST",
                                               "json_body": {"id": "1"}}])
     monkeypatch.setattr(hunt, "_glob_results_csvs", lambda d: [])
@@ -414,7 +785,7 @@ def test_sqlmap_all_unreachable_logs_distinct_message(monkeypatch, tmp_path):
     monkeypatch.setattr(hunt, "_which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
-                        lambda r, limit=15: [])
+                        lambda r, limit=15, **kwargs: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file",
                         lambda *a, **k: ["http://victim.example/p?id=1",
                                          "http://victim.example/q?x=2"])
@@ -452,7 +823,7 @@ def test_sqlmap_never_discovered_logs_recon_hint(monkeypatch, tmp_path):
     monkeypatch.setattr(hunt, "_which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(hunt, "_collect_db_named_candidates", lambda r, **kw: [])
     monkeypatch.setattr(hunt, "_collect_openapi_post_endpoints",
-                        lambda r, limit=15: [])
+                        lambda r, limit=15, **kwargs: [])
     monkeypatch.setattr(hunt, "_collect_urls_from_file", lambda *a, **k: [])
     monkeypatch.setattr(hunt, "run_post_param_discovery", lambda *a, **k: None)
 

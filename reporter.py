@@ -359,9 +359,13 @@ VULN_TEMPLATES = {
         ],
     },
     "email_auth": {
-        "title": "Email Authentication Weakness on {host}",
+        "title": "Email Authentication Posture on {host}",
         "severity": "medium", "cvss": "5.3", "cwe": "CWE-290",
-        "impact": "Missing or weak email authentication (SPF/DKIM/DMARC) lets an attacker spoof mail from this domain, enabling phishing and business-email-compromise against staff, customers, and partners.",
+        "impact": (
+            "Missing or weak email authentication (SPF/DKIM/DMARC) can increase "
+            "the risk that receivers accept spoofed mail. A DNS posture observation "
+            "does not, by itself, prove successful spoofing or mail delivery."
+        ),
         "remediation": "Publish a DMARC record (start p=none with rua reporting, then move to quarantine/reject), tighten SPF toward -all once all senders are covered, and ensure DKIM signing on all sending sources.",
         "references": [
             ("DMARC.org", "https://dmarc.org/"),
@@ -793,6 +797,110 @@ def parse_custom_line(line: str, default_vtype: str = "misconfig") -> dict:
             "vtype": default_vtype}
 
 
+# ANTI-FABRICATION: scanner STATE/summary lines that must NEVER become findings.
+# A "Label: <count>" tally ("Confirmed RCE: 0", "Java targets: 2") and SKIPPED/N/A/none
+# markers are probe state, not vulnerabilities — the generic loader used to promote each
+# to a CRITICAL via the subdir's template default (16 fake CVSS-9.8 RCEs, 2026-07-19).
+_STATE_LINE_RE = re.compile(r'^[A-Za-z][A-Za-z0-9 ()/_.-]*:\s*\d+\s*$')
+
+# A line whose LEADING bracket is a bare HTTP status code ("[302] https://h | header=User-Agent",
+# "[401] https://h/admin — auth required") is a PROBE-RESPONSE echo, never a confirmation.
+# hunt.py's Log4Shell/JBoss RCE probes append one such line per request; the real signal is
+# written elsewhere — the "# OOB CALLBACKS" section, JBOSS_EXPOSED_*.txt, or a NAMED marker
+# ([POC-RCE-CONFIRMED]/[VULN]). Every genuine confirmation across the codebase uses a NAMED
+# bracket ([POC], [VULN], [CVE-...], nuclei [template-id]), so a pure-numeric leading bracket is
+# safe to suppress fail-closed. (2026-07-25 engagement: 10 fake CVSS-9.8 RCEs on one host,
+# each from a [302] probe echo, while the phase's own tally said "Confirmed RCE: 0".)
+_PROBE_STATUS_LINE_RE = re.compile(r'^\[\d{3}\]\s')
+
+# ── Fail-closed confirmation gate (v10.7) ───────────────────────────────────────────────
+# The generic Method-1 loader is fail-OPEN: it stamps every surviving line in findings/<vtype>/
+# with that vtype's template severity. For the ACTIVE-EXPLOITATION classes a Medium+/Critical
+# claim REQUIRES a proof-of-concept by definition — a probe echo, a discovery hit, or a tool log
+# line is NOT a confirmed exploit. So a line in one of these dirs keeps its parsed Medium+
+# severity ONLY if it is producer-verified per _is_verified_finding_line() (a leading confirmation
+# marker, a leading [SEVERITY] prefix, or the nuclei result grammar); otherwise it is CAPPED to
+# LOW and relabelled a "lead" — kept visible, never dropped (hiding a real finding is worse than
+# demoting an unproven one). This kills the whole fabrication class instead of deny-listing each
+# new probe/state/log shape one at a time. Loaders that carry their OWN verification (sqlmap CSV,
+# nuclei-confirmed, Burp confidence gate, brain-active grounding gate, email_auth JSON) do not
+# pass through here.
+_ACTIVE_EXPLOIT_VTYPES = frozenset({
+    "rce", "sqli", "xxe", "ssti", "lfi", "idor", "ssrf", "auth_bypass",
+    "upload", "upload_type_bypass", "deserialization", "business_logic",
+    "smuggling", "oauth", "race_condition", "exploit_chain",
+})
+# A line keeps its parsed Medium+ severity only if it matches one of THREE producer grammars
+# that mean "verified", each anchored to line-START (a trailing/quoted marker in captured console
+# output must NOT count — friends-review, codex):
+#   1. a LEADING confirmation marker — [X-CONFIRMED] / [X-VERIFIED] / [..POC..] / [VULN] /
+#      [EXPLOITED]. The (?<!UN) guard stops [..-UNVERIFIED] (an explicit NON-finding) counting.
+#   2. a LEADING severity prefix — [CRITICAL]/[HIGH]/[MEDIUM]/[LOW]/[INFO]. This is the
+#      auth_utils.FindingSaver.save_txt() convention the API scanners (idor/oauth/auth_bypass/
+#      business_logic/upload/exploit_chain) use to persist findings they already assessed. The raw
+#      infra scanner (scanner.sh/hunt.py) never leads an active-exploit line with a bare severity
+#      tag (it uses named markers), so trusting this prefix keeps real API findings without
+#      re-opening the probe/state/log fabrication path.
+#   3. a nuclei result line — [template-id] [proto] [severity] URL (three leading brackets).
+_LEADING_CONFIRMED_RE = re.compile(
+    r'^\s*\[[A-Z0-9_-]*(?:CONFIRMED|(?<!UN)VERIFIED|EXPLOITED)\]'
+    r'|^\s*\[[A-Z0-9_-]*POC[A-Z0-9_-]*\]'
+    r'|^\s*\[VULN\]',
+    re.I)
+_SEVERITY_PREFIX_RE = re.compile(
+    r'^\s*\[(?:CRITICAL|HIGH|MEDIUM|LOW|INFO|INFORMATIONAL)\]', re.I)
+# nuclei result grammar: [template-id] [proto] [severity] <matched-URL>. The trailing URL is
+# REQUIRED — a three-bracket LOG line with no URL ("[probe-log] [http] [critical] request failed")
+# is not a hit (codex pass-2).
+_NUCLEI_LINE_RE = re.compile(
+    r'^\s*\[[^\]]+\]\s*\[[a-z0-9-]+\]\s*\[(?:critical|high|medium|low|info)\]\S*\s.*https?://', re.I)
+# A leading marker that LOOKS positive but is explicitly NEGATIVE — [UNCONFIRMED]/[NOT-CONFIRMED]/
+# [NO-POC]/[POC-FAILED]/[NOT-VERIFIED]/[UN-VERIFIED] — must NOT count as verified even though it
+# syntactically contains CONFIRMED/VERIFIED/POC. Checked FIRST, wins over the positive grammars.
+_NEGATIVE_MARKER_RE = re.compile(
+    r'^\s*\[[^\]]*(?:UN-?CONFIRMED|UN-?VERIFIED|NOT-?CONFIRMED|NOT-?VERIFIED'
+    r'|NO-?POC|POC-?FAILED|FAILED|INVALID|NEGATIVE)[^\]]*\]', re.I)
+
+
+def _is_verified_finding_line(line: str) -> bool:
+    """True when a findings/<active-exploit>/ line is producer-verified and may keep its parsed
+    Medium+ severity — it matches a leading confirmation marker, a leading severity prefix
+    (FindingSaver), or the nuclei result grammar. An explicit NEGATIVE marker never counts.
+    Everything else is an unproven lead."""
+    if _NEGATIVE_MARKER_RE.match(line):
+        return False
+    return bool(_LEADING_CONFIRMED_RE.match(line)
+                or _SEVERITY_PREFIX_RE.match(line)
+                or _NUCLEI_LINE_RE.match(line))
+
+
+def _demote_to_lead(finding: dict, note: str) -> dict:
+    """Fail-closed: cap an UNCONFIRMED active-exploit finding to LOW and relabel it a lead, so it
+    stays visible for manual verification instead of shipping as a fabricated Medium+/Critical."""
+    orig = finding.get("severity")
+    if orig and str(orig).lower() != "low":
+        finding["original_severity"] = orig
+    finding["severity"] = "low"
+    finding["cvss"] = CVSS_DEFAULT.get("low", "3.1")
+    finding["_unconfirmed_lead"] = True
+    finding["title"] = f"Unconfirmed {note} lead — manual verification required"
+    finding["detail"] = ((finding.get("detail") or finding.get("raw") or "").rstrip()
+                         + "  [NOT a confirmed PoC: no confirmation marker in the scanner output "
+                           "for this active-exploitation class — verify before reporting]")
+    return finding
+
+
+def _is_state_line(line: str) -> bool:
+    """True for a scanner state/summary line that is never a finding (fail-closed)."""
+    s = line.strip()
+    if not s:
+        return True
+    u = s.upper()
+    if u.startswith(("SKIPPED", "N/A", "(NONE)", "NONE FOUND", "NO TARGETS", "NO HOSTS")):
+        return True
+    return bool(_STATE_LINE_RE.match(s))   # "Label: <count>" tally
+
+
 def _load_poc_blocks(poc_path: str) -> dict:
     """Load PoC blocks from a .poc file. Format: ### FINDING_TEXT\\n(poc lines)\\n###"""
     pocs = {}
@@ -812,6 +920,49 @@ def _load_poc_blocks(poc_path: str) -> dict:
     if current_key and current_lines:
         pocs[current_key] = "\n".join(current_lines).strip()
     return pocs
+
+
+def _consolidate_repeated_findings(results: list, threshold: int = 4) -> list:
+    """Collapse many near-identical findings (same vtype+severity+reason across DIFFERENT
+    hosts — e.g. 'Missing CSP header' on 71 hosts) into ONE finding with an aggregated host
+    list, so the report shows the issue once instead of flooding N per-host rows (a real run
+    reported 104 findings, 100 of them per-host header dupes). Only groups with >= threshold
+    members collapse; everything else passes through unchanged, so distinct findings and small
+    fixtures are unaffected."""
+    from collections import OrderedDict
+
+    def _host_of(f) -> str:
+        m = re.search(r'https?://([^/\s"\']+)', (f.get("url") or "") + " " + (f.get("raw") or ""))
+        return m.group(1) if m else ""
+
+    def _reason_key(f):
+        # strip URLs/hosts so the same issue on different hosts groups together
+        txt = f.get("raw") or f.get("title") or f.get("description") or ""
+        txt = re.sub(r'https?://\S+', '', txt)
+        txt = re.sub(r'\s+', ' ', txt).strip().lower()
+        return (f.get("vtype", ""), f.get("severity", ""), txt)
+
+    groups = OrderedDict()
+    for f in results:
+        groups.setdefault(_reason_key(f), []).append(f)
+
+    out = []
+    for members in groups.values():
+        if len(members) >= threshold:
+            hosts = []
+            for m in members:
+                h = _host_of(m)
+                if h and h not in hosts:
+                    hosts.append(h)
+            rep = dict(members[0])
+            rep["_affected_hosts"] = hosts
+            rep["_consolidated_count"] = len(members)
+            note = f"  [consolidated: {len(members)} occurrences across {len(hosts)} host(s): {', '.join(hosts[:8])}{' …' if len(hosts) > 8 else ''}]"
+            rep["raw"] = (rep.get("raw", "") or rep.get("title", "")).rstrip() + note
+            out.append(rep)
+        else:
+            out.extend(members)
+    return out
 
 
 def load_findings(findings_dir: str) -> list:
@@ -893,6 +1044,10 @@ def load_findings(findings_dir: str) -> list:
         # NOT findings; treating them as such inflates the report (97 fake "Unrestricted
         # File Upload" HIGHs from auth_required.txt during the 03-May clienta run).
         NON_FINDING_FILES = {
+            "summary.txt",                # EVERY subdir's per-phase tally (e.g. rce/summary.txt:
+                                          # "Confirmed RCE: 0", "Java targets: 2") — pure state, never
+                                          # a finding. Its lines were promoted to CRITICAL RCEs (16 fake
+                                          # CVSS-9.8 on a real 2026-07-19 run). Global blacklist.
             "auth_required.txt",          # upload/ — paths protected by auth, not vulnerable
             "auth-required.txt",
             # NOTE: timebased_candidates.txt is deliberately NOT blacklisted — it can carry a
@@ -942,6 +1097,15 @@ def load_findings(findings_dir: str) -> list:
             "[CONVERTER-ENDPOINT",       # import_export/ — converter endpoint guess (bare 200/405), not exploited.
             "[SAML-ENDPOINT",            # saml/ — endpoint DISCOVERY (HTTP 200/302), NOT an exploited auth
                                          # bypass; shipped CRITICAL via the auth_bypass template default.
+            "[PROPAGATED]",              # exposure/ — a config/data PATH found reachable (200+textual) and
+                                         # "propagated" from another host: a DISCOVERY lead, NOT a content-
+                                         # confirmed exposure. The reporter promoted it to HIGH 7.5 "Sensitive
+                                         # Data Exposure" — but an SPA/CDN soft-404 (index.html for any path)
+                                         # trivially satisfies 200+text/html (a 2026-08-09 engagement: an SPA served
+                                         # index.html for /openapi.json). Real exposures come from
+                                         # verified_sensitive.txt / [EXPOSED] magika hits (different markers,
+                                         # unaffected). hunt.py now also refuses to EMIT [PROPAGATED] for a
+                                         # config path that returns text/html (soft-404 guard at the source).
             "[JAVA-DESER]",              # deserialize/ — Content-Type fingerprint only (no gadget sent).
             "[PHP-DESER]",               # deserialize/ — unserialize-error reflection heuristic, not exploited.
             "[SQLI-CANDIDATE]",          # unverified time-based candidate, needs follow-up
@@ -1004,12 +1168,24 @@ def load_findings(findings_dir: str) -> list:
                 continue
             if fn in NON_FINDING_FILES:
                 continue
+            if fn.endswith("_targets.txt"):
+                # candidate/target host LISTS (java_targets.txt, tomcat_targets.txt, …) —
+                # hosts queued for testing, not findings. Their bare-URL lines were rendered
+                # as one CRITICAL finding per host via the subdir template default.
+                continue
             if vtype == "jwt" and _JWT_NARRATIVE_FILE_RE.match(fn):
                 continue
             with open(os.path.join(path, fn), errors="replace") as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith("#"):
+                        continue
+                    if _is_state_line(line):
+                        # scanner state/tally/SKIPPED line — never a finding (fail-closed)
+                        continue
+                    if _PROBE_STATUS_LINE_RE.match(line):
+                        # "[302] https://h | header=…" — an HTTP-status probe-response echo
+                        # (Log4Shell/JBoss RCE probes), not a confirmation. Fail-closed.
                         continue
                     if any(line.startswith(p) for p in NON_FINDING_PREFIXES):
                         continue
@@ -1025,6 +1201,25 @@ def load_findings(findings_dir: str) -> list:
                         unconfirmed_cves.append((line.upper(), "", ""))
                         continue
                     finding = parse_custom_line(line, vtype)
+                    # Source-audit output proves what the reviewed source contains, not that
+                    # the deployed application is reachable or exploitable. In particular,
+                    # a source-only row with no affected URL must remain a manual-review lead
+                    # even when its static rule carries a HIGH priority label.
+                    if "[SOURCE-AUDIT]" in line.upper() and finding.get("url") == "N/A":
+                        _demote_to_lead(finding, "source-audit")
+                        finding["verification_method"] = "source_review"
+                    # Fail-closed confirmation gate: an active-exploitation line without a
+                    # confirmation / structural-exposure marker is a LEAD, not a Medium+ finding.
+                    elif vtype in _ACTIVE_EXPLOIT_VTYPES and not _is_verified_finding_line(line):
+                        _demote_to_lead(finding, vtype)
+                    # #5 dalfox executability: dalfox tags each PoC — [V]=verified via headless
+                    # browser (executes), [R]=reflected only, [G]=grep match. Only [V] is a
+                    # confirmed XSS; [R]/[G] reflect into an unproven context (an attribute, or a
+                    # JS file served as application/x-javascript) — demote to a LOW lead.
+                    elif vtype == "xss":
+                        _dfx = re.match(r'\[POC\]\[([VRG])\]', line, re.I)
+                        if _dfx and _dfx.group(1).upper() != "V":
+                            _demote_to_lead(finding, "reflected XSS (dalfox, executable context unproven)")
                     for poc_key, poc_text in all_pocs.items():
                         if poc_key in line or line[:60] in poc_key:
                             finding["poc"] = poc_text
@@ -1255,11 +1450,19 @@ def load_findings(findings_dir: str) -> list:
             with open(email_auth_path, errors="replace") as f:
                 ea_data = _json.load(f)
             for item in (ea_data if isinstance(ea_data, list) else []):
-                sev = str(item.get("severity", "low")).lower()
+                declared_sev = str(item.get("severity", "low")).strip().lower()
+                sev = declared_sev
                 if sev in ("informational", "information"):
                     sev = "info"
                 if sev not in SEVERITY_ORDER:
                     sev = "low"
+                # This loader records observed DNS and mail-control posture. It does not
+                # perform or prove a successful spoofing/delivery exploit. Cap a producer's
+                # HIGH/CRITICAL posture score at MEDIUM and label the evidence level plainly.
+                # A separately verified exploit belongs in a dedicated exploit finding.
+                posture_was_capped = sev in ("critical", "high")
+                if posture_was_capped:
+                    sev = "medium"
                 # v10.0.1 — per-finding CVSS so a LOW/INFO posture item no longer inherits
                 # the email_auth template's fixed MEDIUM 5.3 (previously EVERY email_auth
                 # finding rendered 5.3 because the loader set severity but not cvss and the
@@ -1268,24 +1471,34 @@ def load_findings(findings_dir: str) -> list:
                 # authored score (so MEDIUM stays 5.3 — no needless drift, no split with peer
                 # MEDIUM templates) → otherwise the canonical severity→score map.
                 _ea_tmpl = VULN_TEMPLATES.get("email_auth", {})
-                if item.get("cvss") is not None:
+                if posture_was_capped:
+                    _ea_cvss = _ea_tmpl.get("cvss", CVSS_DEFAULT.get("medium", "N/A"))
+                elif item.get("cvss") is not None:
                     _ea_cvss = str(item["cvss"])
                 elif sev == _ea_tmpl.get("severity"):
                     _ea_cvss = _ea_tmpl.get("cvss", CVSS_DEFAULT.get(sev, "N/A"))
                 else:
                     _ea_cvss = CVSS_DEFAULT.get(sev, "N/A")
-                results.append({
+                raw_title = item.get("title", "Email authentication weakness")
+                finding = {
                     "severity": sev,
                     "cvss": _ea_cvss,
                     "vtype": "email_auth",
-                    "title": item.get("title", "Email authentication weakness"),
+                    "title": f"Email security posture: {raw_title}",
                     "detail": item.get("notes", ""),
                     "url": item.get("endpoint", "N/A"),
                     "poc": (f"Class : {item.get('vuln_class','')}\n"
                             f"Area  : {item.get('area','')}\n"
                             f"Result: {item.get('result','')}\n\n"
-                            f"{item.get('notes','')}"),
-                })
+                            f"{item.get('notes','')}\n\n"
+                            "Evidence classification: observed configuration posture. "
+                            "No spoofing or delivery exploit was performed or confirmed."),
+                    "finding_kind": "posture",
+                    "verification_method": "configuration_observed",
+                }
+                if posture_was_capped:
+                    finding["original_severity"] = declared_sev
+                results.append(finding)
         except Exception as e:
             print(f"[reporter] WARNING: failed to load "
                   f"{os.path.relpath(email_auth_path, findings_dir)}: {e!r} — "
@@ -1506,6 +1719,7 @@ def load_findings(findings_dir: str) -> list:
                     "detail": item.get("detail", ""),
                     "url": item.get("url", "N/A"),
                     "poc": item.get("poc", ""),
+                    "verification_method": item.get("verification_method", "unverified"),
                 }
                 # Honor an explicit per-finding cvss if Burp/normalizer provided one;
                 # otherwise the renderer falls back to the vtype template / severity band.
@@ -1550,6 +1764,10 @@ def load_findings(findings_dir: str) -> list:
                     "detail": item.get("detail", ""),
                     "url": item.get("url", "N/A"),
                     "poc": item.get("poc", ""),
+                    "verification_method": item.get(
+                        "verification_method",
+                        "authenticated" if confidence == "confirmed" else "unverified",
+                    ),
                 }
                 if item.get("cvss"):
                     finding["cvss"] = str(item["cvss"])
@@ -1697,6 +1915,13 @@ def load_findings(findings_dir: str) -> list:
                     # Strip the marker prefix for the collapsed context item.
                     model_claims.append(re.sub(r"^\[MODEL CLAIM[^\]]*\]\s*", "", line))
                     continue
+                # Tool progress/logger line captured into findings_so_far — e.g. sqlmap
+                # "[HH:MM:SS] [CRITICAL] WAF/IPS identified" / "... content is heavily dynamic
+                # ... retry", where [CRITICAL] is a LOG LEVEL, not a vuln severity. Operational
+                # logging is never a finding (and not even a model claim). Fail-closed drop.
+                # (2026-07-25 engagement: two such sqlmap log lines shipped as CRITICAL rows.)
+                if _STATUS_NOISE_RE is not None and _STATUS_NOISE_RE.search(line):
+                    continue
                 # Defence-in-depth: drop a self-declared file-access/traversal claim
                 # that NO iteration's output actually proves (no file content) — a
                 # buggy PoC (`echo "[CRITICAL] ... accessible" || echo`) prints it
@@ -1771,6 +1996,7 @@ def load_findings(findings_dir: str) -> list:
                         "poc": f"Parameter: {vuln.get('parameter','')}\n"
                                f"Payload: {vuln.get('payload','')}\n"
                                f"Evidence: {vuln.get('evidence','')}",
+                        "verification_method": vuln.get("verification_method", "unverified"),
                     })
             except Exception as e:
                 print(f"[reporter] WARNING: failed to load {fn}: {e!r} — "
@@ -2057,6 +2283,16 @@ def load_findings(findings_dir: str) -> list:
                         poc_lines.append("")
                         poc_lines.append("See individual findings above for reproduction steps.")
 
+                # Never invent an observed response, victim record, timing, or
+                # attack result. Flat findings may supply their own exact PoC;
+                # otherwise preserve only the source fields that were recorded.
+                poc_lines = [
+                    f"Finding: {detail}",
+                    f"URL: {url}",
+                    f"Evidence: {evidence or 'No evidence supplied'}",
+                ]
+                if data.get("poc"):
+                    poc_lines.extend(["", str(data["poc"])])
                 poc_text = "\n".join(poc_lines)
                 raw_line = f"[{sev.upper()}] {detail} {url}"
 
@@ -2076,6 +2312,7 @@ def load_findings(findings_dir: str) -> list:
                     "description": tmpl.get("description", detail),
                     "impact": tmpl.get("impact", ""),
                     "attack_id": "",
+                    "verification_method": data.get("verification_method", "unverified"),
                 }
                 key = (vtype, url, detail)
                 if key not in _seen_m2:
@@ -2086,6 +2323,7 @@ def load_findings(findings_dir: str) -> list:
                       f"{e!r} — this finding may be MISSING from the report")
                 continue
 
+    results = _consolidate_repeated_findings(results)
     results.sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 4))
     return results
 
@@ -2395,48 +2633,131 @@ finding maps to them. Resolved IP(s): <code>{ips_str}</code>.</p>
 '''
 
 
-def _render_coverage_limitations_html(report_dir: str) -> str:
-    """Render a "Tooling & Coverage Limitations" chapter.
+def _load_coverage_rows(report_dir: str):
+    """Return ``(rows, inconclusive)`` shared by the HTML and Markdown renderers so BOTH
+    show IDENTICAL degradation info (the Markdown deliverable previously showed none).
 
-    INTEGRATION CONTRACT (v10.0.2): reads ``coverage.json`` under the findings
-    session dir — a JSON list of ``{"tool": ..., "reason": ...}`` entries
-    written by the hunt.py agent describing degraded/skipped capabilities.
-    Degrades gracefully (renders nothing) when the file is absent, empty, or
-    malformed so a normal full-coverage run adds no noise."""
+    ``rows`` is a list of ``(tool_or_phase, reason, source)``. Accepts ``coverage.json`` as a
+    merged list (``{source,tool_or_phase,reason,status}``), a legacy hunt list
+    (``{tool,reason}``), or an api_audit dict — and also folds in scanner.sh's
+    ``manual_review/coverage_gaps.txt`` directly, so the section is populated even if
+    ``merge_coverage`` never ran. ``inconclusive`` comes from the phase manifest."""
     import json as _json
     _, findings_dir = _resolve_recon_findings_dirs(report_dir)
+    rows: list = []
+    seen: set = set()
+
+    def _add(tool, reason, source):
+        reason = " ".join(str(reason or "").split()).strip()
+        tool = str(tool or "").strip()
+        if not reason:
+            return
+        key = (tool, reason, source)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append((tool or "—", reason, source))
+
     cov_path = os.path.join(findings_dir, "coverage.json")
-    if not os.path.isfile(cov_path):
-        return ""
+    data = None
     try:
         with open(cov_path, errors="replace") as fh:
             data = _json.load(fh)
     except (OSError, ValueError):
-        return ""
-    if not isinstance(data, list):
-        return ""
+        data = None
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if "tool_or_phase" in item or "source" in item:      # merged schema
+                _add(item.get("tool_or_phase", ""), item.get("reason", ""), item.get("source", "hunt"))
+            else:                                                # legacy hunt {tool,reason}
+                _add(item.get("tool", ""), item.get("reason", ""), "hunt")
+    elif isinstance(data, dict):                                 # api_audit dict (was silently dropped)
+        deg = data.get("degraded")
+        if isinstance(deg, list):
+            for d in deg:
+                if isinstance(d, dict):
+                    _add(d.get("tool", ""), d.get("reason", ""), "api_audit")
+                elif isinstance(d, str):
+                    _add("", d, "api_audit")
+
+    gaps = os.path.join(findings_dir, "manual_review", "coverage_gaps.txt")
+    try:
+        with open(gaps, errors="replace") as fh:
+            for ln in fh:
+                txt = ln.replace("[COVERAGE-GAP]", "").strip()
+                if not txt:
+                    continue
+                if ":" in txt:
+                    cls, reason = txt.split(":", 1)
+                    _add(cls.strip(), reason.strip(), "scanner.sh")
+                else:
+                    _add("", txt, "scanner.sh")
+    except OSError:
+        pass
+
+    inconclusive = False
+    try:
+        import phase_manifest as _pm
+        inconclusive = _pm.is_inconclusive(findings_dir)
+    except Exception:
+        inconclusive = False
+    return rows, inconclusive
+
+
+_INCONCLUSIVE_MSG = ("ASSESSMENT STATUS: INCONCLUSIVE — one or more phases failed, were "
+                     "aborted, or ran degraded. An absent finding below is NOT a clean bill "
+                     "of health; re-run the affected phases before relying on this report.")
+
+
+def _render_coverage_limitations_html(report_dir: str) -> str:
+    """Render the "Tooling & Coverage Limitations" chapter + an INCONCLUSIVE banner.
+
+    Reads the (merged) ``coverage.json`` and the phase manifest under the findings session
+    dir. Degrades gracefully (renders nothing) when there are no gaps AND the run is
+    conclusive, so a clean full-coverage run adds no noise."""
+    rows_data, inconclusive = _load_coverage_rows(report_dir)
+    banner = ""
+    if inconclusive:
+        banner = ('<div style="background:#7a1020;color:#fff;padding:14px 18px;border-radius:6px;'
+                  'margin-top:30px;font-weight:700">⛔ ' + _INCONCLUSIVE_MSG + '</div>\n')
+    if not rows_data:
+        return banner   # surface the banner even when no per-row detail exists
 
     rows = ""
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        tool = str(item.get("tool", "")).strip() or "—"
-        reason = str(item.get("reason", "")).strip() or "—"
-        rows += f"<tr><td><code>{tool}</code></td><td>{reason}</td></tr>\n"
-    if not rows:
-        return ""
+    for tool, reason, source in rows_data:
+        rows += f"<tr><td><code>{tool}</code></td><td>{reason}</td><td>{source}</td></tr>\n"
 
-    return f'''
+    return banner + f'''
 <h2 id="coverage-limitations" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">
 Tooling &amp; Coverage Limitations</h2>
 <p style="color:#495057">The following capabilities were degraded or skipped during this
 engagement. Findings should be read in light of these gaps — an absent result for a class
 below is <b>inconclusive</b>, not a clean bill of health.</p>
 <table class="tbl">
-  <tr><th style="width:220px">Tool / Capability</th><th>Reason</th></tr>
+  <tr><th style="width:200px">Tool / Capability</th><th>Reason</th><th style="width:110px">Source</th></tr>
   {rows}
 </table>
 '''
+
+
+def _render_coverage_limitations_md(report_dir: str) -> str:
+    """Markdown twin of ``_render_coverage_limitations_html`` — SAME data, so the two
+    deliverables never disagree about what was degraded/skipped."""
+    rows_data, inconclusive = _load_coverage_rows(report_dir)
+    out = ""
+    if inconclusive:
+        out += f"\n> ⛔ **{_INCONCLUSIVE_MSG}**\n"
+    if rows_data:
+        out += ("\n## Tooling & Coverage Limitations\n\n"
+                "The following capabilities were degraded or skipped during this engagement. "
+                "An absent result for a class below is **inconclusive**, not a clean bill of health.\n\n"
+                "| Tool / Capability | Reason | Source |\n|---|---|---|\n")
+        for tool, reason, source in rows_data:
+            _r = reason.replace("|", "\\|")
+            out += f"| `{tool}` | {_r} | {source} |\n"
+    return out
 
 
 def _collect_scan_diagnostics(report_dir: str, target: str) -> dict:
@@ -2621,9 +2942,37 @@ Scan Diagnostics</h2>
 '''
 
 
+_SESSION_TIMESTAMP_RE = re.compile(
+    r"^(20\d{6})_(\d{6})(?:_[A-Za-z0-9][A-Za-z0-9.-]*)?$"
+)
+
+
+def _assessment_session_date(path: str) -> str:
+    """Return the assessment date encoded in a session directory.
+
+    Report generation can happen long after evidence collection. Deriving this
+    field only from the durable session identifier avoids silently presenting
+    today's report-generation date as the assessment date. Unknown layouts fail
+    closed to "Not recorded" instead of inventing a date from mutable file mtimes.
+    """
+    for component in reversed(os.path.normpath(path or "").split(os.sep)):
+        match = _SESSION_TIMESTAMP_RE.fullmatch(component)
+        if not match:
+            continue
+        try:
+            session_dt = datetime.strptime(
+                "".join(match.groups()[:2]), "%Y%m%d%H%M%S"
+            )
+        except ValueError:
+            continue
+        return session_dt.strftime("%d %B %Y")
+    return "Not recorded"
+
+
 def render_html_report(findings: list, target: str, report_dir: str,
                        client: str, consultant: str, title: str) -> str:
-    date_str = datetime.now().strftime("%d %B %Y")
+    generated_date_str = datetime.now().strftime("%d %B %Y")
+    session_date_str = _assessment_session_date(report_dir)
     counts   = _severity_counts(findings)
     total    = len(findings)
     # v10.6.0 — weighted overall risk score + label (report_synthesis)
@@ -2747,7 +3096,8 @@ a{{color:#0d6efd}}code{{background:#f8f9fa;padding:1px 5px;border-radius:3px;fon
   <table style="border-collapse:collapse;max-width:480px">
     <tr><td style="padding:5px 20px 5px 0;color:#adb5bd;width:140px">Client</td><td style="color:#fff;font-weight:600">{client or "—"}</td></tr>
     <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Consultant</td><td style="color:#fff;font-weight:600">{consultant or "—"}</td></tr>
-    <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Date</td><td style="color:#fff;font-weight:600">{date_str}</td></tr>
+    <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Assessment session date</td><td style="color:#fff;font-weight:600">{session_date_str}</td></tr>
+    <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Report generated</td><td style="color:#fff;font-weight:600">{generated_date_str}</td></tr>
     <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Total Findings</td><td style="color:#fff;font-weight:600">{total}</td></tr>
     <tr><td style="padding:5px 20px 5px 0;color:#adb5bd">Classification</td><td style="color:#e05252;font-weight:700">CONFIDENTIAL</td></tr>
   </table>
@@ -2790,9 +3140,11 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
   <tr><td>Target</td><td><code>{target}</code></td></tr>
   <tr><td>Assessment Type</td><td>Black-box / Grey-box VAPT</td></tr>
   <tr><td>Methodology</td><td>PTES, OWASP Testing Guide v4.2</td></tr>
-  <tr><td>Date</td><td>{date_str}</td></tr>
+  <tr><td>Assessment session date</td><td>{session_date_str}</td></tr>
+  <tr><td>Report generated</td><td>{generated_date_str}</td></tr>
   <tr><td>Consultant</td><td>{consultant or "—"}</td></tr>
 </table>
+<p style="color:#6c757d;font-size:.9em">The assessment session date comes from the session identifier. Report generation does not refresh the session evidence.</p>
 <ol>
   <li><b>Reconnaissance</b> — Subdomain enumeration, port scanning, tech fingerprinting</li>
   <li><b>Vulnerability Identification</b> — Automated and manual testing</li>
@@ -2833,7 +3185,7 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 </ul>
 
 <hr style="margin-top:50px;border-color:#dee2e6">
-<p style="color:#6c757d;font-size:.85em;text-align:center">Generated by <a href="https://github.com/venkatas/vikramaditya" style="color:#6c757d">Vikramaditya</a> — Autonomous VAPT Platform &nbsp;|&nbsp; {date_str} &nbsp;|&nbsp; CONFIDENTIAL</p>
+<p style="color:#6c757d;font-size:.85em;text-align:center">Generated by <a href="https://github.com/venkatas/vikramaditya" style="color:#6c757d">Vikramaditya</a> — Autonomous VAPT Platform &nbsp;|&nbsp; {generated_date_str} &nbsp;|&nbsp; CONFIDENTIAL</p>
 </div>
 </body></html>"""
 
@@ -2897,13 +3249,18 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 
 def render_markdown_report(findings: list, target: str, report_dir: str,
                            client: str, consultant: str, title: str) -> str:
-    date_str = datetime.now().strftime("%d %B %Y")
+    generated_date_str = datetime.now().strftime("%d %B %Y")
+    session_date_str = _assessment_session_date(report_dir)
     counts   = _severity_counts(findings)
     lines    = [
         f"# {title}",
         f"**Target:** {target}  \n**Client:** {client or '—'}  \n"
-        f"**Consultant:** {consultant or '—'}  \n**Date:** {date_str}  \n"
+        f"**Consultant:** {consultant or '—'}  \n"
+        f"**Assessment session date:** {session_date_str}  \n"
+        f"**Report generated:** {generated_date_str}  \n"
         "**Classification:** CONFIDENTIAL",
+        "", ("The assessment session date comes from the session identifier. "
+             "Report generation does not refresh the session evidence."),
         "", "---", "", "## Executive Summary", "",
     ]
     # v10.6.0 — weighted overall risk score + label (report_synthesis)
@@ -2919,6 +3276,11 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
     ]
     for s in ("critical", "high", "medium", "low", "info"):
         lines.append(f"| {s.upper()} | {counts[s]} |")
+    # P1 — coverage limitations + INCONCLUSIVE banner. SAME data as the HTML report,
+    # placed up top so an inconclusive run can never read as a clean "N findings" bill.
+    _cov_md = _render_coverage_limitations_md(report_dir)
+    if _cov_md:
+        lines += ["", _cov_md]
     lines += ["", "---", "", "## Vulnerability Summary", "",
               "| ID | Vulnerability | Severity | CVSS | Host |",
               "|----|---------------|----------|------|------|"]
@@ -2962,7 +3324,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
             f"**Remediation:** {_finding_remediation(f, tmpl)}", "",
             "**References:**", refs, "", "---", "",
         ]
-    lines.append(f"*Generated by [Vikramaditya](https://github.com/venkatas/vikramaditya) — Autonomous VAPT Platform | {date_str}*")
+    lines.append(f"*Generated by [Vikramaditya](https://github.com/venkatas/vikramaditya) — Autonomous VAPT Platform | {generated_date_str}*")
     return "\n".join(lines)
 
 
@@ -2981,14 +3343,27 @@ def _apply_verification_gating(findings: list) -> list:
     for f in findings:
         raw = (f.get("raw") or "").lstrip().upper()
         explicit = (f.get("verification_method") or "").strip().lower()
+        # An observed configuration is valid posture evidence, but it is not an
+        # exploited vulnerability. The email-auth loader caps it at MEDIUM and
+        # marks it explicitly, so keep it as posture without converting the
+        # evidence classification into a false exploitation claim.
+        if (f.get("finding_kind") == "posture"
+                and explicit == "configuration_observed"):
+            kept.append(f)
+            continue
         # FAIL OPEN: only an EXPLICIT model-generated claim is unverified-and-droppable.
         # We anchor on the brain_scanner marker PREFIX (not a substring-anywhere match) so a
         # real scanner finding whose evidence text merely contains "UNVERIFIED"/"PENDING"
         # (e.g. a leaked token "AKIAUNVERIFIED...") is NOT mistaken for a model claim.
         is_model_claim = (raw.startswith("[MODEL CLAIM")
                           or raw.startswith("[UNVERIFIED]")
-                          or explicit in ("model_claim", "unverified"))
-        method = VerificationMethod.UNVERIFIED if is_model_claim else VerificationMethod.EXPLOITED
+                          or explicit == "model_claim")
+        # Legacy scanner rows without a verification field retain the prior
+        # compatibility path. Once a producer sets the field, however, parse it
+        # fail-closed: an unknown label is UNVERIFIED, never EXPLOITED.
+        method = (VerificationMethod.UNVERIFIED if is_model_claim
+                  else VerificationMethod.from_string(explicit)
+                  if explicit else VerificationMethod.EXPLOITED)
         sev = f.get("severity", "medium")
         new_sev = adjust_severity(sev, method)
         if new_sev != sev:

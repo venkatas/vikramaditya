@@ -57,6 +57,11 @@ def is_dir_listing(body: str) -> bool:
     return any(m in low for m in _LISTING_MARKERS)
 
 
+def is_html_document(body: str) -> bool:
+    sample = (body or "").lstrip().lower()[:20_000]
+    return any(marker in sample for marker in ("<!doctype html", "<html", "<head", "<form"))
+
+
 def extract_listing_files(body: str) -> list:
     """Filenames from an autoindex page, minus navigation/sort links."""
     out, seen = [], set()
@@ -106,9 +111,11 @@ def assess_exposed_url(url: str, timeout: int = 15) -> dict:
     files = extract_listing_files(body) if listing else []
     result["files"] = files
 
-    # PII: scan filenames (if listing) AND a sample of the body text itself.
+    # PII: scan filenames for listings and structured non-HTML responses. Generic
+    # login/application HTML contains validator labels such as "creditcard" and
+    # must not become a HIGH PII finding without an exposed record or listing.
     scan_targets = list(files)
-    if not listing:
+    if not listing and not is_html_document(body):
         scan_targets += [ln for ln in body.splitlines() if ln.strip()][:400]
     result["pii_indicators"] = scan_for_pii(scan_targets)
     result["backups"] = classify_backups(files)

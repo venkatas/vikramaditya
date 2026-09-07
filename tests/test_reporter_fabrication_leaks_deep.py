@@ -66,8 +66,11 @@ def test_burp_tentative_is_downgraded_to_info(tmp_path):
     tentative = [{"severity": "High", "confidence": "Tentative", "type": "sqli",
                   "title": "SQLi", "url": "https://t.example.invalid/x", "source": "burp"}]
     assert _worst(tmp_path, "burp/findings.json", tentative) not in _MEDPLUS
+    # Scanner confidence alone is not proof.  Preserve a High only when the
+    # normalized issue also carries an explicit recognized verification method.
     certain = [{"severity": "High", "confidence": "Certain", "type": "sqli",
-                "title": "SQLi", "url": "https://t.example.invalid/x", "source": "burp"}]
+                "title": "SQLi", "url": "https://t.example.invalid/x", "source": "burp",
+                "verification_method": "manual_verified"}]
     assert _worst(tmp_path, "burp/findings.json", certain) == "high"
 
 
@@ -92,6 +95,120 @@ def test_brain_single_line_real_proof_is_not_over_suppressed(tmp_path):
     ungrounded = {"findings_so_far": ["[CRITICAL] SQL injection confirmed"],
                   "results": "[*] running\n[*] testing\n[*] no output"}
     assert _worst(tmp_path, "brain_active/iteration_1.json", ungrounded) not in _MEDPLUS
+
+
+def test_sqlmap_log_level_lines_do_not_ship_critical(tmp_path):
+    """2026-07-25 engagement: sqlmap emits '[HH:MM:SS] [CRITICAL] ...' LOG lines where
+    [CRITICAL] is a log LEVEL, not a vuln severity. Two such lines ('WAF/IPS identified',
+    'content is heavily dynamic ... retry') were captured into findings_so_far and shipped as
+    CRITICAL findings (severity CRITICAL but CVSS 5.3 / URL N/A — the tell). A tool-logger line
+    is never a finding, even when the iteration ALSO produced substantive grounding output."""
+    data = {
+        "findings_so_far": [
+            "[21:11:15] [CRITICAL] WAF/IPS identified as 'AWS WAF (Amazon)'",
+            "[21:11:16] [CRITICAL] target URL content appears to be heavily dynamic. "
+            "sqlmap is going to retry the request(s)",
+        ],
+        # substantive output → the grounding gate is satisfied, proving the log lines are
+        # suppressed on their OWN merits (they are noise), not merely for lack of grounding.
+        "results": "GET /Home.aspx HTTP/1.1\nServer: Microsoft-IIS/10.0\nX-AspNet-Version: 4.0.30319\n",
+    }
+    assert _worst(tmp_path, "brain_active/iteration_1.json", data) not in _MEDPLUS
+    # regression guard: a brain self-tagged '[CRITICAL] ...' (NO timestamp) that IS grounded
+    # must still survive — the fix keys on the [HH:MM:SS] logger prefix, not on '[CRITICAL]'.
+    grounded = {"findings_so_far": ["[CRITICAL] RCE confirmed uid=0"],
+                "results": "uid=0(root) gid=0(root) groups=0(root)\n[*] done"}
+    assert _worst(tmp_path, "brain_active/iteration_1.json", grounded) == "critical"
+
+
+def test_active_exploit_line_without_marker_is_demoted(tmp_path):
+    """Fail-closed inversion: a bare/unknown line in an active-exploit dir (no confirmation
+    marker) must NOT ship at the template's Medium+/Critical severity — it caps to a LOW lead.
+    This is the durable guard against the next unknown probe/discovery/log shape."""
+    assert _worst(tmp_path, "rce/newprobe.txt",
+                  "POST /api/exec reached 200 at https://t.example.invalid/x") not in _MEDPLUS
+    assert _worst(tmp_path, "idor/hits.txt",
+                  "id=1001 returned another user's record at https://t.example.invalid/u") not in _MEDPLUS
+    assert _worst(tmp_path, "sqli/notes.txt",
+                  "param id looks injectable at https://t.example.invalid/x?id=1") not in _MEDPLUS
+    assert _worst(tmp_path, "auth_bypass/x.txt",
+                  "admin panel loaded at https://t.example.invalid/admin") not in _MEDPLUS
+
+
+def test_confirmed_active_exploit_markers_survive(tmp_path):
+    """No over-suppression — the three producer 'verified' grammars keep full severity:
+    (1) a leading confirmation marker, (2) a leading [SEVERITY] prefix (auth_utils.FindingSaver,
+    used by the API scanners for findings they already assessed), (3) a nuclei result line."""
+    # (1) leading confirmation markers
+    assert _worst(tmp_path, "rce/c.txt",
+                  "[POC-RCE-CONFIRMED] uid=0(root) at https://t.example.invalid/s.jsp") == "critical"
+    assert _worst(tmp_path, "xxe/c.txt",
+                  "[XXE-OOB-CONFIRMED] callback from https://t.example.invalid/x") == "critical"
+    assert _worst(tmp_path, "auth_bypass/c.txt",
+                  "[LDAP-BYPASS-CONFIRMED] logged in as admin at https://t.example.invalid") == "critical"
+    # (2) FindingSaver [SEVERITY]-prefixed API findings (idor/oauth/auth_bypass) must NOT be demoted
+    assert _worst(tmp_path, "idor/findings.txt",
+                  "[HIGH] Cross-user IDOR: read user 1001 record https://t.example.invalid/u/1001") in _MEDPLUS
+    assert _worst(tmp_path, "auth_bypass/findings.txt",
+                  "[CRITICAL] Endpoint accessible without auth https://t.example.invalid/admin") in _MEDPLUS
+    assert _worst(tmp_path, "oauth/findings.txt",
+                  "[HIGH] redirect_uri_bypass https://t.example.invalid/cb") in _MEDPLUS
+    # (3) nuclei result grammar ([template-id] [proto] [severity] URL) must survive
+    assert _worst(tmp_path, "rce/nuclei_rce.txt",
+                  "[apache-struts-rce] [http] [critical] https://t.example.invalid/x") in _MEDPLUS
+
+
+def test_negative_and_malformed_markers_do_not_survive(tmp_path):
+    """codex pass-2: markers that LOOK positive but are explicitly NEGATIVE
+    ([UNCONFIRMED]/[NOT-CONFIRMED]/[NO-POC]/[POC-FAILED]/[NOT-VERIFIED]/[UN-VERIFIED]) must NOT
+    count as verified (they syntactically contain CONFIRMED/VERIFIED/POC); and a nuclei-shaped
+    three-bracket LOG line with NO matched URL is not a nuclei hit."""
+    for neg in ("[UNCONFIRMED]", "[NOT-CONFIRMED]", "[NO-POC]", "[POC-FAILED]",
+                "[NOT-VERIFIED]", "[UN-VERIFIED]"):
+        assert _worst(tmp_path, "rce/n.txt",
+                      f"{neg} probe only at https://t.example.invalid/x") not in _MEDPLUS, neg
+    # nuclei grammar with no URL after the severity bracket = a log line, not a hit
+    assert _worst(tmp_path, "rce/n2.txt",
+                  "[probe-log] [http] [critical] request failed") not in _MEDPLUS
+    # a genuine nuclei hit (matched URL present) still survives at full severity
+    assert _worst(tmp_path, "rce/n3.txt",
+                  "[cve-2021-0001] [http] [critical] https://t.example.invalid/x") in _MEDPLUS
+
+
+def test_propagated_marker_is_not_a_high_exposure(tmp_path):
+    """a 2026-08-09 engagement: a soft-404 SPA (an SPA host) served index.html for /openapi.json,
+    the scanner emitted [PROPAGATED] (path returns 200 + textual), and the reporter promoted it to
+    HIGH 7.5 'Sensitive Data Exposure'. [PROPAGATED] is a path-DISCOVERY lead (a path found
+    reachable, propagated from another host) — NOT a content-confirmed exposure. It must not ship
+    as a Medium+ finding. (Real, confirmed exposures come from verified_sensitive.txt / [EXPOSED]
+    magika hits, which are untouched.)"""
+    d = tmp_path / "findings"
+    exp = d / "exposure"
+    exp.mkdir(parents=True)
+    (exp / "propagated_config_hits.txt").write_text(
+        "[PROPAGATED] path=/openapi.json url=https://app.example.invalid/openapi.json "
+        "sources=https://a.example.invalid\n")
+    findings = reporter.load_findings(str(d))
+    fab = [f for f in findings if f.get("vtype") == "exposure"]
+    assert fab == [], f"[PROPAGATED] discovery promoted to a finding: {[f.get('raw') for f in fab]}"
+
+
+def test_bare_structural_marker_without_severity_is_a_lead(tmp_path):
+    """A bracket MARKER that is neither a confirmation, a [SEVERITY] prefix, nor nuclei output
+    (e.g. [SAML-METADATA-EXPOSED] mapped to the auth_bypass CRITICAL template) must NOT ship at
+    CRITICAL — it caps to a LOW lead (public SAML metadata is not an auth bypass). Producers that
+    want a real severity emit the FindingSaver [SEVERITY] convention."""
+    assert _worst(tmp_path, "saml/x.txt",
+                  "[SAML-METADATA-EXPOSED] https://t.example.invalid/saml/metadata") not in _MEDPLUS
+
+
+def test_dalfox_reflected_not_verified_is_demoted(tmp_path):
+    """#5: dalfox [R]/[G] = reflection with unproven executable context -> LOW lead; [V] =
+    browser-verified stays a real XSS."""
+    assert _worst(tmp_path, "xss/dalfox_results.txt",
+                  "[POC][R][GET][inHTML-URL] https://t.example.invalid/p?q=x") not in _MEDPLUS
+    assert _worst(tmp_path, "xss/dalfox_results.txt",
+                  "[POC][V][GET][inHTML] https://t.example.invalid/p?q=x") in _MEDPLUS
 
 
 def test_exposed_config_is_surfaced_not_dropped(tmp_path):

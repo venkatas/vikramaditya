@@ -3,10 +3,10 @@ from __future__ import annotations
 
 """
 Brain — Multi-Provider LLM Reasoning Layer for VAPT
-Supports: Ollama (local), MLX (Apple Silicon), Claude API, OpenAI, Grok (xAI), Gemini (Google)
+Supports: Ollama (local), MLX (Apple Silicon), MLX-VLM server, Claude API, OpenAI, Grok (xAI), Gemini (Google)
 
 Provider selection (in order of precedence):
-  1. BRAIN_PROVIDER env var  (ollama | mlx | claude | openai | grok | gemini)
+  1. BRAIN_PROVIDER env var  (ollama | mlx_vlm | mlx | claude | openai | grok | gemini)
   2. Auto-detect: uses first provider whose API key / server is available
 
 API keys (env vars):
@@ -16,6 +16,8 @@ API keys (env vars):
   GEMINI_API_KEY      — Gemini (Google AI Studio; gemini-3.5-flash, gemini-3.1-pro, etc.)
   OLLAMA_HOST         — Ollama base URL (default: http://localhost:11434)
   MLX_MODEL           — MLX model path (default: mlx-community/Qwen2.5-14B-Instruct-4bit)
+  MLX_VLM_BASE_URL    — MLX-VLM server URL (default: http://127.0.0.1:8080)
+  MLX_VLM_MODEL       — MLX-VLM model id/path (auto-detected from /health when omitted)
 
 MLX setup (Apple Silicon — faster than Ollama on M-series chips):
   pip install mlx-lm
@@ -70,10 +72,27 @@ try:
 except ImportError:
     _ollama_lib = None
 
-try:
-    import mlx_lm as _mlx_lm
-except ImportError:
-    _mlx_lm = None
+# mlx_lm pulls in transformers (~80s cold import + ~2 GB RSS); import it LAZILY so the
+# common Ollama/cloud paths never pay that cost (they were, on every brain.py invocation).
+# Only the MLX provider triggers the real import.
+_mlx_lm = None
+_mlx_lm_import_tried = False
+
+
+def _ensure_mlx_lm():
+    """Import mlx_lm on first MLX use; return the module or None if unavailable."""
+    global _mlx_lm, _mlx_lm_import_tried
+    if _mlx_lm is not None:
+        return _mlx_lm
+    if _mlx_lm_import_tried:
+        return None
+    _mlx_lm_import_tried = True
+    try:
+        import mlx_lm as _m
+        _mlx_lm = _m
+    except Exception:
+        _mlx_lm = None
+    return _mlx_lm
 
 
 # ── Ollama over HTTP (no python package dependency) ──────────────────────────────
@@ -659,7 +678,7 @@ class LLMClient:
         reply  = client.chat(model, system_prompt, user_prompt, max_tokens=2000)
     """
 
-    PROVIDER_PRIORITY = ["ollama", "mlx", "claude", "openai", "grok", "gemini"]
+    PROVIDER_PRIORITY = ["ollama", "mlx_vlm", "mlx", "claude", "openai", "grok", "gemini"]
 
     # Default models per provider
     DEFAULT_MODELS = {
@@ -669,12 +688,14 @@ class LLMClient:
         "gemini":  "gemini-3.5-flash",
         "ollama":  None,   # resolved dynamically
         "mlx":     None,   # resolved from MLX_MODEL env var or default
+        "mlx_vlm": None,   # resolved from MLX_VLM_MODEL or the server /health endpoint
     }
 
     def __init__(self, provider: str | None = None):
         self.provider    = (provider or os.environ.get("BRAIN_PROVIDER", "")).lower()
         self._ollama     = None
         self._mlx_model  = None   # loaded MLX model + tokenizer tuple
+        self._mlx_vlm_model = None # loaded MLX-VLM server model id/path
         self._http       = None   # requests session for OpenAI-compatible APIs
         self.available   = False
         self.description = ""
@@ -807,8 +828,26 @@ class LLMClient:
             self.available    = self._healthcheck()
             self.description  = "OpenAI API"
 
+        elif provider == "mlx_vlm":
+            import requests
+            base = os.environ.get("MLX_VLM_BASE_URL", "http://127.0.0.1:8080")
+            self._http = requests.Session()
+            self._http.headers.update({"Content-Type": "application/json"})
+            key = os.environ.get("MLX_VLM_API_KEY", "")
+            if key:
+                self._http.headers.update({"Authorization": f"Bearer {key}"})
+            self._openai_base = self._normalize_openai_base(base)
+            self._mlx_vlm_model = (
+                os.environ.get("MLX_VLM_MODEL", "").strip()
+                or self._discover_mlx_vlm_model(self._openai_base)
+            )
+            if not self._mlx_vlm_model:
+                return
+            self.available = True
+            self.description = f"MLX-VLM server @ {self._openai_base}"
+
         elif provider == "mlx":
-            if _mlx_lm is None:
+            if _ensure_mlx_lm() is None:
                 return
             try:
                 mlx_model_id = os.environ.get("MLX_MODEL", MLX_DEFAULT_MODEL)
@@ -858,7 +897,7 @@ class LLMClient:
                 return self._chat_mlx(model, system, user, max_tokens, temperature)
             elif self.provider == "claude":
                 return self._chat_claude(model, system, user, max_tokens, temperature)
-            elif self.provider in ("openai", "grok", "gemini"):
+            elif self.provider in ("openai", "grok", "gemini", "mlx_vlm"):
                 return self._chat_openai_compat(model, system, user, max_tokens, temperature)
         except Exception as e:
             print(f"{YELLOW}[Brain/{self.provider}] chat error: {_redact_secret(e)}{NC}", flush=True)
@@ -868,27 +907,68 @@ class LLMClient:
     def _chat_mlx(self, model, system, user, max_tokens, temperature) -> str:
         """Apple Silicon MLX inference — significantly faster than Ollama on M-series."""
         mlx_model, tokenizer, model_id = self._mlx_model
-        prompt = f"<|system|>\n{system}\n<|user|>\n{user}\n<|assistant|>\n"
+        # Use the model's OWN chat template (Qwen3.x etc. are trained on ChatML) so the
+        # prompt matches the training distribution. A hand-rolled "<|system|>…" wrapper
+        # silently degrades output quality on every model that isn't generic.
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user})
+        # Reasoning models (Qwen3.x etc.) default to a verbose <think> stream that eats the
+        # token budget and leaks raw chain-of-thought into report artifacts. Default them to
+        # NON-thinking for decisive triage output; opt back in with MLX_ENABLE_THINKING=1.
+        think = os.environ.get("MLX_ENABLE_THINKING", "0").lower() in ("1", "true", "yes")
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False,
+                enable_thinking=think)
+        except TypeError:
+            prompt = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False)
+        except Exception:
+            prompt = f"<|system|>\n{system}\n<|user|>\n{user}\n<|assistant|>\n"
+        # Honour the caller's temperature. mlx_lm dropped the old ``temp=`` kwarg — it is
+        # now swallowed by **kwargs and ignored, so every call silently ran greedy.
+        # Sampling is controlled by an explicit sampler object instead.
+        kwargs = {"max_tokens": max_tokens, "verbose": False}
+        try:
+            from mlx_lm.sample_utils import make_sampler
+            kwargs["sampler"] = make_sampler(temp=float(temperature or 0.0))
+        except Exception:
+            pass
         # mlx_lm.generate returns a string
-        response = _mlx_lm.generate(
-            mlx_model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temp=temperature,
-            verbose=False,
-        )
+        response = _mlx_lm.generate(mlx_model, tokenizer, prompt=prompt, **kwargs)
+        # Strip any chain-of-thought so downstream verdict/report parsing sees only the
+        # answer. The opening <think> lives in the prompt, so a reasoning model's reply is
+        # "…reasoning… </think> answer" — drop everything up to the first close tag, then
+        # any fully-embedded blocks.
+        if "</think>" in response:
+            response = response.split("</think>", 1)[1]
+        response = re.sub(r"(?is)<think>.*?</think>\s*", "", response)
         return response.strip()
 
     def _chat_ollama(self, model, system, user, max_tokens, temperature) -> str:
-        resp = self._ollama.chat(
+        # Reasoning GGUFs (Qwen3.x etc.) default to a verbose <think> stream that eats the
+        # token budget and leaks into report artifacts. Disable it for decisive triage
+        # output; opt back in with BRAIN_OLLAMA_THINKING=1. Safe no-op on non-thinking models.
+        think = os.environ.get("BRAIN_OLLAMA_THINKING", "0").lower() in ("1", "true", "yes")
+        kw = dict(
             model=model,
             messages=[{"role": "system", "content": system},
                       {"role": "user",   "content": user}],
             options={"num_predict": max_tokens, "temperature": temperature,
                      "num_ctx": MAX_CTX},
         )
-        return (resp.get("message", {}).get("content") or "").strip()
+        try:
+            resp = self._ollama.chat(think=think, **kw)
+        except TypeError:
+            resp = self._ollama.chat(**kw)   # older ollama client without think=
+        content = (resp.get("message", {}).get("content") or "").strip()
+        # Strip any leaked chain-of-thought so downstream parsing sees only the answer
+        # (some GGUF chat templates emit the <think> block inline in content).
+        if "</think>" in content:
+            content = content.split("</think>", 1)[1]
+        return re.sub(r"(?is)<think>.*?</think>\s*", "", content).strip()
 
     def _chat_claude(self, model, system, user, max_tokens, temperature) -> str:
         m = model or self.DEFAULT_MODELS["claude"]
@@ -917,13 +997,83 @@ class LLMClient:
             return self._gemini_base
         return self._openai_base
 
+    @staticmethod
+    def _normalize_openai_base(base: str) -> str:
+        """Accept either a server root or a full /v1 OpenAI-compatible base."""
+        base = (base or "").strip().rstrip("/")
+        if not base:
+            return ""
+        if base.endswith("/v1") or base.endswith("/v1beta/openai"):
+            return base
+        return f"{base}/v1"
+
+    @staticmethod
+    def _root_from_openai_base(base: str) -> str:
+        base = (base or "").rstrip("/")
+        return base[:-3] if base.endswith("/v1") else base
+
+    def _discover_mlx_vlm_model(self, base: str) -> str:
+        """Find the preloaded local model path from an mlx_vlm server."""
+        root = self._root_from_openai_base(base)
+        try:
+            r = self._http.get(f"{root}/health", timeout=5)
+            if 200 <= r.status_code < 300:
+                data = r.json()
+                model = data.get("loaded_model") or data.get("model_name")
+                if model:
+                    return str(model)
+        except Exception:
+            pass
+        try:
+            r = self._http.get(f"{base}/models", timeout=5)
+            if 200 <= r.status_code < 300:
+                for item in (r.json().get("data") or []):
+                    model = item.get("id")
+                    if model:
+                        return str(model)
+        except Exception:
+            pass
+        return ""
+
+    def default_model(self) -> str:
+        """Return the active provider's default model id/path."""
+        if self.provider == "mlx_vlm":
+            return self._mlx_vlm_model or ""
+        return self.DEFAULT_MODELS.get(self.provider) or ""
+
+    def _cap_provider_tokens(self, max_tokens: int) -> int:
+        """Keep local MLX-VLM requests inside the configured server KV budget."""
+        if self.provider != "mlx_vlm":
+            return max_tokens
+        try:
+            cap = int(os.environ.get("MLX_VLM_MAX_TOKENS", "128"))
+        except ValueError:
+            cap = 128
+        cap = max(1, cap)
+        try:
+            requested = int(max_tokens)
+        except (TypeError, ValueError):
+            requested = cap
+        return max(1, min(requested, cap))
+
+    def _apply_provider_extras(self, body: dict) -> dict:
+        """Attach provider-specific request fields only when that server supports them."""
+        if self.provider == "mlx_vlm":
+            think = os.environ.get("MLX_VLM_ENABLE_THINKING", "0").lower() in ("1", "true", "yes")
+            body["enable_thinking"] = think
+            if not think:
+                body["thinking_budget"] = 0
+        return body
+
     def _chat_openai_compat(self, model, system, user, max_tokens, temperature) -> str:
         import json as _json
         base = self._openai_compat_base()
-        m    = model or self.DEFAULT_MODELS[self.provider]
+        m    = model or self.default_model()
+        max_tokens = self._cap_provider_tokens(max_tokens)
         body = {"model": m, "max_tokens": max_tokens, "temperature": temperature,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user",   "content": user}]}
+        body = self._apply_provider_extras(body)
         r = self._http.post(f"{base}/chat/completions",
                             data=_json.dumps(body), timeout=120)
         r.raise_for_status()
@@ -971,12 +1121,14 @@ class LLMClient:
                 r.raise_for_status()
                 return r.json()["content"][0]["text"].strip()
 
-            # openai / grok / gemini — native messages array
+            # openai / grok / gemini / mlx_vlm: native messages array
             import json as _json
             base = self._openai_compat_base()
-            m    = model or self.DEFAULT_MODELS[self.provider]
+            m    = model or self.default_model()
+            max_tokens = self._cap_provider_tokens(max_tokens)
             body = {"model": m, "max_tokens": max_tokens, "temperature": temperature,
                     "messages": messages}
+            body = self._apply_provider_extras(body)
             r = self._http.post(f"{base}/chat/completions",
                                 data=_json.dumps(body), timeout=120)
             r.raise_for_status()
@@ -1000,6 +1152,8 @@ class LLMClient:
                 "mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit",
                 "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
             ]
+        elif self.provider == "mlx_vlm":
+            return [self._mlx_vlm_model] if self._mlx_vlm_model else []
         elif self.provider == "claude":
             return ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
         elif self.provider == "openai":
@@ -1089,7 +1243,9 @@ TRIAGE_MODEL_PRIORITY = [
 ]
 
 # Token limits — qwen3-coder-64k supports 64K context
-MAX_CTX   = 32768   # context window to send (32K — safe for most phases)
+MAX_CTX   = int(os.environ.get("BRAIN_MAX_CTX", "32768"))   # context window (32K default;
+# lower via BRAIN_MAX_CTX for big-quant models on a memory-tight GPU, where a full 32K KV
+# cache pushes a 22-29 GB model past the Metal budget and generation crawls)
 MAX_RESP  = 6000    # max tokens to generate for analysis
 MAX_RESP_REPORT = 10000  # full context for report writing
 
@@ -1426,7 +1582,7 @@ class Brain:
             self.client = self._llm._ollama  # backward compat for code that uses self.client
             self.triage_model = _pick_triage_model() or self.model
         else:
-            self.model        = model or LLMClient.DEFAULT_MODELS.get(self._llm.provider)
+            self.model        = model or self._llm.default_model()
             self.triage_model = self.model
             self.client       = None  # not used for cloud providers
 
@@ -1542,7 +1698,11 @@ Keep it under 80 words total."""
         try:
             if self._llm.provider == "ollama":
                 # Streaming path — Ollama supports token-by-token streaming
-                stream = self.client.chat(
+                # Reasoning GGUFs (Qwen3.x etc.) otherwise spend the whole token budget
+                # thinking at high effort — slow, and content comes back empty. Disable
+                # thinking for decisive output; opt back in with BRAIN_OLLAMA_THINKING=1.
+                _think = os.environ.get("BRAIN_OLLAMA_THINKING", "0").lower() in ("1", "true", "yes")
+                _chat_kw = dict(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": system},
@@ -1556,6 +1716,10 @@ Keep it under 80 words total."""
                         "num_ctx": MAX_CTX,
                     },
                 )
+                try:
+                    stream = self.client.chat(think=_think, **_chat_kw)
+                except TypeError:
+                    stream = self.client.chat(**_chat_kw)   # older client without think=
                 thinking_text = ""
                 for chunk in stream:
                     msg = chunk["message"]

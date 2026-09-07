@@ -108,7 +108,7 @@ def probe_url(client, url: str, param: str, attacker_host: str) -> RedirectResul
         new_query = "&".join(f"{k}={v[0]}" for k, v in query.items())
         test_url = parsed._replace(query=new_query).geturl()
 
-        response = client.get(test_url, allow_redirects=False)
+        response = client.get(test_url, follow_redirects=False)
         last_response = response
         if response.status_code not in (301, 302, 303, 307, 308):
             continue

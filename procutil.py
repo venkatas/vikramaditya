@@ -333,6 +333,59 @@ def _fork_safe_spawn(spec, env=None, cwd=None, capture=True, shell=True, merge_s
     )
 
 
+def _terminate_group(proc, grace: float = 5, phase=None) -> None:
+    """Graceful SIGTERM → wait(grace) → SIGKILL → reap → verify for a setsid child.
+
+    The child is launched with ``start_new_session=True`` (its own process group), so
+    killing the group tears down the WHOLE descendant tree (nmap/curl/sqlmap/…), not
+    just the immediate child. Pins the pgid BEFORE any reap (PID-reuse safe), no-ops if
+    the child already exited (poll-first), and NEVER raises — teardown must not mask the
+    interrupt/exception that triggered it.
+    """
+    if proc is None:
+        return
+    # Pin the group id up front — a later reap invalidates getpgid(pid).
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = getattr(proc, "pid", None)
+
+    def _signal_group(sig):
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+                return
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.send_signal(sig)   # fallback: signal just the child
+        except Exception:
+            pass
+
+    # Already exited? Nothing to kill (avoids signalling a reused PID).
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        pass
+
+    _signal_group(signal.SIGTERM)
+    try:
+        proc.wait(timeout=grace)
+    except Exception:
+        pass
+    try:
+        still_alive = proc.poll() is None
+    except Exception:
+        still_alive = True
+    if still_alive:
+        _signal_group(signal.SIGKILL)
+        try:
+            proc.wait(timeout=10)   # reap — posix_spawn has no Popen GC to do it
+        except Exception:
+            pass
+
+
 def run_capture(spec, timeout=None, env=None, cwd=None, shell=True, merge_stderr=True,
                 pty_stdin=False) -> dict:
     """Fork-safe drop-in replacement for ``subprocess.run(..., capture_output=True)``.
@@ -348,6 +401,11 @@ def run_capture(spec, timeout=None, env=None, cwd=None, shell=True, merge_stderr
                             merge_stderr=merge_stderr, pty_stdin=pty_stdin)
     try:
         out, err = proc.communicate(timeout=timeout)
+    except KeyboardInterrupt:
+        # Ctrl-C during a captured child (e.g. brain_scanner) must tear down the
+        # whole group and re-raise — never leave an orphaned scanner tree running.
+        _terminate_group(proc)
+        raise
     except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)

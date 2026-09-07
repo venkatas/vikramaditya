@@ -20,6 +20,7 @@ Usage (standalone):
 from __future__ import annotations
 
 import asyncio  # pre-declared for async task execution in BrowserAgent (Tasks 2-3)
+import importlib.util
 import os
 import sys
 from datetime import datetime
@@ -29,14 +30,36 @@ from urllib.parse import urlsplit
 from request_guard import SafeMethodPolicy
 
 # ── Optional heavy deps ────────────────────────────────────────────────────────
-try:
-    from browser_use import Agent as BUAgent, Browser, BrowserConfig
-    _browser_use_ok = True
-except ImportError:
-    _browser_use_ok = False
-    BUAgent = None
-    Browser = None
-    BrowserConfig = None
+# browser-use imports the full OpenAI response-schema tree. On some supported
+# environments that import takes minutes, which used to stall every CLI command
+# and test that merely imported this module even when the browser phase was not
+# requested. Detect availability cheaply and load the package only when a real
+# browser task starts.
+_browser_use_ok = importlib.util.find_spec("browser_use") is not None
+_browser_use_loaded = False
+BUAgent = None
+Browser = None
+BrowserConfig = None
+
+
+def _load_browser_use() -> bool:
+    """Load browser-use on demand and return whether its runtime is usable."""
+    global _browser_use_ok, _browser_use_loaded, BUAgent, Browser, BrowserConfig
+    if _browser_use_loaded:
+        return _browser_use_ok
+    if not _browser_use_ok:
+        return False
+    try:
+        from browser_use import Agent as _BUAgent, Browser as _Browser, BrowserConfig as _BrowserConfig
+    except (ImportError, RuntimeError) as exc:
+        _browser_use_ok = False
+        _log("warn", f"browser-use unavailable: {exc}")
+        return False
+    BUAgent = _BUAgent
+    Browser = _Browser
+    BrowserConfig = _BrowserConfig
+    _browser_use_loaded = True
+    return True
 
 # ── Colours (same as hunt.py) ──────────────────────────────────────────────────
 GREEN  = "\033[0;32m"
@@ -363,7 +386,7 @@ class BrowserAgent:
         return kwargs
 
     async def _run_task(self, task: "BrowserTask") -> int:
-        if not _browser_use_ok:
+        if not _load_browser_use():
             _log("warn", "browser-use not installed — skipping browser task")
             return 0
         if self.llm is None and not self._init_llm():

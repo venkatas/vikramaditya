@@ -6,6 +6,8 @@ fixed to install tlsx/shuffledns/fingerprintx/massdns but hunt.py's TOOL_REGISTR
 still lacked them, so `--repair-tools` could not restore them. This test keeps the
 two install paths in sync.
 """
+import os
+
 import hunt
 
 
@@ -45,3 +47,9 @@ def test_go_installed_recon_tools_use_go_install_hint():
         assert reg[tool].startswith("go install "), (
             f"{tool} should be a `go install ...` hint, got: {reg[tool]!r}"
         )
+
+
+def test_projectdiscovery_runtime_prefers_go_bin():
+    assert os.environ["PATH"].split(os.pathsep)[0] == hunt.GOBIN
+    assert hunt._tool_bin("httpx") == os.path.join(hunt.GOBIN, "httpx")
+    assert hunt._tool_bin("nuclei") == os.path.join(hunt.GOBIN, "nuclei")

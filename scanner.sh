@@ -49,6 +49,10 @@ RECON_DIR=""
 QUICK_MODE=""
 FULL_MODE=""
 SKIP_CHECKS=""
+# State-changing probes are fail-closed. hunt.py sets this to 1 only after the
+# operator supplies --allow-destructive; direct scanner.sh users must opt in
+# explicitly with VAPT_ALLOW_STATE_CHANGES=1.
+ALLOW_STATE_CHANGES="${VAPT_ALLOW_STATE_CHANGES:-0}"
 
 while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -67,6 +71,22 @@ if [ -z "$RECON_DIR" ] || [ ! -d "$RECON_DIR" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── P0: scope-lock boundary re-filter (fail-closed) ─────────────────────────────────────────────
+# recon.sh persists scope/allow.txt under scope-lock. scanner.sh has no host discovery of its own but
+# TRUSTS recon's URL corpus — so a stale/partial recon dir (e.g. a prior non-scope-lock run) could feed
+# OFF-SCOPE hosts to active curl/ffuf/nuclei. Re-filter the URL corpora through the EXACT-HOST allowlist
+# once, before any active check reads them. Presence of a non-empty allowlist == scope-lock active.
+_SCOPE_ALLOW="${SCOPE_ALLOW_FILE:-$RECON_DIR/scope/allow.txt}"
+if [ -s "$_SCOPE_ALLOW" ]; then
+    for _f in "$RECON_DIR/live/urls.txt" "$RECON_DIR/urls/all.txt" "$RECON_DIR/urls/with_params.txt" \
+              "$RECON_DIR/urls/api_endpoints.txt" "$RECON_DIR/urls/js_files.txt"; do
+        [ -s "$_f" ] || continue
+        timeout 30 python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-filter \
+            --allow-file "$_SCOPE_ALLOW" --in "$_f" --out "$_f" 2>/dev/null \
+            || : > "$_f"   # filter failure under scope-lock ⇒ fail closed (drop, never scan off-scope)
+    done
+fi
 BASE_DIR="$SCRIPT_DIR"
 SESSION_ID=$(basename "$RECON_DIR")
 # Support two invocation styles:
@@ -117,6 +137,19 @@ _mark_coverage() {
     mkdir -p "$FINDINGS_DIR/manual_review" 2>/dev/null || true
     echo "[COVERAGE-GAP] ${1:-?}: ${2:-unspecified}" >> "$COVERAGE_MARKER_FILE"
 }
+
+# P1 — record a genuine tool CRASH (hard signal / unexpected non-zero), distinct from an
+# intentional skip/cap. Any crash makes scanner.sh exit non-zero at the end, so hunt.py's
+# run_live marks the SCAN phase degraded instead of rendering a clean 0-findings pass.
+SCAN_CRASHES=0
+_scan_crash() {   # _scan_crash <tool> <rc> [detail]
+    SCAN_CRASHES=$((SCAN_CRASHES + 1))
+    mkdir -p "$FINDINGS_DIR/manual_review" 2>/dev/null || true
+    echo "[SCAN-CRASH] ${1:-?} rc=${2:-?} ${3:-}" >> "$FINDINGS_DIR/manual_review/scanner_crashes.txt"
+    _mark_coverage "${1:-?}" "tool crashed (rc=${2:-?}) — results incomplete for this class"
+}
+# rc 124 (timeout), 134 (SIGABRT), 137 (SIGKILL/OOM), 139 (SIGSEGV) are hard crashes.
+_is_crash_rc() { case "${1:-0}" in 124|134|137|139) return 0;; *) return 1;; esac; }
 
 skip_has() {
     local want="$1"
@@ -204,6 +237,11 @@ verify_sqli_poc() {
 
 verify_upload_poc() {
     local upload_url="$1"; local base_url=$(echo "$upload_url" | cut -d'/' -f1-3); local ts=$(date +%s)
+
+    if [ "$ALLOW_STATE_CHANGES" != "1" ]; then
+        _mark_coverage "upload-verification" "executable upload and execution probe skipped; explicit state-change authorization was not supplied"
+        return 2
+    fi
     
     # Tech Detection
     local ext="php"; local payload='<?php echo "RCE-VAL-".(7*7); ?>'
@@ -279,6 +317,13 @@ for f in "$PRIORITY_DIR/critical_hosts.txt" "$PRIORITY_DIR/high_hosts.txt" "$PRI
 done
 # Clean and uniqify
 awk '!seen[$0]++' "$ORDERED_SCAN" > "${ORDERED_SCAN}.tmp" && mv "${ORDERED_SCAN}.tmp" "$ORDERED_SCAN"
+# Priority files can outlive the scoped recon corpus. Re-apply the canonical
+# exact-host allowlist to the final active target list immediately before use.
+if [ -s "$_SCOPE_ALLOW" ]; then
+    timeout 30 python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-filter \
+        --allow-file "$_SCOPE_ALLOW" --in "$ORDERED_SCAN" --out "$ORDERED_SCAN" 2>/dev/null \
+        || : > "$ORDERED_SCAN"
+fi
 [ ! -s "$ORDERED_SCAN" ] && log_err "No scan targets found" && exit 1
 
 # ── Check 0: Upload Surface Discovery ──────────────────────────────────
@@ -422,9 +467,17 @@ if ! skip_has upload; then
     log_step "Probing ${#PROBE_PATHS[@]} upload-candidate paths × hosts..."
 
     # ── Probe loop ───────────────────────────────────────────────────────
+    # P1 time-box: on a large estate this hosts×paths probe (with a POST retry per
+    # 401/403) consumed the ENTIRE scanner batch timeout (2×3600s SIGKILL on a
+    # 75-host WAF-403 target) — SQLi/XSS/SSTI never ran. Bound Check 0 to a budget
+    # so the high-value checks always get time. Set CHECK0_BUDGET=0 to disable.
+    CHECK0_BUDGET="${CHECK0_BUDGET:-600}"
+    _C0_DEADLINE=$(( $(date +%s) + CHECK0_BUDGET ))
+    _C0_TIMEOUT=0
     AUTH_FILE="$FINDINGS_DIR/upload/auth_required.txt"
     while read -r host; do
         [ -z "$host" ] && continue
+        [ "$_C0_TIMEOUT" = 1 ] && break
         # Hard skip: confirmed catchall (both random probes agreed on
         # status+hash) — the baseline body would mask any real upload sink.
         # Whole-token match (same ,token, convention as _has_skip) — an
@@ -437,6 +490,12 @@ if ! skip_has upload; then
         # Format: "<code1>|<hash1>" newline-separated.
         EXPECTED_TUPLES=$(awk -v h="$host" -F '\t' '$1==h{print $2"|"$3}' "$SOFT404_FILE" 2>/dev/null)
         for path in "${PROBE_PATHS[@]}"; do
+            if [ "$CHECK0_BUDGET" != 0 ] && [ "$(date +%s)" -ge "$_C0_DEADLINE" ]; then
+                log_warn "Check 0 (upload discovery) hit its ${CHECK0_BUDGET}s budget — stopping so SQLi/XSS/SSTI get scan time (raise CHECK0_BUDGET to probe more)"
+                _mark_coverage "upload" "upload-surface discovery time-boxed at ${CHECK0_BUDGET}s — not all hosts/paths probed"
+                _C0_TIMEOUT=1
+                break
+            fi
             U="${host%/}${path}"
             RESP=$(curl -sk --max-time 5 -o - -w "\nHTTP_CODE:%{http_code}" "$U" 2>/dev/null)
             CODE=$(echo "$RESP" | tail -1 | sed 's/HTTP_CODE://')
@@ -473,6 +532,10 @@ if ! skip_has upload; then
             # 401/403 → endpoint exists but auth-gated.
             # 415 → unsupported media type (endpoint exists, expects different content).
             if [ "$CODE" = "405" ] || [ "$CODE" = "401" ] || [ "$CODE" = "403" ] || [ "$CODE" = "415" ]; then
+                if [ "$ALLOW_STATE_CHANGES" != "1" ]; then
+                    echo "[UPLOAD-ENDPOINT-CANDIDATE] $U (GET=$CODE; POST not sent without explicit state-change authorization)" >> "$FINDINGS_DIR/manual_review/upload_candidates.txt"
+                    continue
+                fi
                 POST_CODE=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
                     -X POST -F "file=@/dev/null;filename=test.txt;type=text/plain" "$U" 2>/dev/null)
                 # 200/201/202 = upload accepted (high-value).
@@ -503,7 +566,9 @@ if tool_ok nuclei && [ -d "$CUSTOM_NUCLEI_TEMPLATES" ] && [ -n "$(ls -A "$CUSTOM
     log_info "Check 1: Custom nuclei templates (${CUSTOM_NUCLEI_TEMPLATES})"
     nuclei -l "$ORDERED_SCAN" -t "$CUSTOM_NUCLEI_TEMPLATES" \
         -severity low,medium,high,critical -silent \
-        -o "$FINDINGS_DIR/cves_custom/nuclei_custom.txt" 2>/dev/null || true
+        -o "$FINDINGS_DIR/cves_custom/nuclei_custom.txt" 2>/dev/null
+    _nrc=$?
+    _is_crash_rc "$_nrc" && _scan_crash "nuclei-custom" "$_nrc" "custom-template pass"
     CUSTOM_HITS=$(count_vuln "$FINDINGS_DIR/cves_custom/nuclei_custom.txt")
     [ "$CUSTOM_HITS" -gt 0 ] && log_ok "[CUSTOM-NUCLEI] $CUSTOM_HITS finding(s) — review $FINDINGS_DIR/cves_custom/"
 fi
@@ -663,7 +728,12 @@ PYEOF
     else
     while IFS= read -r host; do
         [ -z "$host" ] && continue
-        HDR=$(curl -sk --max-time 8 -I "$host" 2>/dev/null | tr -d '\r')
+        # Follow redirects (-L) and use GET (-o /dev/null -D -), not HEAD: recon feeds http://
+        # URLs, so `curl -I "$host"` read the 301 http->https redirect response — which carries
+        # no CSP — and flagged "Missing CSP" on hosts whose FINAL https page sets a full CSP
+        # (a false positive on well-hardened sites). Following to the final hop and reading its
+        # headers as a browser would (GET; some servers omit CSP on HEAD) fixes that.
+        HDR=$(curl -sk -L --max-time 8 -o /dev/null -D - "$host" 2>/dev/null | tr -d '\r')
         CSP=$(echo "$HDR" | grep -i "^content-security-policy:" | cut -d: -f2-)
         if [ -z "$CSP" ]; then
             log_warn "[CSP-MISSING] No CSP header: $host"
@@ -804,13 +874,14 @@ if ! skip_has mfa; then
             BASE=$(echo "$url" | cut -d'?' -f1)
 
             # --- Test 1: Rate limit on OTP endpoint ---
-            log_step "Rate limit probe: $BASE"
-            STATUS_CODES=$(for i in $(seq 1 15); do
-                curl -sk -o /dev/null -w "%{http_code}\n" --max-time 5 \
-                    -X POST "$BASE" \
-                    -H "Content-Type: application/json" \
-                    -d '{"otp":"000000"}' 2>/dev/null || echo "ERR"
-            done | sort | uniq -c | sort -rn | head -5)
+            if [ "$ALLOW_STATE_CHANGES" = "1" ]; then
+                log_step "Rate limit probe: $BASE"
+                STATUS_CODES=$(for i in $(seq 1 15); do
+                    curl -sk -o /dev/null -w "%{http_code}\n" --max-time 5 \
+                        -X POST "$BASE" \
+                        -H "Content-Type: application/json" \
+                        -d '{"otp":"000000"}' 2>/dev/null || echo "ERR"
+                done | sort | uniq -c | sort -rn | head -5)
             # Fire only when the endpoint actually responded with real HTTP
             # codes AND none of them is 429. The old `grep -qv "429\|ERR"`
             # matched if ANY single line was not 429, which is almost always
@@ -818,14 +889,17 @@ if ! skip_has mfa; then
             # positive even when rate limiting works. Requiring a 3-digit code
             # also suppresses a dead/unreachable endpoint whose histogram is
             # all-ERR/all-000 (curl failures), which carries no rate-limit signal.
-            if echo "$STATUS_CODES" | grep -qE '[1-5][0-9]{2}' \
-                && ! echo "$STATUS_CODES" | grep -q "429"; then
-                # A missing 429 is (at most) a MEDIUM rate-limiting gap, NOT a CONFIRMED
-                # authentication bypass. mfa/ maps to the critical auth_bypass template, so
-                # writing it there shipped it as a fabricated CRITICAL 9.8. Route to
-                # manual_review as a lead (reporter also suppresses the prefix, belt+braces).
-                log_info "[MFA] No rate limit on OTP endpoint (manual-review lead): $BASE"
-                echo "[MFA-NO-RATE-LIMIT] $BASE | codes: $STATUS_CODES | missing 429 (medium rate-limit gap — manual review)" >> "$FINDINGS_DIR/manual_review/mfa_candidates.txt"
+                if echo "$STATUS_CODES" | grep -qE '[1-5][0-9]{2}' \
+                    && ! echo "$STATUS_CODES" | grep -q "429"; then
+                    # A missing 429 is (at most) a MEDIUM rate-limiting gap, NOT a CONFIRMED
+                    # authentication bypass. mfa/ maps to the critical auth_bypass template, so
+                    # writing it there shipped it as a fabricated CRITICAL 9.8. Route to
+                    # manual_review as a lead (reporter also suppresses the prefix, belt+braces).
+                    log_info "[MFA] No rate limit on OTP endpoint (manual-review lead): $BASE"
+                    echo "[MFA-NO-RATE-LIMIT] $BASE | codes: $STATUS_CODES | missing 429 (medium rate-limit gap — manual review)" >> "$FINDINGS_DIR/manual_review/mfa_candidates.txt"
+                fi
+            else
+                _mark_coverage "mfa-rate-limit" "OTP POST burst skipped; explicit state-change authorization was not supplied"
             fi
 
             # --- Test 2: MFA workflow skip (pre-MFA session to protected page) ---
@@ -865,16 +939,18 @@ if ! skip_has mfa; then
 
             # --- Test 3: Response manipulation canary ---
             # Check if server returns JSON with a success/failure flag (indicator only)
-            RESP=$(curl -sk --max-time 5 -X POST "$BASE" \
-                -H "Content-Type: application/json" \
-                -d '{"otp":"999999"}' 2>/dev/null || true)
-            if echo "$RESP" | grep -qi '"success"\s*:\s*false\|"verified"\s*:\s*false\|"status"\s*:\s*"fail"'; then
-                # INDICATOR ONLY: the server merely REPORTS failure as a JSON flag for a WRONG
-                # OTP — that is SECURE behaviour, nothing was manipulated or bypassed. Writing
-                # it to mfa/findings.txt shipped a fabricated CRITICAL 9.8. It is a manual-review
-                # lead (try actually flipping the flag), not a finding.
-                log_info "[MFA] Response-flag present (manual-review lead — NOT a confirmed bypass): $BASE"
-                echo "[MFA-RESPONSE-MANIP] $BASE | server emits a JSON success flag — manually verify whether flipping false->true bypasses MFA" >> "$FINDINGS_DIR/manual_review/mfa_candidates.txt"
+            if [ "$ALLOW_STATE_CHANGES" = "1" ]; then
+                RESP=$(curl -sk --max-time 5 -X POST "$BASE" \
+                    -H "Content-Type: application/json" \
+                    -d '{"otp":"999999"}' 2>/dev/null || true)
+                if echo "$RESP" | grep -qi '"success"\s*:\s*false\|"verified"\s*:\s*false\|"status"\s*:\s*"fail"'; then
+                    # INDICATOR ONLY: the server merely REPORTS failure as a JSON flag for a WRONG
+                    # OTP — that is SECURE behaviour, nothing was manipulated or bypassed. Writing
+                    # it to mfa/findings.txt shipped a fabricated CRITICAL 9.8. It is a manual-review
+                    # lead (try actually flipping the flag), not a finding.
+                    log_info "[MFA] Response-flag present (manual-review lead — NOT a confirmed bypass): $BASE"
+                    echo "[MFA-RESPONSE-MANIP] $BASE | server emits a JSON success flag — manually verify whether flipping false->true bypasses MFA" >> "$FINDINGS_DIR/manual_review/mfa_candidates.txt"
+                fi
             fi
 
         done <<< "$MFA_ENDPOINTS"
@@ -900,13 +976,20 @@ if ! skip_has saml; then
 
     while IFS= read -r host; do
         [ -z "$host" ] && continue
+        # A (fix): skip blanket-response (catchall/WAF) hosts — a host that returns the SAME
+        # code to every path yields a false "endpoint found" for EVERY SAML path (real runs:
+        # 100s of FPs on 403-to-everything WAF hosts).
+        _bh="${host#*://}"; _bh="${_bh%%/*}"
+        case ",$CATCHALL_HOSTS," in *"$_bh"*) continue ;; esac
         for SAML_PATH in "/saml/login" "/sso/saml" "/auth/saml" "/api/auth/saml" \
                          "/login/saml" "/saml/acs" "/saml/metadata" "/adfs/ls" \
                          "/.well-known/openid-configuration"; do
             CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
                 "${host}${SAML_PATH}" 2>/dev/null || echo "0")
+            # A (fix): only a genuinely reachable endpoint (200) or an SSO/IdP redirect (302)
+            # is a real signal. 301 = generic redirect, 401/403 = blocked — NOT "found".
             case "$CODE" in
-                200|301|302|403)
+                200|302)
                     log_vuln "[SAML] Endpoint found (HTTP $CODE): ${host}${SAML_PATH}"
                     echo "[SAML-ENDPOINT] ${host}${SAML_PATH} | HTTP $CODE" >> "$FINDINGS_DIR/saml/endpoints.txt"
                     ;;
@@ -919,11 +1002,7 @@ if ! skip_has saml; then
         [ -z "$url" ] && continue
         RESP=$(curl -sk --max-time 8 "$url" 2>/dev/null || true)
         if echo "$RESP" | grep -qi "EntityDescriptor\|IDPSSODescriptor\|X509Certificate"; then
-            # A public SP/IdP SAML metadata document is public BY DESIGN (that is how
-            # federation works). It is a LEAD for XSW/cert extraction, NOT an auth bypass.
-            # saml/ maps to the critical auth_bypass template, so writing it to
-            # saml/findings.txt shipped a fabricated CRITICAL 9.8. Route to manual_review.
-            log_info "[SAML] Metadata exposed (manual-review lead, aids XSW/cert extraction): $url"
+            log_info "[SAML] Metadata exposed (manual-review lead): $url"
             echo "[SAML-METADATA-EXPOSED] $url | public metadata (aids XSW) — manual review, not a confirmed bypass" >> "$FINDINGS_DIR/manual_review/saml_candidates.txt"
             # Extract cert if present
             echo "$RESP" | grep -o '<X509Certificate>[^<]*' | head -3 >> "$FINDINGS_DIR/saml/certs.txt" 2>/dev/null || true
@@ -939,7 +1018,7 @@ if ! skip_has saml; then
     # Set-Cookie) AND any redirect target is NOT the login/error flow; otherwise
     # downgrade to a manual-verification candidate.
     ACS_URL=$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | grep "saml/acs\|saml/login" | head -1 | awk '{print $2}' || true)
-    if [ -n "$ACS_URL" ]; then
+    if [ -n "$ACS_URL" ] && [ "$ALLOW_STATE_CHANGES" = "1" ]; then
         # Minimal stripped SAMLResponse (no Signature element, synthetic NameID)
         STRIPPED_SAML=$(echo '<?xml version="1.0"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>admin@example.invalid</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>' | base64 | tr -d '\n')
         SS_HDRS=$(curl -sk -D - -o /dev/null --max-time 8 \
@@ -959,6 +1038,8 @@ if ! skip_has saml; then
             fi
             ;;
         esac
+    elif [ -n "$ACS_URL" ]; then
+        _mark_coverage "saml-signature-strip" "synthetic assertion POST skipped; explicit state-change authorization was not supplied"
     fi
 
     SAML_FINDINGS=$(count_vuln "$FINDINGS_DIR/saml/findings.txt")
@@ -977,6 +1058,11 @@ if ! skip_has import; then
 
     while IFS= read -r host; do
         [ -z "$host" ] && continue
+        # A (fix): skip blanket-response (catchall/WAF) hosts — a 403/301-to-everything host
+        # otherwise flags EVERY import path as "endpoint exists" (real run: 423 FPs on one
+        # WAF host).
+        _bh="${host#*://}"; _bh="${_bh%%/*}"
+        case ",$CATCHALL_HOSTS," in *"$_bh"*) continue ;; esac
 
         # ── Discover import/export endpoints ──
         # NOTE: loop var is ep_path, NOT PATH — overwriting $PATH here would
@@ -991,8 +1077,11 @@ if ! skip_has import; then
             "/api/migrate" "/template/import" "/backup/restore"; do
             CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
                 "${host}${ep_path}" 2>/dev/null || echo "0")
+            # A (fix): flag only codes that show the endpoint EXISTS and is reachable/handling
+            # input — 200/201 (accessible), 302 (login redirect), 400/405/422 (exists, rejects
+            # GET/validates). Drop 301 (generic redirect) and 401/403 (blocked flood).
             case "$CODE" in
-                200|201|301|302|400|403|405|422)
+                200|201|302|400|405|422)
                     log_vuln "[IMPORT] Endpoint exists (HTTP $CODE): ${host}${ep_path}"
                     echo "[IMPORT-ENDPOINT] ${host}${ep_path} | HTTP $CODE" >> "$FINDINGS_DIR/import_export/endpoints.txt"
                     ;;
@@ -1149,6 +1238,15 @@ if ! skip_has supplychain; then
                 "${host}${CRED_PATH}" 2>/dev/null || echo "0")
             if [ "$CODE" = "200" ]; then
                 RESP=$(curl -sk --max-time 5 "${host}${CRED_PATH}" 2>/dev/null || true)
+                # Soft-404 / SPA guard: these cred/config files (Dockerfile, .npmrc, lockfiles,
+                # docker-compose.yml, settings.xml) are ALL plaintext — never HTML. A SPA/CDN
+                # catch-all that serves index.html with HTTP 200 for ANY path (e.g. /Dockerfile)
+                # otherwise satisfied the loose keyword filter below ("auth"/"key"/"token" appear
+                # in ordinary markup / CSRF metas) and shipped a fabricated HIGH "cred file
+                # exposed" for a file that does not exist. Drop HTML bodies before keyword-match.
+                if echo "$RESP" | head -c 512 | grep -qiE "<!doctype html|<html|<head|<body|<script"; then
+                    continue
+                fi
                 if echo "$RESP" | grep -qiE "password|token|secret|auth|key|credential|registry_url|//npm|@scope"; then
                     log_vuln "[SUPPLY-CHAIN] Credential file exposed: ${host}${CRED_PATH}"
                     echo "[CRED-FILE] ${host}${CRED_PATH}" >> "$FINDINGS_DIR/supply_chain/findings.txt"
@@ -1189,3 +1287,11 @@ log_info "Scan Complete. Consolidating..."
     echo "Supply Chain         : $(count_vuln "$FINDINGS_DIR/supply_chain/findings.txt")"
 } > "$FINDINGS_DIR/summary.txt"
 cat "$FINDINGS_DIR/summary.txt"
+
+# P1 fail-closed exit: if any invoked tool crashed (hard signal / timeout), exit non-zero
+# so hunt.py's run_live records the SCAN phase as degraded. A clean 0 would hide the loss.
+if [ "${SCAN_CRASHES:-0}" -gt 0 ]; then
+    log_warn "$SCAN_CRASHES tool crash(es) recorded during scan — exiting non-zero (coverage degraded)"
+    exit 2
+fi
+exit 0

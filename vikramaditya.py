@@ -401,6 +401,7 @@ def _new_fingerprint_result(url: str) -> dict:
         "login_paths": [],
         "api_detected": False,
         "api_base": None,
+        "cross_origin_api_candidates": [],
         "js_chunks": 0,
         "js_endpoints": 0,
         "openapi_found": False,
@@ -581,24 +582,19 @@ def fingerprint_webapp(url: str, _result: dict | None = None) -> dict:
                 js_text, re.IGNORECASE)
             for api_url in cross_origin_apis:
                 api_url = api_url.rstrip("/")
-                if api_url and parsed.netloc not in api_url:
-                    # Cross-origin API found
-                    result["api_detected"] = True
-                    result["api_base"] = api_url
-                    log("info", f"Cross-origin API found in JS: {api_url}")
-                    # Check if this API has a login endpoint
-                    for lp in ["login-view/", "login/", "auth/login/"]:
-                        try:
-                            lp_resp = requests.post(f"{api_url}/{lp}",
-                                                     data={"email": "", "password": ""},
-                                                     verify=False, timeout=8)
-                            if lp_resp.status_code not in (404, 405, 0):
-                                result["login_detected"] = True
-                                result["login_paths"].append(f"{api_url}/{lp}")
-                                break
-                        except Exception:
-                            continue
-                    break
+                try:
+                    api_host = (urlparse(api_url).hostname or "").lower().rstrip(".")
+                except Exception:
+                    api_host = ""
+                target_host = (parsed.hostname or "").lower().rstrip(".")
+                if api_host and api_host != target_host:
+                    # JavaScript is target-controlled evidence, not scope authority.
+                    # Never probe or route credentials to another host merely because
+                    # a bundle names it. Keep it for a separately authorised run.
+                    candidates = result.setdefault("cross_origin_api_candidates", [])
+                    if api_url not in candidates:
+                        candidates.append(api_url)
+                    log("info", f"Cross-origin API candidate found in JS (not probed): {api_url}")
 
             # Also detect login-view in JS fetch/post calls
             if not result["login_detected"]:
@@ -626,8 +622,8 @@ def fingerprint_webapp(url: str, _result: dict | None = None) -> dict:
                         "v1/auth/login", "api/login"]
         for lp in login_probes:
             try:
-                lp_resp = requests.post(f"{base}/{lp}", json={"email": "", "password": ""},
-                                         verify=False, timeout=8)
+                lp_resp = requests.get(f"{base}/{lp}", verify=False, timeout=8,
+                                       allow_redirects=False)
                 # If we get anything other than 404/405, a login endpoint exists
                 if lp_resp.status_code not in (404, 405, 0):
                     result["login_detected"] = True
@@ -650,21 +646,16 @@ def fingerprint_webapp(url: str, _result: dict | None = None) -> dict:
         except Exception:
             continue
 
-    # Also check subdomain api.*
+    # Record the conventional api.* hostname as a candidate only. A related
+    # name is not scope authority, so an exact-host fingerprint must not probe it.
     host_parts = parsed.netloc.split(".")
     if host_parts[0] != "api" and len(host_parts) >= 2:
         api_host = "api." + ".".join(
             host_parts[1:] if host_parts[0] in ("app", "www") else host_parts)
-        try:
-            probe_resp = requests.get(f"{parsed.scheme}://{api_host}/",
-                                       verify=False, timeout=8)
-            if probe_resp.status_code not in (0, 502, 503):
-                ct = probe_resp.headers.get("Content-Type", "")
-                if "application/json" in ct or probe_resp.status_code == 200:
-                    result["api_detected"] = True
-                    result["api_base"] = f"{parsed.scheme}://{api_host}"
-        except Exception:
-            pass
+        candidate = f"{parsed.scheme}://{api_host}"
+        candidates = result.setdefault("cross_origin_api_candidates", [])
+        if candidate not in candidates:
+            candidates.append(candidate)
 
     # If no explicit API base but JS has endpoints, API is same-origin
     if not result["api_detected"] and result["js_endpoints"] > 3:
@@ -943,8 +934,14 @@ def resolve_assess_creds(cli_assess_creds, autonomous: bool, prompt=None) -> boo
     return bool(prompt()) if prompt else False
 
 
+# P1 — remembers hunt.py's exit code so __main__ can map an inconclusive run (2) to a
+# distinct orchestrator exit code (see the __main__ block below).
+_LAST_HUNT_EXIT = 0
+
+
 def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
-             assess_creds: bool = False, max_urls: int = 0):
+             assess_creds: bool = False, max_urls: int = 0,
+             allow_destructive: bool = False):
     """Route to hunt.py for domain/IP/CIDR recon + scan.
 
     v9.2.0 — pass PYTHONUNBUFFERED=1 to subprocess so phase markers flush in
@@ -967,6 +964,11 @@ def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
         cmd.append("--scope-lock")
     if assess_creds:
         cmd.append("--assess-creds")
+    # Live Metasploit exploitation is FAIL-CLOSED: only forward --allow-destructive
+    # when the caller explicitly opted in. A bare/default run stays dry-run (hunt.py
+    # writes .rc resource files but never stages a live meterpreter session).
+    if allow_destructive:
+        cmd.append("--allow-destructive")
     # v10.5.0 — always forward the URL cap explicitly so 0 (unlimited, the
     # default) reaches recon.sh and overrides hunt.py's legacy 100 default.
     cmd += ["--max-urls", str(max_urls)]
@@ -975,7 +977,15 @@ def run_hunt(target: str, full: bool = False, scope_lock: bool = False,
     env.setdefault("PYTHONUNBUFFERED", "1")
     # Fork-safe launch (this runs AFTER fingerprint_webapp_bounded's in-process
     # HTTP I/O — see _run_streaming / procutil for the macOS atfork SIGSEGV class).
-    _run_streaming(cmd, cwd=SCRIPT_DIR, env=env)
+    _rc = _run_streaming(cmd, cwd=SCRIPT_DIR, env=env)
+    # P1 — propagate hunt.py's inconclusive exit (2) so the orchestrator's own exit
+    # code reflects a degraded/failed run; CI can't mistake it for a clean pass.
+    global _LAST_HUNT_EXIT
+    _LAST_HUNT_EXIT = _rc
+    if _rc == 2:
+        print(f"\n  {Y}[!]{N} hunt.py reported an INCONCLUSIVE assessment "
+              f"(a phase failed / was aborted / ran degraded).\n", flush=True)
+    return _rc
 
 
 def run_legacy_crawl(target_url: str, creds: str, creds_b: str = None,
@@ -1051,6 +1061,27 @@ def run_brain_scan(target: str, cookies: str = "", briefing: str = "",
         output_dir=output_dir, mode=mode, fix_claim=fix_claim,
         code_url=code_url,
     )
+
+
+def _best_live_target(preferred: str, findings_dir: str) -> str:
+    """Pick a reachable 200-status host from recon for the active scanner instead of a
+    WAF-blocked apex. Real WAF-fronted run: the apex answered a CDN 403 to everything, so the
+    active scan fumbled and 'found nothing' against a dead target. Reads the recon
+    httpx_full.txt (scheme://host [code] ...) and returns the first 200 URL; falls back
+    to the preferred target if none/no recon data."""
+    if not findings_dir:
+        return preferred
+    httpx_full = os.path.join(findings_dir.replace("/findings/", "/recon/"), "live", "httpx_full.txt")
+    try:
+        with open(httpx_full, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "[200]" in line:
+                    u = line.split()[0] if line.split() else ""
+                    if u.startswith("http"):
+                        return u
+    except OSError:
+        pass
+    return preferred
 
 
 def run_report(findings_dir: str, client: str = "", consultant: str = ""):
@@ -2552,6 +2583,9 @@ def main():
                 brain_target = api_base
         except NameError:
             pass
+        # P1 — don't point the active scanner at a WAF-blocked apex; prefer a live
+        # 200 host from recon (real WAF-fronted run: apex was CDN 403 → scan found nothing).
+        brain_target = _best_live_target(brain_target, findings_dir)
         log("info", f"Launching brain active scanner on {brain_target}...")
         # Reuse the existing report root rather than spawning a second session
         # dir the reporter never reads. The brain scanner writes brain_active/
@@ -2617,5 +2651,9 @@ if __name__ == "__main__":
         raise
     finally:
         _append_run_log(_target_for_log, _started, _exit_code)
+    # P1 — a clean control-flow exit still surfaces an INCONCLUSIVE hunt (exit 2) so a
+    # degraded/failed assessment is never reported to CI/operators as a clean pass.
+    if _exit_code == 0 and _LAST_HUNT_EXIT == 2:
+        _exit_code = 2
     if _exit_code:
         sys.exit(_exit_code)

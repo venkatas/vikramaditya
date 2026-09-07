@@ -38,3 +38,19 @@ Full MIT license text:
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
+
+-----------------------------------------------------------------------
+s0ld13rr/pentestcode — https://github.com/s0ld13rr/pentestcode
+MIT License — Copyright (c) contributors to s0ld13rr/pentestcode
+-----------------------------------------------------------------------
+
+Ideas adapted (clean-room Python; not a TypeScript copy) into:
+
+  finding_validator.py     <- severity-inflation / critic patterns
+                              (admin panels, banners, version-match hits,
+                               missing API headers, open ports without vuln)
+  agents/validator.md      <- Severity Inflation + PROOF standard section
+  resolved_vectors.py      <- session resolved-vector ledger (skip blind retests)
+  tool_parsers.py          <- mandatory nuclei/sqlmap/ffuf/nmap parsers
+
+Full MIT license text applies as quoted above for xalgorix.

@@ -99,12 +99,12 @@ def test_single_pass_dnsx_captures_exit_and_fails_open():
     assert "DNSX_FAILED_CHUNKS=1" in t, "single-pass dnsx failure does not mark DNSX_FAILED_CHUNKS"
     # The single-pass dnsx must be guarded by an if (exit captured), not `|| true`
     assert re.search(
-        r'if timeout -k 30 300 dnsx -silent -a -l "\$RECON_DIR/subdomains/all\.txt"',
+        r'if timeout -k 30 300 dnsx -silent -a -l "\$DNSX_INPUT"',
         t,
     ), "single-pass dnsx still swallows exit with `|| true` instead of capturing it"
     # On failure it must union the full candidate set back (fail-open)
-    assert 'cat "$RECON_DIR/subdomains/all.txt" >> "$RECON_DIR/subdomains/resolved.txt"' in t, \
-        "single-pass dnsx failure does not fail-open (union candidates back into resolved.txt)"
+    assert 'cat "$DNSX_INPUT" >> "$RECON_DIR/subdomains/resolved.txt"' in t, \
+        "single-pass dnsx failure does not fail-open (union DNS-name candidates back into resolved.txt)"
 
 
 # IDX 1: Phase 3 / Phase 6 resume gate on completion markers, not partial data
