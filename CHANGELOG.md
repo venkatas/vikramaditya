@@ -1,5 +1,23 @@
 # Changelog
 
+## Opt-in Endava CATS OpenAPI negative fuzz (2026-09-07)
+
+Wire Endava CATS (Contract API Testing and Security) as an **opt-in** OpenAPI
+negative/boundary fuzzer alongside Schemathesis and RESTler. Default scan path
+unchanged — no ALLOW_STATE_CHANGES / aggression default changes.
+
+- **`cats_audit.py`** — thin wrapper: resolve `CATS_BIN` / `cats` / `CATS_JAR`,
+  run with `--contract` + `--server`, auth via `--header` / `--token` /
+  `--headers-file`, optional `--blackbox`, write reports under
+  `findings/<host>/cats/`, parse `cats-summary-report.json` → `summary.json` +
+  `error_leads.json`.
+- **CLI** — `vikramaditya.py --cats SPEC --cats-server URL` (+ `--cats-token`,
+  `--cats-header`, `--cats-blackbox`, `--cats-paths`, `--cats-headers-file`).
+- **Docs / setup / NOTICE** — `docs/cats.md`, optional `setup.sh` PATH check,
+  Apache-2.0 attribution (invoke only; not vendored).
+- **Tests** — `tests/test_cats_audit.py` (resolve, argv, summary parse, mock binary).
+
+
 ## v10.6.0 — xalgorix-port batch: native HTTP probe, auth re-auth resilience, API playbooks (2026-06-17)
 
 Second-pass adoption from the peer AI-VAPT tool (xalgorix, MIT). A capability-mining sweep flagged

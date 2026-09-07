@@ -78,3 +78,15 @@ MIT License — Copyright (c) Microsoft Corporation
 
   markitdown_helper.py         <- thin CLI wrapper around MarkItDown
 
+-----------------------------------------------------------------------
+Endava CATS — https://github.com/Endava/cats
+Apache License 2.0 — Copyright (c) Endava
+-----------------------------------------------------------------------
+
+  cats_audit.py            <- optional subprocess invoke of `cats` (native
+                              binary or java -jar via CATS_JAR). Vikramaditya
+                              does not vendor CATS sources; HTML/JSON reports
+                              are written under findings/<host>/cats/.
+
+Docs: https://endava.github.io/cats/
+

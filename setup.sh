@@ -639,6 +639,16 @@ for local_tool in "LinkFinder/linkfinder.py" "SecretFinder/SecretFinder.py" "XSS
     fi
 done
 
+# Optional: Endava CATS for OpenAPI negative fuzz (cats_audit.py).
+# Not required for core VAPT; install separately when needed
+# (brew tap endava/tap && brew install cats, or releases binary/JAR).
+# See docs/cats.md
+if command -v cats >/dev/null 2>&1; then
+    log_ok "Endava CATS on PATH: $(command -v cats)"
+else
+    log_warn "Endava CATS (cats) not installed — optional for --cats / cats_audit.py"
+fi
+
 READINESS_FAILED=0
 if "$VENV_DIR/bin/python" "$SCRIPT_DIR/environment_readiness.py"; then
     log_ok "Environment readiness checks passed"

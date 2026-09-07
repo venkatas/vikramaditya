@@ -1115,7 +1115,7 @@ def make_output_dir(target: str) -> str:
         # v10.6.0 — also redact --llm-auth (carries an Authorization: Bearer token,
         # forwarded as --auth-header) and --header (commonly Authorization/Cookie).
         _secret_flags = {"--burp-key", "--api-key", "--creds", "--creds-b",
-                         "--restler-token", "--ad-pass", "--llm-auth", "--header"}
+                         "--restler-token", "--cats-token", "--ad-pass", "--llm-auth", "--header"}
         # Header names whose VALUE is a credential — for --header (a "Key: Value"
         # string) we keep the header NAME visible but mask its value when sensitive.
         _sensitive_header_names = {"authorization", "cookie", "set-cookie",
@@ -1267,6 +1267,17 @@ Options:
   --restler SPEC          v9.12.0 — Microsoft RESTler stateful REST API
                           fuzzer. --restler-base-url, --restler-token,
                           --restler-mode, --restler-time-h.
+  --cats SPEC             OPT-IN Endava CATS OpenAPI negative fuzz /
+                          contract+security (not default scan). Requires
+                          cats on PATH or CATS_BIN/CATS_JAR. See docs/cats.md.
+                          --cats-server, --cats-token, --cats-header,
+                          --cats-blackbox, --cats-paths, --cats-headers-file.
+  --cats-server URL       Target API base URL for --cats
+  --cats-token VALUE      Authorization header value (e.g. "Bearer …")
+  --cats-header H         Extra -H header (Name=Value or Name: Value; repeatable)
+  --cats-blackbox         CATS --blackbox -k (5xx-as-error)
+  --cats-paths LIST       Comma-separated OpenAPI paths to include
+  --cats-headers-file F   CATS per-path YAML headers file
   --graphql URL           v9.13.0 — graphw00f + Clairvoyance + InQL
                           GraphQL DAST bundle. --graphql-clairvoyance,
                           --graphql-wordlist, --header.
@@ -1379,6 +1390,14 @@ def parse_cli_args() -> dict:
         "restler_token": "",
         "restler_mode": "all",
         "restler_time_h": 2.0,
+        # OPT-IN — Endava CATS (not default scan)
+        "cats": "",
+        "cats_server": "",
+        "cats_token": "",
+        "cats_headers": [],
+        "cats_blackbox": False,
+        "cats_paths": "",
+        "cats_headers_file": "",
         # v9.13.0 — GraphQL
         "graphql": "",
         "graphql_clairvoyance": False,
@@ -1542,6 +1561,20 @@ def parse_cli_args() -> dict:
             except ValueError:
                 pass
             i += 2
+        elif argv[i] == "--cats" and i + 1 < len(argv):
+            args["cats"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cats-server" and i + 1 < len(argv):
+            args["cats_server"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cats-token" and i + 1 < len(argv):
+            args["cats_token"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cats-header" and i + 1 < len(argv):
+            args["cats_headers"].append(argv[i + 1]); i += 2
+        elif argv[i] == "--cats-blackbox":
+            args["cats_blackbox"] = True; i += 1
+        elif argv[i] == "--cats-paths" and i + 1 < len(argv):
+            args["cats_paths"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cats-headers-file" and i + 1 < len(argv):
+            args["cats_headers_file"] = argv[i + 1]; i += 2
         elif argv[i] == "--graphql" and i + 1 < len(argv):
             args["graphql"] = argv[i + 1]; i += 2
         elif argv[i] == "--graphql-clairvoyance":
@@ -1986,6 +2019,28 @@ def main():
             subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=2400)
         except Exception as e:
             log("warn", f"graphql_audit failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["cats"]:
+        log("info", f"--cats: contract={cli['cats']}")
+        if not cli.get("cats_server"):
+            log("error", "--cats requires --cats-server URL")
+            print(f"\n  {D}Done.{N}\n"); return
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "cats_audit.py"),
+                   "--contract", cli["cats"], "--server", cli["cats_server"]]
+            if cli.get("cats_token"):
+                cmd += ["--token", cli["cats_token"]]
+            for h in cli.get("cats_headers") or []:
+                cmd += ["--header", h]
+            if cli.get("cats_blackbox"):
+                cmd.append("--blackbox")
+            if cli.get("cats_paths"):
+                cmd += ["--paths", cli["cats_paths"]]
+            if cli.get("cats_headers_file"):
+                cmd += ["--headers-file", cli["cats_headers_file"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=7800)
+        except Exception as e:
+            log("warn", f"cats failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["restler"]:
         log("info", f"--restler: spec={cli['restler']}")
