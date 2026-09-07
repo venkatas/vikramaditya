@@ -124,12 +124,21 @@ python3 vikramaditya.py example.com            # auto-detect, interactive
 For autonomous operation, install [Ollama](https://ollama.com) and pull the per-role models the brain actually uses (see [AI Brain & Models](#ai-brain--models) for the rationale):
 
 ```bash
-ollama pull phi4:14b               # faithful narrator (default since v9.23)
-ollama pull devstral-small-2:24b   # primary exploit coder (A/B-validated)
-ollama pull qwen2.5-coder:14b      # fast fallback coder
+# Scanner / exploit code-gen — pullable from the Ollama library:
+ollama pull qwen3-coder:30b        # lands grounded PoCs (or qwen2.5-coder:14b for a lighter box)
+
+# Triage + narrator — the 2026-07-16 FP-discipline bench winner is OpenMythos-27B, a GGUF IMPORT
+# (NOT in the Ollama library). Build it once, or use a pullable faithful generic as fallback:
+#   download hf.co/jabbatheduck/OpenMythos-GGUF (Q4_K) → ollama create openmythos-27b -f Modelfile
+ollama pull qwen3:14b              # pullable faithful narrator/triage fallback if you skip the import
 ```
 
-> **Minimum for autonomous mode:** `phi4:14b` (narrator) **plus one** coder — either `devstral-small-2:24b` *or* `qwen2.5-coder:14b` (the brain auto-prefers Devstral when both are present). These three are each multi-GB downloads.
+> **Minimum for autonomous mode:** one triage/narrator model — `openmythos-27b` (the bench winner, a
+> GGUF import) *or* the pullable `qwen3:14b` fallback — **plus one** coder (`qwen3-coder:30b` or
+> `qwen2.5-coder:14b`). See [AI Brain & Models](#ai-brain--models) and the benchmark record at
+> [`docs/benchmarks/2026-07-16-triage-fp-discipline.md`](docs/benchmarks/2026-07-16-triage-fp-discipline.md).
+> A pinned model that isn't installed now warns loudly (and fails under `BRAIN_REQUIRE_PIN=1`), so pin
+> only models you've actually pulled/built.
 
 Optionally create the security-tuned triage model (fully optional — triage defaults to `phi4:14b` without it):
 
@@ -278,16 +287,21 @@ role wants a different model — these are env-overridable with **no code change
 
 | Role | Model | Why | Env var |
 |:--|:--|:--|:--|
-| **Narration / analysis** | `phi4:14b` | Lowest hallucination of any local model (Vectara 3.7 %) — won't fabricate findings | `BRAIN_MODEL=phi4:14b` |
-| **Triage** (submit/drop) | `phi4:14b` *(default)* → `bugtraceai-apex` *(opt-in)* | Triage defaults to `phi4:14b` for speed and consistent JSON. Pull `bugtraceai-apex` and set `TRIAGE_MODEL` to switch to the security-DPO judge (empirically beat phi4 + Foundation-Sec on a triage A/B) | `TRIAGE_MODEL=bugtraceai-apex` |
-| **Exploit code-gen** | `devstral-small-2:24b` (primary) / `qwen2.5-coder:14b` (fast fallback) | Both write valid, runnable PoCs. A/B-validated: Devstral wins on correctness (68 % SWE-bench; emits the canonical sqlmap-GET structure), qwen2.5-coder is faster/lighter | `BRAIN_SCANNER_MODEL=devstral-small-2:24b` |
+| **Triage** (submit/drop) | `openmythos-27b:latest` | 2026-07-16 false-positive-discipline bench winner (73-judge panel, 5/5 clean runs, 0 invented confirmations). Triage's decisive axis is **FP discipline** — not fabricating a vuln that isn't there. ⚠ Provisional: the bench measured false-positives only, not sensitivity — see the benchmark record. | `TRIAGE_MODEL=openmythos-27b:latest` |
+| **Narration / analysis** | `openmythos-27b:latest` (pinned); code fallback `qwen3:14b` | Faithful, low-fabrication narration. Currently pinned to the triage winner; not separately narration-benched, so the code fallback stays a faithful generic. | `BRAIN_MODEL=openmythos-27b:latest` |
+| **Exploit code-gen** | `qwen3-coder:30b` (pinned) / `qwen2.5-coder:14b` (fast fallback) | A coder **lands grounded PoCs** where triage/analysis models flail in the write-and-run loop. | `BRAIN_SCANNER_MODEL=qwen3-coder:30b` |
 
-`brain_scanner.pick_model()` prefers `devstral-small-2:24b` automatically when
-present, else falls back to `qwen2.5-coder:14b`. `brain.py` makes `phi4:14b` the
-default narrator **and** the default triage model (`MODEL_PRIORITY[0]` and
-`TRIAGE_MODEL_PRIORITY[0]`); `bugtraceai-apex` (which resolves to
-`bugtraceai-apex:latest`) sits second in both lists and is only selected when
-pulled or forced via the env var.
+Model selection is layered: **`~/.config/vikramaditya/brain.env` file-WINS** (the
+canonical per-machine pin), and the `MODEL_PRIORITY` / `TRIAGE_MODEL_PRIORITY`
+lists in `brain.py` are the code-level **fallback** (first *installed* model wins).
+A pinned model that is **not installed** no longer silently substitutes — it warns
+loudly (and fails under `BRAIN_REQUIRE_PIN=1`), and the model actually used is
+recorded in `brain.MODEL_SELECTION_LOG`. The triage list is now ranked by FP
+discipline (`openmythos-27b` first, then clean alternates `nemesis` / `devstral` /
+`glm`; the offensive-tune `baron-llm` demoted). Full benchmark + caveats:
+[`docs/benchmarks/2026-07-16-triage-fp-discipline.md`](docs/benchmarks/2026-07-16-triage-fp-discipline.md).
+(Historical defaults `phi4` / `bugtraceai-apex` are retired — speed/JSON-optimized,
+not FP-discipline-validated, and were not installed.)
 
 > ⚠️ A `claude-*` tag in your local Ollama is **not** Claude (Claude weights are
 > not downloadable, so any such tag is a mislabeled local model). Always confirm
