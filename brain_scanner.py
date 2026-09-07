@@ -316,6 +316,27 @@ def extract_code_blocks(text: str) -> list[dict]:
     return blocks
 
 
+def _rewrite_confused_tool_flags(code: str) -> str:
+    """Fix LLM CLI flag mix-ups before bash executes a tool command.
+
+    Observed failure mode: the model invents ``ffuf ... --rate-limit N`` (nuclei's
+    flag). ffuf only accepts ``-rate N``; the unknown flag dumps usage / stalls the
+    brain-active loop. Rewrite ONLY on lines that invoke ffuf; leave nuclei (which
+    correctly uses ``-rate-limit`` / ``-rl``) untouched.
+    """
+    out = []
+    for line in code.splitlines(keepends=True):
+        if re.search(r'(^|[\s;&|])ffuf(\s|$)', line):
+            fixed = re.sub(r'(?<![\w-])--?rate-limit\b', '-rate', line)
+            if fixed != line:
+                log("warn", "Rewrote ffuf flag: --rate-limit/-rate-limit → -rate "
+                            "(nuclei flag is invalid for ffuf)")
+            out.append(fixed)
+        else:
+            out.append(line)
+    return ''.join(out)
+
+
 def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> dict:
     """Execute a code block and capture output.
 
@@ -352,6 +373,7 @@ def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> d
                     "returncode": 3, "scope_blocked": True}
 
     if lang in ("bash", "sh", "curl"):
+        code = _rewrite_confused_tool_flags(code)
         cmd = ["bash", "-c", code]
         # `bash -n` parses without executing — catches unbalanced quotes / EOF.
         # Fork-safe launch (procutil): plain subprocess.run forks and SIGSEGVs on macOS
@@ -596,7 +618,9 @@ Write a ```bash block with:
 
 *** Directory discovery: USE ffuf — wordlists SHIP IN THIS REPO (paths are relative to cwd);
     /usr/share/seclists is NOT installed here, so do NOT use it (ffuf will error on a missing list) ***
-  ffuf -u "URL/FUZZ" -w wordlists/common.txt -mc 200,301,302,403
+  ffuf -u "URL/FUZZ" -w wordlists/common.txt -mc 200,301,302,403 -rate 10
+  Rate limit with ffuf's `-rate N` (req/sec). NEVER pass `--rate-limit` / `-rate-limit` to ffuf —
+  that is a nuclei flag and makes ffuf fail or dump usage.
   (other lists: wordlists/api-endpoints.txt, wordlists/high_value_paths.txt, wordlists/lfi.txt)
   For a KNOWN path/file already named by recon, do NOT ffuf — just `curl` it directly and show the bytes.
 
@@ -605,7 +629,8 @@ CSRF token analysis, file upload content crafting, session manipulation.
 If you find yourself writing "requests.post" with SQL payloads, STOP and use sqlmap instead.
 
 Directory/file discovery → ffuf (use the repo wordlists, NOT /usr/share/seclists which is absent):
-  ffuf -u "URL/FUZZ" -w wordlists/common.txt -mc 200,301,302,403
+  ffuf -u "URL/FUZZ" -w wordlists/common.txt -mc 200,301,302,403 -rate 10
+  (ffuf: `-rate N` only — never nuclei's `--rate-limit`)
 
 SSTI → use Python requests with math canary payloads:
   {{7*7}} → if response contains "49", SSTI confirmed
