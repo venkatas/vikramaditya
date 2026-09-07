@@ -53,4 +53,9 @@ Ideas adapted (clean-room Python; not a TypeScript copy) into:
   resolved_vectors.py      <- session resolved-vector ledger (skip blind retests)
   tool_parsers.py          <- mandatory nuclei/sqlmap/ffuf/nmap parsers
 
+  jwt_analyze.py           <- deterministic static JWT checks
+                              (alg:none, weak HMAC secrets, claim hygiene)
+  skill_loader.py          <- on-demand vuln skill pack loader
+  skills/web/*/SKILL.md    <- focused SSRF/SQLi/SSTI/LFI/IDOR/XXE/upload/deser packs
+
 Full MIT license text applies as quoted above for xalgorix.

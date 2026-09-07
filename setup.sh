@@ -59,6 +59,24 @@ if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
     echo "[*] Installing core dependencies from requirements.txt..."
     if "$VENV_DIR/bin/python" -m pip install --quiet -r "$SCRIPT_DIR/requirements.txt"; then
         log_ok "Core dependencies installed successfully"
+
+    # uro ships as a Python CLI (not a Go tool). requirements.txt installs it into
+    # .venv; ensure the venv bin is on PATH. Fallback for non-venv hosts:
+    #   python3 -m pip install --user --break-system-packages "uro>=1.0.2"
+    if ! command -v uro >/dev/null 2>&1; then
+        if [ -x "$VENV_DIR/bin/uro" ]; then
+            export PATH="$VENV_DIR/bin:$PATH"
+            log_ok "uro available via .venv ($VENV_DIR/bin/uro)"
+        else
+            log_warn "uro missing after requirements install — try: $VENV_DIR/bin/pip install 'uro>=1.0.2'"
+            log_warn "or: python3 -m pip install --user --break-system-packages 'uro>=1.0.2'"
+        fi
+    else
+        log_ok "uro on PATH: $(command -v uro)"
+    fi
+    # rich pin note: requirements keep rich>=13.9.4,<14 (schemathesis 4.17).
+    # semgrep wants rich~=13.5.2 — both resolve on the 13.9.x line. Do NOT install
+    # rich 15 into the main .venv or semgrep breaks.
     else
         log_err "Core dependency installation failed; setup cannot continue with a partial Python environment"
         exit 1

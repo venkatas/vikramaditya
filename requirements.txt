@@ -28,6 +28,12 @@ requests>=2.32.4
 python-dateutil>=2.8.2
 # URL normalization used by recon.sh.  uro is a Python CLI, not a Go module.
 uro>=1.0.2
+# schemathesis 4.17 needs rich>=13.9.4; semgrep pins rich~=13.5.2.
+# Stay on the 13.x line so both can coexist in the main .venv.
+# Do NOT bump to rich 15 — it conflicts with semgrep.
+rich>=13.9.4,<14
+# Optional API property testing (pulls rich). Install when needed:
+#   pip install "schemathesis>=4.17"
 
 # ── Email auth audit (SPF/DMARC/DKIM/MTA-STS/BIMI/DNSSEC) ────────────────────
 # email_audit.py was ported in v7.2.0 from venkatas/subspace-sentinel (MIT).
