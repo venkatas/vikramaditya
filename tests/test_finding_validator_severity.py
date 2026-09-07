@@ -63,6 +63,15 @@ def test_non_strict_passes_real_findings(tmp_path):
     assert any(r["source"] == "sqli/s.txt" for r in res["pass"])
 
 
+def test_strict_counts_auth_bypass_findings(tmp_path):
+    d = str(tmp_path)
+    _write(d, "auth_bypass", "source_audit.txt", [
+        "[HIGH] Confirmed authentication bypass on /admin"
+    ])
+    res = fv.validate_findings_dir(d, strict=True)
+    assert any(r["source"] == "auth_bypass/source_audit.txt" for r in res["pass"])
+
+
 def test_q6_downgrade_branch_fires(tmp_path):
     d = str(tmp_path)
     # Explicit low token routes through Q6 downgrade.

@@ -359,9 +359,13 @@ VULN_TEMPLATES = {
         ],
     },
     "email_auth": {
-        "title": "Email Authentication Weakness on {host}",
+        "title": "Email Authentication Posture on {host}",
         "severity": "medium", "cvss": "5.3", "cwe": "CWE-290",
-        "impact": "Missing or weak email authentication (SPF/DKIM/DMARC) lets an attacker spoof mail from this domain, enabling phishing and business-email-compromise against staff, customers, and partners.",
+        "impact": (
+            "Missing or weak email authentication (SPF/DKIM/DMARC) can increase "
+            "the risk that receivers accept spoofed mail. A DNS posture observation "
+            "does not, by itself, prove successful spoofing or mail delivery."
+        ),
         "remediation": "Publish a DMARC record (start p=none with rua reporting, then move to quarantine/reject), tighten SPF toward -all once all senders are covered, and ensure DKIM signing on all sending sources.",
         "references": [
             ("DMARC.org", "https://dmarc.org/"),
@@ -1255,36 +1259,47 @@ def load_findings(findings_dir: str) -> list:
             with open(email_auth_path, errors="replace") as f:
                 ea_data = _json.load(f)
             for item in (ea_data if isinstance(ea_data, list) else []):
-                sev = str(item.get("severity", "low")).lower()
+                declared_sev = str(item.get("severity", "low")).strip().lower()
+                sev = declared_sev
                 if sev in ("informational", "information"):
                     sev = "info"
                 if sev not in SEVERITY_ORDER:
                     sev = "low"
-                # v10.0.1 — per-finding CVSS so a LOW/INFO posture item no longer inherits
-                # the email_auth template's fixed MEDIUM 5.3 (previously EVERY email_auth
-                # finding rendered 5.3 because the loader set severity but not cvss and the
-                # renderer fell back to the template). Precedence: explicit per-item cvss →
-                # if the finding's severity MATCHES the template's, keep the template's
-                # authored score (so MEDIUM stays 5.3 — no needless drift, no split with peer
-                # MEDIUM templates) → otherwise the canonical severity→score map.
+                # DNS/mail-control posture is observed configuration, not a proven
+                # spoofing exploit. Cap producer HIGH/CRITICAL at MEDIUM.
+                posture_was_capped = sev in ("critical", "high")
+                if posture_was_capped:
+                    sev = "medium"
+                # v10.0.1 — per-finding CVSS. Precedence: explicit per-item cvss
+                # (only when not posture-capped) → template cvss when severity
+                # matches template → otherwise the canonical severity→score map.
                 _ea_tmpl = VULN_TEMPLATES.get("email_auth", {})
-                if item.get("cvss") is not None:
+                if item.get("cvss") is not None and not posture_was_capped:
                     _ea_cvss = str(item["cvss"])
                 elif sev == _ea_tmpl.get("severity"):
                     _ea_cvss = _ea_tmpl.get("cvss", CVSS_DEFAULT.get(sev, "N/A"))
                 else:
                     _ea_cvss = CVSS_DEFAULT.get(sev, "N/A")
+                _poc = (f"Class : {item.get('vuln_class','')}\n"
+                        f"Area  : {item.get('area','')}\n"
+                        f"Result: {item.get('result','')}\n\n"
+                        f"{item.get('notes','')}")
+                if posture_was_capped:
+                    _poc = (
+                        f"[POSTURE — configuration observed; producer declared "
+                        f"{declared_sev.upper()} but DNS posture alone is not an "
+                        f"exploited finding]\n" + _poc
+                    )
                 results.append({
                     "severity": sev,
                     "cvss": _ea_cvss,
                     "vtype": "email_auth",
-                    "title": item.get("title", "Email authentication weakness"),
+                    "title": item.get("title", "Email authentication posture"),
                     "detail": item.get("notes", ""),
                     "url": item.get("endpoint", "N/A"),
-                    "poc": (f"Class : {item.get('vuln_class','')}\n"
-                            f"Area  : {item.get('area','')}\n"
-                            f"Result: {item.get('result','')}\n\n"
-                            f"{item.get('notes','')}"),
+                    "poc": _poc,
+                    "finding_kind": "posture",
+                    "verification_method": "configuration_observed",
                 })
         except Exception as e:
             print(f"[reporter] WARNING: failed to load "
@@ -2981,14 +2996,27 @@ def _apply_verification_gating(findings: list) -> list:
     for f in findings:
         raw = (f.get("raw") or "").lstrip().upper()
         explicit = (f.get("verification_method") or "").strip().lower()
-        # FAIL OPEN: only an EXPLICIT model-generated claim is unverified-and-droppable.
-        # We anchor on the brain_scanner marker PREFIX (not a substring-anywhere match) so a
-        # real scanner finding whose evidence text merely contains "UNVERIFIED"/"PENDING"
-        # (e.g. a leaked token "AKIAUNVERIFIED...") is NOT mistaken for a model claim.
+        # Observed configuration is posture evidence, not an exploited vuln.
+        # Keep posture rows without stamping them EXPLOITED.
+        if (f.get("finding_kind") == "posture"
+                and explicit == "configuration_observed"):
+            kept.append(f)
+            continue
+        # FAIL OPEN for legacy scanner rows with NO verification field.
+        # Anchor on brain_scanner marker PREFIX so a real finding whose evidence
+        # merely contains "UNVERIFIED"/"PENDING" is not mistaken for a model claim.
         is_model_claim = (raw.startswith("[MODEL CLAIM")
                           or raw.startswith("[UNVERIFIED]")
-                          or explicit in ("model_claim", "unverified"))
-        method = VerificationMethod.UNVERIFIED if is_model_claim else VerificationMethod.EXPLOITED
+                          or explicit == "model_claim")
+        # Legacy rows without a verification field keep the prior compatibility
+        # path. Once a producer sets the field, parse fail-closed: unknown labels
+        # become UNVERIFIED, never EXPLOITED.
+        if is_model_claim:
+            method = VerificationMethod.UNVERIFIED
+        elif explicit:
+            method = VerificationMethod.from_string(explicit)
+        else:
+            method = VerificationMethod.EXPLOITED
         sev = f.get("severity", "medium")
         new_sev = adjust_severity(sev, method)
         if new_sev != sev:

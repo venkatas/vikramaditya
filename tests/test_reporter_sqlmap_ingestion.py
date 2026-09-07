@@ -201,10 +201,15 @@ class TestEmailAuthPerFindingCVSS:
         f = _email_auth_findings(load_findings(str(tmp_path)))[0]
         assert f.get("cvss") == VULN_TEMPLATES["email_auth"]["cvss"]
 
-    def test_high_finding_gets_high_band_cvss(self, tmp_path):
+    def test_high_posture_is_capped_to_medium(self, tmp_path):
+        # DNS posture is observed configuration, not a proven exploit — HIGH/CRITICAL
+        # producer scores must not ship as HIGH in the client report.
         _seed_email_auth(tmp_path, [{"severity": "high", "title": "Spoofable", "notes": "n"}])
         f = _email_auth_findings(load_findings(str(tmp_path)))[0]
-        assert f.get("cvss") == CVSS_DEFAULT["high"]
+        assert f.get("severity") == "medium"
+        assert f.get("cvss") == VULN_TEMPLATES["email_auth"]["cvss"]
+        assert f.get("finding_kind") == "posture"
+        assert f.get("verification_method") == "configuration_observed"
 
     def test_explicit_item_cvss_is_honored(self, tmp_path):
         _seed_email_auth(tmp_path, [{"severity": "medium", "title": "DMARC", "notes": "n", "cvss": "6.5"}])

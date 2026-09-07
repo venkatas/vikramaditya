@@ -628,8 +628,12 @@ class ToolDispatcher:
         self.default_cookies = default_cookies
 
     def _url_in_scope(self, url: str) -> bool:
-        """True if url's host is the engagement target domain or a subdomain of it.
-        Used to keep http_request (and its redirect hops) on-target under scope-lock."""
+        """True only when ``url`` uses the exact engagement target host.
+
+        ``--scope-lock`` promises exact-host isolation (see hunt/vikramaditya
+        CLI help). Subdomains are out of scope unless the operator starts a
+        separate exact-host task for that subdomain.
+        """
         from urllib.parse import urlparse
         try:
             host = (urlparse(url).hostname or "").lower().rstrip(".")
@@ -638,7 +642,7 @@ class ToolDispatcher:
         d = (self.domain or "").lower().rstrip(".")
         if not host or not d:
             return False
-        return host == d or host.endswith("." + d)
+        return host == d
 
     def dispatch(self, name: str, args: dict) -> str:
         """Execute named tool and return text observation."""
@@ -688,10 +692,16 @@ class ToolDispatcher:
 
         try:
             if name == "run_recon":
+                # A model may tighten scope, but it must never weaken the
+                # operator's command-line scope lock.
+                try:
+                    _max_urls = int(args.get("max_urls", self.max_urls))
+                except (TypeError, ValueError):
+                    _max_urls = self.max_urls
                 ok = h.run_recon(
                     domain,
-                    scope_lock=args.get("scope_lock", self.scope_lock),
-                    max_urls=int(args.get("max_urls", self.max_urls)),
+                    scope_lock=self.scope_lock or bool(args.get("scope_lock", False)),
+                    max_urls=_max_urls,
                 )
                 obs = self._summarize_recon(domain, ok)
 
@@ -779,7 +789,7 @@ class ToolDispatcher:
                     return "ERROR: http_request requires a 'url'."
                 if self.scope_lock and not self._url_in_scope(url):
                     return (f"[BLOCKED] http_request url {url} is out of scope. scope-lock is "
-                            f"on — only {self.domain} and its subdomains may be probed. Point at "
+                            f"on — only the exact host {self.domain} may be probed. Point at "
                             f"the in-scope target host instead.")
 
                 def _allow_redirect(u: str) -> bool:

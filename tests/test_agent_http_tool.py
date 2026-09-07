@@ -54,14 +54,31 @@ def test_http_request_scope_lock_blocks_offsite(tmp_path, monkeypatch):
     assert "scope" in obs.lower() or "BLOCKED" in obs   # refused, probe never called
 
 
-def test_http_request_scope_lock_allows_subdomain(tmp_path, monkeypatch):
+def test_http_request_scope_lock_blocks_subdomain(tmp_path, monkeypatch):
     import agent_http
-    seen = {}
-    monkeypatch.setattr(agent_http, "probe", lambda method, url, **k: seen.update(url=url) or {
-        "status": 200, "headers": {}, "body": "ok", "bytes": 2, "truncated": False,
-        "is_binary": False, "content_type": "", "elapsed_ms": 1, "url": url,
-        "final_url": url, "method": method, "error": ""})
-    d = _dispatcher(tmp_path)
+    monkeypatch.setattr(agent_http, "probe", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("probe should NOT run for out-of-scope subdomain")))
+    d = _dispatcher(tmp_path)   # scope_lock=True, domain=victim.example
     obs = d.dispatch("http_request", {"url": "https://api.victim.example/v1", "method": "GET"})
-    assert seen.get("url") == "https://api.victim.example/v1"   # subdomain allowed
-    assert "200" in obs
+    assert "BLOCKED" in obs or "scope" in obs.lower()
+    assert "exact host" in obs.lower() or "victim.example" in obs
+
+
+def test_run_recon_cannot_weaken_operator_scope_lock(tmp_path, monkeypatch):
+    """LLM args must not turn off an operator-enabled --scope-lock."""
+    seen = {}
+
+    class FakeH:
+        def run_recon(self, domain, scope_lock=False, max_urls=0):
+            seen["scope_lock"] = scope_lock
+            seen["max_urls"] = max_urls
+            return True
+
+    monkeypatch.setattr(agent, "_h", lambda: FakeH())
+    monkeypatch.setattr(agent.ToolDispatcher, "_summarize_recon",
+                        lambda self, domain, ok: f"ok:{seen.get('scope_lock')}")
+    d = _dispatcher(tmp_path)  # scope_lock=True
+    obs = d.dispatch("run_recon", {"scope_lock": False, "max_urls": "lots"})
+    assert seen.get("scope_lock") is True, "operator scope-lock must not be weakened"
+    assert seen.get("max_urls") == 10, "invalid max_urls must fall back to dispatcher default"
+    assert "ok:True" in obs
