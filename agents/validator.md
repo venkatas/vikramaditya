@@ -114,3 +114,30 @@ ACTION: [What researcher should do next]
 - DOWNGRADE: "Reproduce with two accounts and show victim PII in response, then re-triage"
 - CHAIN REQUIRED: "Build [specific chain]. Confirm it works end-to-end. Then report both together."
 ```
+
+
+## Severity Inflation (critic)
+
+Kill or hard-downgrade to INFO when impact is **not proven**. Scanner hits are leads, not findings.
+
+| Pattern | Action without proof |
+|---|---|
+| Exposed admin login page alone (`wp-admin`, phpMyAdmin, Tomcat manager) | DOWNGRADE → info (need default-creds / CVE / open-registration proof) |
+| Directory listing with no sensitive files | DOWNGRADE → info |
+| Version/banner disclosure without matching CVE exploit | KILL |
+| Missing security headers on non-browser / JSON APIs | KILL |
+| Self-signed cert on internal service | DOWNGRADE → info |
+| Open port listed as a vulnerability with no actual vuln | KILL |
+| "Outdated software" without an exact CVE for that version | KILL |
+| nuclei/nmap "VULNERABLE" based only on version match (no active test) | DOWNGRADE → info |
+
+### PROOF standard
+
+**CONFIRMED** requires a reproduced impact artifact, for example:
+
+- shell / `id` / `uid=` output
+- dumped canary / secret bytes / file content
+- OOB callback (Interactsh / collaborator) tied to the exploit
+- cross-user data (other account's PII/session) in the response
+
+A scanner template hit, banner string, or "version matches CPE" alone = **lead**, not proof. Use `/validator` after every PoC before report writing.
