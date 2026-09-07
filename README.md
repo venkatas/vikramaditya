@@ -86,7 +86,7 @@ This is a stated design contract backed by an audit — not a "100% accurate" cl
 
 ### Prerequisites
 
-Tested on **macOS** (Apple Silicon / Intel). `setup.sh` provisions everything via **Homebrew** (auto-installed if missing), **Go**, and **pip** — it pulls ~30 external binaries onto your `PATH` (`subfinder`, `httpx`, `nuclei`, `ffuf`, `amass`, `sqlmap`, `naabu`, `katana`, `gau`, `dnsx`, `feroxbuster`, `gowitness`, `trufflehog`, `gitleaks`, … — see [`setup.sh`](setup.sh) for the full list). On Linux, install [Homebrew/Linuxbrew](https://docs.brew.sh/Homebrew-on-Linux) first, or install the listed tools manually.
+Tested on **macOS** (Apple Silicon / Intel). `setup.sh` provisions everything via **Homebrew** (auto-installed if missing), **Go**, and **pip** — it pulls ~30 external binaries onto your `PATH` (`subfinder`, `httpx`, `nuclei`, `ffuf`, `amass`, `sqlmap`, `naabu`, `katana`, `gau`, `dnsx`, `feroxbuster`, `gowitness`, `trufflehog`, `gitleaks`, … — see [`setup.sh`](setup.sh) for the full list. Opt-in Gitleaks SARIF / Syft SBOM / BagIt evidence packs: [`docs/gitleaks-syft-bagit.md`](docs/gitleaks-syft-bagit.md). On Linux, install [Homebrew/Linuxbrew](https://docs.brew.sh/Homebrew-on-Linux) first, or install the listed tools manually.
 
 ### 1. Clone & install
 

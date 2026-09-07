@@ -78,3 +78,31 @@ MIT License — Copyright (c) Microsoft Corporation
 
   markitdown_helper.py         <- thin CLI wrapper around MarkItDown
 
+-----------------------------------------------------------------------
+gitleaks — https://github.com/gitleaks/gitleaks
+MIT License — Copyright (c) 2019 Zachary Rice
+-----------------------------------------------------------------------
+
+  gitleaks_report.py       <- subprocess invoke + SARIF/JSON reporting glue.
+                              Vikramaditya does not vendor gitleaks sources.
+                              Installed optionally via setup.sh (Homebrew).
+
+-----------------------------------------------------------------------
+anchore/syft — https://github.com/anchore/syft
+anchore/grype — https://github.com/anchore/grype
+Apache License 2.0 — Copyright (c) Anchore, Inc.
+-----------------------------------------------------------------------
+
+  sbom_syft.py             <- subprocess invoke of syft (SBOM) and optional
+                              grype (SBOM vuln scan). Not vendored; install
+                              via Homebrew / upstream install scripts.
+
+-----------------------------------------------------------------------
+LibraryOfCongress/bagit-python — https://github.com/LibraryOfCongress/bagit-python
+CC0 1.0 Universal — Public Domain Dedication
+-----------------------------------------------------------------------
+
+  evidence_bag.py          <- optional import of bagit.make_bag for hashed
+                              evidence packs; stdlib BagIt writer fallback.
+                              Not vendored; `pip install bagit` when desired.
+

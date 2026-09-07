@@ -600,6 +600,26 @@ if [[ ":$PATH:" != *":$GOPATH/bin:"* ]]; then
     echo "    # Add to ~/.zshrc for persistence"
 fi
 
+
+# ── Optional evidence / SBOM tools (opt-in; missing does NOT fail setup) ──────
+# Gitleaks is already in BREW_TOOLS above. Syft/Grype/bagit power:
+#   gitleaks_report.py / sbom_syft.py / evidence_bag.py
+# See docs/gitleaks-syft-bagit.md
+echo ""
+echo "[*] Optional evidence/SBOM tools (not required for core VAPT)..."
+for opt_tool in syft grype; do
+    if command -v "$opt_tool" &>/dev/null; then
+        log_ok "$opt_tool already installed ($(command -v "$opt_tool"))"
+    else
+        log_warn "$opt_tool not installed — optional: brew install $opt_tool"
+    fi
+done
+if "$VENV_DIR/bin/python" -c "import bagit" 2>/dev/null; then
+    log_ok "bagit (Python) available in venv"
+else
+    log_warn "bagit not in venv — optional: $VENV_DIR/bin/pip install 'bagit>=1.8.1' (stdlib BagIt writer still works)"
+fi
+
 # Verification
 echo ""
 echo "============================================="
