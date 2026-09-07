@@ -58,6 +58,16 @@ try:
 except Exception:
     _scopeguard = None
 
+# Resolved-vector ledger + tool parsers (PentestCode-inspired; optional/no-op if unused)
+try:
+    import resolved_vectors as _resolved_vectors
+except Exception:
+    _resolved_vectors = None
+try:
+    import tool_parsers as _tool_parsers
+except Exception:
+    _tool_parsers = None
+
 # Colors
 G = "\033[0;32m"
 R = "\033[0;31m"
@@ -335,6 +345,71 @@ def _rewrite_confused_tool_flags(code: str) -> str:
         else:
             out.append(line)
     return ''.join(out)
+
+
+
+def _ledger_path_for(output_dir: str | None = None) -> str | None:
+    """Resolve resolved-vectors ledger path (env or session default)."""
+    if _resolved_vectors is None:
+        return None
+    return _resolved_vectors.default_ledger_path(output_dir)
+
+
+def _maybe_skip_resolved_vector(code: str, output_dir: str | None = None) -> dict | None:
+    """If this bash command retests a settled vector, return a synthetic result."""
+    if _resolved_vectors is None:
+        return None
+    path = _ledger_path_for(output_dir)
+    if not path:
+        return None
+    inferred = _resolved_vectors.infer_vector_key(code)
+    if not inferred:
+        return None
+    target, vector = inferred
+    skip, reason = _resolved_vectors.should_skip(path, target, vector)
+    if not skip:
+        return None
+    msg = (f"RESOLVED-VECTOR SKIP: {target} :: {vector} — {reason}. "
+           "Do not retry this vector blindly; pick a different technique or target.")
+    return {"stdout": msg, "stderr": "", "returncode": 0, "resolved_vector_skip": True}
+
+
+def _maybe_record_vector_attempt(code: str, result: dict, output_dir: str | None = None) -> None:
+    """Best-effort: record a failed technique against the ledger."""
+    if _resolved_vectors is None or result.get("resolved_vector_skip"):
+        return
+    path = _ledger_path_for(output_dir)
+    if not path:
+        return
+    inferred = _resolved_vectors.infer_vector_key(code)
+    if not inferred:
+        return
+    target, vector = inferred
+    if not _resolved_vectors.looks_like_technique_failure(
+        result.get("stdout") or "", result.get("stderr") or ""
+    ):
+        return
+    tool = vector.split(":", 1)[0]
+    try:
+        _resolved_vectors.record_attempt(
+            path, target, vector, technique=tool, outcome="failed",
+            detail=(result.get("stdout") or "")[:300],
+        )
+    except Exception:
+        pass
+
+
+def _maybe_parse_tool_stdout(stdout: str) -> str:
+    """If stdout looks like nuclei/sqlmap/ffuf output, append a short parse summary."""
+    if _tool_parsers is None or not (stdout or "").strip():
+        return ""
+    try:
+        parsed = _tool_parsers.auto_parse_stdout(stdout)
+    except Exception:
+        return ""
+    if not parsed:
+        return ""
+    return "\n" + _tool_parsers.summarize_for_feedback(parsed)
 
 
 def execute_script(lang: str, code: str, timeout: int = MAX_SCRIPT_RUNTIME) -> dict:
@@ -1024,7 +1099,13 @@ Then test the most promising attack vectors."""
             # invoked. Recon curls self-cap (--max-time 15) and stay on the default.
             long_tools = ("sqlmap", "nuclei", "ffuf", "feroxbuster", "gobuster", "dalfox")
             tmo = 600 if any(t in code for t in long_tools) else MAX_SCRIPT_RUNTIME
-            result = execute_script(lang, code, timeout=tmo)
+            # Resolved-vector ledger: skip blind retest of settled vectors (no-op if unset)
+            result = None
+            if lang in ("bash", "sh", "curl"):
+                result = _maybe_skip_resolved_vector(code, output_dir)
+            if result is None:
+                result = execute_script(lang, code, timeout=tmo)
+                _maybe_record_vector_attempt(code, result, output_dir)
 
             # Show results
             if result["stdout"]:
@@ -1058,6 +1139,9 @@ Then test the most promising attack vectors."""
                 all_results += f"STDOUT:\n{result['stdout']}\n"
                 if result["stderr"]:
                     all_results += f"STDERR:\n{result['stderr']}\n"
+                _parse_sum = _maybe_parse_tool_stdout(result.get("stdout") or "")
+                if _parse_sum:
+                    all_results += _parse_sum + "\n"
                 # A script that ran (rc 0, or non-zero but not a syntax error) counts
                 # as a real test the model may reason from. Exclude TIMEOUT (-9) and
                 # internal/tooling errors (-1), which did NOT produce target evidence.
