@@ -8,7 +8,7 @@ Covers:
    uses poc-before-detail precedence).
 3. email_auth (and other) findings render their per-area "Fix:" remediation
    instead of always using the single template's generic DMARC advice.
-4. A "Recon / Host & Port Inventory" chapter is rendered from live/httpx +
+4. An "Asset Inventory" chapter is rendered from live/httpx +
    ports/nmap artefacts, listing hosts/ports even with no mapped finding.
 5. A "Tooling & Coverage Limitations" chapter renders coverage.json when
    present and degrades gracefully when absent.
@@ -144,7 +144,7 @@ def test_email_auth_per_area_fix_rendered(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Fix 4 — Recon / Host & Port Inventory chapter
+# Fix 4 — Asset Inventory chapter
 # ---------------------------------------------------------------------------
 def _write_recon(tmp_path):
     recon = tmp_path / "recon" / "t.example" / "sessions" / "s1"
@@ -173,7 +173,7 @@ def _write_recon(tmp_path):
 def test_recon_inventory_lists_hosts_and_ports(tmp_path):
     recon_dir = _write_recon(tmp_path)
     out = reporter._render_recon_inventory_html(recon_dir, "t.example")
-    assert "Recon / Host &amp; Port Inventory" in out
+    assert "Asset Inventory" in out
     # mssql host (no finding) is still listed.
     assert "mssql.t.example" in out
     # FTP 21/990 and 8443 ports appear.

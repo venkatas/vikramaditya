@@ -1,0 +1,19 @@
+# Hadrian auth.yaml example — tokens per role (env-var expansion supported).
+# Prefer env vars over hardcoding. NEVER commit real tokens.
+#
+#   export ADMIN_TOKEN='...'
+#   export USER_TOKEN='...'
+#   export ANON_TOKEN=''   # empty / omitted for unauthenticated role
+#
+# Docs: https://github.com/praetorian-inc/hadrian/wiki/Configuration
+
+method: bearer
+location: header
+
+roles:
+  admin:
+    token: "${ADMIN_TOKEN}"
+  user:
+    token: "${USER_TOKEN}"
+  anonymous:
+    token: "${ANON_TOKEN}"

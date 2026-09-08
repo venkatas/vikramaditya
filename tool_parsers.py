@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-Mandatory tool parsers — normalize nuclei / sqlmap / ffuf / nmap output into
+Mandatory tool parsers — normalize nuclei / sqlmap / ffuf / nmap / hadrian output into
 structured finding dicts. Pure stdlib.
 
 Inspired by PentestCode tool-parser discipline (MIT) — clean-room Python.
@@ -396,6 +396,74 @@ def summarize_for_feedback(findings: list[dict], limit: int = 12) -> str:
     return "\n".join(lines)
 
 
+# ── hadrian (Praetorian API authz) ────────────────────────────────────────────
+
+def parse_hadrian_json(text_or_path: str) -> list[dict]:
+    """Parse Hadrian JSON report → list of finding dicts (status=suspected).
+
+    Accepts the full report shape::{metadata, summary, findings} or a bare
+    list of finding objects. Hits stay status=suspected — Vik requires live
+    operator proof before client-facing confirmation.
+    """
+    text = _read_text(text_or_path).strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+    objs: list[dict] = []
+    if isinstance(data, dict):
+        raw = data.get("findings")
+        if isinstance(raw, list):
+            objs = [x for x in raw if isinstance(x, dict)]
+        elif data.get("name") or data.get("template_id") or data.get("category"):
+            objs = [data]
+    elif isinstance(data, list):
+        objs = [x for x in data if isinstance(x, dict)]
+
+    findings: list[dict] = []
+    for o in objs:
+        sev = _norm_sev(o.get("severity"))
+        title = o.get("name") or o.get("template_id") or o.get("category") or "hadrian-finding"
+        endpoint = o.get("endpoint") or ""
+        method = o.get("method") or ""
+        url = ""
+        evidence = o.get("evidence") if isinstance(o.get("evidence"), dict) else {}
+        req = evidence.get("request") if isinstance(evidence.get("request"), dict) else {}
+        if isinstance(req, dict):
+            url = str(req.get("url") or "")
+            method = method or str(req.get("method") or "")
+        resp = evidence.get("response") if isinstance(evidence.get("response"), dict) else {}
+        status_code = resp.get("status_code") if isinstance(resp, dict) else None
+        evidence_bits = []
+        if o.get("attacker_role") or o.get("victim_role"):
+            evidence_bits.append(
+                f"roles attacker={o.get('attacker_role') or '-'} victim={o.get('victim_role') or '-'}"
+            )
+        if status_code is not None:
+            evidence_bits.append(f"status={status_code}")
+        if o.get("description"):
+            evidence_bits.append(str(o.get("description"))[:400])
+        findings.append({
+            "tool": "hadrian",
+            "title": str(title),
+            "severity": sev,
+            "host": "",
+            "url": url or (f"{method} {endpoint}".strip() if endpoint else ""),
+            "template_id": str(o.get("template_id") or o.get("category") or ""),
+            "matched": str(endpoint),
+            "evidence": "; ".join(evidence_bits)[:800],
+            "status": "suspected",
+            "category": str(o.get("category") or ""),
+            "attacker_role": str(o.get("attacker_role") or ""),
+            "victim_role": str(o.get("victim_role") or ""),
+            "confidence": o.get("confidence"),
+        })
+    return findings
+
+
 def auto_parse_stdout(stdout: str) -> list[dict]:
     """Best-effort detect tool output shape and parse. Never invents vulns."""
     s = (stdout or "").strip()
@@ -418,6 +486,12 @@ def auto_parse_stdout(stdout: str) -> list[dict]:
     # sqlmap text cues
     if re.search(r"sqlmap|injectable|back-end DBMS", s, re.I):
         out.extend(parse_sqlmap_output(s))
+    # Hadrian JSON report
+    if '"tool"' in s and "hadrian" in s.lower() and '"findings"' in s:
+        try:
+            out.extend(parse_hadrian_json(s))
+        except Exception:
+            pass
     return out
 
 
@@ -427,6 +501,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sqlmap", default="", help="sqlmap text output file")
     p.add_argument("--ffuf", default="", help="ffuf -of json file")
     p.add_argument("--nmap", default="", help="nmap XML file")
+    p.add_argument("--hadrian", default="", help="Hadrian JSON report file")
     p.add_argument("--out", required=True, help="Session/findings directory to write into")
     args = p.parse_args(argv)
 
@@ -439,6 +514,8 @@ def main(argv: list[str] | None = None) -> int:
         findings.extend(parse_ffuf_json(args.ffuf))
     if args.nmap:
         findings.extend(parse_nmap_xml(args.nmap))
+    if getattr(args, 'hadrian', ''):
+        findings.extend(parse_hadrian_json(args.hadrian))
 
     written = write_parsed_findings(args.out, findings)
     print(json.dumps({"count": len(findings), "written": written}, indent=2))

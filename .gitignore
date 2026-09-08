@@ -10,7 +10,8 @@
 *.har
 
 # ── Scan output (client data — never commit) ──────────────────────────────────
-recon/
+# Root-anchored so skills/recon/ portable skill packs stay trackable.
+/recon/
 findings/
 reports/
 targets/
@@ -103,7 +104,7 @@ nuclei_output*
 .worktrees/
 
 # Whitebox VAPT — secret evidence + per-machine config
-# (recon/*/sessions/*/cloud/*/secrets/ is documentary; the root `recon/` rule above already ignores it)
+# (recon/*/sessions/*/cloud/*/secrets/ is documentary; the root-anchored `/recon/` rule above already ignores it)
 recon/*/sessions/*/cloud/*/secrets/
 whitebox_config.local.yaml
 *.pmapper-graph.json
@@ -117,6 +118,7 @@ run_scan.sh
 test_file_upload_only.py
 with_params.txt
 schemathesis-report/
+cats-report/
 
 # ── Claude Code ───────────────────────────────────────────────────────────────
 .claude/scheduled_tasks.lock
