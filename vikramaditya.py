@@ -1115,7 +1115,8 @@ def make_output_dir(target: str) -> str:
         # v10.6.0 — also redact --llm-auth (carries an Authorization: Bearer token,
         # forwarded as --auth-header) and --header (commonly Authorization/Cookie).
         _secret_flags = {"--burp-key", "--api-key", "--creds", "--creds-b",
-                         "--restler-token", "--ad-pass", "--llm-auth", "--header"}
+                         "--restler-token", "--ad-pass", "--llm-auth", "--header",
+                         "--hadrian-auth"}
         # Header names whose VALUE is a credential — for --header (a "Key: Value"
         # string) we keep the header NAME visible but mask its value when sensitive.
         _sensitive_header_names = {"authorization", "cookie", "set-cookie",
@@ -1267,6 +1268,18 @@ Options:
   --restler SPEC          v9.12.0 — Microsoft RESTler stateful REST API
                           fuzzer. --restler-base-url, --restler-token,
                           --restler-mode, --restler-time-h.
+  --hadrian SPEC          On-demand Praetorian Hadrian API authz
+                          (BOLA/BFLA role matrix). Requires
+                          --hadrian-roles + --hadrian-auth.
+                          Complements schemathesis (conformance).
+  --hadrian-roles PATH    Hadrian roles.yaml (privilege levels)
+  --hadrian-auth PATH     Hadrian auth.yaml (per-role tokens)
+  --hadrian-protocol MODE rest|graphql|grpc (default rest)
+  --hadrian-target URL    GraphQL URL or gRPC host:port
+  --hadrian-proto PATH    gRPC .proto (with --hadrian-protocol grpc)
+  --hadrian-category CAT  Hadrian --category (default all)
+  --hadrian-templates DIR Optional custom Hadrian YAML templates
+  --hadrian-dry-run       Preview only — send no requests
   --graphql URL           v9.13.0 — graphw00f + Clairvoyance + InQL
                           GraphQL DAST bundle. --graphql-clairvoyance,
                           --graphql-wordlist, --header.
@@ -1373,6 +1386,16 @@ def parse_cli_args() -> dict:
         "waf_pad_bytes": 0,
         "waf_fireprox_create": False,
         "aws_profile": "default",
+        # Hadrian API authz (on-demand)
+        "hadrian": "",
+        "hadrian_roles": "",
+        "hadrian_auth": "",
+        "hadrian_protocol": "rest",
+        "hadrian_target": "",
+        "hadrian_proto": "",
+        "hadrian_category": "all",
+        "hadrian_templates": "",
+        "hadrian_dry_run": False,
         # v9.12.0 — RESTler
         "restler": "",
         "restler_base_url": "",
@@ -1528,6 +1551,24 @@ def parse_cli_args() -> dict:
             args["waf_fireprox_create"] = True; i += 1
         elif argv[i] == "--aws-profile" and i + 1 < len(argv):
             args["aws_profile"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian" and i + 1 < len(argv):
+            args["hadrian"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-roles" and i + 1 < len(argv):
+            args["hadrian_roles"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-auth" and i + 1 < len(argv):
+            args["hadrian_auth"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-protocol" and i + 1 < len(argv):
+            args["hadrian_protocol"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-target" and i + 1 < len(argv):
+            args["hadrian_target"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-proto" and i + 1 < len(argv):
+            args["hadrian_proto"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-category" and i + 1 < len(argv):
+            args["hadrian_category"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-templates" and i + 1 < len(argv):
+            args["hadrian_templates"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-dry-run":
+            args["hadrian_dry_run"] = True; i += 1
         elif argv[i] == "--restler" and i + 1 < len(argv):
             args["restler"] = argv[i + 1]; i += 2
         elif argv[i] == "--restler-base-url" and i + 1 < len(argv):
@@ -1986,6 +2027,32 @@ def main():
             subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=2400)
         except Exception as e:
             log("warn", f"graphql_audit failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["hadrian"]:
+        log("info", f"--hadrian: {cli['hadrian']} protocol={cli['hadrian_protocol']}")
+        if not cli["hadrian_roles"] or not cli["hadrian_auth"]:
+            log("warn", "--hadrian requires --hadrian-roles and --hadrian-auth (see templates/hadrian/)")
+            print(f"\n  {D}Done.{N}\n"); return
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "hadrian_audit.py"),
+                   "--protocol", cli["hadrian_protocol"] or "rest",
+                   "--roles", cli["hadrian_roles"],
+                   "--auth", cli["hadrian_auth"],
+                   "--category", cli["hadrian_category"] or "all"]
+            proto = (cli["hadrian_protocol"] or "rest").lower()
+            if proto == "rest":
+                cmd += ["--api", cli["hadrian"]]
+            else:
+                cmd += ["--target", cli.get("hadrian_target") or cli["hadrian"]]
+                if proto == "grpc" and cli["hadrian_proto"]:
+                    cmd += ["--proto", cli["hadrian_proto"]]
+            if cli["hadrian_templates"]:
+                cmd += ["--templates-dir", cli["hadrian_templates"]]
+            if cli["hadrian_dry_run"]:
+                cmd += ["--dry-run"]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=3900)
+        except Exception as e:
+            log("warn", f"hadrian failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["restler"]:
         log("info", f"--restler: spec={cli['restler']}")
