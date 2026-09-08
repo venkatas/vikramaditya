@@ -1,5 +1,21 @@
 # Changelog
 
+## Portable CAI recon/web/cloud skill packs + Foundation-Sec Ollama note (2026-09-07)
+
+Clean-room portable skill **ideas** from CAI (Alias Robotics) recon/web/cloud craft —
+markdown checklists only. **No** CAI/Strix agent runtime, no `ALLOW_STATE_CHANGES` /
+aggression default changes. openmythos remains the primary brain/triage model.
+
+- **`skills/recon/`** — `passive-osint`, `attack-surface-map`
+- **`skills/web/`** — `http-security-headers`, `api-authz-matrix` (alongside existing vuln packs)
+- **`skills/cloud/`** — `cloud-metadata-imds`, `storage-exposure`
+- **`skill_loader.py`** — registers packs + aliases/heuristics; discovers `web|recon|cloud`
+- **`.gitignore`** — root-anchor `/recon/` so engagement recon stays ignored while `skills/recon/` packs are trackable
+- **`docs/foundation-sec-ollama.md`** — optional local Ollama import of
+  `hf.co/fdtn-ai/Foundation-Sec-8B-Reasoning-Q4_K_M-GGUF` as critic/triage pin
+  (`TRIAGE_MODEL=…`); not added to default priority lists
+- **Tests** — `tests/test_skill_loader.py` discovery/alias/heuristic coverage for new packs
+
 ## Gitleaks SARIF + Syft SBOM + BagIt evidence packs (2026-09-07)
 
 Opt-in supply-chain / evidence glue. No ALLOW_STATE_CHANGES / aggression default

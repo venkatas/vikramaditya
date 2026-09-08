@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """skill_loader.py — on-demand vuln skill pack loader for brain_scanner.
 
-Loads concise SKILL.md packs from skills/web/<name>/ and related trees.
+Loads concise SKILL.md packs from skills/web|recon|cloud/<name>/ and related trees.
 Heuristic matching maps findings/briefing text → skill names.
 
 Env:
@@ -34,6 +34,13 @@ _PACKS: dict[str, str] = {
     "xxe": "web/xxe/SKILL.md",
     "upload-rce": "web/upload-rce/SKILL.md",
     "deserialization": "web/deserialization/SKILL.md",
+    # Portable CAI-inspired packs (checklists only — no CAI runtime)
+    "http-security-headers": "web/http-security-headers/SKILL.md",
+    "api-authz-matrix": "web/api-authz-matrix/SKILL.md",
+    "passive-osint": "recon/passive-osint/SKILL.md",
+    "attack-surface-map": "recon/attack-surface-map/SKILL.md",
+    "cloud-metadata-imds": "cloud/cloud-metadata-imds/SKILL.md",
+    "storage-exposure": "cloud/storage-exposure/SKILL.md",
     "api-authz-hadrian": "web/api-authz-hadrian/SKILL.md",
 }
 
@@ -70,6 +77,27 @@ _ALIASES: dict[str, str] = {
     "pickle": "deserialization",
     "ysoserial": "deserialization",
     "objectinputstream": "deserialization",
+    "http-security-headers": "http-security-headers",
+    "security-headers": "http-security-headers",
+    "cors": "http-security-headers",
+    "csp": "http-security-headers",
+    "api-authz-matrix": "api-authz-matrix",
+    "authz-matrix": "api-authz-matrix",
+    "passive-osint": "passive-osint",
+    "osint": "passive-osint",
+    "shodan": "passive-osint",
+    "attack-surface-map": "attack-surface-map",
+    "attack-surface": "attack-surface-map",
+    "surface-map": "attack-surface-map",
+    "cloud-metadata-imds": "cloud-metadata-imds",
+    "imds": "cloud-metadata-imds",
+    "cloud-metadata": "cloud-metadata-imds",
+    "instance-metadata": "cloud-metadata-imds",
+    "storage-exposure": "storage-exposure",
+    "s3": "storage-exposure",
+    "bucket-exposure": "storage-exposure",
+    "blob-exposure": "storage-exposure",
+    # Generic api-authz / bfla stay on the already-merged Hadrian pack.
     "hadrian": "api-authz-hadrian",
     "api-authz": "api-authz-hadrian",
     "api-authz-hadrian": "api-authz-hadrian",
@@ -87,6 +115,12 @@ _KEYWORD_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(xxe|xml[-\s]?external|external[-\s]?entity)\b", re.I), "xxe"),
     (re.compile(r"\b(file[-\s]?upload|upload[-\s]?rce|webshell|polyglot\s+upload)\b", re.I), "upload-rce"),
     (re.compile(r"\b(deseriali[sz]ation|ysoserial|objectinputstream|pickle\.loads|unserialize\()\b", re.I), "deserialization"),
+    (re.compile(r"\b(security[\-\s]?headers|content[\-\s]?security[\-\s]?policy|\bcsp\b|\bcors\b|access[\-\s]?control[\-\s]?allow)\b", re.I), "http-security-headers"),
+    (re.compile(r"\b(api[\-\s]?authz|bfla|broken[\-\s]?function[\-\s]?level|mass[\-\s]?assignment|authz[\-\s]?matrix)\b", re.I), "api-authz-matrix"),
+    (re.compile(r"\b(osint|certificate[\-\s]?transparency|\bct[\-\s]?log|shodan|censys|passive[\-\s]?recon)\b", re.I), "passive-osint"),
+    (re.compile(r"\b(attack[\-\s]?surface|surface[\-\s]?map|endpoint[\-\s]?map|tech[\-\s]?detect)\b", re.I), "attack-surface-map"),
+    (re.compile(r"\b(imds|instance[\-\s]?metadata|169\.254\.169\.254|metadata\.google\.internal|imdSv2)\b", re.I), "cloud-metadata-imds"),
+    (re.compile(r"\b(s3[\-\s]?bucket|storage[\-\s]?exposure|blob[\-\s]?storage|gcs[\-\s]?bucket|azure[\-\s]?blob)\b", re.I), "storage-exposure"),
     (re.compile(r"\b(hadrian|bfla|bopla|api[\-\s]?authz|broken[\-\s]?function[\-\s]?level|role[\-\s]?matrix)\b", re.I), "api-authz-hadrian"),
 ]
 
@@ -101,11 +135,13 @@ def list_skills() -> list[str]:
         path = os.path.join(SKILLS_ROOT, rel)
         if os.path.isfile(path):
             names.append(name)
-    # Also discover any extra skills/web/*/SKILL.md not in the map
-    web = WEB_SKILLS_DIR
-    if os.path.isdir(web):
-        for entry in sorted(os.listdir(web)):
-            skill = os.path.join(web, entry, "SKILL.md")
+    # Also discover any extra skills/{web,recon,cloud}/*/SKILL.md not in the map
+    for tree in ("web", "recon", "cloud"):
+        base = os.path.join(SKILLS_ROOT, tree)
+        if not os.path.isdir(base):
+            continue
+        for entry in sorted(os.listdir(base)):
+            skill = os.path.join(base, entry, "SKILL.md")
             if os.path.isfile(skill) and entry not in names:
                 names.append(entry)
     return names
@@ -126,18 +162,27 @@ def _resolve(name_or_path: str) -> str | None:
     key = raw.lower().replace("_", "-").strip("/")
     if key.endswith("/skill.md"):
         key = key[: -len("/skill.md")]
-    if key.startswith("web/"):
-        key = key[4:]
+    for prefix in ("web/", "recon/", "cloud/"):
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+            break
     key = _ALIASES.get(key, key)
     rel = _PACKS.get(key)
     if rel:
         path = os.path.join(SKILLS_ROOT, rel)
         if os.path.isfile(path):
             return path
-    # Fallback: skills/web/<key>/SKILL.md
-    path = os.path.join(WEB_SKILLS_DIR, key, "SKILL.md")
-    if os.path.isfile(path):
-        return path
+    # Fallback: skills/{web,recon,cloud}/<key>/SKILL.md
+    for tree in ("web", "recon", "cloud"):
+        path = os.path.join(SKILLS_ROOT, tree, key, "SKILL.md")
+        if os.path.isfile(path):
+            return path
+    # Prefix forms: recon/foo, cloud/foo, web/foo already stripped above for web/
+    for prefix in ("recon/", "cloud/", "web/"):
+        if key.startswith(prefix):
+            path = os.path.join(SKILLS_ROOT, key, "SKILL.md")
+            if os.path.isfile(path):
+                return path
     return None
 
 
