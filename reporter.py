@@ -1479,12 +1479,11 @@ def load_findings(findings_dir: str) -> list:
                     _ea_cvss = _ea_tmpl.get("cvss", CVSS_DEFAULT.get(sev, "N/A"))
                 else:
                     _ea_cvss = CVSS_DEFAULT.get(sev, "N/A")
-                raw_title = item.get("title", "Email authentication weakness")
                 finding = {
                     "severity": sev,
                     "cvss": _ea_cvss,
                     "vtype": "email_auth",
-                    "title": f"Email security posture: {raw_title}",
+                    "title": _email_auth_title(item),
                     "detail": item.get("notes", ""),
                     "url": item.get("endpoint", "N/A"),
                     "poc": (f"Class : {item.get('vuln_class','')}\n"
@@ -1498,6 +1497,10 @@ def load_findings(findings_dir: str) -> list:
                 }
                 if posture_was_capped:
                     finding["original_severity"] = declared_sev
+                    finding["severity_label"] = f"{sev}, capped from {declared_sev}"
+                    finding["poc"] = (
+                        finding.get("poc") or ""
+                    ).rstrip() + f"\nReported severity: {finding['severity_label']}."
                 results.append(finding)
         except Exception as e:
             print(f"[reporter] WARNING: failed to load "
@@ -2358,6 +2361,55 @@ def _badge(sev: str) -> str:
             f'font-size:0.85em;font-weight:bold">{sev.upper()}</span>')
 
 
+def _severity_caption(finding: dict) -> str:
+    """Honest client label. Posture caps stay capped; the original score is printed."""
+    sev = str(finding.get("severity") or "info").strip().lower()
+    explicit = str(finding.get("severity_label") or "").strip()
+    if explicit:
+        return explicit
+    orig = str(finding.get("original_severity") or "").strip().lower()
+    if orig and orig != sev:
+        return f"{sev}, capped from {orig}"
+    return sev
+
+
+_EMAIL_SELECTOR_RE = re.compile(r"\bSelector\s+([A-Za-z0-9._-]+)", re.I)
+_DKIM_EVIDENCE_RE = re.compile(r"^([A-Za-z0-9._-]+)\._domainkey\.", re.I)
+
+
+def _email_auth_scope_label(item: dict) -> str:
+    """Selector when present, otherwise a distinctive endpoint."""
+    selector = str(item.get("selector") or "").strip().rstrip(".,;")
+    if not selector:
+        evidence = item.get("evidence")
+        if isinstance(evidence, str):
+            match = _DKIM_EVIDENCE_RE.match(evidence.strip())
+            if match:
+                selector = match.group(1)
+    if not selector:
+        notes = " ".join(
+            str(item.get(field) or "") for field in ("notes", "detail", "poc")
+        )
+        match = _EMAIL_SELECTOR_RE.search(notes)
+        if match:
+            selector = match.group(1).rstrip(".,;")
+    if selector:
+        return selector
+    endpoint = str(item.get("endpoint") or "").strip()
+    if endpoint and endpoint not in ("N/A",):
+        return endpoint
+    return ""
+
+
+def _email_auth_title(item: dict) -> str:
+    raw_title = str(item.get("title") or "Email authentication weakness").strip()
+    label = _email_auth_scope_label(item)
+    rendered = raw_title
+    if label and label.lower() not in raw_title.lower():
+        rendered = f"{raw_title} ({label})"
+    return f"Email security posture: {rendered}"
+
+
 try:
     import technique_kb as _tkb
 except Exception:  # pragma: no cover - KB is optional; report still renders without it
@@ -3014,8 +3066,12 @@ def render_html_report(findings: list, target: str, report_dir: str,
         # renderer so HTML/MD agree instead of hardcoding the cves template's 9.0.
         m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
         cvss = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
+        caption = _severity_caption(f)
+        sev_cell = _badge(f["severity"])
+        if caption != str(f.get("severity") or "").lower():
+            sev_cell += (f'<div style="font-size:0.75em;margin-top:3px;color:#495057">{caption}</div>')
         tbl  += (f'<tr><td><a href="#VN-{i:03d}">VN-{i:03d}</a></td>'
-                 f'<td>{vtitle}</td><td>{_badge(f["severity"])}</td>'
+                 f'<td>{vtitle}</td><td>{sev_cell}</td>'
                  f'<td>{cvss}</td>'
                  f'<td style="word-break:break-all"><code>{f["url"][:80]}</code></td>'
                  f'<td>{tmpl.get("cwe","N/A")}</td></tr>\n')
@@ -3045,7 +3101,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
   </div>
   <div style="padding:18px">
     <table style="border-collapse:collapse;margin-bottom:14px">
-      <tr><td style="width:130px;font-weight:bold;color:#495057;padding:4px 12px 4px 0">Severity</td><td>{_badge(sev)}</td></tr>
+      <tr><td style="width:130px;font-weight:bold;color:#495057;padding:4px 12px 4px 0">Severity</td><td>{_badge(sev)} <span style="color:#495057">{_severity_caption(f)}</span></td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">CVSS</td><td>{cvss}</td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">CWE</td><td>{tmpl.get("cwe","N/A")}</td></tr>
       <tr><td style="font-weight:bold;color:#495057;padding:4px 12px 4px 0">ATT&amp;CK</td><td><a href="https://attack.mitre.org/techniques/{ATTACK_IDS.get(vtype,'').replace('.','/')}" target="_blank">{ATTACK_IDS.get(vtype,"—")}</a></td></tr>
@@ -3300,7 +3356,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         # precedence over template default.
         m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
         cvss = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
-        lines.append(f"| VN-{i:03d} | {title} | {f['severity'].upper()} | {cvss} | {host} |")
+        lines.append(f"| VN-{i:03d} | {title} | {_severity_caption(f)} | {cvss} | {host} |")
     lines += ["", "---", "", "## Detailed Findings", ""]
     for i, f in enumerate(findings, 1):
         tmpl  = VULN_TEMPLATES.get(f["vtype"], VULN_TEMPLATES["misconfig"])
@@ -3314,7 +3370,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         refs  = "\n".join(f"- [{n}]({u})" for n, u in tmpl.get("references", []))
         lines += [
             f"### VN-{i:03d} — {title}",
-            f"**Severity:** {f['severity'].upper()} | **CVSS:** {cvss} | **CWE:** {tmpl.get('cwe','N/A')} | **ATT&CK:** {ATTACK_IDS.get(f['vtype'],'—')}  ",
+            f"**Severity:** {_severity_caption(f)} | **CVSS:** {cvss} | **CWE:** {tmpl.get('cwe','N/A')} | **ATT&CK:** {ATTACK_IDS.get(f['vtype'],'—')}  ",
             *([f"**Attack chain:** {_attack_chain_str(f['vtype'])}  "] if _attack_chain_str(f['vtype']) else []),
             f"**Affected URL:** `{f['url']}`", "",
             f"**Impact:** {tmpl['impact']}", "",

@@ -61,16 +61,37 @@ def _load_manifest(path: str) -> dict:
     return _new_doc()
 
 
+PHASE_NEVER_INVOKED = "never_invoked"
+
+
 def derive_status(exit_code=None, timed_out: bool = False, signal=None,
                   degraded: bool = False) -> str:
-    """Map raw phase signals to a status. Fail-closed ordering: aborted > failed > degraded."""
-    if timed_out or signal:
+    """Map raw phase signals to a status. Fail-closed ordering: aborted > failed > degraded.
+
+    Exit code -9 / signal 9 is a timeout kill (SIGKILL), not a generic failure and
+    not "never invoked". A missing phase record is the never-invoked case.
+    """
+    if timed_out or signal or exit_code == -9:
         return PHASE_ABORTED
     if exit_code is not None and exit_code != 0:
         return PHASE_FAILED
     if degraded:
         return PHASE_DEGRADED
     return PHASE_OK
+
+
+def invocation_outcome(record: dict | None) -> str:
+    """Distinguish a phase that never started from one killed by timeout (-9)."""
+    if not record:
+        return PHASE_NEVER_INVOKED
+    exit_code = record.get("exit_code")
+    signal = record.get("signal")
+    if record.get("timed_out") or signal == 9 or exit_code == -9:
+        return "timeout"
+    status = record.get("status")
+    if status == PHASE_SKIPPED:
+        return "skipped"
+    return "invoked"
 
 
 def _fold(doc: dict) -> None:
@@ -96,9 +117,13 @@ def record_phase(findings_dir: str, name: str, *, command: str = "", tool: str =
         return None
     path = _manifest_path(findings_dir)
     doc = _load_manifest(path)
+    if exit_code == -9 and signal is None:
+        signal = 9
+    if exit_code == -9 or signal == 9:
+        timed_out = True
     if status is None:
         status = derive_status(exit_code, timed_out, signal, degraded)
-    doc["phases"].append({
+    record = {
         "phase": name,
         "command": command,
         "tool": tool,
@@ -110,7 +135,9 @@ def record_phase(findings_dir: str, name: str, *, command: str = "", tool: str =
         "signal": signal,
         "status": status,
         "artifact_counts": artifact_counts or {},
-    })
+    }
+    record["outcome"] = invocation_outcome(record)
+    doc["phases"].append(record)
     _fold(doc)
     try:
         with open(path, "w", encoding="utf-8") as fh:

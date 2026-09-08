@@ -1391,27 +1391,44 @@ def audit_dmarc(domain: str, dns_client: DNSClient, target_type: str) -> Dict[st
             )
         )
 
-    if tags.get("adkim", "r") == "r":
-        issues.append(
-            make_issue(
-                "low",
-                "DMARC",
-                "DKIM alignment is relaxed",
-                "DMARC uses adkim=r. Relaxed alignment is common, but strict alignment offers tighter hardening.",
-                "Use adkim=s if your mail flow can support strict DKIM alignment.",
-            )
-        )
+    adkim_raw = tags.get("adkim")
+    aspf_raw = tags.get("aspf")
+    result["alignment"] = {
+        "adkim": (adkim_raw or "r"),
+        "aspf": (aspf_raw or "r"),
+        "adkim_tag": "present" if adkim_raw else "absent",
+        "aspf_tag": "present" if aspf_raw else "absent",
+    }
 
-    if tags.get("aspf", "r") == "r":
-        issues.append(
-            make_issue(
-                "low",
-                "DMARC",
-                "SPF alignment is relaxed",
-                "DMARC uses aspf=r. Relaxed alignment is common, but strict alignment offers tighter hardening.",
-                "Use aspf=s if your sending infrastructure supports strict SPF alignment.",
-            )
-        )
+    def _relaxed_alignment_issue(tag_name: str, raw: Optional[str], kind: str, fix: str) -> None:
+        # Do not claim the domain "uses adkim=r" / "aspf=r" when the tag is absent.
+        # The RFC default is relaxed, but the published record did not say so.
+        if raw is None or str(raw).strip() == "":
+            detail = (
+                "DMARC does not set {0}; default relaxed alignment ({0}=r); tag absent. "
+                "Relaxed alignment is common, but strict alignment offers tighter hardening."
+            ).format(tag_name)
+        elif str(raw).strip().lower() == "r":
+            detail = (
+                "DMARC uses {0}=r. Relaxed alignment is common, but strict alignment "
+                "offers tighter hardening."
+            ).format(tag_name)
+        else:
+            return
+        issues.append(make_issue("low", "DMARC", kind, detail, fix))
+
+    _relaxed_alignment_issue(
+        "adkim",
+        adkim_raw,
+        "DKIM alignment is relaxed",
+        "Use adkim=s if your mail flow can support strict DKIM alignment.",
+    )
+    _relaxed_alignment_issue(
+        "aspf",
+        aspf_raw,
+        "SPF alignment is relaxed",
+        "Use aspf=s if your sending infrastructure supports strict SPF alignment.",
+    )
 
     external_report_domains = []
     for mailbox_domain in rua + ruf:

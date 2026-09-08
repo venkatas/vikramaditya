@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from typing import Callable, Optional, Sequence
@@ -28,8 +29,11 @@ CANDIDATE_PREFIX = "[403-BYPASS-CANDIDATE]"
 # Redirects (301/302/303/307/308) are DELIBERATELY excluded: nomore403 runs
 # without -r, so we only see the first-hop status and no Location header, and a
 # 40x->30x is usually a redirect-to-login or a canonicalisation bounce back to
-# the same 403 — not access. Only a real 2xx flip counts (anti-false-positive).
-_BYPASS_OK = frozenset({200, 201, 202, 203, 204, 206})
+# the same 403 — not access. 204 and OPTIONS/CORS preflight are also excluded:
+# an empty 204 (or OPTIONS with Access-Control-Allow-Methods) is a preflight,
+# not a content bypass. Only a content-bearing 2xx that is not a preflight counts.
+_BYPASS_OK = frozenset({200, 201, 202, 203, 206})
+_PREFLIGHT_RE = re.compile(r"(?:^|[^a-z])options(?:[^a-z]|$)|preflight|cors-preflight", re.I)
 # Baseline codes a bypass can "open".
 _FORBIDDEN = frozenset({401, 402, 403, 405, 407})
 
@@ -68,6 +72,35 @@ def find_payloads_dir(binary: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def _is_preflight(hit: dict) -> bool:
+    """True for OPTIONS / CORS preflight flips, which are not content bypasses."""
+    method = str(hit.get("method") or hit.get("verb") or "").strip().lower()
+    if method == "options":
+        return True
+    tech = str(hit.get("technique") or "").strip().lower()
+    payload = str(hit.get("payload") or "")
+    blob = " ".join((tech, payload))
+    if tech in {"options", "option", "http-options", "verb-options", "cors", "preflight", "cors-preflight"}:
+        return True
+    if tech.endswith("-options") or "preflight" in tech:
+        return True
+    return bool(_PREFLIGHT_RE.search(blob))
+
+
+def _is_content_bearing_bypass(hit: dict) -> bool:
+    """A bypass is a non-preflight 2xx with a non-empty body. 204 never qualifies."""
+    status = hit.get("status_code")
+    if status not in _BYPASS_OK:
+        return False
+    if _is_preflight(hit):
+        return False
+    try:
+        size = int(hit.get("content_length"))
+    except (TypeError, ValueError):
+        return False
+    return size > 0
+
+
 def calibrate_hits(results: Sequence[dict], recon_status: int) -> list[dict]:
     """Return the genuine bypass entries from nomore403 --json results for ONE URL.
 
@@ -78,8 +111,8 @@ def calibrate_hits(results: Sequence[dict], recon_status: int) -> list[dict]:
       * recon must have labelled the URL forbidden (40x);
       * nomore403's own baseline row (technique == "default") must ALSO be forbidden
         — else the host is not really gated;
-      * a hit is a non-default technique whose status flipped to 2xx (redirects
-        excluded — no -r, no Location, so a 30x is ambiguous);
+      * a hit is a non-default technique whose status flipped to a content-bearing
+        2xx (redirects, 204, and OPTIONS/CORS preflight excluded);
       * de-duplicated by (technique, status, length).
 
     We deliberately do NOT re-apply an aggressive "N identical signatures = catch-all"
@@ -100,10 +133,9 @@ def calibrate_hits(results: Sequence[dict], recon_status: int) -> list[dict]:
     for r in results:
         if r.get("technique") == "default":
             continue
-        st = r.get("status_code")
-        if st not in _BYPASS_OK:
+        if not _is_content_bearing_bypass(r):
             continue
-        key = (r.get("technique"), st, r.get("content_length"))
+        key = (r.get("technique"), r.get("status_code"), r.get("content_length"))
         if key in seen:
             continue
         seen.add(key)

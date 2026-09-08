@@ -2285,12 +2285,16 @@ def _record_phase_manifest(phase: str, command: str, exit_code, timed_out: bool,
     except OSError:
         pass
     try:
+        signal = abs(exit_code) if isinstance(exit_code, int) and exit_code < 0 else None
+        # rc -9 is SIGKILL (watchdog / budget kill), not "this phase never started".
+        killed_timeout = exit_code == -9 or signal == 9
         phase_manifest.record_phase(
             fd,
             phase,
             command=command,
             exit_code=exit_code,
-            timed_out=bool(timed_out),
+            timed_out=bool(timed_out) or killed_timeout,
+            signal=signal,
             start=started_at.isoformat() if started_at else None,
             end=finished_at.isoformat() if finished_at else None,
             artifact_counts=counts,
@@ -5394,6 +5398,62 @@ def _run_trufflehog_files(trufflehog: str, files: list[str], output: str,
 
 
 
+
+_JS_SCHEME_RE = re.compile(r"https?://", re.I)
+
+
+def _js_url_is_rejected(url: str) -> bool:
+    """True for non-absolute, concatenated, semicolon, or multi-scheme URLs."""
+    if not url or any(ch in url for ch in (";", " ", "\t", "\r", "\n")):
+        return True
+    schemes = _JS_SCHEME_RE.findall(url)
+    if len(schemes) != 1 or not url.lower().startswith(("http://", "https://")):
+        return True
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return True
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        return True
+    return False
+
+
+def _looks_like_js_url(url: str) -> bool:
+    path = (urlsplit(url).path or "").lower().rstrip("/")
+    return path.endswith(".js")
+
+
+def select_js_analysis_urls(lines, *, require_js_suffix: bool = False):
+    """Filter JS analysis URLs before any alphabetical cap.
+
+    Concatenated junk (``404page.html?404;http://...``, bare ``;``, multiple
+    schemes) sorts first and used to fill JS_ANALYSIS_MAX_URLS. Reject those
+    before the cap and prefer real ``*.js`` URLs.
+
+    Returns ``(ordered_urls, rejected_count, unique_count)``.
+    """
+    unique = []
+    seen = set()
+    for line in lines:
+        text = (line or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    js_urls = []
+    other_urls = []
+    rejected = 0
+    for url in unique:
+        if _js_url_is_rejected(url) or (require_js_suffix and not _looks_like_js_url(url)):
+            rejected += 1
+            continue
+        if _looks_like_js_url(url):
+            js_urls.append(url)
+        else:
+            other_urls.append(url)
+    return sorted(js_urls) + sorted(other_urls), rejected, len(unique)
+
+
 def _js_download_failure_summary(dl_dir: str, requested: int, downloaded: int) -> str:
     """Summarize why JS corpus fetch under-delivered (no fake success).
 
@@ -5409,6 +5469,7 @@ def _js_download_failure_summary(dl_dir: str, requested: int, downloaded: int) -
     timed_out = 0
     empty_ok = 0
     curl_fail = 0
+    curl_hist: dict[int, int] = {}
     try:
         with open(manifest, encoding="utf-8", errors="replace") as handle:
             header = handle.readline().rstrip("\n")
@@ -5430,6 +5491,7 @@ def _js_download_failure_summary(dl_dir: str, requested: int, downloaded: int) -
                 if rc == 0 and size == 0:
                     empty_ok += 1
                 elif rc != 0:
+                    curl_hist[rc] = curl_hist.get(rc, 0) + 1
                     # curl -w %{http_code} lands in stdout; we only stored rc.
                     # Map common curl exit codes to human reasons.
                     if rc == 22:  # HTTP error (403/404/5xx with -f)
@@ -5449,6 +5511,8 @@ def _js_download_failure_summary(dl_dir: str, requested: int, downloaded: int) -
         return base + "; could not read download manifest"
 
     bits = [base]
+    if curl_hist:
+        bits.append(", ".join(f"curl_{rc}={curl_hist[rc]}" for rc in sorted(curl_hist)))
     if timed_out:
         bits.append(f"timed_out={timed_out}")
     if empty_ok:
@@ -5521,10 +5585,10 @@ def run_js_analysis(domain: str) -> bool:
 
     try:
         with open(source_file, encoding="utf-8", errors="replace") as handle:
-            selected_urls = sorted({
-                line.strip() for line in handle
-                if line.strip() and (not filter_js or re.search(r"\.js(?:\?|$)", line.strip(), re.I))
-            })
+            raw_js_lines = handle.readlines()
+        selected_urls, rejected_js_urls, _raw_unique = select_js_analysis_urls(
+            raw_js_lines, require_js_suffix=filter_js,
+        )
         _atomic_write_text(
             js_urls_file,
             "\n".join(selected_urls) + ("\n" if selected_urls else ""),
@@ -5552,9 +5616,20 @@ def run_js_analysis(domain: str) -> bool:
     if _js_max > 0 and js_count > _js_max:
         js_scan_file = os.path.join(js_dir, "js_urls_scan.txt")
         _atomic_write_text(js_scan_file, "\n".join(selected_urls[:_js_max]) + "\n")
-        log("warn", f"JS analysis capped at {_js_max} of {js_count} JS URLs "
-                    f"(JS_ANALYSIS_MAX_URLS=0 for all) — partial coverage")
-        _mark_degraded("js_analysis", f"URL surface capped: analyzed {_js_max} of {js_count} JS URLs")
+        log("warn", f"JS analysis capped at {_js_max} of {js_count} valid JS URLs "
+                    f"(rejected {rejected_js_urls} junk URL(s); "
+                    f"JS_ANALYSIS_MAX_URLS=0 for all) — partial coverage")
+        _mark_degraded(
+            "js_analysis",
+            f"URL surface capped: analyzed {_js_max} of {js_count} valid JS URLs "
+            f"(rejected {rejected_js_urls} non-absolute/concatenated/semicolon/multi-scheme URL(s) before the cap)",
+        )
+    elif rejected_js_urls:
+        log("warn", f"Rejected {rejected_js_urls} junk JS URL(s) before analysis")
+        _mark_degraded(
+            "js_analysis",
+            f"rejected {rejected_js_urls} non-absolute/concatenated/semicolon/multi-scheme URL(s) before analysis",
+        )
 
     jsluice_bin  = _tool_bin("jsluice")
     secretfinder = _tool_bin("secretfinder")
