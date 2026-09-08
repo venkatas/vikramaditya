@@ -1115,10 +1115,8 @@ def make_output_dir(target: str) -> str:
         # v10.6.0 — also redact --llm-auth (carries an Authorization: Bearer token,
         # forwarded as --auth-header) and --header (commonly Authorization/Cookie).
         _secret_flags = {"--burp-key", "--api-key", "--creds", "--creds-b",
-                         "--restler-token", "--cats-token", "--ad-pass", "--llm-auth", "--header"}
-
-                         "--restler-token", "--ad-pass", "--llm-auth", "--header",
-                         "--hadrian-auth"}
+                         "--restler-token", "--cats-token", "--ad-pass", "--llm-auth",
+                         "--header", "--hadrian-auth"}
         # Header names whose VALUE is a credential — for --header (a "Key: Value"
         # string) we keep the header NAME visible but mask its value when sensitive.
         _sensitive_header_names = {"authorization", "cookie", "set-cookie",

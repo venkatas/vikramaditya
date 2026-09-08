@@ -649,6 +649,7 @@ if command -v cats >/dev/null 2>&1; then
     log_ok "Endava CATS on PATH: $(command -v cats)"
 else
     log_warn "Endava CATS (cats) not installed — optional for --cats / cats_audit.py"
+fi
 
 # Optional: MITRE SAF CLI for SARIF→HDF→ASFF export (saf_export.py).
 # Not required for core VAPT; install separately when you need HDF/ASFF
