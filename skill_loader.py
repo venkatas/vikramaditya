@@ -34,6 +34,7 @@ _PACKS: dict[str, str] = {
     "xxe": "web/xxe/SKILL.md",
     "upload-rce": "web/upload-rce/SKILL.md",
     "deserialization": "web/deserialization/SKILL.md",
+    "api-authz-hadrian": "web/api-authz-hadrian/SKILL.md",
 }
 
 _ALIASES: dict[str, str] = {
@@ -69,6 +70,11 @@ _ALIASES: dict[str, str] = {
     "pickle": "deserialization",
     "ysoserial": "deserialization",
     "objectinputstream": "deserialization",
+    "hadrian": "api-authz-hadrian",
+    "api-authz": "api-authz-hadrian",
+    "api-authz-hadrian": "api-authz-hadrian",
+    "bfla": "api-authz-hadrian",
+    "bopla": "api-authz-hadrian",
 }
 
 # Keyword → pack heuristics (longer / more specific first via sorted length)
@@ -81,6 +87,7 @@ _KEYWORD_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(xxe|xml[-\s]?external|external[-\s]?entity)\b", re.I), "xxe"),
     (re.compile(r"\b(file[-\s]?upload|upload[-\s]?rce|webshell|polyglot\s+upload)\b", re.I), "upload-rce"),
     (re.compile(r"\b(deseriali[sz]ation|ysoserial|objectinputstream|pickle\.loads|unserialize\()\b", re.I), "deserialization"),
+    (re.compile(r"\b(hadrian|bfla|bopla|api[\-\s]?authz|broken[\-\s]?function[\-\s]?level|role[\-\s]?matrix)\b", re.I), "api-authz-hadrian"),
 ]
 
 

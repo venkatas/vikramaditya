@@ -223,11 +223,13 @@ GO_TOOLS=(
     "github.com/KathanP19/Gxss@latest"
     # v10.7.0 — recon binaries recon.sh already calls but setup.sh never installed
     "github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
+    "github.com/projectdiscovery/uncover/cmd/uncover@latest"
     "github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"
     "github.com/praetorian-inc/fingerprintx/cmd/fingerprintx@latest"
     "github.com/BishopFox/jsluice/cmd/jsluice@latest"
     # v10.7.0 — calibrated 401/403 bypass engine (payloads copied below)
     "github.com/devploit/nomore403@latest"
+    "github.com/praetorian-inc/hadrian/cmd/hadrian@latest"
 )
 
 GO_TOOL_NAMES=(
@@ -250,10 +252,12 @@ GO_TOOL_NAMES=(
     "urlfinder"
     "Gxss"
     "tlsx"
+    "uncover"
     "shuffledns"
     "fingerprintx"
     "jsluice"
     "nomore403"
+    "hadrian"
 )
 
 for i in "${!GO_TOOLS[@]}"; do
@@ -317,7 +321,7 @@ fi
 # Tools to install via pip
 echo ""
 echo "[*] Installing Python tools..."
-PIP_TOOLS=("arjun" "waymore")
+PIP_TOOLS=("arjun" "waymore" "xnLinkFinder")
 for pkg in "${PIP_TOOLS[@]}"; do
     name="${pkg%%[*}"   # strip extras like [cli]
     if pip3 show "$name" &>/dev/null; then
@@ -331,6 +335,37 @@ for pkg in "${PIP_TOOLS[@]}"; do
         fi
     fi
 done
+
+
+# Tier-A recon enrichment notes (uncover / tlsx / waymore / xnLinkFinder)
+# - uncover: OPT-IN via UNCOVER=1 in recon.sh. Configure API keys in
+#   ~/.config/uncover/provider-config.yaml (or SHODAN_API_KEY / FOFA_EMAIL+FOFA_KEY /
+#   CENSYS_API_ID+CENSYS_API_SECRET). shodan-idb needs no key.
+# - tlsx: installed above; Phase 3.5 SAN harvest always runs when present.
+# - waymore: pip tool; archive URL pull in full recon (skipped in --quick).
+# - xnLinkFinder: pip tool; richer JS/SPA endpoint mining after LinkFinder.
+echo ""
+echo "[*] Tier-A recon enrichment tools (uncover/tlsx/waymore/xnLinkFinder) — see docs/recon-enrichment.md"
+if command -v uncover >/dev/null 2>&1; then
+    log_ok "uncover on PATH: $(command -v uncover)"
+else
+    log_warn "uncover not installed — optional OPT-IN (UNCOVER=1); go install github.com/projectdiscovery/uncover/cmd/uncover@latest"
+fi
+if command -v xnLinkFinder >/dev/null 2>&1 || command -v xnlinkfinder >/dev/null 2>&1; then
+    log_ok "xnLinkFinder on PATH"
+else
+    log_warn "xnLinkFinder not installed — pip3 install xnLinkFinder (JS/SPA endpoint mining)"
+fi
+if command -v waymore >/dev/null 2>&1; then
+    log_ok "waymore on PATH: $(command -v waymore)"
+else
+    log_warn "waymore not installed — pip3 install waymore"
+fi
+if command -v tlsx >/dev/null 2>&1; then
+    log_ok "tlsx on PATH: $(command -v tlsx)"
+else
+    log_warn "tlsx not installed — go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
+fi
 
 # garak (NVIDIA LLM vulnerability scanner) — the breadth engine of llm_hunt.py.
 # Installed in an ISOLATED venv: it pulls heavy ML deps that would bloat/conflict
@@ -658,6 +693,25 @@ for local_tool in "LinkFinder/linkfinder.py" "SecretFinder/SecretFinder.py" "XSS
         ((++MISSING))
     fi
 done
+
+# Optional: Endava CATS for OpenAPI negative fuzz (cats_audit.py).
+# Not required for core VAPT; install separately when needed
+# (brew tap endava/tap && brew install cats, or releases binary/JAR).
+# See docs/cats.md
+if command -v cats >/dev/null 2>&1; then
+    log_ok "Endava CATS on PATH: $(command -v cats)"
+else
+    log_warn "Endava CATS (cats) not installed — optional for --cats / cats_audit.py"
+fi
+
+# Optional: MITRE SAF CLI for SARIF→HDF→ASFF export (saf_export.py).
+# Not required for core VAPT; install separately when you need HDF/ASFF
+# (NPM package @mitre/saf, or Homebrew mitre/saf/saf-cli). See docs/saf-export.md
+if command -v saf >/dev/null 2>&1; then
+    log_ok "MITRE SAF CLI on PATH: $(command -v saf)"
+else
+    log_warn "MITRE SAF CLI (saf) not installed — optional for --saf-hdf/--saf-asff"
+fi
 
 READINESS_FAILED=0
 if "$VENV_DIR/bin/python" "$SCRIPT_DIR/environment_readiness.py"; then

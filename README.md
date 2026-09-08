@@ -389,7 +389,9 @@ vikramaditya/
 ├── brain_model_bench.py         # Hallucination-rate model bake-off
 ├── agent.py                     # Autonomous ReAct agent
 ├── reporter.py                  # HTML / Markdown (+ PDF) report generation
+├── saf_export.py                # Opt-in SARIF / HDF / ASFF export (MITRE SAF)
 ├── recon.sh / scanner.sh        # Recon + vuln-scanning pipelines
+├── recon_enrichment.py          # uncover/tlsx/waymore/xnLinkFinder glue (see docs/recon-enrichment.md)
 ├── validate.py                  # Finding validation (CVSS 4.0)
 ├── credential_store.py          # .env-backed auth store
 ├── intel_engine.py              # CVE + HackerOne + hunt-memory intel
@@ -707,6 +709,16 @@ python3 reporter.py findings/ --client "Acme Corp" --consultant "Your Name"
 Every run emits **HTML** (Burp-style) and **Markdown** (documentation-friendly).
 A **PDF** is generated automatically when `wkhtmltopdf` is on your `PATH`.
 Per-finding JSON is written under `findings/<target>/` for downstream tooling.
+
+### Opt-in SARIF / HDF / ASFF (MITRE SAF)
+
+```bash
+python3 saf_export.py findings/<target>/sessions/<id>/ --sarif
+python3 reporter.py findings/<target>/sessions/<id>/ --export-hdf
+python3 vikramaditya.py --export-sarif findings/<target>/sessions/<id>/
+```
+
+Requires the MITRE SAF CLI on `PATH` for HDF/ASFF steps. See `docs/saf-export.md`.
 
 ---
 

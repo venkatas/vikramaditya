@@ -275,6 +275,7 @@ TOOL_REGISTRY = [
     ("amass",             "amass",                                      "go install github.com/owasp-amass/amass/v4/...@master"),
     # ── Wildcard-safe resolve / TLS SAN / service banners (recon.sh callers) ─
     ("tlsx",              f"{GOBIN}/tlsx",                             "go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest"),
+    ("uncover",           f"{GOBIN}/uncover",                          "go install github.com/projectdiscovery/uncover/cmd/uncover@latest"),
     ("shuffledns",        f"{GOBIN}/shuffledns",                       "go install github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"),
     ("massdns",           "massdns",                                    "brew install massdns"),
     ("fingerprintx",      f"{GOBIN}/fingerprintx",                     "go install github.com/praetorian-inc/fingerprintx/cmd/fingerprintx@latest"),
@@ -295,6 +296,8 @@ TOOL_REGISTRY = [
     ("syft",              "syft",                                       "brew install syft"),
     ("grype",             "grype",                                      "brew install grype"),
     ("secretfinder",      f"{TOOLS_DIR}/SecretFinder/SecretFinder.py", "git clone https://github.com/m4ll0k/SecretFinder.git ~/tools/SecretFinder"),
+    ("xnLinkFinder",      "xnLinkFinder",                               "pip3 install xnLinkFinder"),
+    ("waymore",           "waymore",                                    "pip3 install waymore"),
     # ── Parameter & API discovery ────────────────────────────────────────────
     ("arjun",             "arjun",                                      "pip3 install arjun"),
     ("paramspider",       "paramspider",                                "pip3 install git+https://github.com/devanshbatham/paramspider"),
@@ -317,7 +320,7 @@ TOOL_REGISTRY = [
 TOOL_LIST = [t[0] for t in TOOL_REGISTRY]
 AUTO_INSTALL_SYSTEM_TOOLS = {
     "arjun", "feroxbuster", "metasploit", "massdns", "nmap", "paramspider",
-    "semgrep", "sqlmap", "trufflehog", "uro", "whatweb",
+    "semgrep", "sqlmap", "trufflehog", "uro", "whatweb", "waymore", "xnLinkFinder",
 }
 SKIP_ALIASES = {
     "js": "js_analysis",

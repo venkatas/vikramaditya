@@ -14,7 +14,7 @@ import hunt
 # Binaries recon.sh actually shells out to (cert-SAN harvest L1306, wildcard-safe
 # mass-resolve L796 which requires massdns, service banners L337) + jsluice (JS
 # endpoint/secret extraction used by hunt.py).
-RECON_BINARIES = ["tlsx", "shuffledns", "massdns", "fingerprintx", "jsluice"]
+RECON_BINARIES = ["tlsx", "uncover", "shuffledns", "massdns", "fingerprintx", "jsluice", "waymore", "xnLinkFinder"]
 
 
 def test_recon_binaries_registered_for_repair():
@@ -43,10 +43,18 @@ def test_massdns_is_brew_autoinstallable():
 
 def test_go_installed_recon_tools_use_go_install_hint():
     reg = {name: hint for (name, _binp, hint) in hunt.TOOL_REGISTRY}
-    for tool in ["tlsx", "shuffledns", "fingerprintx", "jsluice"]:
+    for tool in ["tlsx", "uncover", "shuffledns", "fingerprintx", "jsluice"]:
         assert reg[tool].startswith("go install "), (
             f"{tool} should be a `go install ...` hint, got: {reg[tool]!r}"
         )
+
+
+def test_pip_recon_enrichment_tools_use_pip_hint():
+    reg = {name: hint for (name, _binp, hint) in hunt.TOOL_REGISTRY}
+    for tool in ["waymore", "xnLinkFinder"]:
+        assert "pip" in reg[tool], f"{tool} should be a pip install hint, got: {reg[tool]!r}"
+    assert "waymore" in hunt.AUTO_INSTALL_SYSTEM_TOOLS
+    assert "xnLinkFinder" in hunt.AUTO_INSTALL_SYSTEM_TOOLS
 
 
 def test_projectdiscovery_runtime_prefers_go_bin():

@@ -18,6 +18,75 @@ changes. Default scan path unchanged.
 - **Tests** — `tests/test_gitleaks_report.py`, `test_sbom_syft.py`,
   `test_evidence_bag.py` (mocked binaries; synthetic fixtures only).
 
+## Tier-A recon enrichment: uncover / tlsx / waymore / xnLinkFinder (2026-09-07)
+
+Wire ProjectDiscovery **uncover** + **tlsx**, **waymore**, and **xnLinkFinder** into
+`recon.sh` as Tier-A recon enrichment beyond katana/gau/subfinder. Alterx-style
+discipline: session artefacts keep full dumps; reports get **counts + samples**
+only (`*.summary.json`). No ALLOW_STATE_CHANGES / aggression default changes.
+
+- **uncover** — **opt-in** (`UNCOVER=1`). FOFA/Shodan/Censys/etc. via provider
+  config or env keys; keyless `shodan-idb` pass on live IPs after probe.
+  Artefacts under `recon/<target>/uncover/` (+ `subdomains/uncover.txt` seeds).
+- **tlsx** — Phase 3.5 SAN harvest (already present) now writes
+  `certs/summary.json`, splits in-scope vs candidates, and optionally merges
+  in-scope SANs into `subdomains/all.txt` (`TLSX_FEEDBACK=1` default).
+- **waymore** — full-recon archive URLs with `WAYMORE_MERGE_CAP` (default 50k);
+  overflow kept as `urls/waymore.full.txt` + `urls/waymore.summary.json`.
+- **xnLinkFinder** — richer JS/SPA endpoint mining after LinkFinder (when
+  installed; skipped in `--quick`). Caps hosts/endpoints; seeds in-scope hosts
+  from JS into `subdomains/xnlinkfinder.txt`.
+- **`recon_enrichment.py`** — pure-stdlib glue (parse / cap-merge / summaries).
+- **setup.sh / hunt TOOL_REGISTRY / NOTICE / docs/recon-enrichment.md**
+- **Tests** — `tests/test_recon_enrichment.py` + registry completeness updates.
+
+## Opt-in Endava CATS OpenAPI negative fuzz (2026-09-07)
+
+Wire Endava CATS (Contract API Testing and Security) as an **opt-in** OpenAPI
+negative/boundary fuzzer alongside Schemathesis and RESTler. Default scan path
+unchanged — no ALLOW_STATE_CHANGES / aggression default changes.
+
+- **`cats_audit.py`** — thin wrapper: resolve `CATS_BIN` / `cats` / `CATS_JAR`,
+  run with `--contract` + `--server`, auth via `--header` / `--token` /
+  `--headers-file`, optional `--blackbox`, write reports under
+  `findings/<host>/cats/`, parse `cats-summary-report.json` → `summary.json` +
+  `error_leads.json`.
+- **CLI** — `vikramaditya.py --cats SPEC --cats-server URL` (+ `--cats-token`,
+  `--cats-header`, `--cats-blackbox`, `--cats-paths`, `--cats-headers-file`).
+- **Docs / setup / NOTICE** — `docs/cats.md`, optional `setup.sh` PATH check,
+  Apache-2.0 attribution (invoke only; not vendored).
+- **Tests** — `tests/test_cats_audit.py` (resolve, argv, summary parse, mock binary).
+
+## Opt-in SARIF / HDF / ASFF export (MITRE SAF) (2026-09-07)
+
+Fill the machine-readable export gap next to custom HTML + `finding_schema`:
+
+- **`saf_export.py`** — in-repo SARIF 2.1.0 writer from validated findings; optional
+  MITRE SAF CLI (`saf convert sarif2hdf` / `hdf2asff`) for HDF and Security Hub ASFF.
+- **Opt-in flags only** — `python3 saf_export.py <findings.json|dir> -o out.sarif [--hdf|--asff]`,
+  `reporter.py --export-sarif|--export-hdf|--export-asff`, and
+  `vikramaditya.py --export-sarif <findings_dir|json>` (+ `--saf-hdf` / `--saf-asff`).
+  Default scan path unchanged.
+- **Docs** — `docs/saf-export.md`, `setup.sh` optional note, NOTICE attribution
+  (Apache-2.0 CLI invoke; not vendored).
+- **Tests** — `tests/test_saf_export.py` (9: SARIF mapping + mocked MITRE CLI).
+
+## Hadrian API authz (on-demand) — Praetorian Hadrian wrapper
+
+Optional API **authorization** step via [Praetorian Hadrian](https://github.com/praetorian-inc/hadrian) (Apache-2.0). Role-permutation BOLA/BFLA/BOPLA across REST (OpenAPI), GraphQL, and gRPC. Complements Schemathesis (schema conformance) and RESTler (stateful fuzz) — does **not** change default scan aggression or `ALLOW_STATE_CHANGES`.
+
+- `hadrian_audit.py` — thin CLI wrapper (`HADRIAN_BIN` / PATH); emits `findings/<label>/hadrian/{report,findings,summary}.json`
+- `tool_parsers.parse_hadrian_json` — normalize Hadrian JSON → Vik finding dicts (`status=suspected`)
+- CLI: `--hadrian SPEC --hadrian-roles PATH --hadrian-auth PATH` (`--hadrian-protocol`, `--hadrian-dry-run`, …)
+- `templates/hadrian/{roles,auth}.example.yaml` + README — how to supply roles/tokens/templates
+- `skills/web/api-authz-hadrian` — on-demand skill pack (skill_loader)
+- `setup.sh` — `go install github.com/praetorian-inc/hadrian/cmd/hadrian@latest`
+
+```bash
+python3 vikramaditya.py --hadrian openapi.yaml \
+  --hadrian-roles roles.yaml --hadrian-auth auth.yaml --hadrian-dry-run
+```
+
 ## v10.6.0 — xalgorix-port batch: native HTTP probe, auth re-auth resilience, API playbooks (2026-06-17)
 
 Second-pass adoption from the peer AI-VAPT tool (xalgorix, MIT). A capability-mining sweep flagged
