@@ -78,3 +78,15 @@ MIT License — Copyright (c) Microsoft Corporation
 
   markitdown_helper.py         <- thin CLI wrapper around MarkItDown
 
+-----------------------------------------------------------------------
+MITRE SAF CLI — https://github.com/mitre/saf
+Apache License 2.0 — Copyright (c) The MITRE Corporation
+-----------------------------------------------------------------------
+
+  saf_export.py                <- optional subprocess invoke of `saf convert
+                                  sarif2hdf` / `hdf2asff` when installed.
+                                  Vikramaditya does not vendor SAF sources;
+                                  SARIF writing is in-repo.
+
+Docs: https://saf-cli.mitre.org/
+

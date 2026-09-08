@@ -1303,6 +1303,15 @@ Options:
   --bmb-recon DIR         Recon dir for the bake-off
   --bmb-models CSV        Ollama model tags (default: phi4:14b,qwen3:14b,
                           deepseek-r1:14b,xploiter/the-xploiter:latest)
+  --export-sarif PATH     v10.7.0 — OPT-IN: convert findings JSON to SARIF 2.1.0
+                          then exit. Use --sarif-output/-o for the .sarif path.
+                          Optional: --saf-hdf, --saf-asff (needs MITRE saf CLI).
+  --sarif-output PATH     SARIF output path for --export-sarif (alias: -o)
+  --saf-hdf PATH          Also write HDF via saf convert sarif2hdf
+  --saf-asff DIR          Also write ASFF folder via saf convert hdf2asff
+  --aws-account ID        AWS account id for --saf-asff
+  --aws-region REGION     AWS region for --saf-asff
+  --asff-target NAME      ASFF target name for --saf-asff
 """
 
 
@@ -1420,6 +1429,14 @@ def parse_cli_args() -> dict:
         "bmb_findings": "",
         "bmb_recon": "",
         "bmb_models": "",
+        # v10.7.0 — opt-in SARIF / MITRE SAF export (never on by default)
+        "export_sarif": "",
+        "sarif_output": "",
+        "saf_hdf": "",
+        "saf_asff": "",
+        "aws_account": "",
+        "aws_region": "",
+        "asff_target": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -1611,6 +1628,20 @@ def parse_cli_args() -> dict:
             args["bmb_recon"] = argv[i + 1]; i += 2
         elif argv[i] == "--bmb-models" and i + 1 < len(argv):
             args["bmb_models"] = argv[i + 1]; i += 2
+        elif argv[i] == "--export-sarif" and i + 1 < len(argv):
+            args["export_sarif"] = argv[i + 1]; i += 2
+        elif argv[i] in ("--sarif-output", "-o") and i + 1 < len(argv):
+            args["sarif_output"] = argv[i + 1]; i += 2
+        elif argv[i] == "--saf-hdf" and i + 1 < len(argv):
+            args["saf_hdf"] = argv[i + 1]; i += 2
+        elif argv[i] == "--saf-asff" and i + 1 < len(argv):
+            args["saf_asff"] = argv[i + 1]; i += 2
+        elif argv[i] == "--aws-account" and i + 1 < len(argv):
+            args["aws_account"] = argv[i + 1]; i += 2
+        elif argv[i] == "--aws-region" and i + 1 < len(argv):
+            args["aws_region"] = argv[i + 1]; i += 2
+        elif argv[i] == "--asff-target" and i + 1 < len(argv):
+            args["asff_target"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1894,6 +1925,42 @@ def main():
     # ── v9.4.0 standalone tools — run and exit before anything else ─────
     # These are operator-driven point tools, not part of the autonomous
     # pipeline. They produce findings/<host>/ artifacts and then return.
+    if cli["export_sarif"]:
+        # Opt-in only: PATH is a findings session dir (preferred) or a JSON list of findings.
+        log("info", f"--export-sarif: {cli['export_sarif']}")
+        try:
+            import saf_export
+            src = cli["export_sarif"]
+            if os.path.isdir(src):
+                findings, target = saf_export._load_findings_from_dir(src)
+                out_dir = os.path.join(src, "export")
+            else:
+                with open(src, encoding="utf-8") as fh:
+                    findings = json.load(fh)
+                if not isinstance(findings, list):
+                    raise ValueError("--export-sarif JSON must be a list of finding objects")
+                target = ""
+                out_dir = os.path.dirname(os.path.abspath(cli["sarif_output"] or src)) or "."
+            produced = saf_export.export_findings(
+                findings,
+                out_dir,
+                target=target,
+                want_sarif=True,
+                want_hdf=bool(cli["saf_hdf"]),
+                want_asff=bool(cli["saf_asff"]),
+                sarif_path=cli["sarif_output"] or None,
+                hdf_path=cli["saf_hdf"] or None,
+                asff_dir=cli["saf_asff"] or None,
+                asff_account=cli["aws_account"],
+                asff_region=cli["aws_region"],
+                asff_target=cli["asff_target"],
+            )
+            for kind, p in produced.items():
+                log("ok", f"{kind}: {p}")
+        except Exception as e:
+            log("err", f"SARIF export failed: {e}")
+            return
+        print(f"\n  {D}Done.{N}\n"); return
     if cli["cicd_audit"]:
         log("info", f"--cicd-audit: scanning {cli['cicd_audit']}")
         run_cicd_audit(cli["cicd_audit"])

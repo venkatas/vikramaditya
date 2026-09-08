@@ -1,5 +1,19 @@
 # Changelog
 
+## Opt-in SARIF / HDF / ASFF export (MITRE SAF) (2026-09-07)
+
+Fill the machine-readable export gap next to custom HTML + `finding_schema`:
+
+- **`saf_export.py`** — in-repo SARIF 2.1.0 writer from validated findings; optional
+  MITRE SAF CLI (`saf convert sarif2hdf` / `hdf2asff`) for HDF and Security Hub ASFF.
+- **Opt-in flags only** — `python3 saf_export.py <findings.json|dir> -o out.sarif [--hdf|--asff]`,
+  `reporter.py --export-sarif|--export-hdf|--export-asff`, and
+  `vikramaditya.py --export-sarif <findings_dir|json>` (+ `--saf-hdf` / `--saf-asff`).
+  Default scan path unchanged.
+- **Docs** — `docs/saf-export.md`, `setup.sh` optional note, NOTICE attribution
+  (Apache-2.0 CLI invoke; not vendored).
+- **Tests** — `tests/test_saf_export.py` (9: SARIF mapping + mocked MITRE CLI).
+
 ## Hadrian API authz (on-demand) — Praetorian Hadrian wrapper
 
 Optional API **authorization** step via [Praetorian Hadrian](https://github.com/praetorian-inc/hadrian) (Apache-2.0). Role-permutation BOLA/BFLA/BOPLA across REST (OpenAPI), GraphQL, and gRPC. Complements Schemathesis (schema conformance) and RESTler (stateful fuzz) — does **not** change default scan aggression or `ALLOW_STATE_CHANGES`.
