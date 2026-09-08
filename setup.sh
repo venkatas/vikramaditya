@@ -713,6 +713,11 @@ else
     log_warn "MITRE SAF CLI (saf) not installed — optional for --saf-hdf/--saf-asff"
 fi
 
+# Optional HexStrike pattern notes (ideas only; not a runtime, not an install wall).
+# Does not install HexStrike or its tool set. MCP facade is stdlib. Session cache
+# stays off unless VIK_SESSION_TOOL_CACHE=1. See docs/hexstrike-patterns.md.
+log_warn "HexStrike patterns: notes only (docs/hexstrike-patterns.md); MCP facade is opt-in, no extra package"
+
 READINESS_FAILED=0
 if "$VENV_DIR/bin/python" "$SCRIPT_DIR/environment_readiness.py"; then
     log_ok "Environment readiness checks passed"

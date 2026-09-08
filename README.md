@@ -390,6 +390,7 @@ vikramaditya/
 ├── agent.py                     # Autonomous ReAct agent
 ├── reporter.py                  # HTML / Markdown (+ PDF) report generation
 ├── saf_export.py                # Opt-in SARIF / HDF / ASFF export (MITRE SAF)
+├── session_tool_cache.py        # Opt-in session tool cache (VIK_SESSION_TOOL_CACHE=1)
 ├── recon.sh / scanner.sh        # Recon + vuln-scanning pipelines
 ├── recon_enrichment.py          # uncover/tlsx/waymore/xnLinkFinder glue (see docs/recon-enrichment.md)
 ├── validate.py                  # Finding validation (CVSS 4.0)
@@ -411,7 +412,7 @@ vikramaditya/
 │   ├── vault.py                 # SQLite per-engagement mapping store
 │   └── anonymizer.py            # anonymize() / deanonymize() facade
 │
-├── mcp/                         # HackerOne / Caido / Burp MCP servers
+├── mcp/                         # HackerOne / Caido / Burp + opt-in Vik MCP facade
 ├── memory/                      # Hunt journal, audit log, pattern DB
 ├── skills/                      # bb-methodology, bug-bounty, meme-coin-audit, …
 ├── agents/                      # recon-ranker, chain-builder, validator,

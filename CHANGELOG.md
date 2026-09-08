@@ -1,5 +1,28 @@
 # Changelog
 
+## HexStrike patterns only: MCP facade, session cache, coverage notes (2026-09-08)
+
+Clean-room ideas from HexStrike (MIT). **Not** a runtime. No fork, vendor,
+import, or subprocess of HexStrike. No 150-tool MCP server. No cloud LLM loop.
+No `ALLOW_STATE_CHANGES` / aggression default changes. Default scan path
+unchanged (no new default tool runs).
+
+- **`mcp/vik-mcp/server.py`** - opt-in stdlib JSON-RPC facade for Cursor.
+  Narrow tools only: list/load skills, session status, cached tool lookup,
+  dry-run scope check, coverage notes. No shell/exec tool.
+- **`session_tool_cache.py`** - skip re-running the same tool+args on the same
+  target within a session. Disk under the session dir (`tool_cache/`, 0700).
+  Off unless `VIK_SESSION_TOOL_CACHE=1`. Never stores secret values. Respects
+  `ScopeChecker` / `scope/allow.txt`. Wired into `hunt.py` `run_cmd` /
+  `run_cmd_args` only; not a second orchestrator.
+- **Optional notes** - `skills/cloud/cloud-iam-notes`,
+  `skills/recon/ctf-coverage-notes`, `hexstrike_patterns.py`. Not an install wall.
+- **Docs / NOTICE / setup.sh** - `docs/hexstrike-patterns.md`. setup.sh prints
+  a pointer and installs nothing new.
+- **Tests** - `tests/test_session_tool_cache.py`, `tests/test_vik_mcp.py`, `tests/test_hunt_session_tool_cache.py`
+  (mocked; no network).
+
+
 ## Portable CAI recon/web/cloud skill packs + Foundation-Sec Ollama note (2026-09-07)
 
 Clean-room portable skill **ideas** from CAI (Alias Robotics) recon/web/cloud craft —

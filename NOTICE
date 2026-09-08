@@ -161,3 +161,24 @@ Apache License 2.0 — Copyright (c) The MITRE Corporation
 
 Docs: https://saf-cli.mitre.org/
 
+-----------------------------------------------------------------------
+HexStrike AI - https://github.com/0x4m4/hexstrike-ai
+MIT License - Copyright (c) contributors to 0x4m4/hexstrike-ai
+-----------------------------------------------------------------------
+
+Ideas only. Vikramaditya does not vendor, fork, import, or subprocess
+HexStrike, and does not ship its 150+ tool MCP server or cloud LLM loop.
+
+  mcp/vik-mcp/server.py    <- narrow opt-in MCP facade (stdlib JSON-RPC;
+                              no arbitrary command tool)
+  session_tool_cache.py    <- session-scoped process/cache idea
+                              (target+tool+args, disk under the session dir,
+                              no secret values, scope-aware)
+  hexstrike_patterns.py    <- optional cloud/CTF coverage notes
+  skills/cloud/cloud-iam-notes/SKILL.md
+  skills/recon/ctf-coverage-notes/SKILL.md
+                           <- checklist stubs for gaps already not covered;
+                              not an install list and not on the default scan path
+
+Docs: docs/hexstrike-patterns.md
+

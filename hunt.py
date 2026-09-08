@@ -1326,6 +1326,7 @@ def _brain_phase_complete(phase: str, success: bool, detail: str = "", artifacts
 from procutil import _POSIX_SPAWN_OK, _PosixSpawnProc, _fork_safe_spawn as _procutil_spawn, run_capture, _terminate_group  # noqa: E402,F401
 import phase_manifest  # noqa: E402
 import environment_readiness  # noqa: E402
+import session_tool_cache  # noqa: E402
 
 
 # ── P1 process-wide interrupt safety net ──────────────────────────────────────
@@ -1365,6 +1366,36 @@ def _terminate_all_active_groups() -> None:
     _ACTIVE_PROCS.clear()
 
 
+
+def _bind_session_tool_cache(domain: str, session_dir: str) -> None:
+    """Remember session for the opt-in tool cache. No disk write unless later enabled."""
+    try:
+        parts = (domain or "").split(".")
+        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            session_tool_cache.bind_session(domain, session_dir, scope_ips=[domain])
+        else:
+            session_tool_cache.bind_session(
+                domain, session_dir,
+                scope_domains=[domain, f"*.{domain}"] if domain else None,
+            )
+    except Exception:
+        pass
+
+
+def _session_cache_lookup(invocation, watch_file=None):
+    try:
+        return session_tool_cache.lookup_for_runner(invocation, watch_file=watch_file)
+    except Exception:
+        return None
+
+
+def _session_cache_store(invocation, ok, output, watch_file=None):
+    try:
+        session_tool_cache.store_for_runner(invocation, ok, output, watch_file=watch_file)
+    except Exception:
+        return None
+
+
 def run_cmd(
     cmd: str,
     cwd: str = None,
@@ -1375,6 +1406,9 @@ def run_cmd(
     watch_max_stale: int = WATCHDOG_MAX_IDLE,
     pty_stdin: bool = False,
 ) -> tuple[bool, str]:
+    cached = _session_cache_lookup(cmd, watch_file=watch_file)
+    if cached is not None:
+        return cached
     try:
         if watch_file is not None:
             label = watch_phase or "COMMAND"
@@ -1479,7 +1513,10 @@ def run_cmd(
             end_level = "ok" if rc == 0 else "warn"
             timeout_note = " (timed out)" if timed_out else ""
             log(end_level, f"END {label}: PID {proc.pid} rc={rc} duration={duration:.1f}s{timeout_note}")
-            return rc == 0, (stdout or "") + (stderr or "")
+            _ok = rc == 0
+            _out = (stdout or "") + (stderr or "")
+            _session_cache_store(cmd, _ok, _out, watch_file=watch_file)
+            return _ok, _out
 
         proc = _fork_safe_spawn(cmd, env=_tool_env(), cwd=cwd, capture=True, shell=True,
                                 pty_stdin=pty_stdin)
@@ -1501,7 +1538,10 @@ def run_cmd(
                 proc.kill()
             proc.wait()
             return False, "Command timed out"
-        return proc.returncode == 0, stdout or ""
+        _ok = proc.returncode == 0
+        _out = stdout or ""
+        _session_cache_store(cmd, _ok, _out, watch_file=watch_file)
+        return _ok, _out
     except Exception as exc:
         return False, str(exc)
 
@@ -1511,6 +1551,9 @@ def run_cmd_args(
     cwd: str = None,
     timeout: int = 600,
 ) -> tuple[bool, str]:
+    cached = _session_cache_lookup(args, watch_file=None)
+    if cached is not None:
+        return cached
     # Fork-safe launch (posix_spawn): avoids the macOS Network.framework atfork
     # SIGSEGV that fork()+exec triggers late in a run (see _PosixSpawnProc). stdout
     # and stderr are merged into one stream, matching the previous concatenation.
@@ -1530,7 +1573,10 @@ def run_cmd_args(
                 proc.kill()
             proc.wait()
             return False, "Command timed out"
-        return proc.returncode == 0, out or ""
+        _ok = proc.returncode == 0
+        _out = out or ""
+        _session_cache_store(args, _ok, _out, watch_file=None)
+        return _ok, _out
     except Exception as exc:
         if proc is not None:
             try:
@@ -3554,6 +3600,7 @@ def _set_active_recon_session(domain: str, session_id: str) -> str:
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     })
     _remember_runtime_session(domain, session_id)
+    _bind_session_tool_cache(domain, session_dir)
     return session_dir
 
 
@@ -3575,6 +3622,7 @@ def _activate_recon_session(
         session_dir = _recon_session_dir(domain, session_id)
         if os.path.isdir(session_dir):
             _remember_runtime_session(domain, session_id)
+            _bind_session_tool_cache(domain, session_dir)
             return session_id, session_dir
     if explicit_session:
         return None, ""

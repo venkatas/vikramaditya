@@ -42,6 +42,9 @@ _PACKS: dict[str, str] = {
     "cloud-metadata-imds": "cloud/cloud-metadata-imds/SKILL.md",
     "storage-exposure": "cloud/storage-exposure/SKILL.md",
     "api-authz-hadrian": "web/api-authz-hadrian/SKILL.md",
+    # Optional HexStrike-pattern coverage notes (checklists, not a runtime)
+    "cloud-iam-notes": "cloud/cloud-iam-notes/SKILL.md",
+    "ctf-coverage-notes": "recon/ctf-coverage-notes/SKILL.md",
 }
 
 _ALIASES: dict[str, str] = {
@@ -103,6 +106,10 @@ _ALIASES: dict[str, str] = {
     "api-authz-hadrian": "api-authz-hadrian",
     "bfla": "api-authz-hadrian",
     "bopla": "api-authz-hadrian",
+    "cloud-iam-notes": "cloud-iam-notes",
+    "iam-posture": "cloud-iam-notes",
+    "ctf-coverage-notes": "ctf-coverage-notes",
+    "ctf-notes": "ctf-coverage-notes",
 }
 
 # Keyword → pack heuristics (longer / more specific first via sorted length)
@@ -122,6 +129,8 @@ _KEYWORD_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(imds|instance[\-\s]?metadata|169\.254\.169\.254|metadata\.google\.internal|imdSv2)\b", re.I), "cloud-metadata-imds"),
     (re.compile(r"\b(s3[\-\s]?bucket|storage[\-\s]?exposure|blob[\-\s]?storage|gcs[\-\s]?bucket|azure[\-\s]?blob)\b", re.I), "storage-exposure"),
     (re.compile(r"\b(hadrian|bfla|bopla|api[\-\s]?authz|broken[\-\s]?function[\-\s]?level|role[\-\s]?matrix)\b", re.I), "api-authz-hadrian"),
+    (re.compile(r"\b(iam[\-\s]?posture|unused access key|enumerate-iam|cloud[\-\s]?iam)\b", re.I), "cloud-iam-notes"),
+    (re.compile(r"\b(ctf|binwalk|steghide|radare2)\b", re.I), "ctf-coverage-notes"),
 ]
 
 

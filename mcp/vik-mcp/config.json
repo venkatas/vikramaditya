@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "vikramaditya": {
+      "command": "python3",
+      "args": ["/ABS/PATH/TO/obsidian/mcp/vik-mcp/server.py"],
+      "env": {
+        "VIK_SCOPE": "*.example.com"
+      }
+    }
+  },
+  "_comment": "Opt-in read-only/dry-run facade. No shell tool. No MCP package required. See docs/hexstrike-patterns.md. Replace the args path with the checkout absolute path."
+}
