@@ -1,5 +1,23 @@
 # Changelog
 
+## Gitleaks SARIF + Syft SBOM + BagIt evidence packs (2026-09-07)
+
+Opt-in supply-chain / evidence glue. No ALLOW_STATE_CHANGES / aggression default
+changes. Default scan path unchanged.
+
+- **`gitleaks_report.py`** — run or ingest Gitleaks; emit SARIF 2.1.0 + JSON;
+  normalize into `finding_schema` (`data_extracted`) / `finding_validator` path;
+  write `findings/<label>/gitleaks/` + `exposure/gitleaks.txt` (secrets redacted).
+  Gitleaks itself already installed by `setup.sh`.
+- **`sbom_syft.py`** — Syft CycloneDX/SPDX SBOM attach under
+  `engagements/<target>/sbom/`; optional Grype scan (`--grype`).
+- **`evidence_bag.py`** — BagIt 0.97 hashed packs (report + Burp + SARIF + SBOM +
+  screenshots). Prefers bagit-python (CC0); stdlib writer fallback.
+- **setup.sh / requirements.txt / hunt TOOL_REGISTRY / NOTICE /
+  docs/gitleaks-syft-bagit.md**
+- **Tests** — `tests/test_gitleaks_report.py`, `test_sbom_syft.py`,
+  `test_evidence_bag.py` (mocked binaries; synthetic fixtures only).
+
 ## Tier-A recon enrichment: uncover / tlsx / waymore / xnLinkFinder (2026-09-07)
 
 Wire ProjectDiscovery **uncover** + **tlsx**, **waymore**, and **xnLinkFinder** into

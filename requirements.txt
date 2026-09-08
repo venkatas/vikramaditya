@@ -76,3 +76,8 @@ jsonschema>=4.24.0,<5
 
 # Office/PDF/HTML → Markdown for LLM ingest (optional helper)
 markitdown[all]>=0.1.0
+
+# ── Evidence packs (optional) ────────────────────────────────────────────────
+# BagIt hashed engagement evidence bags (evidence_bag.py). CC0.
+# Stdlib writer works without this; install for bagit.Bag.validate() parity.
+# bagit>=1.8.1

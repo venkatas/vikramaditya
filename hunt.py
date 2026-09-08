@@ -292,6 +292,9 @@ TOOL_REGISTRY = [
     # ── JS analysis ─────────────────────────────────────────────────────────
     ("jsluice",           f"{GOBIN}/jsluice",                          "go install github.com/BishopFox/jsluice/cmd/jsluice@latest"),
     ("trufflehog",        "trufflehog",                                 "brew install trufflehog"),
+    ("gitleaks",          "gitleaks",                                   "brew install gitleaks"),
+    ("syft",              "syft",                                       "brew install syft"),
+    ("grype",             "grype",                                      "brew install grype"),
     ("secretfinder",      f"{TOOLS_DIR}/SecretFinder/SecretFinder.py", "git clone https://github.com/m4ll0k/SecretFinder.git ~/tools/SecretFinder"),
     ("xnLinkFinder",      "xnLinkFinder",                               "pip3 install xnLinkFinder"),
     ("waymore",           "waymore",                                    "pip3 install waymore"),
