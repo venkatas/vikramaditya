@@ -1,5 +1,27 @@
 # Changelog
 
+## Tier-A recon enrichment: uncover / tlsx / waymore / xnLinkFinder (2026-09-07)
+
+Wire ProjectDiscovery **uncover** + **tlsx**, **waymore**, and **xnLinkFinder** into
+`recon.sh` as Tier-A recon enrichment beyond katana/gau/subfinder. Alterx-style
+discipline: session artefacts keep full dumps; reports get **counts + samples**
+only (`*.summary.json`). No ALLOW_STATE_CHANGES / aggression default changes.
+
+- **uncover** — **opt-in** (`UNCOVER=1`). FOFA/Shodan/Censys/etc. via provider
+  config or env keys; keyless `shodan-idb` pass on live IPs after probe.
+  Artefacts under `recon/<target>/uncover/` (+ `subdomains/uncover.txt` seeds).
+- **tlsx** — Phase 3.5 SAN harvest (already present) now writes
+  `certs/summary.json`, splits in-scope vs candidates, and optionally merges
+  in-scope SANs into `subdomains/all.txt` (`TLSX_FEEDBACK=1` default).
+- **waymore** — full-recon archive URLs with `WAYMORE_MERGE_CAP` (default 50k);
+  overflow kept as `urls/waymore.full.txt` + `urls/waymore.summary.json`.
+- **xnLinkFinder** — richer JS/SPA endpoint mining after LinkFinder (when
+  installed; skipped in `--quick`). Caps hosts/endpoints; seeds in-scope hosts
+  from JS into `subdomains/xnlinkfinder.txt`.
+- **`recon_enrichment.py`** — pure-stdlib glue (parse / cap-merge / summaries).
+- **setup.sh / hunt TOOL_REGISTRY / NOTICE / docs/recon-enrichment.md**
+- **Tests** — `tests/test_recon_enrichment.py` + registry completeness updates.
+
 ## Opt-in Endava CATS OpenAPI negative fuzz (2026-09-07)
 
 Wire Endava CATS (Contract API Testing and Security) as an **opt-in** OpenAPI

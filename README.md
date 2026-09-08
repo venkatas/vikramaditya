@@ -391,6 +391,7 @@ vikramaditya/
 ├── reporter.py                  # HTML / Markdown (+ PDF) report generation
 ├── saf_export.py                # Opt-in SARIF / HDF / ASFF export (MITRE SAF)
 ├── recon.sh / scanner.sh        # Recon + vuln-scanning pipelines
+├── recon_enrichment.py          # uncover/tlsx/waymore/xnLinkFinder glue (see docs/recon-enrichment.md)
 ├── validate.py                  # Finding validation (CVSS 4.0)
 ├── credential_store.py          # .env-backed auth store
 ├── intel_engine.py              # CVE + HackerOne + hunt-memory intel
