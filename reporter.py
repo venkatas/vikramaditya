@@ -2527,28 +2527,112 @@ def _resolve_recon_findings_dirs(report_dir: str) -> tuple[str, str]:
     return report_dir, findings_dir
 
 
-def _render_recon_inventory_html(report_dir: str, target: str) -> str:
-    """Render a "Recon / Host & Port Inventory" chapter from the session's
-    live/httpx, ports/nmap, and priority artefacts.
+def _asset_sample_limit() -> int:
+    """Max hosts/URLs shown inline before truncating with an '... and N more' note."""
+    return 25
 
-    v10.0.2 — discovered hosts (e.g. ``mssql.*``), open ports (FTP 21/990,
-    8443), and the live-host surface previously never appeared in the report:
-    the only recon-derived block was the all-zeros "Recon Surface" metrics
-    table whose paths often miss the real layout. This chapter lists every
-    live host + status/tech and every open port even when no finding maps to
-    them, so the inventory is visible. Degrades to a friendly note when the
-    artefacts are absent."""
+
+def _asset_count_only_threshold() -> int:
+    """Above this size, dump counts only (alterx / merged permutation lists)."""
+    return 200
+
+
+# Known subdomain enumeration artefacts under recon/<t>/sessions/<id>/subdomains/.
+# alterx + merged all*.txt are typically huge permutation dumps — counts only when large.
+_SUBDOMAIN_SOURCE_FILES: tuple[tuple[str, str], ...] = (
+    ("subfinder", "subfinder.txt"),
+    ("assetfinder", "assetfinder.txt"),
+    ("amass", "amass.txt"),
+    ("crtsh", "crtsh.txt"),
+    ("hackertarget", "hackertarget.txt"),
+    ("otx", "otx.txt"),
+    ("wayback", "wayback_subs.txt"),
+    ("alterx", "alterx.txt"),
+)
+
+_MERGED_SUBDOMAIN_FILES: tuple[tuple[str, str], ...] = (
+    ("merged (all.txt)", "all.txt"),
+    ("merged+permutations", "all_with_permutations.txt"),
+)
+
+_HTTP_STATUS_FILES: tuple[tuple[str, str], ...] = (
+    ("HTTP 200", "status_200.txt"),
+    ("HTTP 3xx", "status_3xx.txt"),
+    ("HTTP 401", "status_401.txt"),
+    ("HTTP 403", "status_403.txt"),
+    ("HTTP 429", "status_429.txt"),
+)
+
+
+def _read_recon_lines(recon_dir: str, *parts: str) -> list[str]:
+    try:
+        with open(os.path.join(recon_dir, *parts), errors="replace") as fh:
+            return [ln.rstrip("\n") for ln in fh if ln.strip()]
+    except OSError:
+        return []
+
+
+def _truncate_asset_list(items: list[str], limit: int | None = None
+                         ) -> tuple[list[str], int]:
+    """Return ``(sample, omitted_count)`` for report display."""
+    lim = _asset_sample_limit() if limit is None else limit
+    if len(items) <= lim:
+        return items, 0
+    return items[:lim], len(items) - lim
+
+
+def _collect_asset_inventory(report_dir: str) -> dict:
+    """Collect Asset Inventory data from session recon artefacts.
+
+    Reads subdomain tool outputs, DNS-resolved hosts, httpx live hosts +
+    status-code buckets, IPs, and open ports. Huge alterx / merged dumps
+    contribute **counts only** (no tens-of-thousands dump into the report).
+    Relative artefact names are recorded for "... and N more" footnotes —
+    never absolute filesystem paths.
+    """
     recon_dir, _ = _resolve_recon_findings_dirs(report_dir)
+    sample_lim = _asset_sample_limit()
+    count_thresh = _asset_count_only_threshold()
 
-    def _read_lines(*parts: str) -> list[str]:
-        try:
-            with open(os.path.join(recon_dir, *parts), errors="replace") as fh:
-                return [ln.rstrip("\n") for ln in fh if ln.strip()]
-        except OSError:
-            return []
+    sources: list[dict] = []
+    for label, fname in _SUBDOMAIN_SOURCE_FILES:
+        path = os.path.join(recon_dir, "subdomains", fname)
+        if not os.path.isfile(path):
+            continue
+        lines = _read_recon_lines(recon_dir, "subdomains", fname)
+        count_only = len(lines) > count_thresh and label == "alterx"
+        if count_only:
+            sample, omitted = [], 0
+        else:
+            sample, omitted = _truncate_asset_list(lines, sample_lim)
+        sources.append({
+            "tool": label,
+            "artifact": f"subdomains/{fname}",
+            "count": len(lines),
+            "sample": sample,
+            "omitted": omitted,
+            "count_only": count_only,
+        })
 
-    # --- Live hosts (httpx_full.txt: "URL [status] [len] [title] [ip] [tech]") ---
-    host_rows = ""
+    for label, fname in _MERGED_SUBDOMAIN_FILES:
+        path = os.path.join(recon_dir, "subdomains", fname)
+        if not os.path.isfile(path):
+            continue
+        lines = _read_recon_lines(recon_dir, "subdomains", fname)
+        # Merged lists are almost always permutation-inflated — counts only.
+        sources.append({
+            "tool": label,
+            "artifact": f"subdomains/{fname}",
+            "count": len(lines),
+            "sample": [],
+            "omitted": 0,
+            "count_only": True,
+        })
+
+    resolved = _read_recon_lines(recon_dir, "subdomains", "resolved.txt")
+    resolved_sample, resolved_omitted = _truncate_asset_list(resolved, sample_lim)
+
+    # --- Live hosts (httpx_full.txt) ---
     httpx_re = re.compile(
         r"^(\S+)"                      # url
         r"(?:\s+\[([^\]]*)\])?"        # status
@@ -2556,81 +2640,369 @@ def _render_recon_inventory_html(report_dir: str, target: str) -> str:
         r"(?:\s+\[([^\]]*)\])?"        # title
         r"(?:\s+\[([^\]]*)\])?"        # ip
         r"(?:\s+\[([^\]]*)\])?")       # tech
-    for line in _read_lines("live", "httpx_full.txt"):
+    live_hosts: list[dict] = []
+    for line in _read_recon_lines(recon_dir, "live", "httpx_full.txt"):
         m = httpx_re.match(line.strip())
         if not m:
             continue
         url, status, _clen, ptitle, ip, tech = m.groups()
-        host_rows += (
-            f"<tr><td><code style=\"word-break:break-all\">{url}</code></td>"
-            f"<td>{status or '—'}</td>"
-            f"<td>{ip or '—'}</td>"
-            f"<td>{ptitle or '—'}</td>"
-            f"<td>{tech or '—'}</td></tr>\n")
-    if not host_rows:
-        # Fallback: plain URL list (live/urls.txt) when httpx detail is absent.
-        for url in _read_lines("live", "urls.txt"):
-            host_rows += (
-                f"<tr><td><code style=\"word-break:break-all\">{url}</code></td>"
-                "<td>—</td><td>—</td><td>—</td><td>—</td></tr>\n")
+        live_hosts.append({
+            "url": url,
+            "status": status or "",
+            "ip": ip or "",
+            "title": ptitle or "",
+            "tech": tech or "",
+        })
+    if not live_hosts:
+        for url in _read_recon_lines(recon_dir, "live", "urls.txt"):
+            live_hosts.append({
+                "url": url, "status": "", "ip": "", "title": "", "tech": "",
+            })
 
-    # --- Open ports (open_ports.txt: "21/open"; nmap_greppable for service detail) ---
-    port_service = {}
-    for line in _read_lines("ports", "nmap_greppable.txt"):
+    status_breakdown: list[dict] = []
+    for label, fname in _HTTP_STATUS_FILES:
+        path = os.path.join(recon_dir, "live", fname)
+        if not os.path.isfile(path):
+            continue
+        lines = _read_recon_lines(recon_dir, "live", fname)
+        urls = []
+        for ln in lines:
+            urls.append(ln.split()[0] if ln.split() else ln)
+        sample, omitted = _truncate_asset_list(urls, sample_lim)
+        status_breakdown.append({
+            "label": label,
+            "artifact": f"live/{fname}",
+            "count": len(lines),
+            "sample": sample,
+            "omitted": omitted,
+        })
+
+    # Fallback status breakdown from parsed httpx when status_*.txt absent.
+    if not status_breakdown and live_hosts:
+        from collections import Counter
+        counts: Counter = Counter()
+        by_status: dict[str, list[str]] = {}
+        for h in live_hosts:
+            st = (h.get("status") or "").strip()
+            if not st:
+                continue
+            if st == "200":
+                bucket = "HTTP 200"
+            elif st.startswith("3"):
+                bucket = "HTTP 3xx"
+            else:
+                bucket = f"HTTP {st}"
+            counts[bucket] += 1
+            by_status.setdefault(bucket, []).append(h["url"])
+        for bucket, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            sample, omitted = _truncate_asset_list(by_status[bucket], sample_lim)
+            status_breakdown.append({
+                "label": bucket,
+                "artifact": "live/httpx_full.txt",
+                "count": n,
+                "sample": sample,
+                "omitted": omitted,
+            })
+
+    ips = _read_recon_lines(recon_dir, "live", "ips.txt")
+
+    port_service: dict[str, str] = {}
+    for line in _read_recon_lines(recon_dir, "ports", "nmap_greppable.txt"):
         if "Ports:" not in line:
             continue
         for chunk in line.split("Ports:", 1)[1].split(","):
-            # e.g. "21/open/tcp//ftp//Microsoft ftpd/"
             fields = chunk.strip().split("/")
             if len(fields) >= 5 and fields[0].isdigit():
                 svc = fields[4] or ""
                 ver = fields[6] if len(fields) > 6 else ""
                 port_service[fields[0]] = " ".join(x for x in (svc, ver) if x).strip()
-    port_rows = ""
-    for line in _read_lines("ports", "open_ports.txt"):
+    ports: list[dict] = []
+    for line in _read_recon_lines(recon_dir, "ports", "open_ports.txt"):
         port = line.split("/", 1)[0].strip()
         if not port:
             continue
-        port_rows += (f"<tr><td><code>{line}</code></td>"
-                      f"<td>{port_service.get(port, '—') or '—'}</td></tr>\n")
+        ports.append({"port": line, "service": port_service.get(port, "") or ""})
 
-    ips = _read_lines("live", "ips.txt")
-    ips_str = ", ".join(ips) if ips else "—"
+    has_data = bool(
+        any(s["count"] > 0 for s in sources)
+        or resolved
+        or live_hosts
+        or any(st["count"] > 0 for st in status_breakdown)
+        or ports
+        or ips
+    )
 
-    if not host_rows and not port_rows:
-        # v10.0.3 — render NOTHING (matches the coverage chapter's silent ''),
-        # rather than an empty H2 + "inventory unavailable" block that leaked
-        # raw filesystem paths into a client-facing report. A scan with no
-        # recon artefacts (authenticated-API-only, scope-locked, etc.) should
-        # simply omit the chapter, not advertise a missing directory.
+    return {
+        "recon_dir": recon_dir,
+        "sources": sources,
+        "resolved": resolved,
+        "resolved_sample": resolved_sample,
+        "resolved_omitted": resolved_omitted,
+        "live_hosts": live_hosts,
+        "status_breakdown": status_breakdown,
+        "ips": ips,
+        "ports": ports,
+        "has_data": has_data,
+    }
+
+
+def _format_omitted_note(omitted: int, artifact: str) -> str:
+    if omitted <= 0:
+        return ""
+    art = artifact or "session artefact"
+    return f"… and {omitted} more (see `{art}`)"
+
+
+def _render_recon_inventory_html(report_dir: str, target: str) -> str:
+    """Render an Asset Inventory chapter from session recon artefacts.
+
+    Surfaces subdomain discovery counts/samples (subfinder and peers),
+    DNS-resolved hosts, live httpx hosts + status-code breakdown (esp. HTTP
+    200), open ports, and count-only summaries for huge alterx dumps.
+    Degrades to '' when no artefacts are present (no leaked filesystem paths).
+    """
+    inv = _collect_asset_inventory(report_dir)
+    if not inv["has_data"]:
         return ""
 
-    host_body = host_rows or ('<tr><td colspan="5" style="color:#6c757d">'
-                              'No live hosts recorded.</td></tr>')
-    port_body = port_rows or ('<tr><td colspan="2" style="color:#6c757d">'
-                              'No open ports recorded.</td></tr>')
-    host_tbl = (
-        '<h3 style="margin-top:20px">Live Hosts</h3>'
-        '<table class="tbl">'
-        '<tr><th>Host / URL</th><th style="width:80px">Status</th>'
-        '<th style="width:120px">IP</th><th>Title</th><th>Tech</th></tr>'
-        f'{host_body}'
-        '</table>')
-    port_tbl = (
-        '<h3 style="margin-top:20px">Open Ports</h3>'
-        '<table class="tbl" style="width:auto">'
-        '<tr><th>Port</th><th>Service / Version</th></tr>'
-        f'{port_body}'
-        '</table>')
+    def _esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+    sections: list[str] = []
+
+    # --- Subdomain discovery ---
+    src_rows = ""
+    for s in inv["sources"]:
+        if s["count_only"]:
+            detail = (f'<span style="color:#6c757d">count only — '
+                      f'see <code>{_esc(s["artifact"])}</code></span>')
+        elif s["sample"]:
+            sample_html = "<br>".join(
+                f"<code>{_esc(x)}</code>" for x in s["sample"])
+            note = _format_omitted_note(s["omitted"], s["artifact"])
+            if note:
+                sample_html += f'<br><em style="color:#6c757d">{_esc(note)}</em>'
+            detail = sample_html
+        else:
+            detail = '<span style="color:#6c757d">—</span>'
+        src_rows += (
+            f"<tr><td>{_esc(s['tool'])}</td>"
+            f"<td style=\"text-align:right\">{s['count']}</td>"
+            f"<td>{detail}</td></tr>\n")
+    if src_rows:
+        sections.append(
+            '<h3 style="margin-top:20px">Subdomain Discovery</h3>'
+            '<p style="color:#495057;font-size:.9em">Per-tool counts from '
+            '<code>subdomains/</code>. Large alterx / merged permutation dumps '
+            "are summarised by count only.</p>"
+            '<table class="tbl">'
+            '<tr><th>Source</th><th style="width:90px">Count</th>'
+            "<th>Sample / Notes</th></tr>"
+            f"{src_rows}</table>")
+
+    # --- DNS resolved ---
+    if inv["resolved"]:
+        items = "".join(
+            f"<li><code>{_esc(h)}</code></li>\n"
+            for h in inv["resolved_sample"])
+        note = _format_omitted_note(
+            inv["resolved_omitted"], "subdomains/resolved.txt")
+        if note:
+            items += f'<li><em style="color:#6c757d">{_esc(note)}</em></li>\n'
+        sections.append(
+            '<h3 style="margin-top:20px">DNS Resolved Hosts</h3>'
+            f'<p style="color:#495057">Total resolved: <b>{len(inv["resolved"])}</b> '
+            '(from <code>subdomains/resolved.txt</code>).</p>'
+            f"<ul style=\"columns:2;-webkit-columns:2;column-gap:2em\">{items}</ul>")
+
+    # --- Status-code breakdown ---
+    if inv["status_breakdown"]:
+        st_rows = ""
+        for st in inv["status_breakdown"]:
+            if st["count"] == 0:
+                continue
+            sample = ", ".join(f"<code>{_esc(u)}</code>" for u in st["sample"][:8])
+            note = _format_omitted_note(st["omitted"], st["artifact"])
+            if note:
+                sample = (sample + (" — " if sample else "")
+                          + f'<em style="color:#6c757d">{_esc(note)}</em>')
+            if not sample:
+                sample = "—"
+            st_rows += (
+                f"<tr><td>{_esc(st['label'])}</td>"
+                f"<td style=\"text-align:right\">{st['count']}</td>"
+                f"<td>{sample}</td></tr>\n")
+        if st_rows:
+            sections.append(
+                '<h3 style="margin-top:20px">HTTP Status Breakdown</h3>'
+                '<p style="color:#495057;font-size:.9em">Live probe results from '
+                "<code>live/status_*.txt</code> / httpx.</p>"
+                '<table class="tbl">'
+                '<tr><th style="width:120px">Status</th>'
+                '<th style="width:90px">Count</th><th>Sample hosts</th></tr>'
+                f"{st_rows}</table>")
+
+    # --- Live hosts table (detail) ---
+    host_rows = ""
+    live_sample, live_omitted = _truncate_asset_list(
+        [h["url"] for h in inv["live_hosts"]], _asset_sample_limit())
+    live_by_url = {h["url"]: h for h in inv["live_hosts"]}
+    for url in live_sample:
+        h = live_by_url.get(url) or {"url": url, "status": "", "ip": "",
+                                       "title": "", "tech": ""}
+        host_rows += (
+            f"<tr><td><code style=\"word-break:break-all\">{_esc(h['url'])}</code></td>"
+            f"<td>{_esc(h['status'] or '—')}</td>"
+            f"<td>{_esc(h['ip'] or '—')}</td>"
+            f"<td>{_esc(h['title'] or '—')}</td>"
+            f"<td>{_esc(h['tech'] or '—')}</td></tr>\n")
+    if live_omitted:
+        host_rows += (
+            f'<tr><td colspan="5"><em style="color:#6c757d">'
+            f'{_esc(_format_omitted_note(live_omitted, "live/httpx_full.txt"))}'
+            f"</em></td></tr>\n")
+    if host_rows:
+        sections.append(
+            '<h3 style="margin-top:20px">Live HTTP Hosts</h3>'
+            f'<p style="color:#495057">Total live (httpx): '
+            f'<b>{len(inv["live_hosts"])}</b></p>'
+            '<table class="tbl">'
+            '<tr><th>Host / URL</th><th style="width:80px">Status</th>'
+            '<th style="width:120px">IP</th><th>Title</th><th>Tech</th></tr>'
+            f"{host_rows}</table>")
+
+    # --- Ports ---
+    port_rows = ""
+    for p in inv["ports"]:
+        port_rows += (
+            f"<tr><td><code>{_esc(p['port'])}</code></td>"
+            f"<td>{_esc(p['service'] or '—')}</td></tr>\n")
+    if port_rows:
+        sections.append(
+            '<h3 style="margin-top:20px">Open Ports</h3>'
+            '<table class="tbl" style="width:auto">'
+            '<tr><th>Port</th><th>Service / Version</th></tr>'
+            f"{port_rows}</table>")
+
+    ips_str = ", ".join(_esc(ip) for ip in inv["ips"]) if inv["ips"] else "—"
+    body = "\n".join(sections)
     return f'''
 <h2 id="recon-inventory" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">
-Recon / Host &amp; Port Inventory</h2>
-<p style="color:#495057">Hosts and ports discovered during reconnaissance, listed even where no
+Asset Inventory</h2>
+<p style="color:#495057">Hosts and assets discovered during reconnaissance (subdomain
+enumeration, DNS resolution, live HTTP probing, and port scans), listed even where no
 finding maps to them. Resolved IP(s): <code>{ips_str}</code>.</p>
-{host_tbl}
-{port_tbl}
+{body}
 '''
+
+
+def _render_recon_inventory_md(report_dir: str, target: str) -> str:
+    """Markdown twin of ``_render_recon_inventory_html`` — same artefact sources."""
+    inv = _collect_asset_inventory(report_dir)
+    if not inv["has_data"]:
+        return ""
+
+    lines: list[str] = [
+        "## Asset Inventory",
+        "",
+        "Hosts and assets discovered during reconnaissance (subdomain enumeration, "
+        "DNS resolution, live HTTP probing, and port scans), listed even where no "
+        "finding maps to them.",
+        "",
+    ]
+    if inv["ips"]:
+        lines += [f"**Resolved IP(s):** `{', '.join(inv['ips'])}`", ""]
+
+    if inv["sources"]:
+        lines += [
+            "### Subdomain Discovery",
+            "",
+            "| Source | Count | Sample / Notes |",
+            "|--------|------:|----------------|",
+        ]
+        for s in inv["sources"]:
+            if s["count_only"]:
+                detail = f"count only — see `{s['artifact']}`"
+            elif s["sample"]:
+                shown = ", ".join(f"`{x}`" for x in s["sample"][:10])
+                note = _format_omitted_note(s["omitted"], s["artifact"])
+                detail = shown + (f"; {note}" if note else "")
+            else:
+                detail = "—"
+            # Escape pipes in cells lightly
+            detail = detail.replace("|", "/")
+            lines.append(f"| {s['tool']} | {s['count']} | {detail} |")
+        lines.append("")
+
+    if inv["resolved"]:
+        lines += [
+            "### DNS Resolved Hosts",
+            "",
+            f"Total resolved: **{len(inv['resolved'])}** "
+            "(from `subdomains/resolved.txt`).",
+            "",
+        ]
+        for h in inv["resolved_sample"]:
+            lines.append(f"- `{h}`")
+        note = _format_omitted_note(
+            inv["resolved_omitted"], "subdomains/resolved.txt")
+        if note:
+            lines.append(f"- *{note}*")
+        lines.append("")
+
+    shown_status = [st for st in inv["status_breakdown"] if st["count"] > 0]
+    if shown_status:
+        lines += [
+            "### HTTP Status Breakdown",
+            "",
+            "| Status | Count | Sample hosts |",
+            "|--------|------:|--------------|",
+        ]
+        for st in shown_status:
+            sample = ", ".join(f"`{u}`" for u in st["sample"][:8]) or "—"
+            note = _format_omitted_note(st["omitted"], st["artifact"])
+            if note:
+                sample = f"{sample}; {note}" if sample != "—" else note
+            sample = sample.replace("|", "/")
+            lines.append(f"| {st['label']} | {st['count']} | {sample} |")
+        lines.append("")
+
+    if inv["live_hosts"]:
+        lines += [
+            "### Live HTTP Hosts",
+            "",
+            f"Total live (httpx): **{len(inv['live_hosts'])}**",
+            "",
+            "| Host / URL | Status | IP | Title |",
+            "|------------|--------|----|-------|",
+        ]
+        live_sample, live_omitted = _truncate_asset_list(
+            [h["url"] for h in inv["live_hosts"]], _asset_sample_limit())
+        live_by_url = {h["url"]: h for h in inv["live_hosts"]}
+        for url in live_sample:
+            h = live_by_url.get(url) or {
+                "url": url, "status": "", "ip": "", "title": ""}
+            title = (h.get("title") or "—").replace("|", "/")
+            lines.append(
+                f"| `{h['url']}` | {h.get('status') or '—'} | "
+                f"{h.get('ip') or '—'} | {title} |")
+        note = _format_omitted_note(live_omitted, "live/httpx_full.txt")
+        if note:
+            lines.append(f"| *{note}* | | | |")
+        lines.append("")
+
+    if inv["ports"]:
+        lines += [
+            "### Open Ports",
+            "",
+            "| Port | Service / Version |",
+            "|------|-------------------|",
+        ]
+        for p in inv["ports"]:
+            lines.append(f"| `{p['port']}` | {p['service'] or '—'} |")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def _load_coverage_rows(report_dir: str):
@@ -3111,7 +3483,7 @@ a{{color:#0d6efd}}code{{background:#f8f9fa;padding:1px 5px;border-radius:3px;fon
   <li><a href="#scope">Scope &amp; Methodology</a></li>
   <li><a href="#vtable">Vulnerability Summary</a></li>
   <li><a href="#details">Detailed Findings</a></li>
-  <li><a href="#recon-inventory">Recon / Host &amp; Port Inventory</a></li>
+  <li><a href="#recon-inventory">Asset Inventory</a></li>
   <li><a href="#scan-diagnostics">Scan Diagnostics</a></li>
   <li><a href="#appendix-a">Appendix A: Tools</a></li>
   <li><a href="#appendix-b">Appendix B: Methodology</a></li>
@@ -3324,6 +3696,9 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
             f"**Remediation:** {_finding_remediation(f, tmpl)}", "",
             "**References:**", refs, "", "---", "",
         ]
+    _inv_md = _render_recon_inventory_md(report_dir, target)
+    if _inv_md:
+        lines += ["", "---", "", _inv_md]
     lines.append(f"*Generated by [Vikramaditya](https://github.com/venkatas/vikramaditya) — Autonomous VAPT Platform | {generated_date_str}*")
     return "\n".join(lines)
 
@@ -3466,6 +3841,19 @@ def main() -> None:
     parser.add_argument("--consultant", default="")
     parser.add_argument("--title",      default="Vulnerability Assessment & Penetration Test Report")
     parser.add_argument("--target",     default="", help="Target domain name (overrides auto-detect from dir name)")
+    # Opt-in SARIF / MITRE SAF export (never default)
+    parser.add_argument("--export-sarif", nargs="?", const="", default=None,
+                        help="Also write SARIF 2.1.0 (optional path; default under report/export)")
+    parser.add_argument("--export-hdf", action="store_true",
+                        help="Also convert SARIF to HDF via MITRE SAF CLI (requires saf on PATH)")
+    parser.add_argument("--export-asff", action="store_true",
+                        help="Also convert HDF to ASFF via MITRE SAF CLI (implies --export-hdf)")
+    parser.add_argument("--asff-account", default="", help="AWS account id for ASFF export")
+    parser.add_argument("--asff-region", default="", help="AWS region for ASFF / Security Hub")
+    parser.add_argument("--asff-target", default="", help="ASFF target name (tracks findings over time)")
+    parser.add_argument("--asff-upload", action="store_true",
+                        help="Upload ASFF to Security Hub (requires AWS creds; default local files)")
+    parser.add_argument("--saf-bin", default="", help="Path to saf binary (default: PATH lookup)")
     args = parser.parse_args()
 
     if args.manual:
@@ -3498,7 +3886,7 @@ def main() -> None:
         print(f"[!] Not a directory: {args.findings_dir}", file=sys.stderr)
         sys.exit(1)
 
-    count, _, report_dir, html, md = process_findings_dir(
+    count, findings, report_dir, html, md = process_findings_dir(
         args.findings_dir, args.client, args.consultant, args.title,
         target_override=args.target)
 
@@ -3513,6 +3901,35 @@ def main() -> None:
     print(f"[+] {count} finding(s) — {os.path.basename(report_dir)}")
     print(f"[+] HTML : {html_path}")
     print(f"[+] MD   : {md_path}")
+
+    want_asff = bool(getattr(args, "export_asff", False))
+    want_hdf = bool(getattr(args, "export_hdf", False)) or want_asff
+    want_sarif = args.export_sarif is not None or want_hdf or want_asff
+    if want_sarif:
+        try:
+            import saf_export
+            export_dir = os.path.join(report_dir, "export")
+            sarif_path = args.export_sarif if isinstance(args.export_sarif, str) and args.export_sarif else None
+            produced = saf_export.export_findings(
+                findings,
+                export_dir,
+                target=args.target or "",
+                want_sarif=True,
+                want_hdf=want_hdf,
+                want_asff=want_asff,
+                sarif_path=sarif_path,
+                asff_account=args.asff_account,
+                asff_region=args.asff_region,
+                asff_target=args.asff_target,
+                asff_upload=args.asff_upload,
+                saf_bin=args.saf_bin or None,
+            )
+            for label, path in produced.items():
+                print(f"[+] {label.upper():5s}: {path}")
+        except FileNotFoundError as exc:
+            print(f"[!] SAF export skipped: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[!] SAF/SARIF export failed: {exc}", file=sys.stderr)
 
     if shutil.which("wkhtmltopdf"):
         pdf = html_path.replace(".html", ".pdf")

@@ -90,3 +90,14 @@ Apache License 2.0 — Copyright (c) Endava
 
 Docs: https://endava.github.io/cats/
 
+MITRE SAF CLI — https://github.com/mitre/saf
+Apache License 2.0 — Copyright (c) The MITRE Corporation
+-----------------------------------------------------------------------
+
+  saf_export.py                <- optional subprocess invoke of `saf convert
+                                  sarif2hdf` / `hdf2asff` when installed.
+                                  Vikramaditya does not vendor SAF sources;
+                                  SARIF writing is in-repo.
+
+Docs: https://saf-cli.mitre.org/
+
