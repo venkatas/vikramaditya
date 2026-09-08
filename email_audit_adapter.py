@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Iterable
 
 # Public re-exports — import here so downstream modules don't reach into
@@ -147,7 +148,17 @@ def to_finding_entries(
             notes = detail
             if recommendation:
                 notes = f"{detail}\n\nFix: {recommendation}" if detail else f"Fix: {recommendation}"
-            findings.append({
+            evidence = issue.get("evidence")
+            selector = ""
+            if isinstance(evidence, str):
+                match = re.match(r"^([A-Za-z0-9._-]+)\._domainkey\.", evidence.strip(), re.I)
+                if match:
+                    selector = match.group(1)
+            if not selector:
+                match = re.search(r"\bSelector\s+([A-Za-z0-9._-]+)", issue.get("detail") or "")
+                if match:
+                    selector = match.group(1)
+            entry = {
                 "target": target,
                 "action": "recon",
                 "vuln_class": _to_vuln_class(area),
@@ -158,7 +169,12 @@ def to_finding_entries(
                 "tags": ["email_auth", area, "subspace_sentinel"],
                 "title": title,
                 "area": area,
-            })
+            }
+            if selector:
+                entry["selector"] = selector
+            if evidence not in (None, ""):
+                entry["evidence"] = evidence
+            findings.append(entry)
 
     # Cross-findings (e.g. "SPF+DMARC+DKIM all permissive → spoofable").
     #

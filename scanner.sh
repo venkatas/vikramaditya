@@ -109,7 +109,9 @@ CURL_TIMEOUT=60
 # These are scanned alongside official ProjectDiscovery templates so engagement-
 # specific overrides (e.g. CVE-2025-68645 Zimbra with custom tags) get hit.
 CUSTOM_NUCLEI_TEMPLATES="${CUSTOM_NUCLEI_TEMPLATES:-$SCRIPT_DIR/nuclei-templates}"
-mkdir -p "$FINDINGS_DIR"/{upload,xss,sqli,takeover,misconfig,exposure,ssrf,cves,redirects,idor,auth_bypass,lfi,ssti,graphql,cors,jwt,smuggling,cloud,manual_review,metasploit,cves_custom,.tmp}
+# idor/jwt/ssrf/graphql are created only if that check actually runs.
+# An empty dir is "scanned, zero findings"; do not invent those dirs up front.
+mkdir -p "$FINDINGS_DIR"/{upload,xss,sqli,takeover,misconfig,exposure,cves,redirects,auth_bypass,lfi,ssti,cors,smuggling,cloud,manual_review,metasploit,cves_custom,.tmp}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 file_lines()  { [ -f "${1:-}" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
@@ -555,6 +557,15 @@ if ! skip_has upload; then
         done
     done < <(head -"$UPLOAD_MAX_HOSTS" "$ORDERED_SCAN")
     rm -f "$SOFT404_FILE"
+    # The 600s Check 0 box always writes status.json. An empty upload dir
+    # with this file means scanned-zero (or time-boxed), not not-scanned.
+    mkdir -p "$FINDINGS_DIR/upload"
+    _upload_hits=$(count_vuln "$FINDINGS_DIR/upload/active_upload_probe.txt")
+    _upload_boxed="false"
+    [ "${_C0_TIMEOUT:-0}" = 1 ] && _upload_boxed="true"
+    cat > "$FINDINGS_DIR/upload/status.json" <<EOF
+{"check":"upload","ran":true,"time_boxed":${_upload_boxed},"budget_seconds":${CHECK0_BUDGET:-600},"candidates":${_upload_hits},"note":"empty candidate files mean scanned-zero, not not-scanned"}
+EOF
 fi
 
 # ── Check 1: Custom nuclei templates (vikramaditya-tagged) ──────────────
