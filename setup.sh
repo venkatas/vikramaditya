@@ -229,6 +229,7 @@ GO_TOOLS=(
     "github.com/BishopFox/jsluice/cmd/jsluice@latest"
     # v10.7.0 — calibrated 401/403 bypass engine (payloads copied below)
     "github.com/devploit/nomore403@latest"
+    "github.com/praetorian-inc/hadrian/cmd/hadrian@latest"
 )
 
 GO_TOOL_NAMES=(
@@ -256,6 +257,7 @@ GO_TOOL_NAMES=(
     "fingerprintx"
     "jsluice"
     "nomore403"
+    "hadrian"
 )
 
 for i in "${!GO_TOOLS[@]}"; do
@@ -671,6 +673,25 @@ for local_tool in "LinkFinder/linkfinder.py" "SecretFinder/SecretFinder.py" "XSS
         ((++MISSING))
     fi
 done
+
+# Optional: Endava CATS for OpenAPI negative fuzz (cats_audit.py).
+# Not required for core VAPT; install separately when needed
+# (brew tap endava/tap && brew install cats, or releases binary/JAR).
+# See docs/cats.md
+if command -v cats >/dev/null 2>&1; then
+    log_ok "Endava CATS on PATH: $(command -v cats)"
+else
+    log_warn "Endava CATS (cats) not installed — optional for --cats / cats_audit.py"
+fi
+
+# Optional: MITRE SAF CLI for SARIF→HDF→ASFF export (saf_export.py).
+# Not required for core VAPT; install separately when you need HDF/ASFF
+# (NPM package @mitre/saf, or Homebrew mitre/saf/saf-cli). See docs/saf-export.md
+if command -v saf >/dev/null 2>&1; then
+    log_ok "MITRE SAF CLI on PATH: $(command -v saf)"
+else
+    log_warn "MITRE SAF CLI (saf) not installed — optional for --saf-hdf/--saf-asff"
+fi
 
 READINESS_FAILED=0
 if "$VENV_DIR/bin/python" "$SCRIPT_DIR/environment_readiness.py"; then

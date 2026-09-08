@@ -172,7 +172,7 @@ def test_recon_inventory_empty_leaks_no_filesystem_path(tmp_path):
     out = reporter._render_recon_inventory_html(str(empty), "t.example")
     # The old buggy block embedded the raw live/ and ports/ paths and an H2.
     assert "inventory unavailable" not in out
-    assert "Recon / Host &amp; Port Inventory" not in out
+    assert "Asset Inventory" not in out
     assert str(empty) not in out
 
 
@@ -185,5 +185,5 @@ def test_recon_inventory_still_renders_when_present(tmp_path):
         "https://t.example [200] [10] [Home] [1.2.3.4] [nginx]\n")
     (recon / "ports" / "open_ports.txt").write_text("443/open\n")
     out = reporter._render_recon_inventory_html(str(recon), "t.example")
-    assert "Recon / Host &amp; Port Inventory" in out
+    assert "Asset Inventory" in out
     assert "443/open" in out

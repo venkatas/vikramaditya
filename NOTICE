@@ -98,3 +98,27 @@ MIT License — Copyright (c) xnl-h4ck3r
                               xnLinkFinder (JS/SPA endpoint mining) when installed.
                               Not vendored; install via pip (setup.sh).
 
+-----------------------------------------------------------------------
+Endava CATS — https://github.com/Endava/cats
+Apache License 2.0 — Copyright (c) Endava
+-----------------------------------------------------------------------
+
+  cats_audit.py            <- optional subprocess invoke of `cats` (native
+                              binary or java -jar via CATS_JAR). Vikramaditya
+                              does not vendor CATS sources; HTML/JSON reports
+                              are written under findings/<host>/cats/.
+
+Docs: https://endava.github.io/cats/
+
+-----------------------------------------------------------------------
+MITRE SAF CLI — https://github.com/mitre/saf
+Apache License 2.0 — Copyright (c) The MITRE Corporation
+-----------------------------------------------------------------------
+
+  saf_export.py                <- optional subprocess invoke of `saf convert
+                                  sarif2hdf` / `hdf2asff` when installed.
+                                  Vikramaditya does not vendor SAF sources;
+                                  SARIF writing is in-repo.
+
+Docs: https://saf-cli.mitre.org/
+
