@@ -1115,7 +1115,8 @@ def make_output_dir(target: str) -> str:
         # v10.6.0 — also redact --llm-auth (carries an Authorization: Bearer token,
         # forwarded as --auth-header) and --header (commonly Authorization/Cookie).
         _secret_flags = {"--burp-key", "--api-key", "--creds", "--creds-b",
-                         "--restler-token", "--ad-pass", "--llm-auth", "--header"}
+                         "--restler-token", "--cats-token", "--ad-pass", "--llm-auth",
+                         "--header", "--hadrian-auth"}
         # Header names whose VALUE is a credential — for --header (a "Key: Value"
         # string) we keep the header NAME visible but mask its value when sensitive.
         _sensitive_header_names = {"authorization", "cookie", "set-cookie",
@@ -1267,6 +1268,30 @@ Options:
   --restler SPEC          v9.12.0 — Microsoft RESTler stateful REST API
                           fuzzer. --restler-base-url, --restler-token,
                           --restler-mode, --restler-time-h.
+  --cats SPEC             OPT-IN Endava CATS OpenAPI negative fuzz /
+                          contract+security (not default scan). Requires
+                          cats on PATH or CATS_BIN/CATS_JAR. See docs/cats.md.
+                          --cats-server, --cats-token, --cats-header,
+                          --cats-blackbox, --cats-paths, --cats-headers-file.
+  --cats-server URL       Target API base URL for --cats
+  --cats-token VALUE      Authorization header value (e.g. "Bearer …")
+  --cats-header H         Extra -H header (Name=Value or Name: Value; repeatable)
+  --cats-blackbox         CATS --blackbox -k (5xx-as-error)
+  --cats-paths LIST       Comma-separated OpenAPI paths to include
+  --cats-headers-file F   CATS per-path YAML headers file
+
+  --hadrian SPEC          On-demand Praetorian Hadrian API authz
+                          (BOLA/BFLA role matrix). Requires
+                          --hadrian-roles + --hadrian-auth.
+                          Complements schemathesis (conformance).
+  --hadrian-roles PATH    Hadrian roles.yaml (privilege levels)
+  --hadrian-auth PATH     Hadrian auth.yaml (per-role tokens)
+  --hadrian-protocol MODE rest|graphql|grpc (default rest)
+  --hadrian-target URL    GraphQL URL or gRPC host:port
+  --hadrian-proto PATH    gRPC .proto (with --hadrian-protocol grpc)
+  --hadrian-category CAT  Hadrian --category (default all)
+  --hadrian-templates DIR Optional custom Hadrian YAML templates
+  --hadrian-dry-run       Preview only — send no requests
   --graphql URL           v9.13.0 — graphw00f + Clairvoyance + InQL
                           GraphQL DAST bundle. --graphql-clairvoyance,
                           --graphql-wordlist, --header.
@@ -1290,6 +1315,15 @@ Options:
   --bmb-recon DIR         Recon dir for the bake-off
   --bmb-models CSV        Ollama model tags (default: phi4:14b,qwen3:14b,
                           deepseek-r1:14b,xploiter/the-xploiter:latest)
+  --export-sarif PATH     v10.7.0 — OPT-IN: convert findings JSON to SARIF 2.1.0
+                          then exit. Use --sarif-output/-o for the .sarif path.
+                          Optional: --saf-hdf, --saf-asff (needs MITRE saf CLI).
+  --sarif-output PATH     SARIF output path for --export-sarif (alias: -o)
+  --saf-hdf PATH          Also write HDF via saf convert sarif2hdf
+  --saf-asff DIR          Also write ASFF folder via saf convert hdf2asff
+  --aws-account ID        AWS account id for --saf-asff
+  --aws-region REGION     AWS region for --saf-asff
+  --asff-target NAME      ASFF target name for --saf-asff
 """
 
 
@@ -1373,12 +1407,30 @@ def parse_cli_args() -> dict:
         "waf_pad_bytes": 0,
         "waf_fireprox_create": False,
         "aws_profile": "default",
+        # Hadrian API authz (on-demand)
+        "hadrian": "",
+        "hadrian_roles": "",
+        "hadrian_auth": "",
+        "hadrian_protocol": "rest",
+        "hadrian_target": "",
+        "hadrian_proto": "",
+        "hadrian_category": "all",
+        "hadrian_templates": "",
+        "hadrian_dry_run": False,
         # v9.12.0 — RESTler
         "restler": "",
         "restler_base_url": "",
         "restler_token": "",
         "restler_mode": "all",
         "restler_time_h": 2.0,
+        # OPT-IN — Endava CATS (not default scan)
+        "cats": "",
+        "cats_server": "",
+        "cats_token": "",
+        "cats_headers": [],
+        "cats_blackbox": False,
+        "cats_paths": "",
+        "cats_headers_file": "",
         # v9.13.0 — GraphQL
         "graphql": "",
         "graphql_clairvoyance": False,
@@ -1397,6 +1449,14 @@ def parse_cli_args() -> dict:
         "bmb_findings": "",
         "bmb_recon": "",
         "bmb_models": "",
+        # v10.7.0 — opt-in SARIF / MITRE SAF export (never on by default)
+        "export_sarif": "",
+        "sarif_output": "",
+        "saf_hdf": "",
+        "saf_asff": "",
+        "aws_account": "",
+        "aws_region": "",
+        "asff_target": "",
     }
     argv = sys.argv[1:]
     i = 0
@@ -1528,6 +1588,24 @@ def parse_cli_args() -> dict:
             args["waf_fireprox_create"] = True; i += 1
         elif argv[i] == "--aws-profile" and i + 1 < len(argv):
             args["aws_profile"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian" and i + 1 < len(argv):
+            args["hadrian"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-roles" and i + 1 < len(argv):
+            args["hadrian_roles"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-auth" and i + 1 < len(argv):
+            args["hadrian_auth"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-protocol" and i + 1 < len(argv):
+            args["hadrian_protocol"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-target" and i + 1 < len(argv):
+            args["hadrian_target"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-proto" and i + 1 < len(argv):
+            args["hadrian_proto"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-category" and i + 1 < len(argv):
+            args["hadrian_category"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-templates" and i + 1 < len(argv):
+            args["hadrian_templates"] = argv[i + 1]; i += 2
+        elif argv[i] == "--hadrian-dry-run":
+            args["hadrian_dry_run"] = True; i += 1
         elif argv[i] == "--restler" and i + 1 < len(argv):
             args["restler"] = argv[i + 1]; i += 2
         elif argv[i] == "--restler-base-url" and i + 1 < len(argv):
@@ -1542,6 +1620,20 @@ def parse_cli_args() -> dict:
             except ValueError:
                 pass
             i += 2
+        elif argv[i] == "--cats" and i + 1 < len(argv):
+            args["cats"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cats-server" and i + 1 < len(argv):
+            args["cats_server"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cats-token" and i + 1 < len(argv):
+            args["cats_token"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cats-header" and i + 1 < len(argv):
+            args["cats_headers"].append(argv[i + 1]); i += 2
+        elif argv[i] == "--cats-blackbox":
+            args["cats_blackbox"] = True; i += 1
+        elif argv[i] == "--cats-paths" and i + 1 < len(argv):
+            args["cats_paths"] = argv[i + 1]; i += 2
+        elif argv[i] == "--cats-headers-file" and i + 1 < len(argv):
+            args["cats_headers_file"] = argv[i + 1]; i += 2
         elif argv[i] == "--graphql" and i + 1 < len(argv):
             args["graphql"] = argv[i + 1]; i += 2
         elif argv[i] == "--graphql-clairvoyance":
@@ -1570,6 +1662,20 @@ def parse_cli_args() -> dict:
             args["bmb_recon"] = argv[i + 1]; i += 2
         elif argv[i] == "--bmb-models" and i + 1 < len(argv):
             args["bmb_models"] = argv[i + 1]; i += 2
+        elif argv[i] == "--export-sarif" and i + 1 < len(argv):
+            args["export_sarif"] = argv[i + 1]; i += 2
+        elif argv[i] in ("--sarif-output", "-o") and i + 1 < len(argv):
+            args["sarif_output"] = argv[i + 1]; i += 2
+        elif argv[i] == "--saf-hdf" and i + 1 < len(argv):
+            args["saf_hdf"] = argv[i + 1]; i += 2
+        elif argv[i] == "--saf-asff" and i + 1 < len(argv):
+            args["saf_asff"] = argv[i + 1]; i += 2
+        elif argv[i] == "--aws-account" and i + 1 < len(argv):
+            args["aws_account"] = argv[i + 1]; i += 2
+        elif argv[i] == "--aws-region" and i + 1 < len(argv):
+            args["aws_region"] = argv[i + 1]; i += 2
+        elif argv[i] == "--asff-target" and i + 1 < len(argv):
+            args["asff_target"] = argv[i + 1]; i += 2
         elif not argv[i].startswith("--"):
             args["target"] = argv[i]; i += 1
         else:
@@ -1853,6 +1959,42 @@ def main():
     # ── v9.4.0 standalone tools — run and exit before anything else ─────
     # These are operator-driven point tools, not part of the autonomous
     # pipeline. They produce findings/<host>/ artifacts and then return.
+    if cli["export_sarif"]:
+        # Opt-in only: PATH is a findings session dir (preferred) or a JSON list of findings.
+        log("info", f"--export-sarif: {cli['export_sarif']}")
+        try:
+            import saf_export
+            src = cli["export_sarif"]
+            if os.path.isdir(src):
+                findings, target = saf_export._load_findings_from_dir(src)
+                out_dir = os.path.join(src, "export")
+            else:
+                with open(src, encoding="utf-8") as fh:
+                    findings = json.load(fh)
+                if not isinstance(findings, list):
+                    raise ValueError("--export-sarif JSON must be a list of finding objects")
+                target = ""
+                out_dir = os.path.dirname(os.path.abspath(cli["sarif_output"] or src)) or "."
+            produced = saf_export.export_findings(
+                findings,
+                out_dir,
+                target=target,
+                want_sarif=True,
+                want_hdf=bool(cli["saf_hdf"]),
+                want_asff=bool(cli["saf_asff"]),
+                sarif_path=cli["sarif_output"] or None,
+                hdf_path=cli["saf_hdf"] or None,
+                asff_dir=cli["saf_asff"] or None,
+                asff_account=cli["aws_account"],
+                asff_region=cli["aws_region"],
+                asff_target=cli["asff_target"],
+            )
+            for kind, p in produced.items():
+                log("ok", f"{kind}: {p}")
+        except Exception as e:
+            log("err", f"SARIF export failed: {e}")
+            return
+        print(f"\n  {D}Done.{N}\n"); return
     if cli["cicd_audit"]:
         log("info", f"--cicd-audit: scanning {cli['cicd_audit']}")
         run_cicd_audit(cli["cicd_audit"])
@@ -1986,6 +2128,54 @@ def main():
             subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=2400)
         except Exception as e:
             log("warn", f"graphql_audit failed: {e}")
+        print(f"\n  {D}Done.{N}\n"); return
+    if cli["cats"]:
+        log("info", f"--cats: contract={cli['cats']}")
+        if not cli.get("cats_server"):
+            log("error", "--cats requires --cats-server URL")
+            print(f"\n  {D}Done.{N}\n"); return
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "cats_audit.py"),
+                   "--contract", cli["cats"], "--server", cli["cats_server"]]
+            if cli.get("cats_token"):
+                cmd += ["--token", cli["cats_token"]]
+            for h in cli.get("cats_headers") or []:
+                cmd += ["--header", h]
+            if cli.get("cats_blackbox"):
+                cmd.append("--blackbox")
+            if cli.get("cats_paths"):
+                cmd += ["--paths", cli["cats_paths"]]
+            if cli.get("cats_headers_file"):
+                cmd += ["--headers-file", cli["cats_headers_file"]]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=7800)
+        except Exception as e:
+            log("warn", f"cats failed: {e}")
+
+    if cli["hadrian"]:
+        log("info", f"--hadrian: {cli['hadrian']} protocol={cli['hadrian_protocol']}")
+        if not cli["hadrian_roles"] or not cli["hadrian_auth"]:
+            log("warn", "--hadrian requires --hadrian-roles and --hadrian-auth (see templates/hadrian/)")
+            print(f"\n  {D}Done.{N}\n"); return
+        try:
+            cmd = [sys.executable, "-u", os.path.join(SCRIPT_DIR, "hadrian_audit.py"),
+                   "--protocol", cli["hadrian_protocol"] or "rest",
+                   "--roles", cli["hadrian_roles"],
+                   "--auth", cli["hadrian_auth"],
+                   "--category", cli["hadrian_category"] or "all"]
+            proto = (cli["hadrian_protocol"] or "rest").lower()
+            if proto == "rest":
+                cmd += ["--api", cli["hadrian"]]
+            else:
+                cmd += ["--target", cli.get("hadrian_target") or cli["hadrian"]]
+                if proto == "grpc" and cli["hadrian_proto"]:
+                    cmd += ["--proto", cli["hadrian_proto"]]
+            if cli["hadrian_templates"]:
+                cmd += ["--templates-dir", cli["hadrian_templates"]]
+            if cli["hadrian_dry_run"]:
+                cmd += ["--dry-run"]
+            subprocess.run(cmd, cwd=SCRIPT_DIR, check=False, timeout=3900)
+        except Exception as e:
+            log("warn", f"hadrian failed: {e}")
         print(f"\n  {D}Done.{N}\n"); return
     if cli["restler"]:
         log("info", f"--restler: spec={cli['restler']}")

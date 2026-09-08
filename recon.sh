@@ -207,7 +207,7 @@ SKIP_SCREENSHOTS="${SKIP_SCREENSHOTS:-}"
 CURL_TIMEOUT=10        # per request
 HTTP_PROBE_TIMEOUT=5   # reduced: 5s per-host timeout (was 10) — avoids macOS TCP hang
 
-mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params,priority,exposure,screenshots,api_specs,cors,secrets,vhosts}
+mkdir -p "$RECON_DIR"/{subdomains,live,ports,urls,js,dirs,params,priority,exposure,screenshots,api_specs,cors,secrets,vhosts,certs,uncover}
 
 # ── Safety net: merge partial subdomain results on early exit ────────────────
 # If the watchdog or timeout kills this script mid-Phase-1, the merge step at
@@ -220,7 +220,7 @@ _emergency_merge_subs() {
         # blind *.txt glob re-ingested derived artefacts on a partial-exit re-run.
         local _emf
         local -a _em_files=()
-        for _emf in subfinder assetfinder amass crtsh wayback_subs otx hackertarget; do
+        for _emf in subfinder assetfinder amass crtsh wayback_subs otx hackertarget uncover; do
             [ -f "$RECON_DIR/subdomains/$_emf.txt" ] && _em_files+=("$RECON_DIR/subdomains/$_emf.txt")
         done
         [ "${#_em_files[@]}" -eq 0 ] && return 0
@@ -777,13 +777,65 @@ except: pass
     fi
 fi
 
+
+# ── uncover (OPT-IN) — FOFA/Shodan/Censys/shodan-idb host discovery ───────────
+# Tier-A recon enrichment. Default OFF: most engines need per-engagement API
+# keys (~/.config/uncover/provider-config.yaml or SHODAN_API_KEY / FOFA_* /
+# CENSYS_*). shodan-idb needs no key and is used when live IPs already exist.
+# Enable with UNCOVER=1. Alterx-style discipline: UNCOVER_LIMIT (default 100),
+# summary JSON (count+sample) only — never dump full uncover noise into reports.
+if [ "${UNCOVER:-0}" = "1" ] && tool_ok uncover && [ "$QUICK_MODE" != "--quick" ]; then
+    log_step "uncover (OPT-IN internet-db / search-engine host discovery)..."
+    mkdir -p "$RECON_DIR/uncover"
+    UNCOVER_LIMIT="${UNCOVER_LIMIT:-100}"
+    UNCOVER_ENGINES="${UNCOVER_ENGINES:-shodan,shodan-idb}"
+    : > "$RECON_DIR/uncover/raw.txt"
+    # Domain-oriented query (engines that support hostname/ssl filters)
+    timeout -k 15 "${UNCOVER_TIMEOUT:-120}" uncover \
+        -q "ssl.cert.subject.cn:$TARGET" \
+        -e "$UNCOVER_ENGINES" \
+        -silent -l "$UNCOVER_LIMIT" \
+        >> "$RECON_DIR/uncover/raw.txt" 2>/dev/null || true
+    timeout -k 15 "${UNCOVER_TIMEOUT:-120}" uncover \
+        -q "hostname:$TARGET" \
+        -e "$UNCOVER_ENGINES" \
+        -silent -l "$UNCOVER_LIMIT" \
+        >> "$RECON_DIR/uncover/raw.txt" 2>/dev/null || true
+    # Keyless IP enrichment when we already have live IPs
+    if [ -s "$RECON_DIR/live/ips.txt" ]; then
+        timeout -k 15 "${UNCOVER_TIMEOUT:-120}" uncover \
+            -e shodan-idb -silent -l "$UNCOVER_LIMIT" \
+            < "$RECON_DIR/live/ips.txt" \
+            >> "$RECON_DIR/uncover/raw.txt" 2>/dev/null || true
+    fi
+    python3 "$SCRIPT_DIR/recon_enrichment.py" parse-uncover \
+        --path "$RECON_DIR/uncover/raw.txt" \
+        --out-hosts "$RECON_DIR/uncover/hosts.txt" \
+        --summary-out "$RECON_DIR/uncover/summary.json" \
+        --sample 20 \
+        --scope "$TARGET" \
+        >/dev/null 2>&1 || true
+    # Hostname-shaped rows that look like in-scope subdomains → seed file
+    if [ -s "$RECON_DIR/uncover/hosts.txt" ]; then
+        grep -E '^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$' "$RECON_DIR/uncover/hosts.txt" \
+            | tr '[:upper:]' '[:lower:]' | sort -u \
+            > "$RECON_DIR/subdomains/uncover.txt" 2>/dev/null || true
+        log_done "uncover: $(file_lines "$RECON_DIR/uncover/hosts.txt") hosts (see uncover/summary.json)"
+    else
+        : > "$RECON_DIR/subdomains/uncover.txt"
+        log_done "uncover: 0 hosts (check API keys / UNCOVER_ENGINES)"
+    fi
+elif [ "${UNCOVER:-0}" = "1" ]; then
+    log_warn "UNCOVER=1 but uncover not installed — go install github.com/projectdiscovery/uncover/cmd/uncover@latest"
+fi
+
 # ── Merge & deduplicate ───────────────────────────────────────────────────────
 # v10.6.0 — merge ONLY the passive-source files. A blind `*.txt` glob re-ingested
 # derived artefacts on a re-run (all.txt, all_with_permutations.txt, alterx.txt,
 # resolved.txt, shuffledns_resolved.txt …), which on a large estate re-fed the
 # 24M permutation set back into the passive merge. Enumerate the real sources.
 _PASSIVE_SUB_FILES=()
-for _f in subfinder assetfinder amass crtsh wayback_subs otx hackertarget; do
+for _f in subfinder assetfinder amass crtsh wayback_subs otx hackertarget uncover; do
     [ -f "$RECON_DIR/subdomains/$_f.txt" ] && _PASSIVE_SUB_FILES+=("$RECON_DIR/subdomains/$_f.txt")
 done
 # v10.6.0 — guard the empty-array case (mirrors the emergency-merge path above).
@@ -1505,22 +1557,61 @@ if tool_ok tlsx && [ -s "$RECON_DIR/live/ips.txt" ]; then
     SAN_COUNT=$(file_lines "$RECON_DIR/certs/sans.txt")
     log_done "tlsx: $SAN_COUNT cert SAN/CN values"
 
-    # Cross-check against subdomains/all.txt: anything new is a "scope candidate"
-    if [ "$SAN_COUNT" -gt 0 ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
-        comm -23 \
-            <(grep -E '\.[a-z]+$' "$RECON_DIR/certs/sans.txt" | sort -u) \
-            <(sort -u "$RECON_DIR/subdomains/all.txt") \
-            > "$RECON_DIR/certs/scope_candidates.txt" 2>/dev/null || true
-        NEW=$(file_lines "$RECON_DIR/certs/scope_candidates.txt")
-        if [ "$NEW" -gt 0 ]; then
-            log_warn "tlsx surfaced $NEW domain(s) not in subdomain enum — see certs/scope_candidates.txt"
-        fi
+    # Diff SANs vs known subs → in-scope new hosts + out-of-scope candidates.
+    # Summary JSON keeps count+sample for reports (alterx-style; no SAN dump).
+    python3 "$SCRIPT_DIR/recon_enrichment.py" tlsx-feedback \
+        --sans "$RECON_DIR/certs/sans.txt" \
+        --known "$RECON_DIR/subdomains/all.txt" \
+        --target "$TARGET" \
+        --out-in-scope "$RECON_DIR/certs/in_scope_new.txt" \
+        --out-candidates "$RECON_DIR/certs/scope_candidates.txt" \
+        --summary-out "$RECON_DIR/certs/summary.json" \
+        --sample 20 \
+        >/dev/null 2>&1 || true
+    NEW=$(file_lines "$RECON_DIR/certs/scope_candidates.txt")
+    IN_NEW=$(file_lines "$RECON_DIR/certs/in_scope_new.txt")
+    if [ "${NEW:-0}" -gt 0 ]; then
+        log_warn "tlsx surfaced $NEW domain(s) not in subdomain enum ($IN_NEW in-scope) — see certs/scope_candidates.txt + certs/summary.json"
+    fi
+    # Feed in-scope SAN hostnames back into subdomain corpus for later phases /
+    # resume runs (bounded; does not re-run Phase 3 httpx in this pass).
+    if [ "${TLSX_FEEDBACK:-1}" = "1" ] && [ "${IN_NEW:-0}" -gt 0 ]; then
+        cat "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/certs/in_scope_new.txt" 2>/dev/null \
+            | tr '[:upper:]' '[:lower:]' | sed 's/^\*\.//' | sort -u \
+            > "$RECON_DIR/subdomains/all.txt.tlsx" 2>/dev/null \
+            && mv "$RECON_DIR/subdomains/all.txt.tlsx" "$RECON_DIR/subdomains/all.txt"
+        cp "$RECON_DIR/certs/in_scope_new.txt" "$RECON_DIR/subdomains/tlsx_sans.txt" 2>/dev/null || true
+        log_ok "tlsx feedback: $IN_NEW in-scope SAN host(s) merged into subdomains/all.txt"
     fi
 else
     [ -s "$RECON_DIR/live/ips.txt" ] || log_warn "Phase 3.5 skipped — no live hosts"
     tool_ok tlsx || log_warn "Phase 3.5 skipped — tlsx not installed (go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest)"
 fi
 fi  # end Phase 3.5
+
+# ── uncover shodan-idb (OPT-IN, keyless) on live IPs ──────────────────────────
+# Phase-1 uncover runs before live/ips.txt exists; this pass enriches after probe.
+if [ "${UNCOVER:-0}" = "1" ] && tool_ok uncover && [ -s "$RECON_DIR/live/ips.txt" ] \
+   && [ "$QUICK_MODE" != "--quick" ]; then
+    log_step "uncover shodan-idb on live IPs (keyless)..."
+    mkdir -p "$RECON_DIR/uncover"
+    UNCOVER_LIMIT="${UNCOVER_LIMIT:-100}"
+    timeout -k 15 "${UNCOVER_TIMEOUT:-120}" uncover \
+        -e shodan-idb -silent -l "$UNCOVER_LIMIT" \
+        < "$RECON_DIR/live/ips.txt" \
+        > "$RECON_DIR/uncover/idb_raw.txt" 2>/dev/null || true
+    if [ -s "$RECON_DIR/uncover/idb_raw.txt" ]; then
+        cat "$RECON_DIR/uncover/idb_raw.txt" >> "$RECON_DIR/uncover/raw.txt" 2>/dev/null || true
+        python3 "$SCRIPT_DIR/recon_enrichment.py" parse-uncover \
+            --path "$RECON_DIR/uncover/raw.txt" \
+            --out-hosts "$RECON_DIR/uncover/hosts.txt" \
+            --summary-out "$RECON_DIR/uncover/summary.json" \
+            --sample 20 \
+            --scope "$TARGET" \
+            >/dev/null 2>&1 || true
+        log_done "uncover idb: $(file_lines "$RECON_DIR/uncover/hosts.txt") total hosts (summary.json)"
+    fi
+fi
 
 # ============================================================
 # Phase 4: Tech CVE Prioritization
@@ -1713,11 +1804,37 @@ fi
 
 # waymore — richer archive coverage than gau+waybackurls combined
 # Pulls from Wayback, URLScan, CommonCrawl, VirusTotal, AlienVault
+# Alterx-style: WAYMORE_MERGE_CAP (default 50000) — full dump kept as
+# urls/waymore.full.txt when capped; only the capped set merges into all.txt.
+# Reports should read urls/waymore.summary.json (count+sample), not the dump.
 if tool_ok waymore && [ "$QUICK_MODE" != "--quick" ]; then
     log_step "waymore (multi-source archive URLs)..."
-    timeout -k 15 "$WAYMORE_TIMEOUT" waymore -i "$TARGET" -mode U -oU "$RECON_DIR/urls/waymore.txt" \
+    timeout -k 15 "$WAYMORE_TIMEOUT" waymore -i "$TARGET" -mode U -oU "$RECON_DIR/urls/waymore.raw.txt" \
         2>/dev/null || true
-    log_done "waymore: $(file_lines "$RECON_DIR/urls/waymore.txt") URLs"
+    WAYMORE_MERGE_CAP="${WAYMORE_MERGE_CAP:-50000}"
+    if [ -s "$RECON_DIR/urls/waymore.raw.txt" ]; then
+        python3 "$SCRIPT_DIR/recon_enrichment.py" cap-merge \
+            --src "$RECON_DIR/urls/waymore.raw.txt" \
+            --merge-out "$RECON_DIR/urls/waymore.txt" \
+            --full-out "$RECON_DIR/urls/waymore.full.txt" \
+            --summary-out "$RECON_DIR/urls/waymore.summary.json" \
+            --cap "$WAYMORE_MERGE_CAP" \
+            --tool waymore \
+            --sample 20 \
+            >/dev/null 2>&1 || cp "$RECON_DIR/urls/waymore.raw.txt" "$RECON_DIR/urls/waymore.txt"
+        rm -f "$RECON_DIR/urls/waymore.raw.txt"
+        _wm_n=$(file_lines "$RECON_DIR/urls/waymore.txt")
+        _wm_full=$(file_lines "$RECON_DIR/urls/waymore.full.txt")
+        if [ "${_wm_full:-0}" -gt "${_wm_n:-0}" ]; then
+            log_warn "waymore: $_wm_full URLs exceed merge cap $WAYMORE_MERGE_CAP — merging $_wm_n (full: urls/waymore.full.txt)"
+        else
+            rm -f "$RECON_DIR/urls/waymore.full.txt"
+            log_done "waymore: $_wm_n URLs"
+        fi
+    else
+        : > "$RECON_DIR/urls/waymore.txt"
+        log_done "waymore: 0 URLs"
+    fi
 fi
 
 # katana — active crawl on live hosts (prioritised first)
@@ -2022,6 +2139,61 @@ if [ -f "$_LINKFINDER" ] && [ -s "$RECON_DIR/urls/js_files.txt" ]; then
         cat "$RECON_DIR/js/linkfinder/endpoints.txt" >> "$RECON_DIR/js/endpoints.txt" 2>/dev/null || true
         sort -u "$RECON_DIR/js/endpoints.txt" -o "$RECON_DIR/js/endpoints.txt" 2>/dev/null || true
         log_done "LinkFinder: $(file_lines "$RECON_DIR/js/linkfinder/endpoints.txt") additional endpoints"
+    fi
+fi
+
+# xnLinkFinder — richer JS/SPA endpoint mining (Next.js chunks, Vite, etc.)
+# Complements LinkFinder. Default ON when installed (skip in --quick).
+# XNLINKFINDER_HOST_CAP (default 15 live hosts) + XNLINKFINDER_MERGE_CAP
+# (default 5000 endpoints) keep artefacts bounded; summary is count+sample.
+_XNLF_BIN=""
+if tool_ok xnLinkFinder; then
+    _XNLF_BIN="xnLinkFinder"
+elif tool_ok xnlinkfinder; then
+    _XNLF_BIN="xnlinkfinder"
+fi
+if [ -n "$_XNLF_BIN" ] && [ "$QUICK_MODE" != "--quick" ] && [ -s "$RECON_DIR/live/urls.txt" ]; then
+    log_step "xnLinkFinder endpoint mining (SPA/JS richer than LinkFinder)..."
+    mkdir -p "$RECON_DIR/js/xnlinkfinder"
+    XNLINKFINDER_HOST_CAP="${XNLINKFINDER_HOST_CAP:-15}"
+    XNLINKFINDER_MERGE_CAP="${XNLINKFINDER_MERGE_CAP:-5000}"
+    XNLINKFINDER_DEPTH="${XNLINKFINDER_DEPTH:-1}"
+    head -n "$XNLINKFINDER_HOST_CAP" "$RECON_DIR/live/urls.txt" \
+        > "$RECON_DIR/js/xnlinkfinder/targets.txt" 2>/dev/null || true
+    timeout -k 15 "${XNLINKFINDER_TIMEOUT:-300}" "$_XNLF_BIN" \
+        -i "$RECON_DIR/js/xnlinkfinder/targets.txt" \
+        -sf "$TARGET" \
+        -d "$XNLINKFINDER_DEPTH" \
+        -o "$RECON_DIR/js/xnlinkfinder/endpoints_raw.txt" \
+        -op "$RECON_DIR/js/xnlinkfinder/params.txt" \
+        -ow \
+        >/dev/null 2>&1 || true
+    if [ -s "$RECON_DIR/js/xnlinkfinder/endpoints_raw.txt" ]; then
+        python3 "$SCRIPT_DIR/recon_enrichment.py" parse-xnlinkfinder \
+            --path "$RECON_DIR/js/xnlinkfinder/endpoints_raw.txt" \
+            --out "$RECON_DIR/js/xnlinkfinder/endpoints.txt" \
+            --full-out "$RECON_DIR/js/xnlinkfinder/endpoints.full.txt" \
+            --summary-out "$RECON_DIR/js/xnlinkfinder/summary.json" \
+            --cap "$XNLINKFINDER_MERGE_CAP" \
+            --sample 20 \
+            >/dev/null 2>&1 || sort -u "$RECON_DIR/js/xnlinkfinder/endpoints_raw.txt" \
+                > "$RECON_DIR/js/xnlinkfinder/endpoints.txt"
+        # Merge capped endpoints into main JS endpoints file
+        cat "$RECON_DIR/js/xnlinkfinder/endpoints.txt" >> "$RECON_DIR/js/endpoints.txt" 2>/dev/null || true
+        sort -u "$RECON_DIR/js/endpoints.txt" -o "$RECON_DIR/js/endpoints.txt" 2>/dev/null || true
+        # Cross-feed absolute in-scope hosts discovered in JS back as subdomain seeds
+        grep -oiE 'https?://[a-z0-9._-]+\.'"$TARGET" "$RECON_DIR/js/xnlinkfinder/endpoints.txt" 2>/dev/null \
+            | sed -E 's|https?://||; s|/.*||' | tr '[:upper:]' '[:lower:]' | sort -u \
+            > "$RECON_DIR/subdomains/xnlinkfinder.txt" 2>/dev/null || true
+        if [ -s "$RECON_DIR/subdomains/xnlinkfinder.txt" ]; then
+            cat "$RECON_DIR/subdomains/all.txt" "$RECON_DIR/subdomains/xnlinkfinder.txt" 2>/dev/null \
+                | sort -u > "$RECON_DIR/subdomains/all.txt.xnl" \
+                && mv "$RECON_DIR/subdomains/all.txt.xnl" "$RECON_DIR/subdomains/all.txt"
+            log_ok "xnLinkFinder: $(file_lines "$RECON_DIR/subdomains/xnlinkfinder.txt") in-scope host(s) seeded from JS"
+        fi
+        log_done "xnLinkFinder: $(file_lines "$RECON_DIR/js/xnlinkfinder/endpoints.txt") endpoints (see js/xnlinkfinder/summary.json)"
+    else
+        log_done "xnLinkFinder: 0 endpoints"
     fi
 fi
 
@@ -2413,6 +2585,9 @@ printf "  %-24s %s\n" "API endpoints:"           "$(file_lines "$RECON_DIR/urls/
 printf "  %-24s %s\n" "JS files:"                "$(file_lines "$RECON_DIR/urls/js_files.txt")"
 printf "  %-24s %s\n" "Exposed configs:"         "$(file_lines "$RECON_DIR/exposure/config_files.txt")"
 printf "  %-24s %s\n" "Unique params:"           "$(file_lines "$RECON_DIR/params/unique_params.txt")"
+printf "  %-24s %s\n" "tlsx SAN new (in-scope):" "$(file_lines "$RECON_DIR/certs/in_scope_new.txt")"
+printf "  %-24s %s\n" "uncover hosts:"           "$(file_lines "$RECON_DIR/uncover/hosts.txt")"
+printf "  %-24s %s\n" "xnLinkFinder endpoints:"  "$(file_lines "$RECON_DIR/js/xnlinkfinder/endpoints.txt")"
 echo ""
 echo -e "  Results : $RECON_DIR/"
 echo -e "  Priority: $RECON_DIR/priority/prioritized_hosts.txt"

@@ -12,6 +12,7 @@ def test_list_skills_includes_core_packs():
     for expected in (
         "ssrf", "sqli", "ssti", "lfi-traversal",
         "auth-bypass-idor", "xxe", "upload-rce", "deserialization",
+        "api-authz-hadrian",
     ):
         assert expected in names, names
 
@@ -85,3 +86,10 @@ def test_format_skills_context_cap_and_disable(monkeypatch):
     monkeypatch.setenv("VIK_SKILLS", "0")
     assert skill_loader.skills_enabled() is False
     assert skill_loader.format_skills_context(["sqli"]) == ""
+
+
+def test_hadrian_skill_match():
+    matched = skill_loader.skills_for_findings(
+        'Hadrian BFLA / API authz role-matrix on /admin'
+    )
+    assert 'api-authz-hadrian' in matched

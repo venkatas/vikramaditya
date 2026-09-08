@@ -118,6 +118,7 @@ run_scan.sh
 test_file_upload_only.py
 with_params.txt
 schemathesis-report/
+cats-report/
 
 # ── Claude Code ───────────────────────────────────────────────────────────────
 .claude/scheduled_tasks.lock

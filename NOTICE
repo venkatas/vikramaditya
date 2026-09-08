@@ -89,3 +89,75 @@ and skills/cloud/ are clean-room checklist adaptations of publicly described
 recon/web/cloud methodology ideas only (same approach as other skill ports).
 No CAI source, prompts, or tooling were copied.
 
+-----------------------------------------------------------------------
+gitleaks — https://github.com/gitleaks/gitleaks
+MIT License — Copyright (c) 2019 Zachary Rice
+-----------------------------------------------------------------------
+
+  gitleaks_report.py       <- subprocess invoke + SARIF/JSON reporting glue.
+                              Vikramaditya does not vendor gitleaks sources.
+                              Installed optionally via setup.sh (Homebrew).
+
+-----------------------------------------------------------------------
+anchore/syft — https://github.com/anchore/syft
+anchore/grype — https://github.com/anchore/grype
+Apache License 2.0 — Copyright (c) Anchore, Inc.
+-----------------------------------------------------------------------
+
+  sbom_syft.py             <- subprocess invoke of syft (SBOM) and optional
+                              grype (SBOM vuln scan). Not vendored; install
+                              via Homebrew / upstream install scripts.
+
+-----------------------------------------------------------------------
+LibraryOfCongress/bagit-python — https://github.com/LibraryOfCongress/bagit-python
+CC0 1.0 Universal — Public Domain Dedication
+-----------------------------------------------------------------------
+
+  evidence_bag.py          <- optional import of bagit.make_bag for hashed
+                              evidence packs; stdlib BagIt writer fallback.
+                              Not vendored; `pip install bagit` when desired.
+
+-----------------------------------------------------------------------
+projectdiscovery/uncover — https://github.com/projectdiscovery/uncover
+projectdiscovery/tlsx — https://github.com/projectdiscovery/tlsx
+MIT License — Copyright (c) ProjectDiscovery, Inc.
+-----------------------------------------------------------------------
+
+  recon.sh                 <- optional/ subprocess invoke of uncover (UNCOVER=1)
+                              and tlsx (Phase 3.5 SAN harvest). Vikramaditya does
+                              not vendor uncover/tlsx sources.
+
+-----------------------------------------------------------------------
+xnl-h4ck3r/waymore — https://github.com/xnl-h4ck3r/waymore
+xnl-h4ck3r/xnLinkFinder — https://github.com/xnl-h4ck3r/xnLinkFinder
+MIT License — Copyright (c) xnl-h4ck3r
+-----------------------------------------------------------------------
+
+  recon.sh                 <- subprocess invoke of waymore (archive URLs) and
+                              xnLinkFinder (JS/SPA endpoint mining) when installed.
+                              Not vendored; install via pip (setup.sh).
+
+-----------------------------------------------------------------------
+Endava CATS — https://github.com/Endava/cats
+Apache License 2.0 — Copyright (c) Endava
+-----------------------------------------------------------------------
+
+  cats_audit.py            <- optional subprocess invoke of `cats` (native
+                              binary or java -jar via CATS_JAR). Vikramaditya
+                              does not vendor CATS sources; HTML/JSON reports
+                              are written under findings/<host>/cats/.
+
+Docs: https://endava.github.io/cats/
+
+-----------------------------------------------------------------------
+MITRE SAF CLI — https://github.com/mitre/saf
+Apache License 2.0 — Copyright (c) The MITRE Corporation
+-----------------------------------------------------------------------
+
+  saf_export.py                <- optional subprocess invoke of `saf convert
+                                  sarif2hdf` / `hdf2asff` when installed.
+                                  Vikramaditya does not vendor SAF sources;
+                                  SARIF writing is in-repo.
+
+Docs: https://saf-cli.mitre.org/
+

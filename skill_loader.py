@@ -41,6 +41,7 @@ _PACKS: dict[str, str] = {
     "attack-surface-map": "recon/attack-surface-map/SKILL.md",
     "cloud-metadata-imds": "cloud/cloud-metadata-imds/SKILL.md",
     "storage-exposure": "cloud/storage-exposure/SKILL.md",
+    "api-authz-hadrian": "web/api-authz-hadrian/SKILL.md",
 }
 
 _ALIASES: dict[str, str] = {
@@ -81,8 +82,6 @@ _ALIASES: dict[str, str] = {
     "cors": "http-security-headers",
     "csp": "http-security-headers",
     "api-authz-matrix": "api-authz-matrix",
-    "api-authz": "api-authz-matrix",
-    "bfla": "api-authz-matrix",
     "authz-matrix": "api-authz-matrix",
     "passive-osint": "passive-osint",
     "osint": "passive-osint",
@@ -98,6 +97,12 @@ _ALIASES: dict[str, str] = {
     "s3": "storage-exposure",
     "bucket-exposure": "storage-exposure",
     "blob-exposure": "storage-exposure",
+    # Generic api-authz / bfla stay on the already-merged Hadrian pack.
+    "hadrian": "api-authz-hadrian",
+    "api-authz": "api-authz-hadrian",
+    "api-authz-hadrian": "api-authz-hadrian",
+    "bfla": "api-authz-hadrian",
+    "bopla": "api-authz-hadrian",
 }
 
 # Keyword → pack heuristics (longer / more specific first via sorted length)
@@ -116,6 +121,7 @@ _KEYWORD_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(attack[\-\s]?surface|surface[\-\s]?map|endpoint[\-\s]?map|tech[\-\s]?detect)\b", re.I), "attack-surface-map"),
     (re.compile(r"\b(imds|instance[\-\s]?metadata|169\.254\.169\.254|metadata\.google\.internal|imdSv2)\b", re.I), "cloud-metadata-imds"),
     (re.compile(r"\b(s3[\-\s]?bucket|storage[\-\s]?exposure|blob[\-\s]?storage|gcs[\-\s]?bucket|azure[\-\s]?blob)\b", re.I), "storage-exposure"),
+    (re.compile(r"\b(hadrian|bfla|bopla|api[\-\s]?authz|broken[\-\s]?function[\-\s]?level|role[\-\s]?matrix)\b", re.I), "api-authz-hadrian"),
 ]
 
 
