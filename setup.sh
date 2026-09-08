@@ -228,6 +228,7 @@ GO_TOOLS=(
     "github.com/BishopFox/jsluice/cmd/jsluice@latest"
     # v10.7.0 — calibrated 401/403 bypass engine (payloads copied below)
     "github.com/devploit/nomore403@latest"
+    "github.com/praetorian-inc/hadrian/cmd/hadrian@latest"
 )
 
 GO_TOOL_NAMES=(
@@ -254,6 +255,7 @@ GO_TOOL_NAMES=(
     "fingerprintx"
     "jsluice"
     "nomore403"
+    "hadrian"
 )
 
 for i in "${!GO_TOOLS[@]}"; do

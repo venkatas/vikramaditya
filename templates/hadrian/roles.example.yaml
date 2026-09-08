@@ -1,0 +1,43 @@
+# Hadrian roles.yaml example — privilege levels + permissions.
+# Format: <action>:<object>:<scope>  (own | public | all | *)
+# Docs: https://github.com/praetorian-inc/hadrian/wiki/Configuration
+#
+# Copy to your engagement dir, rename roles.yaml, and align object names
+# with the API under test. Do NOT commit real engagement copies.
+
+objects:
+  - users
+  - orders
+  - documents
+
+roles:
+  - name: admin
+    level: 100
+    permissions:
+      - "*:*:*"
+
+  - name: user
+    level: 10
+    permissions:
+      - "read:users:own"
+      - "write:users:own"
+      - "read:orders:own"
+      - "write:orders:own"
+      - "read:documents:own"
+      - "read:documents:public"
+
+  - name: anonymous
+    level: 0
+    permissions:
+      - "read:documents:public"
+
+endpoints:
+  - path: /api/users/{id}
+    object: users
+    owner_field: id
+  - path: /api/orders/{id}
+    object: orders
+    owner_field: user_id
+  - path: /api/documents/{id}
+    object: documents
+    owner_field: user_id
