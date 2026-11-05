@@ -16,7 +16,9 @@ def test_full_recon_defaults_to_uncapped_katana_without_overriding_operator():
     assert 'if [ -z "${KATANA_HOST_CAP+x}" ]; then' in source
     assert '[ "${FULL_RECON:-0}" = "1" ]' in source
     assert "KATANA_HOST_CAP=0" in source
-    assert '-o "$RECON_DIR/urls/katana.txt" >/dev/null 2>&1' in source
+    assert '-o "$RECON_DIR/urls/katana.txt" >"$URL_DIAGNOSTICS/katana.stdout.log"' in source
+    assert '2>>"$URL_DIAGNOSTICS/katana.stderr.log"' in source
+    assert '_url_collection_gap katana "crawler exited rc=$_katana_rc; partial URLs retained"' in source
 
 
 def test_archive_discovery_uses_resolved_scope_not_only_label_domain():

@@ -99,6 +99,8 @@ def build_cmd(binary: str, input_file: str, out_file: str, domain: str, *,
     else:
         # No OAST: never exfil client req/resp to public oast.* servers.
         argv += ["-ni"]
+    from nuclei_scope import nuclei_scope_flags
+    argv += nuclei_scope_flags(input_file, out_file)
     return argv
 
 
@@ -159,11 +161,21 @@ def run(input_file: str, out_dir: str, domain: str, *, binary: Optional[str] = N
     argv = build_cmd(binary, scan_input, out_file, domain, aggression=aggression,
                      rate=rate, concurrency=concurrency, retries=retries,
                      oob_server=oob_server, oob_token=oob_token, input_mode=input_mode)
+    # scan_input is temporary; retain the original corpus's persisted scope.
+    from nuclei_scope import nuclei_scope_flags, record_nuclei_coverage
+    if "-dr" not in argv:
+        argv += nuclei_scope_flags(input_file, out_dir)
     try:
         res = (runner or _default_runner)(argv, timeout)
         if isinstance(res, dict):
             result["timed_out"] = bool(res.get("timed_out"))
             result["returncode"] = res.get("returncode")
+        record_nuclei_coverage(
+            input_file, out_dir,
+            exit_code=-1 if result.get("timed_out") else result.get("returncode"))
+    except Exception:
+        record_nuclei_coverage(input_file, out_dir, exit_code=-1)
+        raise
     finally:
         if tmp_input:
             try:

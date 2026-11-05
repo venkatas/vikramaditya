@@ -22,7 +22,7 @@ def test_large_lists_resolved_in_chunks():
     # -a 4 -> 456,976-chunk ceiling; the default 2-char suffix caps at 676 and silently truncates.
     assert 'split -a 4 -l "$DNSX_CAP"' in t, "no suffix-safe (-a 4) DNSX_CAP-sized chunking"
     assert re.search(r'for\s+_chunk\b', t), "no per-chunk loop"
-    assert re.search(r'dnsx -silent -a -l "\$_chunk"', t), "chunks are not fed to dnsx"
+    assert re.search(r'"\$VIK_DNSX_BIN" -silent -a -l "\$_chunk"', t), "chunks are not fed to pinned dnsx"
 
 
 def test_dedup_before_resolve():
@@ -82,7 +82,7 @@ def test_explicit_ip_targets_survive_dns_resolution():
     t = _t()
     assert ".explicit_ip_literals.txt" in t
     assert ".dns_name_candidates.txt" in t
-    assert 'dnsx -silent -a -l "$DNSX_INPUT"' in t
+    assert '"$VIK_DNSX_BIN" -silent -a -l "$DNSX_INPUT"' in t
     assert 'dnsx -silent -a -l "$RECON_DIR/subdomains/all.txt"' not in t
     assert 'cat "$DNSX_IP_LITERALS" >> "$RECON_DIR/subdomains/resolved.txt"' in t
     assert "preserved $DNSX_IP_COUNT explicit IP target(s)" in t

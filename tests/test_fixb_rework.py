@@ -61,9 +61,12 @@ def test_coverage_dir_noop_without_recon_segment():
 
 # ── 1. hunt.py scan-phase label + sentinel cleanup (source-level) ───────────
 def test_hunt_scan_phase_maps_vuln_scan_label():
-    src = open(os.path.join(REPO, "hunt.py"), encoding="utf-8").read()
-    assert '"VULN SCAN", "SCAN", "scan"' in src, "scan phase still missing the VULN SCAN label"
-    assert "_dt.upper().startswith(_lab.upper())" in src, "phase-degraded match is not prefix-aware"
+    import hunt
+
+    for label in ("VULN SCAN", "SCAN", "scan", "VULN SCAN (Batch 1/3)"):
+        assert hunt._phase_coverage_matches("scan", {"tool": label}), label
+    assert not hunt._phase_coverage_matches("scan", {"tool": "scanner.sh"})
+    assert hunt._phase_coverage_matches("nuclei_dast", {"tool": "nuclei"})
 
 
 def test_hunt_recon_truncated_sentinel_cleared_on_fresh_run():

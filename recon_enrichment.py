@@ -176,7 +176,7 @@ def in_scope_hosts(hosts: list[str], target: str) -> list[str]:
     return kept
 
 
-def tlsx_scope_delta(sans: list[str], known_subs: list[str], target: str) -> dict[str, list[str]]:
+def tlsx_scope_delta(sans: list[str], known_subs: list[str], target: str, exact_hosts=None) -> dict[str, list[str]]:
     """Split SANs into in-scope-new vs out-of-scope candidates."""
     known = {s.strip().lower().rstrip(".") for s in known_subs if s.strip()}
     known.add(target.strip().lower().rstrip("."))
@@ -192,7 +192,11 @@ def tlsx_scope_delta(sans: list[str], known_subs: list[str], target: str) -> dic
         if d not in seen:
             seen.add(d)
             uniq.append(d)
-    in_scope_new = [d for d in uniq if d not in known and (d == target or d.endswith("." + target.strip().lower().rstrip(".")))]
+    if exact_hosts is None:
+        in_scope_new = [d for d in uniq if d not in known and (d == target or d.endswith("." + target.strip().lower().rstrip(".")))]
+    else:
+        from scope_checker import scope_lock_allows
+        in_scope_new = [d for d in uniq if d not in known and scope_lock_allows(d, exact_hosts)]
     out_of_scope = [d for d in uniq if d not in known and d not in in_scope_new]
     return {"in_scope_new": in_scope_new, "out_of_scope": out_of_scope, "all_new": [d for d in uniq if d not in known]}
 
@@ -277,7 +281,11 @@ def cmd_parse_xnlinkfinder(args: argparse.Namespace) -> int:
 def cmd_tlsx_feedback(args: argparse.Namespace) -> int:
     sans = _read_lines(Path(args.sans))
     known = _read_lines(Path(args.known)) if args.known else []
-    delta = tlsx_scope_delta(sans, known, args.target)
+    exact_hosts = None
+    if args.allow_file is not None:
+        from scope_checker import _load_allow_file
+        exact_hosts = _load_allow_file(args.allow_file)
+    delta = tlsx_scope_delta(sans, known, args.target, exact_hosts=exact_hosts)
     Path(args.out_in_scope).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_in_scope).write_text(
         "".join(f"{h}\n" for h in delta["in_scope_new"]), encoding="utf-8"
@@ -345,6 +353,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--sans", required=True)
     t.add_argument("--known", default="")
     t.add_argument("--target", required=True)
+    t.add_argument("--allow-file", default=None,
+                   help="Use an exact-host allowlist instead of suffix-domain scope")
     t.add_argument("--out-in-scope", required=True)
     t.add_argument("--out-candidates", required=True)
     t.add_argument("--summary-out")

@@ -238,15 +238,18 @@ def test_structured_finding_count_excludes_noise(tmp_path):
     (fdir / "candidates.txt").write_text("")
     # Banner/comment lines only -> 0
     (fdir / "log.txt").write_text("# header\n=========\n-- separator --\n")
-    # 3 real text findings
-    (fdir / "sqli.txt").write_text("INJ https://x?id=1\nINJ https://x?id=2\nINJ https://x?id=3\n")
-    # JSON list of 2
+    # Three recognized, proof-bearing scanner findings.
+    (fdir / "sqli").mkdir()
+    (fdir / "sqli/findings.txt").write_text("".join(
+        f"[SQLI-POC-VERIFIED] https://x.invalid/?id={n}\n" for n in range(3)
+    ))
+    # Arbitrary JSON containers/values are not typed vulnerability records.
     (fdir / "xss.json").write_text(json.dumps([{"a": 1}, {"b": 2}]))
-    # JSON dict with findings key (count = 4)
+    # A field named 'findings' does not turn integers into vulnerabilities.
     (fdir / "wrap.json").write_text(json.dumps({"findings": [1, 2, 3, 4]}))
 
     structured = hunt._structured_finding_count(str(fdir))
     raw = hunt._dir_file_count(str(fdir))
     assert raw == 5            # five files on disk
-    assert structured == 9     # 0 + 0 + 3 + 2 + 4 real findings
+    assert structured == 3     # Only the three typed/proof-bearing records.
     assert structured != raw   # the whole point: structured != raw file count

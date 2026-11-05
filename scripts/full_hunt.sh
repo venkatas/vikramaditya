@@ -258,17 +258,23 @@ if [ "$(check_tool nuclei)" = true ]; then
     log "Running Nuclei (critical + high)..."
     NUCLEI_OPTS=""
     [ -n "$TOKEN" ] && NUCLEI_OPTS="$NUCLEI_OPTS -H 'Authorization: Bearer $TOKEN'"
+    # A configured/persisted lock must override template-enabled redirects.
+    NUCLEI_SCOPE_FLAGS=$(python3 "$TOOLS_DIR/nuclei_scope.py" --shell-flags "$OUT")
     nuclei -u "$TARGETURL" \
         -severity critical,high \
         -o "$OUT/vulns/nuclei_critical_high.txt" \
-        -silent $NUCLEI_OPTS 2>/dev/null
+        -silent $NUCLEI_OPTS $NUCLEI_SCOPE_FLAGS 2>/dev/null && NUCLEI_RC=0 || NUCLEI_RC=$?
+    python3 "$TOOLS_DIR/nuclei_scope.py" --record-coverage --exit-code "$NUCLEI_RC" "$OUT"
+    [ "$NUCLEI_RC" -eq 0 ] || exit "$NUCLEI_RC"
     ok "Nuclei critical/high: $(wc -l < $OUT/vulns/nuclei_critical_high.txt) findings"
 
     if [ "$QUICK" = false ]; then
         nuclei -u "$TARGETURL" \
             -severity medium \
             -o "$OUT/vulns/nuclei_medium.txt" \
-            -silent $NUCLEI_OPTS 2>/dev/null
+            -silent $NUCLEI_OPTS $NUCLEI_SCOPE_FLAGS 2>/dev/null && NUCLEI_RC=0 || NUCLEI_RC=$?
+        python3 "$TOOLS_DIR/nuclei_scope.py" --record-coverage --exit-code "$NUCLEI_RC" "$OUT"
+        [ "$NUCLEI_RC" -eq 0 ] || exit "$NUCLEI_RC"
         ok "Nuclei medium: $(wc -l < $OUT/vulns/nuclei_medium.txt) findings"
     fi
 else

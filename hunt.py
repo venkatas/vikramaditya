@@ -54,6 +54,8 @@ import time
 from datetime import datetime
 from urllib.parse import urlsplit
 
+import tool_resolution
+
 
 # ── Whitebox integration (Task 22) ────────────────────────────────────────────
 
@@ -923,6 +925,9 @@ def _tool_bin(name: str) -> str:
     """Return the binary path for a tool name from TOOL_REGISTRY."""
     for t_name, t_bin, _ in TOOL_REGISTRY:
         if t_name == name:
+            if name in tool_resolution.PD_TOOLS:
+                resolved, _ = tool_resolution.resolve(name, preferred=t_bin, gobin=GOBIN)
+                return resolved or t_bin
             return t_bin
     return name
 
@@ -957,14 +962,8 @@ def skip_has(skips: set[str], *names: str) -> bool:
 
 
 def _tool_env() -> dict:
-    """Runtime environment with Go tools first and the active venv available."""
-    env = os.environ.copy()
-    current = [part for part in env.get("PATH", "").split(os.pathsep) if part]
-    preferred = [path for path in (GOBIN, ACTIVE_PYTHON_BIN) if os.path.isdir(path)]
-    env["PATH"] = os.pathsep.join(
-        preferred + [part for part in current if part not in preferred]
-    )
-    return env
+    """Use the same healthy PD executables for Python phases and shell children."""
+    return tool_resolution.runtime_env(gobin=GOBIN, python_bin=ACTIVE_PYTHON_BIN)
 
 
 def _gowitness_install_command() -> str | None:
@@ -1091,57 +1090,35 @@ def _dir_file_count(path: str) -> int:
 
 
 def _structured_finding_count(path: str) -> int:
-    """Count real findings under a findings directory, not raw file count.
+    """Count unique classified findings, never metadata keys or raw lines.
 
-    v9.24 — ``_artifact_summary`` previously reported ``files=N`` for the
-    ``findings`` dir, conflating empty/placeholder/scaffolding files (e.g. an
-    empty ``candidates.txt`` or a tool's ``-o`` log) with actual findings. The
-    brain then announced "22 findings" when only 10 were real.
-
-    Parsing rule per file:
-      * ``.json`` — count list items, or dict entries, or JSON-object lines.
-      * other text — count non-empty, non-comment, non-banner lines.
-    Empty files contribute 0. Directories are walked recursively.
+    Reuse the report's supported artifact parsers and proof gates. Informational
+    context/model claims and explicitly unconfirmed leads are not findings for
+    the Brain summary. Recognized posture observations remain findings, without
+    claiming that a vulnerability was exploited. Unknown artifacts stay raw
+    candidates; there is deliberately no generic JSON/line-count fallback.
     """
     if not os.path.isdir(path):
         return 0
-    total = 0
-    for root, _dirs, files in os.walk(path):
-        for fname in files:
-            fpath = os.path.join(root, fname)
-            try:
-                if os.path.getsize(fpath) == 0:
-                    continue
-            except OSError:
-                continue
-            if fname.endswith(".json"):
-                try:
-                    with open(fpath, errors="ignore") as fh:
-                        data = json.load(fh)
-                    if isinstance(data, list):
-                        total += len(data)
-                    elif isinstance(data, dict):
-                        # Common shapes: {"findings": [...]} or a flat map.
-                        inner = data.get("findings") if "findings" in data else None
-                        total += len(inner) if isinstance(inner, list) else len(data)
-                    continue
-                except Exception:
-                    # Fall through to line-based count (JSONL / malformed).
-                    total += _count_json_findings(fpath)
-                    continue
-            # Plain-text findings: skip blanks, comments, and banner lines.
-            try:
-                with open(fpath, errors="ignore") as fh:
-                    for raw in fh:
-                        ln = raw.strip()
-                        if not ln:
-                            continue
-                        if ln.startswith(("#", "//", "=", "-", "*", "[")):
-                            continue
-                        total += 1
-            except OSError:
-                continue
-    return total
+    from reporter import load_findings, _apply_verification_gating
+    from finding_schema import VerificationMethod
+
+    classified = []
+    for finding in _apply_verification_gating(load_findings(path)):
+        title = str(finding.get("title") or "").strip().lower()
+        detail = str(finding.get("detail") or "")
+        raw = str(finding.get("raw") or "").lstrip().upper()
+        method = str(finding.get("verification_method") or "").strip().lower()
+        posture = finding.get("finding_kind") == "posture" and method == "configuration_observed"
+        if (finding.get("_unconfirmed_lead") or title.startswith("unconfirmed ")
+                or raw.startswith(("[MODEL CLAIM", "[UNVERIFIED]", "[UNCONFIRMED]", "[NOT-CONFIRMED]"))
+                or (finding.get("vtype") == "nuclei_finding" and "[UNCONFIRMED " in detail)
+                or (method and not posture and VerificationMethod.from_string(method) == VerificationMethod.UNVERIFIED)):
+            continue
+        # The shared report collection already suppresses exact duplicates
+        # while preserving distinct proof/observations at one endpoint.
+        classified.append(finding)
+    return len(classified)
 
 
 def _artifact_summary(artifacts: dict[str, str] | None = None) -> str:
@@ -1162,11 +1139,15 @@ def _artifact_summary(artifacts: dict[str, str] | None = None) -> str:
                 lines.append(_upload_artifact_summary(path))
                 continue
             if label == "findings":
-                # v9.24 — report a structured finding count (parsed), not the
-                # raw file count which over-reports placeholder/empty files.
+                # Classification errors must not become either a raw-line
+                # vulnerability count or an authoritative clean-zero result.
+                try:
+                    count = str(_structured_finding_count(path))
+                except Exception:
+                    count = "unavailable (report parser failed)"
                 lines.append(
-                    f"{label}: dir {path} | findings={_structured_finding_count(path)} "
-                    f"| files={_dir_file_count(path)}"
+                    f"{label}: dir {path} | classified_findings={count} "
+                    f"| files={_dir_file_count(path)} (includes metadata/raw candidates, not findings)"
                 )
                 continue
             lines.append(f"{label}: dir {path} | files={_dir_file_count(path)}")
@@ -1350,7 +1331,8 @@ def _fork_safe_spawn(*args, **kwargs):
     proc = _procutil_spawn(*args, **kwargs)
     try:
         # prune finished children so the registry stays ~ the live set, then track this one
-        _ACTIVE_PROCS[:] = [p for p in _ACTIVE_PROCS if _proc_alive(p)]
+        from procutil import _owned_group_alive
+        _ACTIVE_PROCS[:] = [p for p in _ACTIVE_PROCS if _owned_group_alive(p)]
         _ACTIVE_PROCS.append(proc)
     except Exception:
         pass
@@ -1358,11 +1340,10 @@ def _fork_safe_spawn(*args, **kwargs):
 
 
 def _terminate_all_active_groups() -> None:
-    """Tear down every still-live registered child group (backstop for interrupts
-    that land outside a launcher). _terminate_group polls first, so exited procs no-op."""
+    """Tear down registered owned groups, including surviving descendants
+    whose leaders exited before an interrupt landed outside a launcher."""
     for proc in list(_ACTIVE_PROCS):
-        if _proc_alive(proc):
-            _terminate_group(proc)
+        _terminate_group(proc)
     _ACTIVE_PROCS.clear()
 
 
@@ -1409,18 +1390,24 @@ def run_cmd(
     cached = _session_cache_lookup(cmd, watch_file=watch_file)
     if cached is not None:
         return cached
+    proc = None
+    started_at = datetime.now().astimezone()
     try:
         if watch_file is not None:
             label = watch_phase or "COMMAND"
-            started_at = datetime.now()
             started_label = started_at.strftime("%Y-%m-%d %H:%M:%S")
             env = _tool_env()
 
             # Fork-safe launch: posix_spawn avoids macOS Network.framework atfork
             # SIGSEGV that killed SQLMAP/CVE HUNT/REPORTS at 0.0s (see _PosixSpawnProc).
             # pty_stdin gives the child a tty on fd 0 (sqlmap -r needs it; see below).
-            proc = _fork_safe_spawn(cmd, env=env, cwd=cwd, capture=True, shell=True,
-                                    pty_stdin=pty_stdin)
+            # A successful tee must not hide a failed assessment producer.
+            # Use argv-mode Bash so pipefail is explicit and cannot depend on
+            # the login shell. Do not enable errexit or change optional probes.
+            proc = _fork_safe_spawn(
+                ["/bin/bash", "-o", "pipefail", "-c", cmd],
+                env=env, cwd=cwd, capture=True, shell=False, pty_stdin=pty_stdin,
+            )
             log("info", f"START {label}: PID {proc.pid} @ {started_label}")
             log("info", f"Command: {cmd}")
 
@@ -1495,6 +1482,10 @@ def run_cmd(
                 _mark_aborted(watch_phase or "subprocess",
                               "user interrupt (SIGINT) — phase aborted, coverage partial/none")
                 _terminate_group(proc, phase=label)
+                _record_phase_manifest(
+                    watch_phase or "COMMAND", cmd, -signal.SIGINT, False, watch_file,
+                    started_at=started_at, finished_at=datetime.now().astimezone(),
+                )
                 raise
             finally:
                 watchdog.stop()
@@ -1507,13 +1498,20 @@ def run_cmd(
                     _mark_degraded(watch_phase or "subprocess",
                                    "watchdog SIGKILL (stuck/no progress) — partial coverage")
 
-            finished_at = datetime.now()
+            finished_at = datetime.now().astimezone()
             duration = (finished_at - started_at).total_seconds()
             rc = proc.returncode if proc.returncode is not None else -1
             end_level = "ok" if rc == 0 else "warn"
             timeout_note = " (timed out)" if timed_out else ""
             log(end_level, f"END {label}: PID {proc.pid} rc={rc} duration={duration:.1f}s{timeout_note}")
-            _ok = rc == 0
+            if rc != 0 and not timed_out:
+                _mark_degraded(watch_phase or "COMMAND",
+                               f"exited non-zero (rc={rc}) — partial/failed coverage")
+            _record_phase_manifest(
+                watch_phase or "COMMAND", cmd, rc, timed_out, watch_file,
+                started_at=started_at, finished_at=finished_at,
+            )
+            _ok = rc == 0 and not timed_out
             _out = (stdout or "") + (stderr or "")
             _session_cache_store(cmd, _ok, _out, watch_file=watch_file)
             return _ok, _out
@@ -1543,6 +1541,14 @@ def run_cmd(
         _session_cache_store(cmd, _ok, _out, watch_file=watch_file)
         return _ok, _out
     except Exception as exc:
+        if watch_file is not None:
+            if proc is not None:
+                _terminate_group(proc, phase=watch_phase or "COMMAND")
+            _mark_degraded(watch_phase or "COMMAND", f"command failed before completion: {exc}")
+            _record_phase_manifest(
+                watch_phase or "COMMAND", cmd, 1, False, watch_file,
+                started_at=started_at, finished_at=datetime.now().astimezone(),
+            )
         return False, str(exc)
 
 
@@ -1690,6 +1696,15 @@ def run_live(cmd: str, timeout: int = 3600,
 
 def _which(binary: str) -> bool:
     """Return True if binary exists on disk (absolute path) or in PATH."""
+    name = os.path.basename(binary)
+    # Registry entries may name ~/go/bin even when only a healthy Homebrew/PATH
+    # installation exists. Resolve those entries identically to _tool_bin().
+    # Unrelated explicit paths retain the ordinary file semantics below.
+    if name in tool_resolution.PD_TOOLS and (
+        os.path.sep not in binary or os.path.abspath(binary) == os.path.join(GOBIN, name)
+    ):
+        resolved, _ = tool_resolution.resolve(name, preferred=binary, gobin=GOBIN)
+        return resolved is not None
     if os.path.isfile(binary):
         if os.access(binary, os.X_OK):
             return True
@@ -1782,12 +1797,16 @@ def _lightpanda_supports_header() -> bool:
 
 def _lightpanda_fetch_forms(url: str, cookies: str = "",
                              headers: dict | None = None,
-                             timeout: int = 20) -> list[dict]:
+                             timeout: int = 20,
+                             exact_hosts=None,
+                             errors: list[dict] | None = None) -> list[dict]:
     """
     Use lightpanda `fetch` to get JS-rendered HTML, then parse all <form> elements.
     Returns list of dicts: {action, method, inputs: [name, ...]}
 
-    Falls back to plain requests if lightpanda is unavailable.
+    Falls back to plain requests if lightpanda is unavailable.  An exact
+    allowlist bypasses Lightpanda entirely: only scoped HTTP GETs can enforce
+    every redirect before it reaches the network.  This branch does not run JS.
     """
     from html.parser import HTMLParser
 
@@ -1814,6 +1833,36 @@ def _lightpanda_fetch_forms(url: str, cookies: str = "",
         def handle_endtag(self, tag):
             if tag == "form":
                 self._cur = None
+
+    if exact_hosts is not None:
+        from scoped_http import get as scoped_get
+        from urllib.parse import urljoin
+
+        req_headers = {"User-Agent": "Mozilla/5.0"}
+        if cookies:
+            req_headers["Cookie"] = cookies
+        req_headers.update(headers or {})
+        try:
+            response = scoped_get(url, exact_hosts, headers=req_headers, timeout=timeout)
+            try:
+                parser = _FormParser()
+                parser.feed(response.text)
+                # A same-scope redirect can change the directory against which
+                # relative actions resolve.  Never resolve them against the
+                # original seed URL or launch a browser to infer the base URL.
+                for form in parser.forms:
+                    form["action"] = urljoin(response.url, form["action"])
+                return parser.forms
+            finally:
+                response.close()
+        except Exception as exc:
+            error = {"page_url": url, "reason": str(exc)}
+            if hasattr(exc, "destination"):
+                error.update(source=exc.source, destination=exc.destination)
+            if errors is not None:
+                errors.append(error)
+            _mark_degraded("post_params", f"scoped form fetch failed for {url!r}: {exc}")
+            return []
 
     lp = _lightpanda_bin()
     # When cookies/headers are required for an AUTHENTICATED fetch but this lightpanda build
@@ -1886,42 +1935,13 @@ def _httpx_readiness_reason(candidates: list[str] | None = None) -> str | None:
     ``-version`` probe is timed out so a hanging binary can never stall startup.
     ``candidates`` is injectable for testing; None uses the production search path.
     """
-    if candidates is None:
-        candidates = [
-            os.path.expanduser("~/go/bin/httpx"),
-            "/opt/homebrew/bin/httpx",
-            "/usr/local/bin/httpx",
-            shutil.which("httpx") or "",
-        ]
-    present_reason: str | None = None
-    seen: set[str] = set()
-    for cand in candidates:
-        if not cand or cand in seen:
-            continue
-        seen.add(cand)
-        if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
-            continue
-        try:
-            proc = subprocess.run([cand, "-version"], capture_output=True,
-                                  text=True, timeout=20)
-        except subprocess.TimeoutExpired:
-            present_reason = f"{cand}: -version timed out (hanging binary) — live-host probing would stall"
-            continue
-        except OSError as exc:
-            present_reason = f"{cand}: failed to execute ({exc})"
-            continue
-        out = ((proc.stdout or "") + (proc.stderr or "")).lower()
-        if proc.returncode != 0:
-            present_reason = f"{cand}: -version exited {proc.returncode} (crash/segfault) — probing silently yields 0 live hosts"
-            continue
-        if "python-httpx" in out:
-            present_reason = f"{cand}: Python HTTP client, not ProjectDiscovery httpx — live-host probing finds 0 hosts"
-            continue
-        if "projectdiscovery" not in out:
-            present_reason = f"{cand}: missing ProjectDiscovery banner — not the expected probing tool"
-            continue
-        return None  # a healthy ProjectDiscovery httpx exists → no readiness gap
-    return present_reason  # None when no binary was present at all
+    # The injectable path preserves focused readiness tests; production uses
+    # the same fingerprint-cached, fork-safe resolver as _tool_bin/_tool_env.
+    resolved, reason = tool_resolution.resolve(
+        "httpx", gobin=GOBIN, candidates=candidates,
+        runner=subprocess.run if candidates is not None else None,
+    )
+    return None if resolved else reason
 
 
 def check_tool_readiness(installed: list[str] | None = None) -> list[dict[str, str]]:
@@ -2046,6 +2066,103 @@ def derive_phase_status(requested: bool, ran_truthy: bool,
     return PHASE_STATUS_RAN if ran_truthy else PHASE_STATUS_SKIPPED
 
 
+_PHASE_TOOL_LABELS = {
+    "recon": {"recon", "gf", "dnsx", "httpx", "katana", "gau", "wayback",
+              "waybackurls", "waymore", "nmap", "naabu", "fingerprintx", "tlsx"},
+    "scan": {"scan", "VULN SCAN", "nuclei", "csp", "upload", "sqli", "xss", "ssti"},
+    "js_analysis": {"JS ANALYSIS", "js_analysis", "js_download", "secretfinder", "jsluice", "trufflehog"},
+    "secret_hunt": {"SECRET HUNT", "git-hound", "trufflehog"},
+    "param_discovery": {"PARAM DISCOVERY", "param_discovery", "arjun", "paramspider"},
+    "post_params": {"POST-PARAMS", "post_params", "arjun"},
+    "api_fuzz": {"API FUZZ", "api_fuzz", "api_discovery", "api_audit", "kiterunner", "feroxbuster"},
+    "cors": {"CORS CHECK", "cors"},
+    "cms_exploit": {"CMS EXPLOIT", "cms_exploit", "whatweb"},
+    "rce_scan": {"RCE SCAN", "rce_scan"},
+    "sqlmap": {"SQLMAP", "sqlmap_post"},
+    "jwt_audit": {"JWT AUDIT", "jwt_tool"},
+    "browser_scan": {"BROWSER SCAN", "browser"},
+    "auth_bypass": {"auth_bypass", "nomore403"},
+    "nuclei_dast": {"nuclei_dast", "nuclei"},
+}
+_PHASE_MANIFEST_LABELS = {
+    "recon": {"RECON"}, "scan": {"VULN SCAN", "SCAN"},
+    "js_analysis": {"JS ANALYSIS"}, "secret_hunt": {"SECRET HUNT"},
+    "param_discovery": {"PARAM DISCOVERY"}, "post_params": {"POST-PARAMS"},
+    "api_fuzz": {"API FUZZ"}, "cors": {"CORS CHECK"},
+    "cms_exploit": {"CMS EXPLOIT"}, "rce_scan": {"RCE SCAN"},
+    "sqlmap": {"SQLMAP", "SQLMAP POST"}, "jwt_audit": {"JWT AUDIT"},
+    "browser_scan": {"BROWSER SCAN"},
+}
+
+
+def _phase_label_matches(value: str, labels: set[str]) -> bool:
+    def normalize(label):
+        return re.sub(r"[\s_-]+", " ", str(label or "").casefold()).strip()
+    value = normalize(value)
+    # A separated suffix handles batch labels without matching unrelated tools
+    # such as `scanner.sh` merely because their name starts with `scan`.
+    return any(value == (label := normalize(raw)) or value.startswith(label + " ")
+               for raw in labels if raw)
+
+
+def _phase_coverage_matches(phase: str, row: dict) -> bool:
+    tool = row.get("tool_or_phase") or row.get("tool") or row.get("phase") or ""
+    if str(tool).casefold() == "arjun":
+        is_post = bool(re.search(r"\bpost\b", str(row.get("reason", "")), re.I))
+        if phase == "param_discovery" and is_post:
+            return False
+        if phase == "post_params" and not is_post:
+            return False
+    return _phase_label_matches(tool, _PHASE_TOOL_LABELS.get(phase, {phase}))
+
+
+def _update_phase_status(result: dict, findings_dir: str, *, coverage_rows=None) -> None:
+    """Use execution evidence and coverage, not just legacy result booleans.
+
+    No-finding invocations may have a falsy legacy result. Conversely a truthy
+    result may mean only that applicability was evaluated (for example RCE on
+    an IIS-only target). Explicit manifest skips and failures are authoritative.
+    """
+    requested = result.get("phase_requested")
+    if not isinstance(requested, dict):
+        return
+    rows = list(phase_manifest.collect_coverage(findings_dir)
+                if coverage_rows is None else coverage_rows)
+    rows.extend({"tool": row["tool"], "reason": row["reason"],
+                 "status": "aborted" if str(row["reason"]).startswith("ABORTED") else "degraded"}
+                for row in _DEGRADED_CAPABILITIES)
+    records = phase_manifest.read_manifest(findings_dir).get("phases", [])
+    statuses = result.setdefault("phase_status", {})
+    for phase, enabled in requested.items():
+        if not enabled:
+            statuses[phase] = PHASE_STATUS_SKIPPED
+            continue
+        labels = {phase} | _PHASE_MANIFEST_LABELS.get(phase, set())
+        evidence = [row for row in records if _phase_label_matches(row.get("phase", ""), labels)]
+        gaps = [row for row in rows if row.get("status", "degraded") in
+                {"degraded", "failed", "aborted"} and _phase_coverage_matches(phase, row)]
+        states = {row.get("status") for row in evidence + gaps}
+        # Do not trust an old producer's optimistic status over its actual
+        # exit/signal/timeout evidence (the manifest fold has the same rule).
+        states.update(phase_manifest.derive_status(
+            row.get("exit_code"), bool(row.get("timed_out")), row.get("signal"))
+            for row in evidence)
+        completed = bool(result.get(phase)) or any(row.get("status") == "ran" for row in evidence)
+        if phase == "post_params" and result.get("recon_dir"):
+            completed = completed or _file_nonempty(os.path.join(
+                result["recon_dir"], "params", "post_params_done.marker"))
+        if "aborted" in states:
+            statuses[phase] = PHASE_STATUS_ABORTED
+        elif "failed" in states:
+            statuses[phase] = PHASE_STATUS_FAILED
+        elif gaps or "degraded" in states:
+            statuses[phase] = derive_phase_status(True, completed, degraded=True)
+        elif evidence and evidence[-1].get("status") == "skipped":
+            statuses[phase] = PHASE_STATUS_SKIPPED
+        else:
+            statuses[phase] = derive_phase_status(True, completed)
+
+
 def _file_nonempty(path: str) -> bool:
     return os.path.isfile(path) and os.path.getsize(path) > 0
 
@@ -2084,13 +2201,22 @@ def _exact_allowed_hosts(domain: str, recon_dir: str) -> set[str]:
     so a target-controlled form or OpenAPI document cannot introduce a new host.
     """
     scope_file = os.path.join(recon_dir, "scope", "allow.txt")
-    if os.path.isfile(scope_file):
+    if not os.path.exists(scope_file) and os.environ.get("SCOPE_ALLOW_FILE"):
+        scope_file = os.environ["SCOPE_ALLOW_FILE"]
+    if os.path.exists(scope_file) or os.environ.get("SCOPE_ALLOW_FILE"):
         try:
-            hosts = {
-                host
-                for line in open(scope_file, encoding="utf-8", errors="replace")
-                if (host := _scope_host(line))
-            }
+            hosts = set()
+            with open(scope_file, encoding="utf-8", errors="replace") as source:
+                for line in source:
+                    value = line.strip()
+                    if not value or value.startswith("#"):
+                        continue
+                    host = _scope_host(value)
+                    if not host:
+                        continue
+                    parsed = urlsplit(value if "://" in value else f"//{value}")
+                    port = parsed.port
+                    hosts.add(f"{host}:{port}" if port not in (None, 80, 443) else host)
         except OSError:
             hosts = set()
         # A present-but-unreadable/empty allowlist fails closed.
@@ -2130,24 +2256,68 @@ def _exact_allowed_hosts(domain: str, recon_dir: str) -> set[str]:
                     in_scope = host == root_host or host.endswith("." + root_host)
                 if in_scope:
                     allowed.add(host)
+                    parsed = urlsplit(candidate if "://" in candidate else f"//{candidate}")
+                    if parsed.port not in (None, 80, 443):
+                        allowed.add(f"{host}:{parsed.port}")
     return allowed
 
 
 def _url_in_exact_allowed_hosts(url: str, allowed_hosts: set[str]) -> bool:
     """Fail closed unless an HTTP(S) URL names one exact allowed host."""
-    if not isinstance(url, str) or not allowed_hosts:
-        return False
-    try:
-        parsed = urlsplit(url)
-        _ = parsed.port
-    except (TypeError, ValueError):
-        return False
-    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return False
-    host = (parsed.hostname or "").lower().rstrip(".")
-    return bool(host) and host in allowed_hosts
+    from scoped_http import allows
+    return isinstance(url, str) and allows(url, allowed_hosts)
+
+
+def _restrict_session_scope(domain: str, recon_dir: str, targets_file: str | None = None) -> set[str]:
+    """Bind exact authority before consumers run, including scan-only/resume.
+
+    Passive source evidence is retained. Only derived execution lists are
+    filtered, so an earlier unlocked session cannot authorize a later locked run.
+    """
+    from scope_checker import scope_lock_allows, scope_lock_crawl_regex
+
+    if targets_file:
+        allowed = set(_read_targets_file(targets_file))
+    else:
+        try:
+            network = ipaddress.ip_network(domain, strict=False)
+        except ValueError:
+            network = None
+        if network is not None and "/" in domain:
+            allowed = set()
+            source = os.path.join(recon_dir, "subdomains", "all.txt")
+            with open(source, encoding="utf-8") as candidates:
+                for line in candidates:
+                    candidate = line.strip()
+                    try:
+                        if ipaddress.ip_address(candidate) in network:
+                            allowed.add(candidate)
+                    except ValueError:
+                        continue
+        else:
+            allowed = {domain}
+    scope_lock_crawl_regex(allowed)  # validate every authority before persistence
+    scope_dir = os.path.join(recon_dir, "scope")
+    os.makedirs(scope_dir, exist_ok=True)
+    with open(os.path.join(scope_dir, "allow.txt"), "w", encoding="utf-8") as output:
+        output.write("\n".join(sorted(allowed)) + "\n")
+    lists = (
+        "subdomains/all.txt", "subdomains/resolved.txt", "live/urls.txt", "live/httpx_full.txt",
+        "urls/all.txt", "urls/with_params.txt", "urls/js_files.txt", "urls/api_endpoints.txt",
+        "urls/discovered_html.txt",
+        "urls/live_hosts.txt", "params/top_urls.txt", "params/post_urls.txt",
+        "priority/critical_hosts.txt", "priority/high_hosts.txt", "priority/medium_hosts.txt",
+        "priority/low_hosts.txt", "priority/prioritized_hosts.txt",
+    )
+    for relative in lists:
+        path = os.path.join(recon_dir, relative)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as source:
+            lines = [line for line in source if line.strip() and scope_lock_allows(line.split()[0], allowed)]
+        with open(path, "w", encoding="utf-8") as output:
+            output.writelines(lines)
+    return allowed
 
 
 def _manifest_phase_completed(findings_dir: str, *phase_names: str) -> bool | None:
@@ -2390,12 +2560,67 @@ def write_coverage_json(findings_dir: str) -> str | None:
         return None
     try:
         os.makedirs(findings_dir, exist_ok=True)
-        out = os.path.join(findings_dir, "coverage.json")
-        with open(out, "w") as fh:
-            json.dump(list(_DEGRADED_CAPABILITIES), fh, indent=2)
-        return out
+        return phase_manifest.write_coverage(findings_dir, list(_DEGRADED_CAPABILITIES))
     except OSError:
         return None
+
+
+def _finalize_assessment(result: dict, findings_dir: str) -> None:
+    """Consolidate coverage and fold one outcome for reports, CLI, and sessions.
+
+    Keep the pre-write snapshot: writing this run's accumulator must not erase
+    unresolved gaps on resume. Use the merged rows even if persistence fails,
+    and never turn an existing failure back into a clean result.
+    """
+    core_broken = any(
+        status in (PHASE_STATUS_FAILED, PHASE_STATUS_ABORTED,
+                   PHASE_STATUS_ERROR, PHASE_STATUS_PARTIAL)
+        for phase, status in (result.get("phase_status") or {}).items()
+        if phase in {"recon", "scan"}
+    )
+    explicit_failure = (core_broken or result.get("success") is False
+                        or result.get("assessment_status") == "inconclusive")
+    prior_rows = []
+    try:
+        prior_rows = phase_manifest.collect_coverage(findings_dir)
+        prior_bad = phase_manifest.assessment_status(
+            findings_dir, coverage=prior_rows) == "inconclusive"
+    except Exception as exc:
+        _mark_degraded("coverage", f"could not read assessment coverage: {exc}")
+        prior_bad = True
+
+    # An autonomous step can fail before a subprocess records a manifest row
+    # (for example, a Python exception). Persist that failure for the reporter,
+    # not just in the return value or the saved autonomous session.
+    if explicit_failure and not prior_bad and not _DEGRADED_CAPABILITIES:
+        _mark_degraded("assessment", "a requested phase did not complete successfully")
+
+    try:
+        if write_coverage_json(findings_dir) is None:
+            _mark_degraded("coverage", "could not persist assessment coverage")
+    except Exception as exc:
+        _mark_degraded("coverage", f"could not persist assessment coverage: {exc}")
+    rows = prior_rows
+    try:
+        rows = phase_manifest.merge_coverage(findings_dir, prior_rows=prior_rows)
+    except Exception as exc:
+        _mark_degraded("coverage", f"could not consolidate assessment coverage: {exc}")
+    try:
+        persisted_bad = phase_manifest.assessment_status(
+            findings_dir, coverage=rows) == "inconclusive"
+    except Exception as exc:
+        _mark_degraded("coverage", f"could not determine assessment status: {exc}")
+        persisted_bad = True
+
+    try:
+        _update_phase_status(result, findings_dir, coverage_rows=rows)
+    except Exception as exc:
+        _mark_degraded("coverage", f"could not classify phase execution: {exc}")
+        persisted_bad = True
+
+    inconclusive = explicit_failure or prior_bad or persisted_bad or bool(_DEGRADED_CAPABILITIES)
+    result["success"] = not inconclusive
+    result["assessment_status"] = "inconclusive" if inconclusive else "complete"
 
 
 # Strings that mean GitHound (and similar GitHub-secret scanners) printed a
@@ -2612,7 +2837,7 @@ def _sanitize_sqlmap_candidates(candidates: list[str]) -> list[str]:
 _DEAD_HTTP_CODES: frozenset[int] = frozenset({404, 410})
 
 
-def _url_reachable(url: str, timeout: int = 8, cookies: str = "") -> bool:
+def _url_reachable(url: str, timeout: int = 8, cookies: str = "", *, allowed_hosts=None) -> bool:
     """Lightweight reachability preflight: True if the host responds at all.
 
     A SQLi candidate is "reachable" whenever the server answers — including
@@ -2630,6 +2855,19 @@ def _url_reachable(url: str, timeout: int = 8, cookies: str = "") -> bool:
     """
     import urllib.request
     import urllib.error
+
+    if allowed_hosts is not None:
+        from scoped_http import get, ScopeError
+        try:
+            response = get(url, allowed_hosts, timeout=timeout, max_body=0,
+                           headers={"Cookie": cookies} if cookies else None)
+            return response.status_code not in _DEAD_HTTP_CODES
+        except ScopeError:
+            # An in-scope redirect response proves reachability without
+            # authorizing the destination. sqlmap must also ignore redirects.
+            return _url_in_exact_allowed_hosts(url, allowed_hosts)
+        except Exception:
+            return False
 
     def _probe(method: str) -> bool | None:
         try:
@@ -2667,7 +2905,7 @@ def _url_reachable(url: str, timeout: int = 8, cookies: str = "") -> bool:
 def _filter_reachable_candidates(candidates: list[str], *,
                                  limit: int | None = None,
                                  timeout: int = 8,
-                                 cookies: str = "") -> tuple[list[str], int]:
+                                 cookies: str = "", allowed_hosts=None) -> tuple[list[str], int]:
     """Return (reachable_subset, dead_count). Probes at most ``limit`` URLs.
 
     ``cookies`` is threaded into each preflight probe so auth-gated endpoints
@@ -2680,7 +2918,9 @@ def _filter_reachable_candidates(candidates: list[str], *,
         # Only forward ``cookies`` when set, so callers/tests that monkeypatch
         # ``_url_reachable`` with the legacy ``(u, timeout=...)`` signature keep
         # working on the no-cookie path (backward compatibility).
-        if cookies:
+        if allowed_hosts is not None:
+            ok = _url_reachable(c, timeout=timeout, cookies=cookies, allowed_hosts=allowed_hosts)
+        elif cookies:
             ok = _url_reachable(c, timeout=timeout, cookies=cookies)
         else:
             ok = _url_reachable(c, timeout=timeout)
@@ -3730,6 +3970,10 @@ def _collect_completed_steps(domain: str, session_id: str | None = None) -> set[
         completed.add("cve_hunt")
     if _file_nonempty(os.path.join(findings_dir, "zero_day", "zero_day_findings.json")):
         completed.add("zero_day")
+    if any(os.path.exists(os.path.join(recon_dir, name)) for name in (
+            "ports/.nmap.failed", "urls/.urls.failed")):
+        completed.discard("recon")
+    completed.difference_update(_api_pending_consumers(domain, session_id=session_id))
     return completed
 
 
@@ -3788,7 +4032,11 @@ def _load_autonomous_session(
         current_completed = []
         if _file_nonempty(os.path.join(_resolve_recon_dir(domain, session_id=session_id), "live", "httpx_full.txt")):
             current_completed.append("recon")
-    session["completed_steps"] = current_completed
+    pending = _api_pending_consumers(domain, session_id=session_id)
+    if any(os.path.exists(os.path.join(_resolve_recon_dir(domain, session_id=session_id), name))
+           for name in ("ports/.nmap.failed", "urls/.urls.failed")):
+        pending.add("recon")
+    session["completed_steps"] = sorted(set(current_completed) - pending)
     return session
 
 
@@ -3937,6 +4185,7 @@ def _build_autonomous_plan(
 ) -> tuple[dict, list[dict]]:
     completed_steps = completed_steps or set()
     signals = _collect_autonomous_signals(domain)
+    pending_discovery = _api_pending_consumers(domain)
     plan = []
     planned_steps = set()
 
@@ -3946,6 +4195,8 @@ def _build_autonomous_plan(
         if destructive and not allow_destructive:
             return
         priority = AUTONOMOUS_STEP_BASE_PRIORITY.get(step, 10)
+        if step in pending_discovery:
+            priority += 30
         if signals["critical_hosts"] > 0 and step in {"cve_hunt", "rce_scan", "cms_exploit", "api_fuzz", "scan"}:
             priority += 20
         if signals["legacy_drupal_versions"] and step in {"cms_exploit", "cve_hunt"}:
@@ -3993,6 +4244,8 @@ def _build_autonomous_plan(
         return signals, plan[:1]
 
     add("scan", "Run the core vulnerability scan against the prioritized attack surface.")
+    for pending_step in sorted(pending_discovery):
+        add(pending_step, "Consume new scoped discovery inputs before trusting prior completion.")
 
     if signals["js_files"] > 0 or signals["ai_surface"]:
         add("js_analysis", f"Client-side or agent UI surface detected ({signals['js_files']} JS files).")
@@ -4152,6 +4405,16 @@ def _run_autonomous_step(
 
     if ok:
         completed.add(step)
+        if step in {"scan", "js_analysis", "param_discovery"}:
+            _consume_api_discovery(domain, step)
+    # A producer can promote fresh valid input while another API subtool fails.
+    # Invalidate dependent completion regardless of the aggregate phase result;
+    # otherwise a prior successful scan can hide the newly added attack surface.
+    if step == "api_fuzz":
+        pending = _api_pending_consumers(domain)
+        completed.difference_update(pending)
+        for dependent in pending:
+            result[dependent] = False
     result["success"] = result.get("success", True) and ok
     return ok
 
@@ -4169,8 +4432,19 @@ def run_autonomous_hunt(
     time_left_hours: float = 2.0,
     scope_lock: bool = False,
     max_urls: int = 0,
+    initial_coverage: list[dict[str, str]] | None = None,
 ) -> dict:
     skip_items = skip_items or set()
+    _reset_degraded()
+    for gap in initial_coverage or []:
+        _mark_degraded(gap["tool"], gap["reason"])
+    # Match synchronous per-target readiness tracking without inheriting a
+    # previous target's in-memory failures.
+    try:
+        for gap in check_tool_readiness():
+            _mark_degraded(gap["tool"], gap["reason"])
+    except Exception:
+        pass
     if resume:
         session_id, recon_dir = _activate_recon_session(
             domain,
@@ -4182,6 +4456,7 @@ def run_autonomous_hunt(
             return {
                 "domain": domain,
                 "success": False,
+                "assessment_status": "inconclusive",
                 "autonomous": True,
                 "reports": 0,
             }
@@ -4227,6 +4502,8 @@ def run_autonomous_hunt(
         ("jwt_audit", "jwt_audit"),
     ):
         result[key] = step in completed
+    result["phase_requested"] = {step: True for step in completed}
+    result["phase_requested"]["recon"] = not skip_has(skip_items, "recon") or "recon" in completed
 
     if "recon" not in completed and skip_has(skip_items, "recon"):
         log("warn", f"Skipping recon for {domain} (--skip recon)")
@@ -4247,6 +4524,16 @@ def run_autonomous_hunt(
         if recon_ok:
             completed.add("recon")
         findings_dir = _resolve_findings_dir(domain, session_id=session_id, create=True)
+        if not recon_ok:
+            _mark_degraded("recon", "recon failed — downstream phases not started")
+            result["assessment_status"] = "inconclusive"
+            phase_manifest.record_phase(findings_dir, "RECON", exit_code=1)
+            _finalize_assessment(result, findings_dir)
+            session["completed_steps"] = sorted(completed)
+            session["attempted_steps"] = sorted(attempted)
+            session["last_result"] = result
+            _save_autonomous_session(session)
+            return result
         if _brain and _brain.enabled and os.path.isdir(recon_dir):
             log("info", "Brain: autonomous post-recon hook...")
             _brain.post_recon_hook(recon_dir, findings_dir)
@@ -4254,6 +4541,20 @@ def run_autonomous_hunt(
         _save_autonomous_session(session)
 
     recon_dir = _resolve_recon_dir(domain, session_id=session_id)
+    if scope_lock:
+        try:
+            # Resumed legacy recon may predate allow.txt. Rebind exact scope
+            # before any discovery/crawler consumer can reuse its URL lists.
+            _restrict_session_scope(domain, recon_dir)
+        except (OSError, ValueError) as exc:
+            _mark_degraded("scope", f"exact-scope authority unavailable: {exc}")
+            result["success"] = False
+            _finalize_assessment(result, result["findings_dir"])
+            session["completed_steps"] = sorted(completed)
+            session["attempted_steps"] = sorted(attempted)
+            session["last_result"] = result
+            _save_autonomous_session(session)
+            return result
     recon_httpx = os.path.join(recon_dir, "live", "httpx_full.txt")
     if _file_nonempty(recon_httpx):
         log("info", "Refreshing tech-CVE prioritization from latest recon artifacts...")
@@ -4324,6 +4625,7 @@ def run_autonomous_hunt(
 
         step = next_item["step"]
         attempted.add(step)
+        result["phase_requested"][step] = True
         executed_steps.append(step)
         danger = " [destructive]" if next_item.get("destructive") else ""
         log("phase", f"AUTONOMOUS STEP: {step}{danger}")
@@ -4372,8 +4674,18 @@ def run_autonomous_hunt(
         if _brain and _brain.enabled and os.path.isdir(findings_dir):
             log("info", "Brain: autonomous post-scan hook (triage + exploit + report)...")
             _brain.post_scan_hook(findings_dir, recon_dir)
-        if not skip_has(skip_items, "reports"):
-            result["reports"] = generate_reports(domain)
+
+    # Also finalize no-op resumes: persisted coverage still determines the
+    # outcome when the planner has no new steps to execute.
+    pending = _api_pending_consumers(domain)
+    if pending:
+        _mark_degraded("api_discovery", "newly discovered inputs still require "
+                       + ", ".join(sorted(pending)) + " within the autonomous budget")
+    _finalize_assessment(result, result["findings_dir"])
+    if executed_steps and not skip_has(skip_items, "reports"):
+        result["reports"] = generate_reports(domain)
+        # Report/authz subprocesses can add manifest failures or late gaps.
+        _finalize_assessment(result, result["findings_dir"])
 
     if resume:
         session["completed_steps"] = sorted(completed | _collect_completed_steps(domain, session_id=session_id))
@@ -4674,6 +4986,11 @@ def run_recon(
     else:
         log("phase", f"RECON: {domain} (batch={batch_size}) [{active_session_id}]")
     log("info", f"Recon output dir: {recon_dir}")
+    # Bind the new session before the first subprocess, not after recon returns:
+    # otherwise its manifest row is lost or attributed to a previous target.
+    global _LAST_FINDINGS_DIR
+    _LAST_FINDINGS_DIR = _resolve_findings_dir(
+        domain, session_id=active_session_id, create=True)
     script     = os.path.join(SCRIPT_DIR, "recon.sh")
     quick_flag = "--quick" if quick else ""
     adaptive_env = _shell_env_prefix(_adaptive_runtime_overrides(domain))
@@ -4761,7 +5078,11 @@ def run_recon(
                 _af.write("\n".join(_allow_hosts) + "\n")
             _allow_env = f"SCOPE_ALLOW_FILE={shlex.quote(_allow_path)} "
         except OSError as _e:
-            log("warn", f"scope allowlist persist failed ({_e}) — recon fails closed under scope-lock")
+            _reason = f"scope allowlist persist failed ({_e}) — recon not started"
+            log("err", _reason)
+            _mark_degraded("recon", _reason)
+            _brain_phase_complete("RECON", False, detail=_reason, artifacts={"recon": recon_dir})
+            return False
     ok = run_live(
         f'{adaptive_env}{_scope_env}{_allow_env}{_type_env}{_maxurl_env}{_full_env}{_targets_env}'
         f'RECON_OUT_DIR="{recon_dir}" RECON_SESSION_ID="{active_session_id or ""}" '
@@ -5855,9 +6176,13 @@ def run_secret_hunt(domain: str) -> bool:
 
     trufflehog = _tool_bin("trufflehog")
     git_hound  = _tool_bin("git-hound")
+    command_failed = False
+    attempted_engines = 0
+    successful_engines = 0
 
     # TruffleHog on full recon dir
     if _which(trufflehog):
+        attempted_engines += 1
         tf_out = os.path.join(secret_dir, "trufflehog_recon.json")
         ok, out = run_cmd(
             f'{trufflehog} filesystem "{recon_dir}" --json --no-update 2>/dev/null | tee "{tf_out}"',
@@ -5865,11 +6190,19 @@ def run_secret_hunt(domain: str) -> bool:
             watch_file=secret_dir,
             watch_phase="SECRET HUNT"
         )
+        if not ok:
+            command_failed = True
+            _mark_degraded("trufflehog", "recon secret scan command failed; any output is partial")
+        else:
+            successful_engines += 1
         if os.path.exists(tf_out):
             hits = _count_json_findings(tf_out)
-            log("ok" if hits == 0 else "crit", f"TruffleHog recon scan: {hits} secrets → {tf_out}")
+            level = "crit" if hits else "ok" if ok else "warn"
+            qualifier = "" if ok else " (partial/failed scan)"
+            log(level, f"TruffleHog recon scan: {hits} secrets{qualifier} → {tf_out}")
     else:
         log("warn", "trufflehog not in PATH")
+        _mark_degraded("trufflehog", "binary unavailable; recon secret scan was not invoked")
 
     # GitHound: search GitHub for secrets related to domain
     if _which(git_hound) and not _githound_config_ready(_githound_config_candidates()):
@@ -5880,6 +6213,7 @@ def run_secret_hunt(domain: str) -> bool:
                        "config.yml missing or placeholder creds — GitHub secret scan SKIPPED")
         log("warn", "git-hound: no usable GitHub creds in config.yml — skipping (cannot invent tokens; provide ~/.githound/config.yml)")
     elif _which(git_hound):
+        attempted_engines += 1
         gh_out = os.path.join(secret_dir, "githound.txt")
         # v9.24 — capture stderr too: GitHound prints "[!] config.yml was not
         # found." to stdout, but other auth/rate-limit errors land on stderr.
@@ -5889,6 +6223,9 @@ def run_secret_hunt(domain: str) -> bool:
             watch_file=secret_dir,
             watch_phase="SECRET HUNT"
         )
+        if not ok:
+            command_failed = True
+            _mark_degraded("git-hound", "GitHub secret scan command failed; any output is partial")
         if os.path.exists(gh_out):
             gh_text = _read_text(gh_out)
             # If GitHound emitted a config/auth error (e.g. missing config.yml),
@@ -5898,13 +6235,18 @@ def run_secret_hunt(domain: str) -> bool:
                 _mark_degraded("git-hound",
                                "not configured (config.yml / GitHub creds missing) — GitHub secret scan SKIPPED")
             else:
+                if ok:
+                    successful_engines += 1
                 # Count only actual match lines; GitHound prefixes informational
                 # warnings with "[!]" which are not findings.
                 count = sum(1 for line in gh_text.splitlines()
                             if line.strip() and not line.lstrip().startswith("[!]"))
-                log("ok" if count == 0 else "crit", f"GitHound: {count} results → {gh_out}")
+                level = "crit" if count else "ok" if ok else "warn"
+                qualifier = "" if ok else " (partial/failed scan)"
+                log(level, f"GitHound: {count} results{qualifier} → {gh_out}")
     else:
         log("warn", "git-hound not in PATH — skipping GitHub scan")
+        _mark_degraded("git-hound", "binary unavailable; GitHub secret scan was not invoked")
 
     # ── Discovered-credential reporting (ALWAYS) + blast-radius (opt-in: --assess-creds) ──
     # A TruffleHog-VERIFIED cloud credential is a confirmed critical exposure — report it to the
@@ -5922,13 +6264,32 @@ def run_secret_hunt(domain: str) -> bool:
     except Exception as e:
         log("warn", f"cred reporting failed: {e}")
 
+    # Passive reporting of old/verified credential evidence above is useful,
+    # but it does not establish that a secret-scanning engine ran this time.
+    phase_ok = successful_engines > 0 and not command_failed
+    if not attempted_engines:
+        phase_manifest.record_phase(
+            _resolve_findings_dir(domain, create=True), "SECRET HUNT",
+            status=phase_manifest.PHASE_SKIPPED,
+            artifact_counts={"attempted_engines": 0, "successful_engines": 0},
+        )
+    elif not successful_engines:
+        # A process can exit zero while reporting an authentication/config
+        # error. Record the semantic phase failure as well as its raw exit so
+        # the dashboard cannot infer usable coverage from that exit alone.
+        phase_manifest.record_phase(
+            _resolve_findings_dir(domain, create=True), "SECRET HUNT",
+            status=phase_manifest.PHASE_FAILED,
+            artifact_counts={"attempted_engines": attempted_engines, "successful_engines": 0},
+        )
     _brain_phase_complete(
         "SECRET HUNT",
-        True,
-        detail=f"target={domain}",
+        phase_ok,
+        detail=(f"target={domain} attempted_engines={attempted_engines} "
+                f"successful_engines={successful_engines}"),
         artifacts={"secrets": secret_dir},
     )
-    return True
+    return phase_ok
 
 
 # ── NEW: Parameter Discovery ───────────────────────────────────────────────────
@@ -5940,6 +6301,8 @@ def run_param_discovery(domain: str) -> bool:
     log("phase", f"PARAM DISCOVERY: {domain}")
     recon_dir  = _resolve_recon_dir(domain)
     param_dir  = os.path.join(recon_dir, "params")
+    scope_locked = os.path.exists(os.path.join(recon_dir, "scope", "allow.txt")) or bool(os.environ.get("SCOPE_ALLOW_FILE"))
+    allowed_hosts = _exact_allowed_hosts(domain, recon_dir) if scope_locked else None
     os.makedirs(param_dir, exist_ok=True)
     if _brain and _brain.enabled:
         _brain.phase_start("PARAM DISCOVERY", f"target={domain}")
@@ -5983,6 +6346,7 @@ def run_param_discovery(domain: str) -> bool:
     # exceeds PARAM_TIMEOUT (observed rc=-9 at 905s twice). We use the
     # bundled small.txt wordlist (~835 params) and drop --stable; arjun
     # scales linearly with wordlist size and --stable triples runtime.
+    arjun_failed = False
     if _which("arjun"):
         top_urls_file = os.path.join(param_dir, "top_urls.txt")
         # Env-overridable cap (parity with CORS_MAX_URLS). Default 5 mitigates
@@ -5991,45 +6355,53 @@ def run_param_discovery(domain: str) -> bool:
         ARJUN_MAX_URLS = int(os.environ.get("ARJUN_MAX_URLS", "5"))
         # Count the full live-URL surface BEFORE capping so we can surface the
         # coverage loss via _mark_degraded (matching the CORS/sqlmap pattern).
-        _arjun_all_live = _collect_urls_from_file(live_file)
+        from discovery_feedback import normalize_url
+        _arjun_all_live = []
+        _arjun_seen = set()
+        for source in (live_file, os.path.join(recon_dir, "urls", "discovered_html.txt"),
+                       os.path.join(recon_dir, "urls", "api_endpoints.txt"), with_params_file):
+            for url in _collect_urls_from_file(source, strip_query=True):
+                key = normalize_url(url)
+                if key is None or key in _arjun_seen:
+                    continue
+                if scope_locked and not _url_in_exact_allowed_hosts(url, allowed_hosts):
+                    continue
+                _arjun_seen.add(key)
+                _arjun_all_live.append(url)
         _arjun_limit = ARJUN_MAX_URLS if ARJUN_MAX_URLS > 0 else None
-        arjun_inputs = _collect_urls_from_file(live_file, limit=_arjun_limit)
-        if ARJUN_MAX_URLS <= 0 or len(arjun_inputs) < ARJUN_MAX_URLS:
-            _topup_limit = (ARJUN_MAX_URLS * 2) if ARJUN_MAX_URLS > 0 else None
-            for url in _collect_urls_from_file(with_params_file, strip_query=True, limit=_topup_limit):
-                if url not in arjun_inputs:
-                    arjun_inputs.append(url)
-                if ARJUN_MAX_URLS > 0 and len(arjun_inputs) >= ARJUN_MAX_URLS:
-                    break
+        arjun_inputs = _arjun_all_live[:_arjun_limit]
         if ARJUN_MAX_URLS > 0 and len(_arjun_all_live) > ARJUN_MAX_URLS:
             _mark_degraded("arjun", f"URL surface capped: probed {ARJUN_MAX_URLS} of "
-                                    f"{len(_arjun_all_live)} live URLs (set ARJUN_MAX_URLS=0 for unlimited)")
+                                    f"{len(_arjun_all_live)} candidate URLs (set ARJUN_MAX_URLS=0 for unlimited)")
 
+        if scope_locked:
+            arjun_inputs = [url for url in arjun_inputs if _url_in_exact_allowed_hosts(url, allowed_hosts)]
         if arjun_inputs:
             with open(top_urls_file, "w") as fh:
                 fh.write("\n".join(arjun_inputs) + "\n")
             arjun_out = os.path.join(param_dir, "arjun.json")
-            # Locate the bundled small wordlist; fall back to default if not found
-            try:
-                import arjun as _arjun_pkg
-                arjun_small = os.path.join(os.path.dirname(_arjun_pkg.__file__), "db", "small.txt")
-            except Exception:
-                arjun_small = ""
-            wl_flag = f' -w "{arjun_small}"' if arjun_small and os.path.isfile(arjun_small) else ""
+            # Let the executable resolve its own bundled wordlist. It may live
+            # in pipx/uv rather than this interpreter's import environment.
+            wl_flag = " -w small"
+            redirect_flag = " --disable-redirects" if scope_locked else ""
             ok, out = run_cmd(
-                f'arjun -i "{top_urls_file}" -oJ "{arjun_out}"{wl_flag} '
+                f'arjun -i "{top_urls_file}" -oJ "{arjun_out}"{wl_flag}{redirect_flag} '
                 f'-t 10 -T 10 2>/dev/null',
                 timeout=PARAM_TIMEOUT,
                 watch_file=param_dir,
                 watch_phase="PARAM DISCOVERY"
             )
+            arjun_failed = not ok
+            if arjun_failed:
+                _mark_degraded("arjun", "parameter discovery command failed or timed out; coverage incomplete")
+                log("warn", "Arjun failed — retaining available partial output; parameter coverage incomplete")
             if os.path.exists(arjun_out):
                 try:
                     data = json.load(open(arjun_out))
                     total = sum(len(v.get("params", [])) for v in data.values())
-                    log("ok", f"Arjun: {total} hidden params found → {arjun_out}")
+                    log("warn" if arjun_failed else "ok", f"Arjun: {total} hidden params found → {arjun_out}")
                 except Exception:
-                    log("ok", f"Arjun complete → {arjun_out}")
+                    log("warn" if arjun_failed else "ok", f"Arjun output → {arjun_out}")
         else:
             log("warn", "Arjun skipped — no candidate URLs available")
     else:
@@ -6037,11 +6409,60 @@ def run_param_discovery(domain: str) -> bool:
 
     _brain_phase_complete(
         "PARAM DISCOVERY",
-        True,
-        detail=f"target={domain}",
+        not arjun_failed,
+        detail=f"target={domain} arjun_failed={int(arjun_failed)}",
         artifacts={"params": param_dir},
     )
-    return True
+    return not arjun_failed
+
+
+# ── Discovery handoff ─────────────────────────────────────────────────────────
+def _api_pending_consumers(domain: str, session_id: str | None = None) -> set[str]:
+    path = os.path.join(_resolve_recon_dir(domain, session_id=session_id), "api", "discovery_feedback.json")
+    data = _load_json(path, {})
+    pending = data.get("pending_consumers", []) if isinstance(data, dict) else []
+    if not isinstance(pending, list):
+        return set()
+    return {phase for phase in pending if isinstance(phase, str)}.intersection(
+        {"scan", "js_analysis", "param_discovery"})
+
+
+def _consume_api_discovery(domain: str, phase: str) -> None:
+    path = os.path.join(_resolve_recon_dir(domain), "api", "discovery_feedback.json")
+    data = _load_json(path, {})
+    if isinstance(data, dict) and phase in data.get("pending_consumers", []):
+        data["pending_consumers"] = sorted(set(data["pending_consumers"]) - {phase})
+        _write_json(path, data)
+
+
+def _promote_api_discovery(domain: str, response_file: str, *, producer_ok: bool) -> dict:
+    """Make fresh scoped discovery inputs available before dependent phases."""
+    recon_dir = _resolve_recon_dir(domain)
+    pending = _api_pending_consumers(domain)
+    feedback = {"changed": False, "errors": [], "pending_consumers": sorted(pending)}
+    if producer_ok and os.path.isfile(response_file):
+        from discovery_feedback import merge_ferox_discoveries
+        feedback = merge_ferox_discoveries(recon_dir, response_file, target=domain)
+        if feedback.get("added_js_urls"):
+            pending.add("js_analysis")
+        if any(feedback.get(key) for key in (
+                "added_html_urls", "added_parameter_urls", "added_api_urls")):
+            pending.add("param_discovery")
+        if feedback.get("added_parameter_urls") or feedback.get("added_api_urls"):
+            pending.add("scan")
+        for error in feedback.get("errors", []):
+            _mark_degraded("api_discovery", error)
+        if feedback.get("changed"):
+            log("info", f"Discovery handoff: {len(feedback.get('added_urls', []))} new scoped URLs, "
+                        f"{len(feedback.get('added_js_urls', []))} JS inputs")
+    elif producer_ok:
+        reason = "successful discovery command produced no response artifact"
+        feedback["errors"].append(reason)
+        _mark_degraded("api_discovery", reason)
+    feedback["pending_consumers"] = sorted(pending)
+    feedback["producer_ok"] = producer_ok
+    _write_json(os.path.join(recon_dir, "api", "discovery_feedback.json"), feedback)
+    return feedback
 
 
 # ── NEW: API Fuzzing ───────────────────────────────────────────────────────────
@@ -6067,6 +6488,8 @@ def run_api_fuzz(domain: str) -> bool:
     kiterunner = _tool_bin("kiterunner")
     feroxbuster = _tool_bin("feroxbuster")
     api_audit = os.path.join(SCRIPT_DIR, "api_audit.py")
+    ferox_ok = False
+    fb_out = os.path.join(api_dir, "feroxbuster.json")
 
     # Autoswagger-style schema discovery + low-noise unauth API audit
     if os.path.isfile(api_audit):
@@ -6124,7 +6547,7 @@ def run_api_fuzz(domain: str) -> bool:
 
     # Feroxbuster: recursive dir brute on primary domain
     if _which(feroxbuster):
-        fb_out     = os.path.join(api_dir, "feroxbuster.json")
+        _quarantine_managed_file(fb_out, os.path.join(api_dir, "stale-evidence", str(time.time_ns())))
         wordlist   = os.path.join(WORDLIST_DIR, "api-endpoints.txt")
         if not os.path.isfile(wordlist):
             wordlist = os.path.join(WORDLIST_DIR, "common.txt")
@@ -6157,12 +6580,14 @@ def run_api_fuzz(domain: str) -> bool:
             watch_file=api_dir,
             watch_phase="API FUZZ"
         )
+        ferox_ok = ok
         if os.path.exists(fb_out):
             hits = sum(1 for line in open(fb_out) if '"status"' in line and '"404"' not in line)
             log("ok", f"Feroxbuster: {hits} endpoints → {fb_out}")
     else:
         log("warn", "feroxbuster not in PATH")
 
+    _promote_api_discovery(domain, fb_out, producer_ok=ferox_ok)
     _brain_phase_complete(
         "API FUZZ",
         True,
@@ -6193,19 +6618,36 @@ def run_cors_check(domain: str) -> bool:
         _brain_phase_complete("CORS CHECK", False, detail=f"target={domain} missing urls.txt")
         return False
 
+    from scope_checker import _load_allow_file
+    scope_file = os.environ.get("SCOPE_ALLOW_FILE") or os.path.join(recon_dir, "scope", "allow.txt")
+    scope_locked = bool(os.environ.get("SCOPE_ALLOW_FILE")) or os.path.exists(scope_file) or os.environ.get("SCOPE_LOCK") == "1"
+    if scope_locked and not _load_allow_file(scope_file):
+        _mark_degraded("cors", "missing or empty exact-host CORS allowlist; no requests issued")
+        _brain_phase_complete("CORS CHECK", False, detail=f"target={domain} invalid scope allowlist")
+        return False
+
     cors_out = os.path.join(cors_dir, "cors_findings.txt")
+    scope_coverage = os.path.join(cors_dir, "scope_coverage.json")
     # Test each live URL for CORS misconfig
     # audit-fix (finding 6): the old ``[:100]`` slice silently dropped every live
     # URL past the first 100 with no coverage marker. CORS_MAX_URLS (env
     # CORS_MAX_URLS, default 0 = unlimited) replaces it; when a positive cap drops
     # URLs we record a degradation below so the report shows partial coverage.
     cors_script = f"""
-import subprocess, sys, urllib.request
-_all_urls = open("{live_file}").read().splitlines()
+import json, sys, urllib.request
+# Generated in the session directory, not alongside the scope helpers.
+sys.path.insert(0, {SCRIPT_DIR!r})
+scope_locked = {scope_locked!r}
+scope_file = {scope_file!r}
+if scope_locked:
+    from scope_checker import _load_allow_file
+    from scoped_http import get as scoped_get
+_all_urls = open({live_file!r}).read().splitlines()
 _cap = {CORS_MAX_URLS}
 urls = _all_urls[:_cap] if _cap > 0 else _all_urls
 findings = []
-target_domain = "{domain}"
+coverage = {{"tested": 0, "blocked": [], "errors": []}}
+target_domain = {domain!r}
 origins = [
     "https://evil.com",
     "null",
@@ -6215,11 +6657,21 @@ origins = [
 for url in urls:
     for origin in origins:
         try:
-            req = urllib.request.Request(url,
-                headers={{"Origin": origin, "User-Agent": "Mozilla/5.0"}})
-            resp = urllib.request.urlopen(req, timeout=5)
-            acao = resp.headers.get("Access-Control-Allow-Origin", "")
-            acac = resp.headers.get("Access-Control-Allow-Credentials", "")
+            headers = {{"Origin": origin, "User-Agent": "Mozilla/5.0"}}
+            if scope_locked:
+                # The live URL corpus is untrusted. Reload the authoritative
+                # scope for EACH Origin request, and gate every redirect hop.
+                resp = scoped_get(url, _load_allow_file(scope_file), timeout=5,
+                                  headers=headers, max_body=0)
+            else:
+                req = urllib.request.Request(url, headers=headers)
+                resp = urllib.request.urlopen(req, timeout=5)
+            try:
+                acao = resp.headers.get("Access-Control-Allow-Origin", "")
+                acac = resp.headers.get("Access-Control-Allow-Credentials", "")
+            finally:
+                resp.close()
+            coverage["tested"] += 1
             cred = acac.strip().lower() == "true"
             line = None
             if acao == origin:
@@ -6237,23 +6689,46 @@ for url in urls:
             if line:
                 findings.append(line)
                 print(line, flush=True)
-        except Exception:
-            pass
-with open("{cors_out}", "w") as f:
+        except Exception as exc:
+            if scope_locked:
+                entry = {{"url": url, "origin": origin, "reason": str(exc)}}
+                if hasattr(exc, "destination"):
+                    entry.update(source=exc.source, destination=exc.destination)
+                    coverage["blocked"].append(entry)
+                else:
+                    coverage["errors"].append(entry)
+with open({cors_out!r}, "w") as f:
     f.write("\\n".join(findings))
-print(f"[CORS] {{len(findings)}} findings saved to {cors_out}")
+if scope_locked:
+    with open({scope_coverage!r}, "w") as f:
+        json.dump(coverage, f, indent=2)
+print(f"[CORS] {{len(findings)}} findings saved to " + {cors_out!r})
 """
     cors_script_path = os.path.join(cors_dir, "_cors_test.py")
     with open(cors_script_path, "w") as f:
         f.write(cors_script)
 
     ok, out = run_cmd(
-        f'python3 "{cors_script_path}"',
+        f'{shlex.quote(sys.executable)} {shlex.quote(cors_script_path)}',
         timeout=CORS_TIMEOUT,
         watch_file=cors_dir,
         watch_phase="CORS CHECK",
     )
     print(out.strip())
+
+    cors_partial = False
+    if scope_locked:
+        try:
+            with open(scope_coverage, encoding="utf-8") as cf:
+                coverage = json.load(cf)
+            blocked_count = len(coverage["blocked"])
+            error_count = len(coverage["errors"])
+            if blocked_count or error_count:
+                cors_partial = True
+                _mark_degraded("cors", f"exact scope: {blocked_count} Origin requests blocked and {error_count} failed; see {scope_coverage}")
+        except (OSError, ValueError, KeyError, TypeError):
+            cors_partial = True
+            _mark_degraded("cors", "scoped CORS coverage unavailable; generated check did not complete")
 
     if os.path.exists(cors_out):
         # Count only credentialed-reflection findings as vulnerabilities; benign
@@ -6272,7 +6747,7 @@ print(f"[CORS] {{len(findings)}} findings saved to {cors_out}")
             log("crit", f"CORS: {vuln_count} reflection vulnerabilities → {cors_out}")
         elif info_count:
             log("info", f"CORS: {info_count} wildcard (no-creds) endpoint(s) [informational] → {cors_out}")
-        else:
+        elif not cors_partial:
             log("ok", "CORS: No misconfigurations found")
     # audit-fix (finding 6): if a positive CORS_MAX_URLS capped the surface,
     # surface the skipped count rather than passing the phase silently.
@@ -6286,11 +6761,11 @@ print(f"[CORS] {{len(findings)}} findings saved to {cors_out}")
         _mark_degraded("cors", f"URL surface capped: tested {CORS_MAX_URLS} of {_cors_total}")
     _brain_phase_complete(
         "CORS CHECK",
-        ok,
+        ok and not cors_partial,
         detail=f"target={domain} live_urls={_cors_total} cors_skipped={_cors_skipped}",
         artifacts={"cors": cors_dir},
     )
-    return True
+    return (ok and not cors_partial) if scope_locked else True
 
 
 # ── NEW: Semgrep static analysis ───────────────────────────────────────────────
@@ -6580,11 +7055,50 @@ def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
     whatweb_bin  = _tool_bin("whatweb")
     drupal_poc   = _tool_bin("drupalgeddon2")
     nuclei_bin   = _tool_bin("nuclei")
+    from nuclei_scope import nuclei_scope_flags, record_nuclei_coverage
+    nuclei_guard = "".join(" " + flag for flag in nuclei_scope_flags(recon_dir))
 
     if not os.path.isfile(live_file):
         log("warn", "No httpx_full.txt — run recon first")
         _brain_phase_complete("CMS EXPLOIT", False, detail=f"target={domain} missing httpx_full.txt")
         return False
+
+    # A persisted allowlist applies to every CMS input and every redirect hop.
+    # An empty/unreadable file is still a scope lock, never permission to widen it.
+    from scope_checker import _load_allow_file
+    from scoped_http import allows as _scope_allows
+    scope_file = os.environ.get("SCOPE_ALLOW_FILE") or os.path.join(recon_dir, "scope", "allow.txt")
+    scope_locked = bool(os.environ.get("SCOPE_ALLOW_FILE")) or os.path.exists(scope_file)
+    allowed = _load_allow_file(scope_file) if scope_locked else None
+    if scope_locked and not allowed:
+        _mark_degraded("cms_exploit", "exact-host allowlist missing/empty — CMS probes not started")
+        return False
+
+    def cms_get(url: str, fallback: str, *, timeout=10, max_redirects=3,
+                max_body=300_000, include_headers=False, status_marker=False) -> str:
+        if not scope_locked:
+            return fallback
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, "scoped_http.py"),
+                "--allow-file", scope_file, "--timeout", str(timeout),
+                "--max-redirects", str(max_redirects), "--max-body", str(max_body),
+                "--blocked-log", os.path.join(findings_dir, "manual_review", "off_scope_redirects.jsonl")]
+        if include_headers:
+            argv.append("--include-headers")
+        if status_marker:
+            argv.append("--status-marker")
+        return shlex.join(argv + [url])
+
+    if scope_locked:
+        # Pass a filtered copy to external tools; keep the original recon evidence.
+        cms_targets = os.path.join(exploit_dir, "scoped_live_urls.txt")
+        with open(cms_targets, "w") as output:
+            source = live_urls if os.path.isfile(live_urls) else live_file
+            with open(source, errors="ignore") as inputs:
+                for line in inputs:
+                    candidate = line.split()[0] if line.strip() else ""
+                    if _scope_allows(candidate, allowed):
+                        output.write(candidate + "\n")
+        live_urls = cms_targets
 
     # ── Step 1: whatweb fingerprinting ──
     # v9.23 — the old form `... | xargs -I{} whatweb --color=never {} 2>/dev/null
@@ -6616,7 +7130,7 @@ def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
             # (the jsluice/secretfinder loops are safe because they read the URL
             # via shell `read` into "$url", which is never re-parsed).
             run_cmd(
-                f'{whatweb_bin} -a1 --color=never --follow-redirect=always '
+                f'{whatweb_bin} -a1 --color=never --follow-redirect={"never" if scope_locked else "always"} '
                 f'--max-redirects=3 --open-timeout=25 --read-timeout=25 '
                 f'{shlex.quote(url)} >> {shlex.quote(whatweb_out)} 2>> {shlex.quote(whatweb_err)}',
                 timeout=70,
@@ -6650,13 +7164,14 @@ def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
     if _which(nuclei_bin):
         log("info", "nuclei: running CMS CVE templates...")
         nuclei_targets = live_urls if os.path.isfile(live_urls) else live_file
-        run_cmd(
+        nuclei_ok, _ = run_cmd(
             f'{nuclei_bin} -l "{nuclei_targets}" -tags drupal,wordpress,joomla,cms '
-            f'-severity critical,high,medium -silent -o "{nuclei_cms_out}" 2>/dev/null',
+            f'-severity critical,high,medium -silent -o "{nuclei_cms_out}"{nuclei_guard} 2>/dev/null',
             timeout=int(os.environ.get("VIK_CMS_NUCLEI_TIMEOUT", "900")),
             watch_file=exploit_dir,
             watch_phase="CMS EXPLOIT"
         )
+        record_nuclei_coverage(recon_dir, exit_code=0 if nuclei_ok else 1)
         if os.path.exists(nuclei_cms_out):
             count = sum(1 for _ in open(nuclei_cms_out) if _.strip())
             log("ok" if count == 0 else "crit", f"nuclei CMS: {count} findings → {nuclei_cms_out}")
@@ -6666,6 +7181,8 @@ def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
     # ── Step 3: Detect Drupal hosts ──
     def remember_host(store: dict[str, str], candidate: str) -> None:
         candidate = (candidate or "").strip()
+        if scope_locked and not _scope_allows(candidate, allowed):
+            return
         if not candidate.startswith(("http://", "https://")):
             return
         parsed = urlsplit(candidate)
@@ -6741,8 +7258,10 @@ def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
             for path in ("/misc/drupal.js", "/core/misc/drupal.js",
                          "/CHANGELOG.txt", "/core/CHANGELOG.txt"):
                 ok, body = run_cmd(
-                    f'curl -sk -L --max-redirs 3 --max-time 8 '
-                    f'-w "\\nHTTP_STATUS:%{{http_code}}" "{host}{path}"',
+                    cms_get(f"{host}{path}",
+                            f'curl -sk -L --max-redirs 3 --max-time 8 '
+                            f'-w "\\nHTTP_STATUS:%{{http_code}}" {shlex.quote(host + path)}',
+                            timeout=8, status_marker=True),
                     timeout=12
                 )
                 if not ok or not body:
@@ -6775,11 +7294,12 @@ def run_cms_exploit(domain: str, allow_destructive: bool = False) -> bool:
                 log("info", f"nuclei (drupal templates): {host}")
                 ok, out = run_cmd(
                     f'{nuclei_bin} -u "{host}" -tags drupal,cms '
-                    f'-severity medium,high,critical -silent -o "{droop_out}"',
+                    f'-severity medium,high,critical -silent -o "{droop_out}"{nuclei_guard}',
                     timeout=int(os.environ.get("VIK_CMS_HOST_TIMEOUT", "600")),
                     watch_file=exploit_dir,
                     watch_phase="CMS EXPLOIT"
                 )
+                record_nuclei_coverage(recon_dir, exit_code=0 if ok else 1)
                 print(out[:2000])
         else:
             log("warn", "nuclei not installed — skipping Drupal template scan")
@@ -6947,22 +7467,26 @@ check
         confirmed = False
         # Probe 1: wp-login.php must return WP markers in body
         ok_p, body = run_cmd(
-            f'curl -sk -L --max-time 10 --max-redirs 2 "{host}/wp-login.php" 2>/dev/null | head -c 4000',
+            cms_get(f"{host}/wp-login.php",
+                    f'curl -sk -L --max-time 10 --max-redirs 2 {shlex.quote(host + "/wp-login.php")} 2>/dev/null | head -c 4000',
+                    max_redirects=2, max_body=4000),
             timeout=14
         )
         body_l = (body or "").lower()
-        if any(marker in body_l for marker in ("wp-content", "wp-includes", "wordpress", "wp-submit")):
+        if ok_p and any(marker in body_l for marker in ("wp-content", "wp-includes", "wordpress", "wp-submit")):
             confirmed_wp_hosts.append(host)
             log("crit", f"WordPress confirmed live at {host} (body markers on /wp-login.php)")
             confirmed = True
         if not confirmed:
             # Probe 2: wp-json must return a real WP REST namespace
             ok_p, body = run_cmd(
-                f'curl -sk -L --max-time 10 --max-redirs 2 "{host}/wp-json/wp/v2/" 2>/dev/null | head -c 4000',
+                cms_get(f"{host}/wp-json/wp/v2/",
+                        f'curl -sk -L --max-time 10 --max-redirs 2 {shlex.quote(host + "/wp-json/wp/v2/")} 2>/dev/null | head -c 4000',
+                        max_redirects=2, max_body=4000),
                 timeout=14
             )
             body_l = (body or "").lower()
-            if '"namespace"' in body_l and "wp/v2" in body_l:
+            if ok_p and '"namespace"' in body_l and "wp/v2" in body_l:
                 confirmed_wp_hosts.append(host)
                 log("crit", f"WordPress confirmed live at {host} (wp/v2 namespace JSON)")
                 confirmed = True
@@ -6983,10 +7507,12 @@ check
             # User enum via /?author=N
             for n in range(1, 4):
                 ok, out = run_cmd(
-                    f'curl -sk -D- -L "{host}/?author={n}" 2>/dev/null | grep -iE "location:|author/" | head -3',
+                    cms_get(f"{host}/?author={n}",
+                            f'curl -sk -D- -L {shlex.quote(host + "/?author=" + str(n))} 2>/dev/null | grep -iE "location:|author/" | head -3',
+                            timeout=8, include_headers=True),
                     timeout=10
                 )
-                if out.strip():
+                if ok and out.strip():
                     results.append(f"## author={n}\n{out}\n")
 
             # REST API user leak
@@ -7117,10 +7643,18 @@ def run_rce_scan(domain: str, allow_destructive: bool = False) -> bool:
 
     if not java_targets:
         log("info", "No Java/Tomcat/JBoss targets detected — skipping RCE scan")
+        phase_manifest.record_phase(
+            os.path.dirname(rce_dir), "RCE SCAN", status=phase_manifest.PHASE_SKIPPED,
+            artifact_counts={"applicable_targets": 0},
+        )
+        # Preserve the legacy successful-evaluation return value so autonomy
+        # does not retry a non-applicable check. The manifest records the skip.
         return True
 
     # ── Step 2: nuclei CVE templates (Tomcat + JBoss + Log4Shell) ───────────────
     nuclei_bin = _tool_bin("nuclei")
+    from nuclei_scope import nuclei_scope_flags, record_nuclei_coverage
+    nuclei_guard = "".join(" " + flag for flag in nuclei_scope_flags(recon_dir))
     nuclei_rce_out = os.path.join(rce_dir, "nuclei_rce.txt")
     if _which(nuclei_bin):
         targets_file = os.path.join(rce_dir, "java_targets.txt")
@@ -7137,11 +7671,12 @@ def run_rce_scan(domain: str, allow_destructive: bool = False) -> bool:
             f'{nuclei_bin} -l "{targets_file}" '
             f'-tags tomcat,jboss,log4shell,rce,cve '
             f'-severity critical,high,medium '
-            f'-silent -o "{nuclei_rce_out}" 2>/dev/null',
+            f'-silent -o "{nuclei_rce_out}"{nuclei_guard} 2>/dev/null',
             timeout=int(os.environ.get("VIK_RCE_NUCLEI_TIMEOUT", "900")),
             watch_file=rce_dir,
             watch_phase="RCE SCAN"
         )
+        record_nuclei_coverage(recon_dir, exit_code=0 if ok else 1)
         if os.path.exists(nuclei_rce_out):
             count = sum(1 for l in open(nuclei_rce_out) if l.strip())
             if count:
@@ -7152,14 +7687,15 @@ def run_rce_scan(domain: str, allow_destructive: bool = False) -> bool:
                 log("info", f"nuclei RCE: 0 findings")
         # Also run specifically on Tomcat/JBoss CVEs
         nuclei_tomcat_out = os.path.join(rce_dir, "nuclei_tomcat_cve.txt")
-        run_cmd(
+        nuclei_ok, _ = run_cmd(
             f'{nuclei_bin} -l "{targets_file}" '
             f'-id "CVE-2017-12615,CVE-2019-0232,CVE-2020-1938,CVE-2021-44228,CVE-2021-45046" '
-            f'-silent -o "{nuclei_tomcat_out}" 2>/dev/null',
+            f'-silent -o "{nuclei_tomcat_out}"{nuclei_guard} 2>/dev/null',
             timeout=int(os.environ.get("VIK_RCE_CVE_TIMEOUT", "600")),
             watch_file=rce_dir,
             watch_phase="RCE SCAN"
         )
+        record_nuclei_coverage(recon_dir, exit_code=0 if nuclei_ok else 1)
         if os.path.exists(nuclei_tomcat_out) and os.path.getsize(nuclei_tomcat_out) > 0:
             for l in open(nuclei_tomcat_out):
                 log("crit", f"[CVE] {l.strip()}")
@@ -7860,7 +8396,8 @@ def _seed_urls_into_recon_corpus(recon_dir: str, seeds: list[str]) -> dict[str, 
 
 # ── NEW: sqlmap targeted scan ───────────────────────────────────────────────────
 def _build_get_sqlmap_command(cand_file: str, sqli_dir: str, sqli_out: str,
-                              cookie_opt: str = "", *, deep: bool = False) -> str:
+                              cookie_opt: str = "", *, deep: bool = False,
+                              scope_lock: bool = False) -> str:
     """Build the multi-target GET-candidate sqlmap command.
 
     Defaults to a FAST confirm-first pass — ``--level=1 --risk=1
@@ -7883,15 +8420,22 @@ def _build_get_sqlmap_command(cand_file: str, sqli_dir: str, sqli_out: str,
         f'--level={level} --risk={risk} --technique={technique} --smart '
         f'--output-dir={shlex.quote(sqli_dir)} --results-file={shlex.quote(sqli_out)} '
         f'--random-agent --timeout=10 {cookie_opt}'
+        + (' --ignore-redirects' if scope_lock else '')
     )
 
 
-def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
+def run_sqlmap_targeted(domain: str, cookies: str = "", *,
+                        allow_post_preflight: bool = True) -> bool:
     """
     Run sqlmap on SQLi candidates from nuclei findings and parameterized URLs.
+
+    A caller that already attempted POST discovery in this invocation passes
+    ``allow_post_preflight=False``. This does not mark that attempt successful;
+    a later standalone or resumed invocation may retry with the default policy.
     """
     log("phase", f"SQLMAP: {domain}")
     recon_dir    = _resolve_recon_dir(domain)
+    scope_locked = os.path.exists(os.path.join(recon_dir, "scope", "allow.txt")) or bool(os.environ.get("SCOPE_ALLOW_FILE"))
     allowed_hosts = _exact_allowed_hosts(domain, recon_dir)
     _n_seeded = _seed_urls_into_recon(recon_dir, _SEED_URLS)
     if _n_seeded:
@@ -7908,13 +8452,18 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         return False
 
     post_params_file = os.path.join(recon_dir, "params", "post_params.json")
-    # v9.24 — short-circuit when POST discovery already ran this session. On a
-    # 0-form target ``post_params.json`` is never written, so also honour the
-    # done-marker; otherwise lightpanda re-renders every page a second time.
+    # Reuse successful persisted artifacts on resume, independently of the
+    # caller's current-invocation attempt state. A failed attempt must not write
+    # a successful zero-result marker merely to suppress duplicate work.
     post_params_done = os.path.join(recon_dir, "params", "post_params_done.marker")
-    if not os.path.isfile(post_params_file) and not os.path.isfile(post_params_done):
+    if (allow_post_preflight and not os.path.isfile(post_params_file)
+            and not os.path.isfile(post_params_done)):
         log("info", "sqlmap preflight: discovering POST parameters first (lightpanda + arjun)...")
         run_post_param_discovery(domain, cookies=cookies)
+    elif not allow_post_preflight:
+        # The caller's invocation-local attempt state is not a successful
+        # completion marker: later standalone/resumed invocations may retry.
+        log("info", "sqlmap preflight: POST discovery already attempted or explicitly skipped in this invocation")
 
     # Collect candidates: nuclei SQLi findings + parameterized URLs
     candidates = []
@@ -8017,8 +8566,9 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         # finding D: thread the engagement's session cookies into the preflight
         # so auth-gated parameterized endpoints aren't dropped before the
         # cookie-aware sqlmap run that follows.
+        scope_options = {"allowed_hosts": allowed_hosts} if scope_locked else {}
         reachable, dead = _filter_reachable_candidates(
-            candidates, limit=20, cookies=cookies)
+            candidates, limit=20, cookies=cookies, **scope_options)
         if dead:
             log("info", f"sqlmap preflight: {dead} unreachable candidate(s) dropped")
         if not reachable:
@@ -8070,7 +8620,7 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
             f.write("\n".join(candidates))
 
         ok, out = run_cmd(
-            _build_get_sqlmap_command(cand_file, sqli_dir, sqli_out, cookie_opt),
+            _build_get_sqlmap_command(cand_file, sqli_dir, sqli_out, cookie_opt, scope_lock=scope_locked),
             timeout=1800,
             watch_file=sqli_dir,
             watch_phase="SQLMAP"
@@ -8116,6 +8666,7 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
         # sqlmap's detection fails before it starts.
         is_json_body = body.startswith("{") or body.startswith("[")
         json_header = ' --headers="Content-Type: application/json"' if is_json_body else ''
+        redirect_flag = ' --ignore-redirects' if scope_locked else ''
 
         # Shell-injection hardening (audit-fix): op["url"] comes from the
         # target-served OpenAPI/Swagger spec and `body` = json.dumps(...) whose
@@ -8128,7 +8679,7 @@ def run_sqlmap_targeted(domain: str, cookies: str = "") -> bool:
             f'sqlmap -u {shlex.quote(op["url"])} --data={shlex.quote(body)} '
             f'--method {shlex.quote(op["method"])} --batch --level=3 --risk=2 '
             f'--technique=BEU --smart '
-            f'--random-agent --timeout=10 {cookie_opt}{json_header} '
+            f'--random-agent --timeout=10 {cookie_opt}{json_header}{redirect_flag} '
             f'--output-dir={shlex.quote(sqli_dir)}',
             timeout=600,
         )
@@ -8440,7 +8991,10 @@ def _extract_dump_targets(extra_flags: str) -> tuple[str, str, list[str], int]:
 
 
 def _sqlmap_targeted_extract(req_abs: str, sqli_dir: str, schema: str, table: str,
-                             columns: list[str], limit: int) -> dict[str, list[str]]:
+                             columns: list[str], limit: int,
+                             scope_lock: bool = False,
+                             webforms_eval: str = "",
+                             refresh_errors: list[str] | None = None) -> dict[str, list[str]]:
     """Per-column ``--sql-query`` extraction — the reflection-limited-endpoint
     fallback. Each column is fetched as ONE short expression (which fits a limited
     UNION reflection where a wide full-row --dump overflows it) with --no-cast and
@@ -8448,6 +9002,23 @@ def _sqlmap_targeted_extract(req_abs: str, sqli_dir: str, schema: str, table: st
     on target.example.invalid where a full --dump returned nothing but this recovered the
     citizen IdProof/IdProofType values. Returns {column: [values]}."""
     import shlex as _shlex
+    recon_dir, _ = phase_manifest.resolve_session_dirs(os.path.dirname(sqli_dir))
+    scope_file = os.environ.get("SCOPE_ALLOW_FILE") or os.path.join(recon_dir, "scope", "allow.txt")
+    persisted_scope = bool(os.environ.get("SCOPE_ALLOW_FILE")) or os.path.exists(scope_file)
+    scope_locked = scope_lock or persisted_scope or os.environ.get("SCOPE_LOCK") == "1"
+    if persisted_scope:
+        from scope_checker import _load_allow_file
+        from scoped_http import allows as _scoped_allows
+        try:
+            with open(req_abs, encoding="utf-8") as rf:
+                host = re.search(r"(?im)^Host:\s*([^\r\n]+)", rf.read())
+            authorized = bool(host) and _scoped_allows(f"https://{host.group(1).strip()}/", _load_allow_file(scope_file))
+        except OSError:
+            authorized = False
+        if not authorized:
+            _mark_degraded("sqlmap_rf", "targeted extraction request is outside or missing its authoritative scope; no requests issued")
+            return {}
+    redirect_flag = "--ignore-redirects " if scope_locked else ""
     MAX_COLS = 20
     if len(columns) > MAX_COLS:
         log("warn", f"Targeted extraction capped at {MAX_COLS} of {len(columns)} columns")
@@ -8466,11 +9037,17 @@ def _sqlmap_targeted_extract(req_abs: str, sqli_dir: str, schema: str, table: st
             log("warn", f"Skipping unsafe column name: {e}")
             continue
         q = f'SELECT {cq} FROM {tq} WHERE {cq} IS NOT NULL LIMIT {int(limit)}'
-        cmd = (f'sqlmap -r {_shlex.quote(req_abs)} --batch -v0 --no-cast '
+        cmd = (f'sqlmap -r {_shlex.quote(req_abs)} --batch -v0 --no-cast {redirect_flag}'
                f'--output-dir={_shlex.quote(sqli_dir)} '
-               f'--sql-query {_shlex.quote(q)}')
+               f'--sql-query {_shlex.quote(q)}') + webforms_eval
         _ok, _out = run_cmd(cmd, timeout=900, watch_file=sqli_dir,
                             watch_phase=f"SQLQ-{col}", pty_stdin=True)
+        if scope_locked and webforms_eval and (_sqlmap_eval_crashed(_out)
+                or "sqlmap_unsafe_eval" in (_out or "").lower()):
+            if refresh_errors is not None:
+                refresh_errors.append(_out)
+            _mark_degraded("sqlmap_rf", "targeted extraction WebForms refresh failed or is unsupported; remaining extraction not tested")
+            break
         out_rows[col] = _parse_sqlmap_sql_query_rows(_out)
     return out_rows
 
@@ -8497,7 +9074,8 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                              level: int = 5, risk: int = 3,
                              extra_flags: str = "",
                              tamper: str = "space2comment,between",
-                             lean: bool = False, escalate: bool = False) -> bool:
+                             lean: bool = False, escalate: bool = False,
+                             scope_lock: bool = False) -> bool:
     """
     Run sqlmap against a raw Burp-style HTTP request file.
     Usage: hunt.py --request-file req.txt [--target domain]
@@ -8581,6 +9159,15 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
 
     effective_domain = domain or host_from_file or "unknown"
     log("info", f"Target: {effective_domain}  {method_from_file} {path_from_file}")
+    from scope_checker import _load_allow_file
+    from scoped_http import allows as _scoped_allows
+    scope_file = os.environ.get("SCOPE_ALLOW_FILE") or os.path.join(_resolve_recon_dir(effective_domain), "scope", "allow.txt")
+    persisted_scope = bool(os.environ.get("SCOPE_ALLOW_FILE")) or os.path.exists(scope_file)
+    scope_locked = scope_lock or persisted_scope or os.environ.get("SCOPE_LOCK") == "1"
+    allowed_hosts = _load_allow_file(scope_file) if persisted_scope else {host_from_file.lower().rstrip(".")}
+    if scope_locked and not _scoped_allows(f"https://{host_from_file}/", allowed_hosts):
+        _mark_degraded("sqlmap_rf", "request Host is outside or missing its authoritative exact scope; no requests issued")
+        return False
 
     # ── ASP.NET WebForms support (gap fix) ───────────────────────────────────
     # __VIEWSTATE / __EVENTVALIDATION / __VIEWSTATEGENERATOR are server-VALIDATED on
@@ -8618,37 +9205,70 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
         # fresh fetch. If not, do NOT enable the refresh — a scan with stale/empty tokens
         # would scan rejected postbacks and FALSE-NEGATIVE (the very bug this fixes).
         _wf_ok = False
+        _wf_reason = "missing refresh tokens"
         try:
             import requests as _rqf
             try:
                 _rqf.packages.urllib3.disable_warnings()
             except Exception:
                 pass
-            _pf = _rqf.get(_form_url, verify=False, timeout=15,
-                           headers={"User-Agent": "Mozilla/5.0", "Cookie": _cookie_hdr}).text
+            if scope_locked and not _scoped_allows(_form_url, allowed_hosts):
+                raise ValueError("scope blocked WebForms form URL")
+            _pf_options = {"allow_redirects": False} if scope_locked else {}
+            _pf_response = _rqf.get(_form_url, verify=False, timeout=15,
+                           headers={"User-Agent": "Mozilla/5.0", "Cookie": _cookie_hdr}, **_pf_options)
+            try:
+                if scope_locked and _pf_response.status_code in (301, 302, 303, 307, 308):
+                    raise ValueError(f"scope blocked WebForms refresh redirect: {_pf_response.headers.get('Location', '')!r}")
+                _pf = _pf_response.text
+            finally:
+                _pf_response.close()
             _wf_ok = all(_tok_re(n, _pf) for n in
                          ("__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR"))
-        except Exception:
+        except Exception as exc:
+            _wf_reason = str(exc)
             _wf_ok = False
         if not _wf_ok:
             log("warn", f"ASP.NET WebForms detected but token pre-flight FAILED ({_form_url}) "
                         "— NOT enabling auto-refresh (a stale-token scan would false-negative). "
                         "Verify the form URL / session binding manually.")
+            if scope_locked:
+                _mark_degraded("sqlmap_rf", f"WebForms token preflight failed: {_wf_reason}; no stale-token SQLi scan issued")
+                _brain_phase_complete("SQLMAP-RF", False, detail=f"target={effective_domain} WebForms refresh unavailable")
+                return False
         else:
             # json.dumps makes the URL + cookie SAFE Python string literals — a quote/backslash
             # in the request-file path can no longer break out and execute code in sqlmap's
             # --eval on the OPERATOR BOX (codex+grok: critical RCE in the first cut). Stdlib
             # urllib so the eval runs even where sqlmap's python lacks `requests`.
-            _ec = (
-                "import urllib.request as _U,re as _R,ssl as _SS; "
-                "_cx=_SS.create_default_context(); _cx.check_hostname=False; _cx.verify_mode=_SS.CERT_NONE; "
-                f"_rq=_U.Request({json.dumps(_form_url)},headers={{'User-Agent':'Mozilla/5.0','Cookie':{json.dumps(_cookie_hdr)}}}); "
-                "_vsT=_U.urlopen(_rq,timeout=15,context=_cx).read().decode('utf-8','replace'); "
-                "_g=lambda n:(lambda m:m.group(1) if m else None)(_R.search('\"'+n+'\"[^>]*value=\"([^\"]*)\"',_vsT)); "
+            _refresh_fetch = "_vsT=_U.urlopen(_rq,timeout=15,context=_cx).read().decode('utf-8','replace'); "
+            if scope_locked:
+                # Standard library only: sqlmap may use an interpreter without
+                # requests or repo imports. Reject ALL refresh redirects before
+                # urllib can contact their destinations (including same-host).
+                _refresh_fetch = (
+                    "_NR=type('_NoRedirect',(_U.HTTPRedirectHandler,),{'redirect_request':lambda *a,**k:None}); "
+                    "_op=_U.build_opener(_U.HTTPSHandler(context=_cx),_NR()); "
+                    "_rp=_op.open(_rq,timeout=15); _vsT=_rp.read(300000).decode('utf-8','replace'); _rp.close(); "
+                )
+            _assign_tokens = (
                 "__VIEWSTATE=_g('__VIEWSTATE') or __VIEWSTATE; "
                 "__EVENTVALIDATION=_g('__EVENTVALIDATION') or __EVENTVALIDATION; "
                 "__VIEWSTATEGENERATOR=_g('__VIEWSTATEGENERATOR') or __VIEWSTATEGENERATOR"
             )
+            if scope_locked:
+                _assign_tokens = (
+                    "__VIEWSTATE=_g('__VIEWSTATE'); __EVENTVALIDATION=_g('__EVENTVALIDATION'); "
+                    "__VIEWSTATEGENERATOR=_g('__VIEWSTATEGENERATOR'); "
+                    "assert __VIEWSTATE and __EVENTVALIDATION and __VIEWSTATEGENERATOR, 'WebForms refresh missing tokens'"
+                )
+            _ec = (
+                "import urllib.request as _U,re as _R,ssl as _SS; "
+                "_cx=_SS.create_default_context(); _cx.check_hostname=False; _cx.verify_mode=_SS.CERT_NONE; "
+                f"_rq=_U.Request({json.dumps(_form_url)},headers={{'User-Agent':'Mozilla/5.0','Cookie':{json.dumps(_cookie_hdr)}}}); "
+                + _refresh_fetch +
+                "_g=lambda n:(lambda m:m.group(1) if m else None)(_R.search('\"'+n+'\"[^>]*value=\"([^\"]*)\"',_vsT)); "
+            ) + _assign_tokens
             import shlex as _shlex0
             webforms_eval = " --eval=" + _shlex0.quote(_ec)
             log("ok", f"ASP.NET WebForms detected ({_form_url}) — auto-refreshing "
@@ -8692,12 +9312,13 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
             toks.extend(_shlex.split(r or ""))
         return " ".join(_shlex.quote(t) for t in toks)
     def _build(tamper_clause: str, extra: str = "") -> str:
+        redirect_flag = '--ignore-redirects ' if scope_locked else ''
         return (
             f'sqlmap -r {_q_req} '
             f'--batch --level={level} --risk={risk} '
             f'{enum_clause}--random-agent {tamper_clause}'
             f'--output-dir={_q_dir} --results-file={_q_out} '
-            f'--timeout=15 --retries=2 '
+            f'--timeout=15 --retries=2 {redirect_flag}'
             f'{_quote_flags(extra_flags, extra)}'
         ).strip()
 
@@ -8713,6 +9334,10 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     ok, out = run_cmd(cmd, timeout=2400, watch_file=sqli_dir, watch_phase="SQLMAP-RF",
                       pty_stdin=True)
     print(out[-4000:] if len(out) > 4000 else out)
+    def _refresh_failed(output: str) -> bool:
+        return scope_locked and bool(webforms_eval) and (_sqlmap_eval_crashed(output)
+               or "sqlmap_unsafe_eval" in (output or "").lower())
+    refresh_failed = _refresh_failed(out)
 
     # ── Auto-retry a BLANK dump WITHOUT tampers ──────────────────────────────
     # space2comment/between are great for getting injection *detected* through a
@@ -8722,7 +9347,7 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # for a dump and it came back all-`<blank>`, re-fetch fresh and tamper-less so
     # request-file mode produces actual PoC data, not just a detection.
     dump_requested = "--dump" in (extra_flags or "")
-    if dump_requested and tamper and _sqlmap_dump_failed(out):
+    if not refresh_failed and dump_requested and tamper and _sqlmap_dump_failed(out):
         log("warn", "Dump extraction failed with tampers active (blank/errored) — "
                     "retrying WITHOUT tampers (--fresh-queries); tampers can corrupt "
                     "the heavier data-extraction payloads")
@@ -8734,7 +9359,12 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
         # Adopt the retry ONLY if it actually extracted real rows; otherwise keep
         # run 1 so a flaky/worse retry never discards data. (run 1 extracted nothing
         # to get here, so adopting a retry that DID is strictly an improvement.)
-        if _sqlmap_has_real_dump_rows(out2):
+        if _refresh_failed(out2):
+            # Do not hide a token-refresh abort behind the first run's output
+            # or proceed to a stale-token extraction fallback.
+            refresh_failed = True
+            ok, out = False, out2
+        elif _sqlmap_has_real_dump_rows(out2):
             ok, out = ok2, out2
         else:
             log("warn", "Tamper-less retry produced no data either — keeping original output")
@@ -8744,12 +9374,18 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # UNION reflection — the target's GetSearch autocomplete), fall back to fetching
     # each requested -C column as ONE short --sql-query expression. This recovered
     # the citizen IdProof/IdProofType values where the full --dump returned nothing.
-    if dump_requested and _sqlmap_dump_failed(out):
+    if not refresh_failed and dump_requested and _sqlmap_dump_failed(out):
         _schema, _table, _cols, _limit = _extract_dump_targets(extra_flags)
         if _table and _cols:
             log("warn", f"Full dump failed — targeted per-column --sql-query extraction "
                         f"on {_table} ({len(_cols)} col(s)); reflection-limited endpoint")
-            extracted = _sqlmap_targeted_extract(req_abs, sqli_dir, _schema, _table, _cols, _limit)
+            extraction_refresh_errors: list[str] = []
+            extract_options = {"scope_lock": True, "webforms_eval": webforms_eval,
+                               "refresh_errors": extraction_refresh_errors} if scope_locked else {}
+            extracted = _sqlmap_targeted_extract(req_abs, sqli_dir, _schema, _table, _cols, _limit, **extract_options)
+            if extraction_refresh_errors:
+                refresh_failed = True
+                ok, out = False, extraction_refresh_errors[-1]
             nrows = sum(len(v) for v in extracted.values())
             if nrows:
                 poc_f = os.path.join(sqli_dir, "TARGETED_EXTRACT.txt")
@@ -8771,8 +9407,12 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
 
     # ── Parse results: robust CONFIRMED-injection detection ──────────────────
     conf = _parse_sqlmap_confirmation(out)
+    if refresh_failed:
+        ok = False
+        conf["confirmed"] = False
+        _mark_degraded("sqlmap_rf", "WebForms token refresh failed or --eval is unsupported; request-file SQLi coverage is INCONCLUSIVE")
     # results.txt CSV is an extra signal on a fresh (non-resumed) run.
-    if os.path.isfile(sqli_out):
+    if os.path.isfile(sqli_out) and not refresh_failed:
         # audit-fix (finding 10): context-managed read (was a leaked fd).
         with open(sqli_out) as _sf:
             for ln in _sf:
@@ -8816,7 +9456,7 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
                 sf.write(f"ENUMERATED TABLES ({len(conf['tables'])}):\n"
                          + "\n".join(conf["tables"]) + "\n")
         log("crit", f"Summary → {summary_f}")
-    elif _sqlmap_eval_crashed(out):
+    elif _sqlmap_eval_crashed(out) or refresh_failed:
         # The --eval (WebForms token refresh) crashed → the parameter was NEVER tested.
         # Report INCONCLUSIVE, not a clean negative (anti-fabrication / false-negative guard).
         log("warn", f"sqlmap (request-file) INCONCLUSIVE — the WebForms --eval token refresh "
@@ -8853,7 +9493,9 @@ def run_sqlmap_request_file(req_file: str, domain: str | None = None,
     # --file-write (webshell) against the LIVE target. Off by default so a confirmation
     # run never autonomously attempts RCE/file-write on production (the model also emits
     # wrong DB names / empty responses). Enable deliberately with --sqli-rce.
-    if escalate and conf["confirmed"] and _brain and _brain.enabled:
+    if scope_locked and escalate and conf["confirmed"]:
+        _mark_degraded("sqlmap_rf", "model-driven SQLi escalation disabled under exact scope: generated commands have no enforced network boundary")
+    elif escalate and conf["confirmed"] and _brain and _brain.enabled:
         evidence = _sqlmap_evidence_block(conf)
         extra = _sqli_rce_hints(conf, req_abs, target_url)
         log("phase", f"SQLi→RCE escalation (brain exploit loop) → {target_url}")
@@ -8875,14 +9517,17 @@ def run_post_param_discovery(domain: str,
                               cookies: str = "",
                               headers: dict | None = None,
                               session_file: str = "",
-                              auto_install_lp: bool = True) -> bool:
+                              auto_install_lp: bool = True,
+                              scope_lock: bool = False,
+                              exact_hosts=None,
+                              allow_file: str | None = None) -> bool:
     """
     Discover POST endpoints and their parameters — the gap that gau/wayback miss.
 
     Priority tool chain:
     1. lightpanda fetch (JS-rendered HTML) → parse all <form> elements with real input names
        Falls back to plain HTTP GET if lightpanda not installed (auto-install attempted).
-    2. arjun --method POST on each live host → brute-forces hidden POST param names
+    2. arjun -m POST on bounded candidates → brute-forces hidden POST param names
     3. Writes post_params.json + post_urls.txt to recon/params/
     4. sqlmap --data on each POST endpoint with discovered params
 
@@ -8890,6 +9535,10 @@ def run_post_param_discovery(domain: str,
     - Executes JavaScript before dumping HTML → catches dynamically-injected forms (JSP, React)
     - Sees forms that require JS to render (single-page apps, Spring MVC, etc.)
     - katana -form-extraction is passive/shallow and misses JS-rendered forms entirely
+
+    Hidden-parameter probing uses the bundled small wordlist with serial pacing
+    and a default five-URL cap (ARJUN_POST_MAX_URLS=0 removes that cap). Passive
+    form extraction keeps its separate page budget and successful form evidence.
     """
     import json as _json
     import urllib.parse
@@ -8899,6 +9548,26 @@ def run_post_param_discovery(domain: str,
     params_dir = os.path.join(recon_dir, "params")
     os.makedirs(params_dir, exist_ok=True)
     allowed_hosts = _exact_allowed_hosts(domain, recon_dir)
+    from scope_checker import _load_allow_file
+    from scoped_http import allows as _scoped_allows
+
+    scope_file = allow_file or os.environ.get("SCOPE_ALLOW_FILE") or os.path.join(recon_dir, "scope", "allow.txt")
+    persisted_scope = allow_file is not None or bool(os.environ.get("SCOPE_ALLOW_FILE")) or os.path.exists(scope_file)
+    scope_locked = scope_lock or exact_hosts is not None or persisted_scope or os.environ.get("SCOPE_LOCK") == "1"
+    if persisted_scope:
+        transport_hosts = _load_allow_file(scope_file)
+    elif exact_hosts is not None:
+        transport_hosts = set(exact_hosts)
+    else:
+        target = urlsplit(domain if "://" in domain else f"https://{domain}")
+        transport_hosts = {target.netloc} if target.netloc else set()
+    if scope_locked and not transport_hosts:
+        _mark_degraded("post_params", "missing or empty exact-host form discovery allowlist; no requests issued")
+        return False
+
+    def _discovery_url_allowed(url: str) -> bool:
+        return (_scoped_allows(url, transport_hosts) if scope_locked
+                else _url_in_exact_allowed_hosts(url, allowed_hosts))
 
     if _brain and _brain.enabled:
         _brain.phase_start("POST-PARAMS", f"target={domain}")
@@ -8909,7 +9578,7 @@ def run_post_param_discovery(domain: str,
     if not os.path.isfile(live_file):
         live_file = legacy_live_file
 
-    def _looks_form_page(url: str) -> bool:
+    def _looks_form_page(url: str, *, known_html: bool = False) -> bool:
         parsed = urlsplit(url)
         lower = url.lower()
         path = (parsed.path or "").lower()
@@ -8921,7 +9590,7 @@ def run_post_param_discovery(domain: str,
         if path.endswith(static_suffixes):
             return False
         return (
-            lower.endswith("/")
+            known_html or path == "" or lower.endswith("/")
             or any(token in lower for token in (
                 ".jsp", ".jspx", ".php", ".asp", ".aspx", ".do", ".action", ".html", ".htm",
             ))
@@ -8956,24 +9625,34 @@ def run_post_param_discovery(domain: str,
 
     seed_candidates: list[tuple[str, str]] = []
     seen_seeds: set[str] = set()
+    from discovery_feedback import normalize_url
     for source_file in (
         ("live", live_file),
         ("top", os.path.join(params_dir, "top_urls.txt")),
+        ("discovery", os.path.join(recon_dir, "urls", "discovered_html.txt")),
         ("gau", os.path.join(recon_dir, "urls", "gau.txt")),
         ("wayback", os.path.join(recon_dir, "urls", "waybackurls.txt")),
         ("all", os.path.join(recon_dir, "urls", "all.txt")),
     ):
         source_tag, source_path = source_file
-        for url in _collect_urls_from_file(source_path, limit=250):
-            if not _url_in_exact_allowed_hosts(url, allowed_hosts):
+        candidates = _collect_urls_from_file(source_path, limit=251)
+        if len(candidates) > 250:
+            _mark_degraded("post_params", f"form input source capped at 250 URLs: {source_tag}")
+        for url in candidates[:250]:
+            if not _discovery_url_allowed(url):
                 continue
-            if not _looks_form_page(url):
+            # Discovery's HTML list is MIME-qualified; guessing from its suffix
+            # would discard valid extensionless application pages such as /contact.
+            if not _looks_form_page(url, known_html=source_tag == "discovery"):
                 continue
-            if url in seen_seeds:
+            key = normalize_url(url)
+            if key is None or key in seen_seeds:
                 continue
-            seen_seeds.add(url)
+            seen_seeds.add(key)
             seed_candidates.append((url, source_tag))
 
+    if len(seed_candidates) > 30:
+        _mark_degraded("post_params", f"HTML page surface capped: reading 30 of {len(seed_candidates)} pages")
     seed_urls = [
         url for url, _ in sorted(
             seed_candidates,
@@ -8990,13 +9669,16 @@ def run_post_param_discovery(domain: str,
     forms_raw:   list[dict] = []  # raw parsed forms for logging
 
     # ── Try to auto-install lightpanda if missing ────────────────────────────
-    lp = _lightpanda_bin()
-    if not lp and auto_install_lp:
+    lp = None if scope_locked else _lightpanda_bin()
+    if not scope_locked and not lp and auto_install_lp:
         log("info", "lightpanda not found — attempting auto-install...")
         if _install_lightpanda():
             lp = _lightpanda_bin()
 
-    if lp:
+    if scope_locked:
+        _mark_degraded("post_params", "exact scope: static HTTP forms only; Lightpanda JavaScript rendering unavailable without enforced request containment")
+        log("info", f"scoped HTTP: reading {min(len(seed_urls), 30)} pages for static form extraction")
+    elif lp:
         log("info", f"lightpanda: JS-rendering {min(len(seed_urls), 30)} pages for form extraction")
     else:
         log("warn", "lightpanda unavailable — falling back to plain HTTP form parse (no JS rendering)")
@@ -9005,9 +9687,11 @@ def run_post_param_discovery(domain: str,
     lp_forms_file = os.path.join(params_dir, "lightpanda_forms.json")
     all_forms: list[dict] = []   # {page_url, action, method, inputs}
     rejected_form_actions = 0
+    fetch_errors: list[dict] = []
 
     for host in seed_urls[:30]:
-        forms = _lightpanda_fetch_forms(host, cookies=cookies, headers=headers, timeout=20)
+        fetch_options = {"exact_hosts": transport_hosts, "errors": fetch_errors} if scope_locked else {}
+        forms = _lightpanda_fetch_forms(host, cookies=cookies, headers=headers, timeout=20, **fetch_options)
         for form in forms:
             action = form.get("action", "")
             method = form.get("method", "GET").upper()
@@ -9016,7 +9700,7 @@ def run_post_param_discovery(domain: str,
             # Resolve every action against the page, then exact-scope it.  HTML
             # is target-controlled and may point at an unrelated third party.
             action = urllib.parse.urljoin(host, action) if action else host
-            action_allowed = _url_in_exact_allowed_hosts(action, allowed_hosts)
+            action_allowed = _discovery_url_allowed(action)
             if not action_allowed:
                 rejected_form_actions += 1
 
@@ -9041,19 +9725,44 @@ def run_post_param_discovery(domain: str,
     # Save all forms (GET + POST) for reference
     with open(lp_forms_file, "w") as ff:
         _json.dump(all_forms, ff, indent=2)
+    if fetch_errors:
+        with open(os.path.join(params_dir, "form_fetch_errors.json"), "w") as ef:
+            _json.dump(fetch_errors, ef, indent=2)
 
     total_forms = len(all_forms)
     post_forms  = sum(1 for f in all_forms if f["method"] == "POST")
-    engine_label = "lightpanda" if lp else "HTTP-fallback"
+    engine_label = "scoped-HTTP" if scope_locked else "lightpanda" if lp else "HTTP-fallback"
     log("info", f"{engine_label}: {total_forms} forms found ({post_forms} POST) across {len(seed_urls[:30])} pages")
     if rejected_form_actions:
         log("warn", f"POST discovery: rejected {rejected_form_actions} off-scope form action(s)")
     log("ok",   f"All forms → {lp_forms_file}")
 
     # ── Step 2: arjun POST param brute-force ─────────────────────────────────
-    # Runs on all live hosts + POST URLs discovered in step 1
+    # Prefer actual POST actions, then HTML seeds. Hidden-parameter probing is
+    # bounded separately from passive form extraction, which still reads all
+    # selected pages above.
+    arjun_failed = False
     if _which("arjun"):
-        arjun_targets = list(dict.fromkeys(seed_urls + post_urls))[:30]
+        arjun_candidates = []
+        seen_arjun_targets = set()
+        for url in post_urls + seed_urls:
+            key = normalize_url(url)
+            if (key is None or key in seen_arjun_targets
+                    or not _discovery_url_allowed(key)):
+                continue
+            seen_arjun_targets.add(key)
+            arjun_candidates.append(key)
+        try:
+            arjun_limit = int(os.environ.get("ARJUN_POST_MAX_URLS", "5"))
+            if arjun_limit < 0:
+                raise ValueError("negative URL limit")
+        except (TypeError, ValueError):
+            arjun_limit = 5
+            _mark_degraded("arjun", "POST URL limit invalid (ARJUN_POST_MAX_URLS); using safe default of 5 URLs")
+        arjun_targets = arjun_candidates[:arjun_limit] if arjun_limit else arjun_candidates
+        if arjun_limit and len(arjun_candidates) > arjun_limit:
+            _mark_degraded("arjun", f"POST URL surface capped: probed {arjun_limit} of "
+                           f"{len(arjun_candidates)} candidate URLs (set ARJUN_POST_MAX_URLS=0 for unlimited)")
         targets_file  = os.path.join(params_dir, "arjun_post_targets.txt")
         arjun_post_out = os.path.join(params_dir, "arjun_post.json")
 
@@ -9064,18 +9773,34 @@ def run_post_param_discovery(domain: str,
         # value (interpolated into a /bin/sh -c string below). A `"`/`$()`/`;`
         # in --cookie would otherwise break out of the command.
         cookie_flag = f"--headers {shlex.quote('Cookie: ' + cookies)}" if cookies else ""
+        redirect_flag = "--disable-redirects " if scope_locked else ""
         ok_arjun, out_arjun = run_cmd(
-            f'arjun -i {shlex.quote(targets_file)} --method POST --stable '
-            f'--rate-limit 5 -t 5 {cookie_flag} '
+            # Explicit small wordlist and serial six-second pacing replace the
+            # implicit 25k-word/random stable mode without increasing request
+            # concurrency or its maximum cadence. The command keeps its 600s budget.
+            f'arjun -i {shlex.quote(targets_file)} -m POST -w small '
+            f'--rate-limit 1 -t 1 -d 6 {redirect_flag}{cookie_flag} '
             f'-oJ {shlex.quote(arjun_post_out)}',
             timeout=600,
         )
+        arjun_failed = not ok_arjun
+        if arjun_failed:
+            _mark_degraded("arjun", "POST parameter discovery command failed or timed out; coverage incomplete")
+            log("warn", "Arjun POST failed — retaining form/partial output; discovery incomplete")
+            # A prior zero-result marker must not make this failed attempt look
+            # clean to SQLmap's preflight/resume checks.
+            try:
+                os.remove(os.path.join(params_dir, "post_params_done.marker"))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log("warn", f"Could not invalidate POST completion marker: {exc}")
         if os.path.isfile(arjun_post_out):
             try:
                 data = _json.load(open(arjun_post_out))
                 new_from_arjun = 0
                 for url, info in data.items():
-                    if not _url_in_exact_allowed_hosts(url, allowed_hosts):
+                    if not _discovery_url_allowed(url):
                         log("warn", f"POST discovery: rejected off-scope arjun result {url!r}")
                         continue
                     params = info.get("params", [])
@@ -9097,25 +9822,29 @@ def run_post_param_discovery(domain: str,
     # sqlmap use.  This also protects against future producer changes above.
     post_params = {
         url: info for url, info in post_params.items()
-        if _url_in_exact_allowed_hosts(url, allowed_hosts)
+        if _discovery_url_allowed(url)
     }
     post_urls = [
         url for url in post_urls
-        if _url_in_exact_allowed_hosts(url, allowed_hosts)
+        if _discovery_url_allowed(url)
     ]
 
     if not post_params and not post_urls:
-        log("info", "No POST parameters discovered")
+        discovery_ok = not fetch_errors and not arjun_failed
+        log("info" if discovery_ok else "warn", "No POST parameters discovered" if discovery_ok
+            else "POST parameter discovery incomplete — no parameters recovered")
         # v9.24 — record that discovery completed (0 forms) so the sqlmap
         # preflight does not re-render the same pages with lightpanda a second
         # time. ``post_params.json`` is never written on the empty path, so use
         # a sentinel marker as the "already ran this session" signal.
-        try:
-            with open(os.path.join(params_dir, "post_params_done.marker"), "w") as mk:
-                mk.write("0\n")
-        except OSError:
-            pass
-        _brain_phase_complete("POST-PARAMS", True, detail=f"target={domain} found=0")
+        if discovery_ok:
+            try:
+                with open(os.path.join(params_dir, "post_params_done.marker"), "w") as mk:
+                    mk.write("0\n")
+            except OSError:
+                pass
+        _brain_phase_complete("POST-PARAMS", discovery_ok,
+                              detail=f"target={domain} found=0 fetch_errors={len(fetch_errors)} arjun_failed={int(arjun_failed)}")
         return False
 
     # ── Write results ────────────────────────────────────────────────────────
@@ -9146,6 +9875,7 @@ def run_post_param_discovery(domain: str,
         # Shell-injection hardening: shlex.quote the operator-supplied cookie
         # (interpolated into a /bin/sh -c string below).
         cookie_opt = f"--cookie={shlex.quote(cookies)}" if cookies else ""
+        redirect_opt = "--ignore-redirects " if scope_locked else ""
 
         # audit-fix (finding 2): iterate ALL discovered POST endpoints. The
         # per-call ``--timeout=10`` + run_cmd timeout already bound total runtime,
@@ -9179,7 +9909,7 @@ def run_post_param_discovery(domain: str,
             ok2, out2 = run_cmd(
                 f'sqlmap -u {shlex.quote(url)} --data={shlex.quote(params_str)} '
                 f'--method POST --batch --level=3 --risk=2 '
-                f'--random-agent --timeout=10 {cookie_opt} '
+                f'--random-agent --timeout=10 {redirect_opt}{cookie_opt} '
                 f'--output-dir={shlex.quote(sqli_post_dir)} -o {shlex.quote(out_file)}',
                 timeout=600,
             )
@@ -9197,11 +9927,12 @@ def run_post_param_discovery(domain: str,
 
     _brain_phase_complete(
         "POST-PARAMS",
-        True,
+        not fetch_errors and not arjun_failed,
         detail=(f"target={domain} engine={engine_label} "
                 f"forms={total_forms} post_endpoints={len(post_params)} "
                 f"post_urls={len(post_urls)} "
-                f"sqlmap_tested={post_tested} sqlmap_skipped={post_skipped}"),
+                f"sqlmap_tested={post_tested} sqlmap_skipped={post_skipped} "
+                f"fetch_errors={len(fetch_errors)} arjun_failed={int(arjun_failed)}"),
         artifacts={"post_params": post_params_file, "lp_forms": lp_forms_file},
     )
     return True
@@ -10179,6 +10910,9 @@ def generate_reports(domain: str) -> int:
         detail=f"target={domain}",
         artifacts={"reports": report_dir, "findings": findings_dir},
     )
+    if not ok:
+        log("warn", "Report generation failed; partial or existing reports are not fresh completion")
+        return 0
     if os.path.isdir(report_dir):
         return len([f for f in os.listdir(report_dir)
                     if f.endswith(".md") and f != "SUMMARY.md"])
@@ -10192,6 +10926,8 @@ def run_browser_scan(
     model_override: str | None = None,
     session_id: str | None = None,
     allow_unsafe: bool = False,
+    scope_lock: bool = False,
+    enable_ai: bool = True,
 ) -> bool:
     """Run the optional real-browser validation phase safely."""
     phase_name = "BROWSER SCAN"
@@ -10217,6 +10953,8 @@ def run_browser_scan(
             model_override=model_override,
             session_id=session_id,
             allow_unsafe=allow_unsafe,
+            scope_lock=scope_lock,
+            enable_ai=enable_ai,
         )
         results = agent.run()
         total = sum(results.values()) if results else 0
@@ -10586,6 +11324,8 @@ def hunt_target(
     browser_model: str | None = None,
     browser_unsafe: bool = False,
     allow_destructive: bool = False,
+    initial_coverage: list[dict[str, str]] | None = None,
+    enable_ai: bool = True,
 ) -> dict:
     skip_items = skip_items or set()
     result = {
@@ -10618,6 +11358,8 @@ def hunt_target(
         result["success"] = False
         return result
     _reset_degraded()  # per-target reset of the degraded-capability accumulator
+    for gap in initial_coverage or []:
+        _mark_degraded(gap["tool"], gap["reason"])
 
     # v9.24 audit-fix (finding K): install-time readiness gaps (tool present on
     # PATH but missing its config / key / wordlist — e.g. git-hound with no
@@ -10701,9 +11443,6 @@ def hunt_target(
             max_urls=max_urls,
             targets_file=targets_file,
         )
-        if not result["recon"]:
-            log("warn", f"Recon had issues for {domain}, continuing...")
-
         # Brain: post-recon hook — analyze data AND generate targeted scan plan
         recon_dir = _resolve_recon_dir(domain, session_id=resume_session_id)
         result["session_id"] = _active_recon_session_id(domain)
@@ -10711,6 +11450,14 @@ def hunt_target(
         result["findings_dir"] = _resolve_findings_dir(domain, session_id=result["session_id"], create=True)
         result["report_dir"] = _resolve_reports_dir(domain, session_id=result["session_id"], create=True)
         findings_dir_early = result["findings_dir"]
+        if not result["recon"]:
+            _mark_degraded("recon", "recon failed — downstream phases not started")
+            result["success"] = False
+            result["assessment_status"] = "inconclusive"
+            result["phase_status"]["recon"] = PHASE_STATUS_FAILED
+            phase_manifest.record_phase(findings_dir_early, "RECON", exit_code=1)
+            _finalize_assessment(result, findings_dir_early)
+            return result
         if _brain and _brain.enabled and os.path.isdir(recon_dir) and not selected_only_mode:
             log("info", "Brain: post-recon hook (analyze + scan plan)...")
             _brain.post_recon_hook(recon_dir, findings_dir_early)
@@ -10746,6 +11493,18 @@ def hunt_target(
         else:
             log("info", f"Skipping recon for {domain} (--skip recon)")
 
+    if scope_lock or targets_file:
+        recon_dir = result.get("recon_dir") or _resolve_recon_dir(domain, session_id=resume_session_id)
+        try:
+            _restrict_session_scope(domain, recon_dir, targets_file=targets_file)
+            result["recon_dir"] = recon_dir
+        except (OSError, ValueError) as exc:
+            _mark_degraded("scope", f"exact-scope authority unavailable: {exc}")
+            log("err", f"Exact scope could not be enforced — downstream phases not started: {exc}")
+            result["success"] = False
+            result["assessment_status"] = "inconclusive"
+            return result
+
     if recon_only:
         return result
 
@@ -10755,6 +11514,10 @@ def hunt_target(
         import os as _os
         _live_urls_file = _os.path.join(_recon_dir, "live", "urls.txt")
         _extra_hosts = _enrich_targets_with_whitebox_asset_feed([], _recon_dir, target_domain=domain)
+        if scope_lock or targets_file:
+            allowed = _exact_allowed_hosts(domain, _recon_dir)
+            _extra_hosts = [host for host in _extra_hosts
+                            if _url_in_exact_allowed_hosts(host if host.startswith("http") else f"https://{host}", allowed)]
         if _extra_hosts:
             try:
                 _os.makedirs(_os.path.dirname(_live_urls_file), exist_ok=True)
@@ -10769,9 +11532,16 @@ def hunt_target(
             except Exception as _wb_err:
                 pass  # Whitebox enrichment is optional
 
+    # Discovery must precede its consumers: merge late scoped HTML/JS inputs
+    # before JS, parameter and form discovery read the canonical corpus.
+    if api_fuzz and not quick and not skip_has(skip_items, "api_fuzz"):
+        result["api_fuzz"] = run_api_fuzz(domain)
+
     # ── Phase 2: JS Analysis (new) ─────────────────────────────────────────
     if js_scan and not skip_has(skip_items, "js_analysis"):
         result["js_analysis"] = run_js_analysis(domain)
+        if result["js_analysis"]:
+            _consume_api_discovery(domain, "js_analysis")
 
     # ── Phase 3: Secret Hunt (new) ─────────────────────────────────────────
     if secret_hunt and not skip_has(skip_items, "secret_hunt"):
@@ -10780,10 +11550,8 @@ def hunt_target(
     # ── Phase 4: Parameter Discovery (new) ────────────────────────────────
     if param_discover and not skip_has(skip_items, "param_discovery"):
         result["param_discovery"] = run_param_discovery(domain)
-
-    # ── Phase 5: API Fuzzing (new) ─────────────────────────────────────────
-    if api_fuzz and not quick and not skip_has(skip_items, "api_fuzz"):
-        result["api_fuzz"] = run_api_fuzz(domain)
+        if result["param_discovery"]:
+            _consume_api_discovery(domain, "param_discovery")
 
     # ── Phase 6: CORS Check (new) ──────────────────────────────────────────
     if cors_check and not skip_has(skip_items, "cors"):
@@ -10803,6 +11571,8 @@ def hunt_target(
             full=full,
             allow_destructive=allow_destructive,
         )
+        if result["scan"]:
+            _consume_api_discovery(domain, "scan")
 
     # ── Phase 7.6: Calibrated 401/403 bypass audit (nomore403) ─────────────
     # Honours the same skip predicate as the vuln scan (active requests). No-ops
@@ -10902,12 +11672,19 @@ def hunt_target(
         result["email_audit"] = run_email_audit(domain)
 
     # ── Phase 9: POST parameter discovery + sqlmap POST ─────────────────────
+    post_discovery_attempted = False
     if post_param_discover and not skip_has(skip_items, "post_params"):
-        result["post_params"] = run_post_param_discovery(domain, cookies=cookie)
+        post_discovery_attempted = True
+        result["post_params"] = run_post_param_discovery(domain, cookies=cookie, scope_lock=scope_lock)
 
     # ── Phase 9b: sqlmap targeted (GET params) ───────────────────────────────
     if sqlmap_scan and not skip_has(skip_items, "sqlmap"):
-        result["sqlmap"] = run_sqlmap_targeted(domain, cookies=cookie)
+        result["sqlmap"] = run_sqlmap_targeted(
+            domain, cookies=cookie,
+            allow_post_preflight=not (
+                post_discovery_attempted or skip_has(skip_items, "post_params")
+            ),
+        )
 
     # ── Phase 10: JWT Audit ────────────────────────────────────────────────
     if jwt_audit and not skip_has(skip_items, "jwt_audit"):
@@ -10926,6 +11703,8 @@ def hunt_target(
             model_override=browser_model,
             session_id=result.get("session_id"),
             allow_unsafe=browser_unsafe,
+            scope_lock=scope_lock,
+            enable_ai=enable_ai,
         )
 
     # ── Phase 11: CVE Hunt ─────────────────────────────────────────────────
@@ -10956,35 +11735,14 @@ def hunt_target(
     # Derive ran/skipped/error per phase so the dashboard stops marking
     # skipped/no-op/errored phases with ✓. A phase is "error" when a degraded
     # capability was recorded for one of its tools during this run.
-    _degraded_tools = {d["tool"] for d in _DEGRADED_CAPABILITIES}
-    _phase_tool_map = {
-        "js_analysis":     {"js_analysis", "js_download", "secretfinder", "jsluice", "trufflehog"},
-        "secret_hunt":     {"git-hound", "trufflehog"},
-        "sqlmap":          {"sqlmap"},
-        "jwt_audit":       {"jwt_tool"},
-        "api_fuzz":        {"kiterunner", "feroxbuster"},
-        # v9.24 audit-fix (finding A): a total browser failure records a
-        # "browser" degradation; map it so the phase renders ✗ (ERROR), not ✓/∅.
-        "browser_scan":    {"browser"},
-        # audit-fix: a watchdog SIGKILL / wall-clock timeout in run_live/run_cmd
-        # records a degradation under the subprocess watch_phase label (e.g.
-        # "RECON", "SCAN"). Map those so a truncated phase renders ⚠/✗ instead
-        # of silently collapsing to "skipped". Match the uppercase watch_phase
-        # labels used at the subprocess call sites.
-        "recon":           {"RECON", "recon"},
-        # the vuln-scan watch_phase label is "VULN SCAN" (and "VULN SCAN (Batch
-        # X/Y)") — NOT "SCAN" — so the degraded-tool match below is prefix-aware.
-        "scan":            {"VULN SCAN", "SCAN", "scan"},
-        "auth_bypass":     {"nomore403"},
-        "nuclei_dast":     {"nuclei"},
-    }
     _phase_requested = {
         "recon":           should_run_recon,
-        "js_analysis":     js_scan,
-        "secret_hunt":     secret_hunt,
-        "param_discovery": param_discover,
-        "api_fuzz":        api_fuzz and not quick,
-        "cors":            cors_check,
+        "js_analysis":     js_scan and not skip_has(skip_items, "js_analysis"),
+        "secret_hunt":     secret_hunt and not skip_has(skip_items, "secret_hunt"),
+        "param_discovery": param_discover and not skip_has(skip_items, "param_discovery"),
+        "post_params":     post_param_discover and not skip_has(skip_items, "post_params"),
+        "api_fuzz":        api_fuzz and not quick and not skip_has(skip_items, "api_fuzz"),
+        "cors":            cors_check and not skip_has(skip_items, "cors"),
         "scan":            should_run_vuln_scan and not (skip_scan or skip_has(skip_items, "scan", "vuln_scan")),
         # mirror the Phase 7.6 / 7.7 orchestration gates so the dashboard can show
         # ran/skipped/errored for the new active phases.
@@ -10998,76 +11756,24 @@ def hunt_target(
         "saml_xsw":          should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "saml_xsw"),
         "actuator_probe":    should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "actuator_probe"),
         "ldap_injection":    should_run_vuln_scan and not skip_scan and not skip_has(skip_items, "scan", "vuln_scan", "ldap_injection"),
-        "cms_exploit":     cms_exploit,
-        "rce_scan":        rce_scan,
-        "sqlmap":          sqlmap_scan,
-        "jwt_audit":       jwt_audit,
-        "browser_scan":    browser_scan,
+        "cms_exploit":     cms_exploit and not skip_has(skip_items, "cms_exploit"),
+        "rce_scan":        rce_scan and not skip_has(skip_items, "rce_scan"),
+        "sqlmap":          sqlmap_scan and not skip_has(skip_items, "sqlmap"),
+        "jwt_audit":       jwt_audit and not skip_has(skip_items, "jwt_audit"),
+        "browser_scan":    browser_scan and not skip_has(skip_items, "browser_scan", "browser"),
     }
     # v9.24 audit-fix (finding A): persist per-phase "requested" flags so the
     # dashboard can DISPLAY a requested phase that ended up skipped/errored
     # (a requested browser phase that produced nothing must not be hidden).
     result["phase_requested"] = {k: bool(v) for k, v in _phase_requested.items()}
-    for _phase, _requested in _phase_requested.items():
-        # Prefix-aware: a degraded tool matches a phase label exactly OR starts
-        # with it (covers dynamic suffixes like "VULN SCAN (Batch 1/3)" that an
-        # exact set-intersection silently missed → scan coverage-loss collapsed
-        # to "skipped" instead of rendering degraded).
-        _labels = _phase_tool_map.get(_phase, set())
-        _degraded = any(
-            _dt == _lab or _dt.upper().startswith(_lab.upper())
-            for _dt in _degraded_tools for _lab in _labels
-        )
-        result["phase_status"][_phase] = derive_phase_status(
-            bool(_requested), bool(result.get(_phase)), degraded=_degraded
-        )
-
-    # ── P1 fail-closed overall status ───────────────────────────────────────
-    # A broken run must never present as a clean pass. Fold phase outcomes into
-    # result["success"] (the sync path never did this — only the autonomous path
-    # did). Inconclusive when: ANY phase hard-failed/aborted (non-zero exit,
-    # signal, timeout — from the manifest), an ABORTED marker exists, or a CORE
-    # phase (recon/scan) is degraded/errored. A phase that RAN and found nothing
-    # stays success — 0 findings is a result, not a failure.
-    _CORE_PHASES = {"recon", "scan"}
-    _core_broken = any(
-        _ph in _CORE_PHASES and _st in (PHASE_STATUS_FAILED, PHASE_STATUS_ABORTED,
-                                        PHASE_STATUS_ERROR, PHASE_STATUS_PARTIAL)
-        for _ph, _st in result["phase_status"].items()
-    )
-    _any_aborted = any(str(d.get("reason", "")).startswith("ABORTED")
-                       for d in _DEGRADED_CAPABILITIES)
-    _manifest_bad = False
-    try:
-        _manifest_bad = any(
-            _p.get("status") in (phase_manifest.PHASE_FAILED, phase_manifest.PHASE_ABORTED)
-            for _p in phase_manifest.read_manifest(findings_dir).get("phases", [])
-        )
-    except Exception:
-        _manifest_bad = False
-    if _core_broken or _any_aborted or _manifest_bad:
-        result["success"] = False
-        result["assessment_status"] = "inconclusive"
-    else:
-        result.setdefault("assessment_status", "complete")
-
-    # Persist the degraded-capabilities list for the reporter (integration
-    # contract). Always written (even empty) so the reporter can tell
-    # "no degradations" from "coverage not measured".
-    write_coverage_json(findings_dir)
-    # Consolidate the three historically-separate coverage artifacts (hunt degraded
-    # list + scanner.sh coverage_gaps.txt + vikramaditya coverage_degraded.json)
-    # into the canonical coverage.json so both report renderers show one picture.
-    try:
-        phase_manifest.merge_coverage(findings_dir)
-    except Exception:
-        pass
+    _finalize_assessment(result, findings_dir)
 
     # ── Phase 13: Reports ───────────────────────────────────────────────────
     if selected_only_mode:
         log("info", f"Skipping automatic report generation for {domain} (targeted phase mode)")
     elif not skip_has(skip_items, "reports"):
         result["reports"] = generate_reports(domain)
+        _finalize_assessment(result, findings_dir)
 
     # (Report writing is handled inside post_scan_hook above)
 
@@ -11083,7 +11789,10 @@ def print_dashboard(results: list) -> None:
 
     total_reports = 0
     for r in results:
-        status = f"{GREEN}OK{NC}" if r["success"] else f"{RED}FAIL{NC}"
+        if r.get("assessment_status") == "inconclusive":
+            status = f"{YELLOW}INCONCLUSIVE{NC}"
+        else:
+            status = f"{GREEN}OK{NC}" if r["success"] else f"{RED}FAIL{NC}"
         print(f"  [{status}] {BOLD}{r['domain']}{NC}")
         phases = []
         pstatus = r.get("phase_status") or {}
@@ -11094,6 +11803,7 @@ def print_dashboard(results: list) -> None:
             ("js_analysis",     "JS",      CYAN),
             ("secret_hunt",     "Secrets", MAGENTA),
             ("param_discovery", "Params",  BLUE),
+            ("post_params",     "POST",    BLUE),
             ("api_fuzz",        "API",     YELLOW),
             ("cors",            "CORS",    CYAN),
             ("scan",            "Scan",    GREEN),
@@ -11213,7 +11923,7 @@ def print_dashboard(results: list) -> None:
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
-def _verify_authenticated(target: str, cookie: str) -> tuple[bool, str, str]:
+def _verify_authenticated(target: str, cookie: str, *, exact_hosts=None) -> tuple[bool, str, str]:
     """Pre-flight a --cookie session BEFORE the scan: confirm it is actually authenticated,
     and capture any load-balancer stickiness cookie.
 
@@ -11234,8 +11944,16 @@ def _verify_authenticated(target: str, cookie: str) -> tuple[bool, str, str]:
             _rq.packages.urllib3.disable_warnings()
         except Exception:
             pass
-        r = _rq.get(url, headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie},
-                    verify=False, timeout=15, allow_redirects=True)
+        if exact_hosts is not None:
+            from scoped_http import get as scoped_get, ScopeError
+            try:
+                r = scoped_get(url, exact_hosts, timeout=15,
+                               headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie})
+            except ScopeError as exc:
+                return False, str(exc), ""
+        else:
+            r = _rq.get(url, headers={"User-Agent": "Mozilla/5.0", "Cookie": cookie},
+                        verify=False, timeout=15, allow_redirects=True)
         # ── Stickiness: harvest from the WHOLE redirect chain (ALB sets it on the 302),
         # upsert by name (no AWSALB=old; AWSALB=new dupes), reject header-splitting bytes.
         _STICK = ("AWSALB", "AWSALBCORS", "AWSELB", "ARRAffinity", "ARRAffinitySameSite")
@@ -11461,6 +12179,12 @@ Examples:
                              "OFF by default — opt in deliberately.")
 
     args = parser.parse_args()
+    if args.no_brain and args.agent:
+        parser.error("--agent requires AI and cannot be combined with --no-brain")
+    # Start this invocation clean. Pass only its own preflight gaps through
+    # dispatch so per-target resets cannot discard failed authentication or
+    # wordlist setup, or accidentally inherit another invocation's failures.
+    _reset_degraded()
 
     # ── Authenticated-session pre-flight (gap fix #2/#3) ──────────────────────
     # Placed BEFORE any mode dispatch (--post-params etc. early-return below) so an
@@ -11473,7 +12197,11 @@ Examples:
     _why = "no authenticated cookie supplied"
     _stick = ""
     if getattr(args, "cookie", "") and getattr(args, "target", ""):
-        _authed, _why, _stick = _verify_authenticated(args.target, args.cookie)
+        _auth_scope = None
+        if args.scope_lock or args.targets_file:
+            _auth_url = args.target if "://" in args.target else f"https://{args.target}"
+            _auth_scope = {urlsplit(_auth_url).netloc.lower()}
+        _authed, _why, _stick = _verify_authenticated(args.target, args.cookie, exact_hosts=_auth_scope)
         if _stick:
             args.cookie = args.cookie.rstrip("; ") + "; " + _stick
             log("info", "Captured load-balancer stickiness cookie — session pinned to one backend")
@@ -11662,6 +12390,7 @@ Examples:
             tamper=args.sqlmap_tamper,
             lean=args.sqlmap_lean,
             escalate=args.sqli_rce,
+            scope_lock=args.scope_lock,
         )
         sys.exit(0 if found else 1)
 
@@ -11673,6 +12402,7 @@ Examples:
         run_post_param_discovery(
             args.target,
             cookies=args.cookie,
+            scope_lock=args.scope_lock,
         )
         return
 
@@ -11755,6 +12485,7 @@ Examples:
             _mark_degraded("wordlists",
                            f"required payload wordlists missing/invalid: {', '.join(_bad)} — run --setup-wordlists")
 
+    preflight_coverage = [dict(gap) for gap in _DEGRADED_CAPABILITIES]
     if args.target:
         resume_label = resume_session_id or ("latest" if resume_requested else "new")
         log("info", f"Target: {args.target} | batch={args.batch_size} | full={args.full} | autonomous={args.autonomous} | agent={getattr(args, 'agent', False)} | session={resume_label}")
@@ -11789,6 +12520,7 @@ Examples:
                 batch_size=args.batch_size,
                 max_steps=args.max_steps,
                 allow_destructive=args.allow_destructive,
+                initial_coverage=preflight_coverage,
                 skip_items=skip_items,
                 time_left_hours=args.time,
                 scope_lock=args.scope_lock,
@@ -11827,6 +12559,8 @@ Examples:
                 browser_model=args.browser_model,
                 browser_unsafe=args.browser_unsafe,
                 allow_destructive=args.allow_destructive,
+                initial_coverage=preflight_coverage,
+                enable_ai=not args.no_brain,
             )
         print_dashboard([result])
         _exit_for_assessment([result])
@@ -11862,6 +12596,8 @@ Examples:
             browser_model=args.browser_model if hasattr(args, "browser_model") else None,
             browser_unsafe=args.browser_unsafe if hasattr(args, "browser_unsafe") else False,
             allow_destructive=args.allow_destructive if hasattr(args, "allow_destructive") else False,
+            initial_coverage=preflight_coverage,
+            enable_ai=not args.no_brain,
         )
         results.append(result)
 

@@ -11,6 +11,7 @@ Known limitation: IP addresses and CIDR ranges are NOT supported (returns False 
 """
 
 import sys
+import re
 from fnmatch import fnmatch
 from urllib.parse import urlparse
 
@@ -240,6 +241,34 @@ def filter_scope_lock(urls, exact_hosts) -> list:
     return [u for u in urls if scope_lock_allows(u, exact_hosts)]
 
 
+def scope_lock_crawl_regex(exact_hosts) -> str:
+    """Build a RE2-compatible, anchored HTTP URL scope for active crawlers.
+
+    Match the same default/explicit-port authorities as ``scope_lock_allows``.
+    A malformed or empty allowlist is an error, never an unrestricted regex.
+    The URL authority boundary excludes credentials and hostname suffix tricks.
+    """
+    if not exact_hosts:
+        raise ValueError("missing or empty exact-host crawl allowlist")
+    authorities = set()
+    for raw in exact_hosts:
+        entry = str(raw).strip().lower().rstrip(".")
+        if not entry or re.search(r"[\s/@?#\\]", entry):
+            raise ValueError("crawl allowlist must contain normalized hosts, not URLs")
+        host, port = _parse_host_port(entry)
+        if not host or ":" in host:
+            raise ValueError("invalid exact-host crawl authority")
+        escaped = re.escape(host) + r"\.?"
+        if scope_lock_allows(f"https://{host}", exact_hosts):
+            authorities.add(escaped + r"(?::(?:80|443))?")
+        if port is not None and port not in _DEFAULT_PORTS:
+            if scope_lock_allows(f"https://{host}:{port}", exact_hosts):
+                authorities.add(escaped + ":" + str(port))
+    if not authorities:
+        raise ValueError("exact-host crawl allowlist authorizes no HTTP URLs")
+    return r"(?i)^https?://(?:" + "|".join(sorted(authorities)) + r")(?:[/?#]|$)"
+
+
 def _load_allow_file(path) -> set:
     hosts = set()
     if not path:
@@ -263,12 +292,22 @@ if __name__ == "__main__":
                     help="exit 0 iff the host arg is exactly in scope (else nonzero)")
     ap.add_argument("--scope-lock-filter", action="store_true",
                     help="filter --in through the allowlist to --out (drops off-scope)")
+    ap.add_argument("--scope-lock-crawl-regex", action="store_true",
+                    help="emit an anchored exact-host HTTP scope for active crawlers")
     ap.add_argument("--allow-file", help="file of exact allowed hosts (one per line)")
     ap.add_argument("--in", dest="infile")
     ap.add_argument("--out", dest="outfile")
     ap.add_argument("host", nargs="?")
     a = ap.parse_args()
     allow = _load_allow_file(a.allow_file)
+
+    if a.scope_lock_crawl_regex:
+        try:
+            print(scope_lock_crawl_regex(allow))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     if a.scope_lock_filter:
         try:

@@ -89,7 +89,7 @@ def test_exact_allowlist_rejects_subdomain_and_userinfo(tmp_path):
     (scope_dir / "allow.txt").write_text("https://api.example.invalid:8443/path\n")
     allowed = hunt._exact_allowed_hosts("example.invalid", str(recon_dir))
 
-    assert allowed == {"api.example.invalid"}
+    assert allowed == {"api.example.invalid:8443"}
     assert hunt._url_in_exact_allowed_hosts(
         "https://api.example.invalid:8443/v1", allowed
     )
@@ -99,6 +99,8 @@ def test_exact_allowlist_rejects_subdomain_and_userinfo(tmp_path):
     assert not hunt._url_in_exact_allowed_hosts(
         "https://api.example.invalid@evil.invalid/v1", allowed
     )
+    assert not hunt._url_in_exact_allowed_hosts("https://api.example.invalid/v1", allowed)
+    assert not hunt._url_in_exact_allowed_hosts("https://api.example.invalid:9000/v1", allowed)
 
 
 def test_openapi_operations_and_servers_are_exact_scope_filtered(tmp_path):

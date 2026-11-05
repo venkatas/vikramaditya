@@ -10,7 +10,9 @@ if str(REPO) not in sys.path:
 # ── B: vuln-scan batches must fit the timeout ────────────────────────────────
 def test_scan_batch_size_and_timeout():
     h = (REPO / "hunt.py").read_text()
-    assert "SCAN_TIMEOUT       = 5400" in h, "batch timeout not raised"
+    # The default was subsequently raised from 5400 to 7200, with explicit
+    # environment overrides. Preserve that stronger bound, not the old literal.
+    assert 'os.environ.get("VIK_SCAN_TIMEOUT") or os.environ.get("SCAN_TIMEOUT") or "7200"' in h
     assert "batch_size = 25" in h, "batch size not reduced"
 
 
@@ -112,12 +114,11 @@ def test_csp_check_follows_redirects():
     check did `curl -I "$host"` (HEAD, no -L) against the http:// URL, reading the 301
     redirect response (which carries no CSP) instead of the final https page. Follow redirects
     (and use GET, since some servers omit CSP on HEAD) so the header seen matches a browser."""
-    import re
     sc = (REPO / "scanner.sh").read_text()
     i = sc.index("Analysing Content-Security-Policy")
     block = sc[i:i + 2400]
-    m = re.search(r"HDR=\$\(curl[^\n]*\)", block)
-    assert m, "CSP header-fetch curl not found in the CSP block"
-    line = m.group(0)
-    assert "-L" in line, f"CSP fetch must follow redirects (-L) to read the final page; got: {line}"
-    assert "-I " not in line, f"CSP fetch must not use HEAD (-I) — some servers omit CSP on HEAD; got: {line}"
+    assert 'HDR=$(_csp_headers "$host"' in block
+    helper = sc[sc.index('_csp_headers() {'):sc.index('\n}', sc.index('_csp_headers() {'))]
+    assert 'scoped_http.py' in helper and '--headers-only' in helper
+    assert 'curl -sk -L' in helper, "unlocked fetch must still follow redirects"
+    assert '-I ' not in helper, "fetch must use GET: some servers omit CSP on HEAD"

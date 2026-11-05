@@ -116,6 +116,89 @@ def test_merge_empty_dir_is_empty(tmp_path):
     assert pm.merge_coverage(str(tmp_path)) == []
 
 
+def _split_session_dirs(tmp_path):
+    recon = tmp_path / "recon" / "acme" / "sessions" / "session-1"
+    findings = tmp_path / "findings" / "acme" / "sessions" / "session-1"
+    recon.mkdir(parents=True)
+    findings.mkdir(parents=True)
+    return recon, findings
+
+
+@pytest.mark.parametrize("local_marker", [[], {"unexpected": "schema"}])
+def test_merge_sibling_recon_gaps_not_shadowed_by_local_marker(tmp_path, local_marker):
+    recon, findings = _split_session_dirs(tmp_path)
+    (findings / "coverage_degraded.json").write_text(json.dumps(local_marker))
+    (recon / "coverage_degraded.json").write_text(json.dumps([
+        {"tool": "sqlmap", "reason": "timed out in fallback"},
+    ]))
+    first = pm.merge_coverage(str(findings))
+    second = pm.merge_coverage(str(findings))
+    assert first == second
+    assert {
+        "source": "vikramaditya", "tool_or_phase": "sqlmap",
+        "reason": "timed out in fallback", "status": "degraded",
+    } in first
+    integrity = [row for row in first if row["source"] == "coverage_integrity"]
+    assert len(first) == (1 if local_marker == [] else 2)
+    assert len(integrity) == (0 if local_marker == [] else 1)
+    if integrity:
+        assert integrity[0]["status"] == "failed"
+        assert "coverage_degraded.json" in integrity[0]["reason"]
+
+
+def test_merge_all_degraded_marker_locations_and_deduplicate(tmp_path):
+    recon, findings = _split_session_dirs(tmp_path)
+    duplicate = {"tool": "sqlmap", "reason": "crashed"}
+    for directory, entries in (
+        (findings, [duplicate]),
+        (findings.parent, [{"tool": "nuclei", "reason": "legacy timeout"}]),
+        (recon, [duplicate, {"tool": "httpx", "reason": "probe failed"}]),
+    ):
+        (directory / "coverage_degraded.json").write_text(json.dumps(entries))
+    merged = pm.merge_coverage(str(findings))
+    assert len(merged) == 3
+    assert {item["tool_or_phase"] for item in merged} == {"sqlmap", "nuclei", "httpx"}
+
+
+@pytest.mark.parametrize("entry_tree", ["findings", "recon", "reports"])
+@pytest.mark.parametrize("clean_manifest", [False, True])
+def test_reporter_reads_unmerged_recon_gaps_without_writing(tmp_path, entry_tree, clean_manifest):
+    import reporter
+    recon, findings = _split_session_dirs(tmp_path)
+    (recon / "coverage_degraded.json").write_text(json.dumps([
+        {"tool": "sqlmap", "reason": "sibling recon timeout"},
+    ]))
+    if clean_manifest:
+        pm.record_phase(str(findings), "scan", exit_code=0)
+    entry = tmp_path / entry_tree / "acme" / "sessions" / "session-1"
+    before = {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    for blob in (reporter._render_coverage_limitations_html(str(entry)),
+                 reporter._render_coverage_limitations_md(str(entry))):
+        assert "sibling recon timeout" in blob and "sqlmap" in blob
+        assert "INCONCLUSIVE" in blob
+    after = {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before, "rendering coverage must remain read-only"
+
+
+def test_sibling_coverage_resolution_keeps_nested_tree_names_and_session(tmp_path):
+    import reporter
+    root = tmp_path / "project"
+    findings = root / "findings" / "reports" / "sessions" / "recon"
+    recon = root / "recon" / "reports" / "sessions" / "recon"
+    other_session = root / "recon" / "reports" / "sessions" / "other"
+    for directory in (findings, recon, other_session):
+        directory.mkdir(parents=True)
+    (recon / "coverage_degraded.json").write_text(json.dumps([
+        {"tool": "httpx", "reason": "correct session failure"},
+    ]))
+    (other_session / "coverage_degraded.json").write_text(json.dumps([
+        {"tool": "nuclei", "reason": "unrelated session failure"},
+    ]))
+    rows, inconclusive = reporter._load_coverage_rows(str(findings))
+    assert rows == [("httpx", "correct session failure", "vikramaditya")]
+    assert inconclusive is True
+
+
 # ── reporter: HTML and MD show IDENTICAL degradation info + INCONCLUSIVE banner ──
 def _findings_report_dir(tmp_path):
     d = tmp_path / "findings" / "acme" / "sessions" / "20260101_x"

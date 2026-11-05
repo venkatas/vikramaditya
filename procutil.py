@@ -133,6 +133,10 @@ class _PosixSpawnProc:
         try:
             self.pid = spawn(program, argv, env if env is not None else os.environ,
                              file_actions=file_actions, setsid=True)
+            # setsid makes this PID the group ID. Retain ownership before any
+            # poll/wait can reap the leader: descendants may outlive it.
+            self._vik_pgid = self.pid
+            self._vik_group_gone = False
         except Exception:
             for _fd in (r_out, w_out, r_err, w_err, pty_master, pty_slave):
                 if _fd is not None:
@@ -179,24 +183,32 @@ class _PosixSpawnProc:
                     pass
                 setattr(self, _attr, None)
 
-    def poll(self):
+    def poll(self, *, close_streams=True):
+        """Reap without blocking on pipe-reader locks when teardown defers closing.
+
+        A descendant may retain a captured pipe after the immediate child exits.
+        Group teardown must be able to observe that exit and kill the descendant
+        before closing the pipe that another thread is still reading.
+        """
         with self._lock:
-            if self.returncode is not None:
-                return self.returncode
-            try:
-                pid, status = os.waitpid(self.pid, os.WNOHANG)
-            except ChildProcessError:
-                self.returncode = 0  # already reaped elsewhere; status unknowable
-                self._close_pty()
-                self._close_streams()
-                return self.returncode
-            if pid == 0:
-                return None
-            self.returncode = -os.WTERMSIG(status) if os.WIFSIGNALED(status) \
-                else os.WEXITSTATUS(status)
-            self._close_pty()
+            if self.returncode is None:
+                try:
+                    pid, status = os.waitpid(self.pid, os.WNOHANG)
+                except ChildProcessError:
+                    self.returncode = 0  # already reaped elsewhere; status unknowable
+                else:
+                    if pid == 0:
+                        return None
+                    self.returncode = -os.WTERMSIG(status) if os.WIFSIGNALED(status) \
+                        else os.WEXITSTATUS(status)
+            rc = self.returncode
+        # Closing a TextIO pipe can wait for a reader's lock. Never hold the
+        # process-status lock during that wait: teardown must still be able to
+        # poll without closing and escalate the child's process group.
+        self._close_pty()
+        if close_streams:
             self._close_streams()
-            return self.returncode
+        return rc
 
     def wait(self, timeout=None):
         deadline = None if timeout is None else time.time() + timeout
@@ -235,13 +247,7 @@ class _PosixSpawnProc:
                 # child + the daemon reader threads' read-pipe fds + the pty master).
                 # Kill the whole session group, then close the pty/read fds — closing the
                 # read fds unblocks the daemon reader threads still parked in s.read().
-                try:
-                    os.killpg(os.getpgid(self.pid), signal.SIGKILL)
-                except Exception:
-                    try:
-                        self.kill()
-                    except Exception:
-                        pass
+                _terminate_group(self, grace=0)
                 self._close_pty()
                 self._close_streams()
                 raise subprocess.TimeoutExpired("posix_spawn", timeout)
@@ -324,13 +330,54 @@ def _fork_safe_spawn(spec, env=None, cwd=None, capture=True, shell=True, merge_s
     # reap hook to close it), so we keep the historical /dev/null stdin; sqlmap -r on
     # such an ancient interpreter would just retain the old non-tty behaviour.
     _err = subprocess.STDOUT if merge_stderr else subprocess.PIPE
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         spec, shell=bool(shell),
         stdout=subprocess.PIPE if capture else None,
         stderr=(_err if capture else None),
         stdin=subprocess.DEVNULL, cwd=cwd, env=env, text=True,
         start_new_session=True,
     )
+    proc._vik_pgid = proc.pid
+    proc._vik_group_gone = False
+    return proc
+
+
+def _poll_without_stream_close(proc):
+    if isinstance(proc, _PosixSpawnProc):
+        return proc.poll(close_streams=False)
+    return proc.poll()  # subprocess.Popen.poll does not close captured pipes
+
+
+def _owned_group_alive(proc) -> bool:
+    """Check a spawn-owned group without closing inherited captured pipes.
+
+    A group ID remains allocated while descendants belong to it, even after its
+    leader is reaped. Once absence (or a new process occupying the reaped leader
+    PID) is observed, retire that ownership so repeated cleanup cannot target a
+    later group that reused the numeric ID.
+    """
+    pgid = getattr(proc, "_vik_pgid", None)
+    if not isinstance(pgid, int) or pgid <= 0 or getattr(proc, "_vik_group_gone", False):
+        return False
+    try:
+        exited = _poll_without_stream_close(proc) is not None
+        if exited:
+            try:
+                os.getpgid(proc.pid)
+            except ProcessLookupError:
+                pass  # Leader is gone; its still-live descendants retain the group.
+            else:
+                proc._vik_group_gone = True  # Reaped PID now belongs to somebody else.
+                return False
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        proc._vik_group_gone = True
+        return False
+    except PermissionError:
+        return True  # Existence is known even when signalling is not permitted.
+    except Exception:
+        return False
 
 
 def _terminate_group(proc, grace: float = 5, phase=None) -> None:
@@ -338,52 +385,74 @@ def _terminate_group(proc, grace: float = 5, phase=None) -> None:
 
     The child is launched with ``start_new_session=True`` (its own process group), so
     killing the group tears down the WHOLE descendant tree (nmap/curl/sqlmap/…), not
-    just the immediate child. Pins the pgid BEFORE any reap (PID-reuse safe), no-ops if
-    the child already exited (poll-first), and NEVER raises — teardown must not mask the
-    interrupt/exception that triggered it.
+    just the immediate child. Spawn-owned group identity survives leader exit;
+    empty/retired groups are not signalled. NEVER raises — teardown must not mask
+    the interrupt/exception that triggered it.
     """
     if proc is None:
         return
-    # Pin the group id up front — a later reap invalidates getpgid(pid).
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, OSError):
-        pgid = getattr(proc, "pid", None)
+    pgid = getattr(proc, "_vik_pgid", None)
+    if pgid is None:
+        # Compatibility for an external Popen: only adopt a live session leader,
+        # never reconstruct ownership from an already-reaped, reusable PID.
+        try:
+            if _poll_without_stream_close(proc) is not None:
+                return
+            candidate = os.getpgid(proc.pid)
+            if candidate == proc.pid:
+                pgid = proc._vik_pgid = candidate
+                proc._vik_group_gone = False
+        except Exception:
+            pass
 
     def _signal_group(sig):
         try:
-            if pgid is not None:
+            if pgid is not None and _owned_group_alive(proc):
                 os.killpg(pgid, sig)
                 return
         except (ProcessLookupError, OSError):
             pass
         try:
-            proc.send_signal(sig)   # fallback: signal just the child
+            if _poll_without_stream_close(proc) is None:
+                proc.send_signal(sig)   # fallback: signal just the live child
         except Exception:
             pass
 
-    # Already exited? Nothing to kill (avoids signalling a reused PID).
-    try:
-        if proc.poll() is not None:
-            return
-    except Exception:
-        pass
-
-    _signal_group(signal.SIGTERM)
-    try:
-        proc.wait(timeout=grace)
-    except Exception:
-        pass
-    try:
-        still_alive = proc.poll() is None
-    except Exception:
-        still_alive = True
-    if still_alive:
-        _signal_group(signal.SIGKILL)
+    def _group_alive():
+        if pgid is not None:
+            return _owned_group_alive(proc)
         try:
-            proc.wait(timeout=10)   # reap — posix_spawn has no Popen GC to do it
+            return _poll_without_stream_close(proc) is None
+        except Exception:
+            return False
+
+    if not _group_alive():
+        if pgid is not None:
+            # No owned writers remain. Reap/close the original capture handles
+            # even though there was no group left to signal.
+            try:
+                proc.wait(timeout=0)
+            except Exception:
+                pass
+        return
+
+    deadline = time.monotonic() + max(0, grace)
+    _signal_group(signal.SIGTERM)
+    # Reap without closing streams during grace. wait()/ordinary poll() can
+    # deadlock here on a reader lock held until a resistant descendant closes
+    # its inherited pipe, preventing the SIGKILL that would release that reader.
+    while _group_alive() and time.monotonic() < deadline:
+        try:
+            _poll_without_stream_close(proc)
         except Exception:
             pass
+        time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+    if _group_alive():
+        _signal_group(signal.SIGKILL)
+    try:
+        proc.wait(timeout=10)   # reap — posix_spawn has no Popen GC to do it
+    except Exception:
+        pass
 
 
 def run_capture(spec, timeout=None, env=None, cwd=None, shell=True, merge_stderr=True,
@@ -407,13 +476,7 @@ def run_capture(spec, timeout=None, env=None, cwd=None, shell=True, merge_stderr
         _terminate_group(proc)
         raise
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        _terminate_group(proc, grace=0)
         # Reap so a timed-out child never lingers as a zombie (bounded; never hangs).
         try:
             proc.wait(timeout=10)

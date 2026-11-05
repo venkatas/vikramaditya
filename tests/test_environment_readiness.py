@@ -37,12 +37,10 @@ def test_missing_required_runtime_command_is_not_ready():
         which=lambda tool: None,
         runner=lambda *args, **kwargs: _result(),
     )
-    assert gaps == [
-        {
-            "tool": "uro",
-            "reason": "required runtime command not found on PATH: uro",
-        }
-    ]
+    assert len(gaps) == 1
+    assert gaps[0]["tool"] == "uro"
+    assert gaps[0]["reason"].startswith("required runtime command not found on PATH: uro")
+    assert "pip install uro" in gaps[0]["reason"]
 
 
 def test_pip_check_timeout_fails_closed():

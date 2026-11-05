@@ -11,11 +11,14 @@ Usage:
 """
 
 import argparse
+import ipaddress
+import json
 import os
 import re
 import shutil
 import sys
 from datetime import datetime
+from html import escape as _html_escape
 
 # v10.6.0 — verification-based severity gating + weighted risk scoring / framework
 # mapping (finding_schema.py, report_synthesis.py; adapted from xalgorix MIT). Both
@@ -695,6 +698,40 @@ SEVERITY_COLOR = {
 CVSS_DEFAULT = {"critical": "9.0", "high": "7.5", "medium": "5.0", "low": "2.5", "info": "0.0"}
 
 
+def _cvss_score_text(value) -> str | None:
+    """Accept recorded numeric scores, including zero, but never invent a vector."""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if text.upper() in {"N/A", "NOT SCORED"}:
+        return "N/A"
+    if not re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return None
+    return text if 0 <= float(text) <= 10 else None
+
+
+def _finding_cvss(finding: dict, template: dict | None = None) -> str:
+    """Use one score policy in every report table and finding detail.
+
+    Legacy CVE evidence embeds its actual score in the PoC. Explicit per-item
+    values (including 0.0 and N/A) otherwise take precedence. A template score
+    is only a compatible fallback when its severity matches the finding; e.g.
+    a LOW CSP observation must not inherit the generic MEDIUM misconfig score.
+    Unknown scores stay unscored rather than synthesizing a severity-band score.
+    """
+    for match in re.finditer(r"\bCVSS:\s*(\d+(?:\.\d+)?)(?![\d/]|\.\d)",
+                             str(finding.get("poc") or "")):
+        score = _cvss_score_text(match.group(1))
+        return score or "N/A"
+    if finding.get("cvss") is not None and str(finding["cvss"]).strip():
+        return _cvss_score_text(finding["cvss"]) or "N/A"
+    template = template or VULN_TEMPLATES.get(finding.get("vtype"), {})
+    severity = str(finding.get("severity") or "").strip().lower()
+    if severity == str(template.get("severity") or "").strip().lower():
+        return _cvss_score_text(template.get("cvss")) or "N/A"
+    return "N/A"
+
+
 def _severity_counts(findings: list) -> dict:
     """Per-severity counts for the Executive Summary table that ALWAYS reconcile
     with len(findings). Loaders normalize severity, but as defense-in-depth any
@@ -922,6 +959,25 @@ def _load_poc_blocks(poc_path: str) -> dict:
     return pocs
 
 
+def _dedupe_exact_findings(results: list) -> list:
+    """Remove repeated parsed records without erasing distinct evidence.
+
+    Resume runs append scanner lines. Compare the entire parsed record, not only
+    title/URL: different parameters, CVEs, PoCs or observations remain distinct.
+    This only changes the in-memory report collection, never source artifacts.
+    """
+    import json as _json
+    seen = set()
+    unique = []
+    for finding in results:
+        identity = _json.dumps(finding, sort_keys=True, ensure_ascii=False,
+                               separators=(",", ":"))
+        if identity not in seen:
+            seen.add(identity)
+            unique.append(finding)
+    return unique
+
+
 def _consolidate_repeated_findings(results: list, threshold: int = 4) -> list:
     """Collapse many near-identical findings (same vtype+severity+reason across DIFFERENT
     hosts — e.g. 'Missing CSP header' on 71 hosts) into ONE finding with an aggregated host
@@ -948,7 +1004,10 @@ def _consolidate_repeated_findings(results: list, threshold: int = 4) -> list:
 
     out = []
     for members in groups.values():
-        if len(members) >= threshold:
+        # Exact duplicates were removed before grouping. Multiple remaining
+        # observations of one endpoint have distinct evidence and must survive.
+        unique_urls = {f.get("url") for f in members}
+        if len(members) >= threshold and len(unique_urls) == len(members):
             hosts = []
             for m in members:
                 h = _host_of(m)
@@ -1077,6 +1136,7 @@ def load_findings(findings_dir: str) -> list:
             # cert line was ingested as its OWN CRITICAL "Authentication Bypass". This is evidence
             # for the [SAML-METADATA-EXPOSED] note (itself suppressed below), not a finding.
             "certs.txt",
+            "guarded_pages.json", "blocked_requests.jsonl",  # guarded browser metadata
         }
         # Line-prefix markers used by scanner.sh to record state, not findings.
         NON_FINDING_PREFIXES = (
@@ -2010,8 +2070,8 @@ def load_findings(findings_dir: str) -> list:
     # v10: always run — no other loader reads finding_*.json, so the old
     # `if not results:` gate silently dropped autopilot findings whenever any
     # earlier method (a brain_active INFO row, CORS, …) had already appended a
-    # row. Dedup by (vtype,url,detail) guards against any overlap.
-    _seen_m2 = {(r.get("vtype"), r.get("url"), r.get("detail")) for r in results}
+    # row. Exact duplicate suppression is shared at the collection boundary;
+    # a title/URL/detail-only key here would lose distinct recorded evidence.
     if os.path.isdir(findings_dir):
         for fn in sorted(os.listdir(findings_dir)):
             if not fn.startswith("finding_") or not fn.endswith(".json"):
@@ -2308,7 +2368,8 @@ def load_findings(findings_dir: str) -> list:
                     "detail": detail,
                     "evidence": evidence,
                     "poc": poc_text,
-                    "cvss": tmpl.get("cvss", "N/A"),
+                    "cvss": _finding_cvss({"severity": sev, "vtype": vtype,
+                                           "poc": poc_text, "cvss": data.get("cvss")}, tmpl),
                     "cwe": tmpl.get("cwe", ""),
                     "owasp": tmpl.get("owasp", ""),
                     "remediation": tmpl.get("remediation", ""),
@@ -2317,16 +2378,13 @@ def load_findings(findings_dir: str) -> list:
                     "attack_id": "",
                     "verification_method": data.get("verification_method", "unverified"),
                 }
-                key = (vtype, url, detail)
-                if key not in _seen_m2:
-                    _seen_m2.add(key)
-                    results.append(finding)
+                results.append(finding)
             except Exception as e:
                 print(f"[reporter] WARNING: failed to load finding file {fn}: "
                       f"{e!r} — this finding may be MISSING from the report")
                 continue
 
-    results = _consolidate_repeated_findings(results)
+    results = _consolidate_repeated_findings(_dedupe_exact_findings(results))
     results.sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 4))
     return results
 
@@ -2556,27 +2614,8 @@ def _resolve_recon_findings_dirs(report_dir: str) -> tuple[str, str]:
     — all non-existent — and rendered empty in every real report. We now also
     recognise the ``reports/`` segment and map it to BOTH sibling layouts
     (recon for host/port artefacts, findings for coverage.json)."""
-    report_dir = (report_dir or "").rstrip("/")
-    # Match the top-level "findings/", "recon/", or "reports/" segment whether
-    # the caller passed an absolute ("/.../findings/...") or a relative
-    # ("findings/...") path — the inline /findings/-only check in
-    # _collect_scan_diagnostics silently no-ops on a relative findings dir,
-    # which would leave the recon inventory empty. Swap only the FIRST segment
-    # so a literal "findings"/"recon"/"reports" deeper in the path is preserved.
-    findings_seg = re.compile(r"(^|/)findings/")
-    recon_seg = re.compile(r"(^|/)recon/")
-    reports_seg = re.compile(r"(^|/)reports/")
-    if reports_seg.search(report_dir):
-        # The generated-report layout: map the SAME session dir onto both the
-        # recon/ tree (live/, ports/) and the findings/ tree (coverage.json).
-        recon_dir = reports_seg.sub(lambda m: m.group(1) + "recon/", report_dir, count=1)
-        findings_dir = reports_seg.sub(lambda m: m.group(1) + "findings/", report_dir, count=1)
-        return recon_dir, findings_dir
-    if findings_seg.search(report_dir):
-        recon_dir = findings_seg.sub(lambda m: m.group(1) + "recon/", report_dir, count=1)
-        return recon_dir, report_dir
-    findings_dir = recon_seg.sub(lambda m: m.group(1) + "findings/", report_dir, count=1)
-    return report_dir, findings_dir
+    from phase_manifest import resolve_session_dirs
+    return resolve_session_dirs(report_dir)
 
 
 def _asset_sample_limit() -> int:
@@ -2633,6 +2672,92 @@ def _truncate_asset_list(items: list[str], limit: int | None = None
     return items[:lim], len(items) - lim
 
 
+def _httpx_ip(value) -> str:
+    """Recognize an address by type instead of a missing optional column's index."""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    try:
+        return str(ipaddress.ip_address(value.strip("[]")))
+    except ValueError:
+        return ""
+
+
+def _httpx_bracket_fields(value: str) -> list[str]:
+    """Read top-level fields while retaining nested brackets in page titles."""
+    fields, current = [], []
+    depth = 0
+    for char in value:
+        if char == "[":
+            if depth:
+                current.append(char)
+            depth += 1
+        elif char == "]" and depth:
+            depth -= 1
+            if depth:
+                current.append(char)
+            else:
+                fields.append("".join(current))
+                current = []
+        elif depth:
+            current.append(char)
+    return fields
+
+
+def _parse_httpx_inventory_line(line: str) -> dict | None:
+    """Decode structured HTTPX records or the legacy optional-field text format.
+
+    Text HTTPX omits absent titles entirely. Anchor its trailing fields on an
+    actual IPv4/IPv6 value; positional optional regex groups shift every column.
+    JSON keeps explicit field names and is unambiguous even without an address.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    if line.startswith("{"):
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(row, dict):
+            return None
+        url = row.get("url") or row.get("input")
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+            return None
+        status = row.get("status_code", row.get("status"))
+        status = str(status) if type(status) in (str, int) and re.fullmatch(r"[1-5]\d{2}", str(status)) else ""
+        addresses = [row.get("host_ip"), row.get("host"), row.get("ip")]
+        if isinstance(row.get("a"), list):
+            addresses.extend(row["a"])
+        ip = next((parsed for candidate in addresses if (parsed := _httpx_ip(candidate))), "")
+        tech = row.get("tech", row.get("technologies", ""))
+        tech = ",".join(str(item) for item in tech if isinstance(item, str)) if isinstance(tech, list) else tech
+        return {"url": url, "status": status, "ip": ip,
+                "title": row.get("title") if isinstance(row.get("title"), str) else "",
+                "tech": tech if isinstance(tech, str) else ""}
+    parts = line.split(maxsplit=1)
+    url = parts[0]
+    if not url.startswith(("https://", "http://")):
+        return None
+    fields = _httpx_bracket_fields(parts[1] if len(parts) == 2 else "")
+    status = ""
+    if fields and re.fullmatch(r"[1-5]\d{2}(?:,[1-5]\d{2})*", fields[0]):
+        status = fields.pop(0)
+    if fields and fields[0].isdigit():
+        fields.pop(0)  # optional content length, never a title/address
+    ip_index = next((index for index in range(len(fields) - 1, -1, -1)
+                     if _httpx_ip(fields[index])), None)
+    if ip_index is not None:
+        ip = _httpx_ip(fields[ip_index])
+        title = " ".join(fields[:ip_index])
+        tech = ",".join(fields[ip_index + 1:])
+    else:
+        # Without typed address evidence, a single legacy string is ambiguous
+        # between title and tech. Keep it as title instead of inventing an IP.
+        ip, title, tech = "", fields[0] if fields else "", ",".join(fields[1:])
+    return {"url": url, "status": status, "ip": ip, "title": title, "tech": tech}
+
+
 def _collect_asset_inventory(report_dir: str) -> dict:
     """Collect Asset Inventory data from session recon artefacts.
 
@@ -2685,26 +2810,11 @@ def _collect_asset_inventory(report_dir: str) -> dict:
     resolved_sample, resolved_omitted = _truncate_asset_list(resolved, sample_lim)
 
     # --- Live hosts (httpx_full.txt) ---
-    httpx_re = re.compile(
-        r"^(\S+)"                      # url
-        r"(?:\s+\[([^\]]*)\])?"        # status
-        r"(?:\s+\[([^\]]*)\])?"        # content length
-        r"(?:\s+\[([^\]]*)\])?"        # title
-        r"(?:\s+\[([^\]]*)\])?"        # ip
-        r"(?:\s+\[([^\]]*)\])?")       # tech
     live_hosts: list[dict] = []
     for line in _read_recon_lines(recon_dir, "live", "httpx_full.txt"):
-        m = httpx_re.match(line.strip())
-        if not m:
-            continue
-        url, status, _clen, ptitle, ip, tech = m.groups()
-        live_hosts.append({
-            "url": url,
-            "status": status or "",
-            "ip": ip or "",
-            "title": ptitle or "",
-            "tech": tech or "",
-        })
+        parsed = _parse_httpx_inventory_line(line)
+        if parsed is not None:
+            live_hosts.append(parsed)
     if not live_hosts:
         for url in _read_recon_lines(recon_dir, "live", "urls.txt"):
             live_hosts.append({
@@ -3061,72 +3171,16 @@ def _load_coverage_rows(report_dir: str):
     """Return ``(rows, inconclusive)`` shared by the HTML and Markdown renderers so BOTH
     show IDENTICAL degradation info (the Markdown deliverable previously showed none).
 
-    ``rows`` is a list of ``(tool_or_phase, reason, source)``. Accepts ``coverage.json`` as a
-    merged list (``{source,tool_or_phase,reason,status}``), a legacy hunt list
-    (``{tool,reason}``), or an api_audit dict — and also folds in scanner.sh's
-    ``manual_review/coverage_gaps.txt`` directly, so the section is populated even if
-    ``merge_coverage`` never ran. ``inconclusive`` comes from the phase manifest."""
-    import json as _json
+    ``rows`` is a list of ``(tool_or_phase, reason, source)`` from the same read-only
+    collector used by coverage consolidation. Existing failure markers take precedence
+    over a missing/stale clean manifest; rendering never writes coverage artifacts.
+    """
+    import phase_manifest as _pm
     _, findings_dir = _resolve_recon_findings_dirs(report_dir)
-    rows: list = []
-    seen: set = set()
-
-    def _add(tool, reason, source):
-        reason = " ".join(str(reason or "").split()).strip()
-        tool = str(tool or "").strip()
-        if not reason:
-            return
-        key = (tool, reason, source)
-        if key in seen:
-            return
-        seen.add(key)
-        rows.append((tool or "—", reason, source))
-
-    cov_path = os.path.join(findings_dir, "coverage.json")
-    data = None
-    try:
-        with open(cov_path, errors="replace") as fh:
-            data = _json.load(fh)
-    except (OSError, ValueError):
-        data = None
-    if isinstance(data, list):
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            if "tool_or_phase" in item or "source" in item:      # merged schema
-                _add(item.get("tool_or_phase", ""), item.get("reason", ""), item.get("source", "hunt"))
-            else:                                                # legacy hunt {tool,reason}
-                _add(item.get("tool", ""), item.get("reason", ""), "hunt")
-    elif isinstance(data, dict):                                 # api_audit dict (was silently dropped)
-        deg = data.get("degraded")
-        if isinstance(deg, list):
-            for d in deg:
-                if isinstance(d, dict):
-                    _add(d.get("tool", ""), d.get("reason", ""), "api_audit")
-                elif isinstance(d, str):
-                    _add("", d, "api_audit")
-
-    gaps = os.path.join(findings_dir, "manual_review", "coverage_gaps.txt")
-    try:
-        with open(gaps, errors="replace") as fh:
-            for ln in fh:
-                txt = ln.replace("[COVERAGE-GAP]", "").strip()
-                if not txt:
-                    continue
-                if ":" in txt:
-                    cls, reason = txt.split(":", 1)
-                    _add(cls.strip(), reason.strip(), "scanner.sh")
-                else:
-                    _add("", txt, "scanner.sh")
-    except OSError:
-        pass
-
-    inconclusive = False
-    try:
-        import phase_manifest as _pm
-        inconclusive = _pm.is_inconclusive(findings_dir)
-    except Exception:
-        inconclusive = False
+    coverage = _pm.collect_coverage(findings_dir)
+    rows = [(item["tool_or_phase"] or "—", item["reason"], item["source"])
+            for item in coverage]
+    inconclusive = _pm.assessment_status(findings_dir, coverage) == "inconclusive"
     return rows, inconclusive
 
 
@@ -3393,6 +3447,98 @@ def _assessment_session_date(path: str) -> str:
     return "Not recorded"
 
 
+_METHODOLOGY_NOTE = (
+    "This report is assembled from the supplied session artifacts. Recorded "
+    "phase invocations describe execution outcomes, not proof that every "
+    "technique or subtask completed. Manual activity, model use, and successful "
+    "exploitation require their own evidence; none is inferred from tool "
+    "availability or report generation."
+)
+
+
+def _methodology_evidence(report_dir: str) -> dict:
+    """Read only this session's scope and explicit phase execution records."""
+    recon_dir, findings_dir = _resolve_recon_findings_dirs(report_dir)
+    scope = _read_recon_lines(recon_dir, "scope", "allow.txt")
+    scope = [line.strip() for line in scope if line.strip() and not line.lstrip().startswith("#")]
+    phases = []
+    manifest_state = "not recorded"
+    try:
+        with open(os.path.join(findings_dir, "phase_manifest.json"), encoding="utf-8") as source:
+            manifest = json.load(source)
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("phases"), list):
+            raise ValueError("invalid phase manifest")
+        manifest_state = "no invocations recorded"
+        for record in manifest["phases"]:
+            if not isinstance(record, dict) or not isinstance(record.get("phase"), str):
+                continue
+            # An artifact/directory alone is not evidence a tool ran. A command
+            # or explicit exit outcome is required; never print raw commands,
+            # which may contain authentication data.
+            if not record.get("command") and type(record.get("exit_code")) is not int:
+                continue
+            phases.append({
+                "phase": record["phase"],
+                "status": str(record.get("status") or "not recorded"),
+                "exit_code": str(record["exit_code"]) if type(record.get("exit_code")) is int else "not recorded",
+            })
+        if phases:
+            manifest_state = "recorded"
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        manifest_state = "unreadable or invalid; execution cannot be established"
+    return {"scope": scope, "phases": phases, "manifest_state": manifest_state}
+
+
+def _methodology_html(evidence: dict) -> str:
+    scope = ", ".join(_html_escape(host) for host in evidence["scope"])
+    scope_note = (f"Recorded exact-host allowlist: <code>{scope}</code>."
+                  if scope else "Exact-host scope authority is not recorded in the supplied session artifacts.")
+    return (f"<p>{_METHODOLOGY_NOTE}</p><p>{scope_note}</p>"
+            "<p>Framework references describe report organization, not evidence "
+            "of complete framework coverage. See Appendix A for recorded phase "
+            "outcomes and the coverage limitations for gaps. Scores without a "
+            "recorded vector may be template defaults; unavailable scores are N/A.</p>")
+
+
+def _execution_evidence_html(evidence: dict) -> str:
+    if not evidence["phases"]:
+        return f"<p>Phase execution: {_html_escape(evidence['manifest_state'])}.</p>"
+    rows = "".join(
+        f"<tr><td>{_html_escape(row['phase'])}</td><td>{_html_escape(row['status'])}</td>"
+        f"<td>{_html_escape(row['exit_code'])}</td></tr>"
+        for row in evidence["phases"][:100]
+    )
+    omitted = len(evidence["phases"]) - 100
+    note = f"<p>{omitted} additional records are retained in phase_manifest.json.</p>" if omitted > 0 else ""
+    return ("<p>Source: this session's phase_manifest.json. A successful process "
+            "exit is not proof of full coverage or successful exploitation.</p>"
+            "<table class=\"tbl\"><tr><th>Recorded phase</th><th>Status</th><th>Exit code</th></tr>"
+            + rows + "</table>" + note)
+
+
+def _methodology_md(evidence: dict) -> str:
+    scope = ", ".join(host.replace("`", "\\`") for host in evidence["scope"])
+    lines = ["## Scope & Execution Evidence", "", _METHODOLOGY_NOTE, "",
+             f"Recorded exact-host allowlist: `{scope}`." if scope else
+             "Exact-host scope authority is not recorded in the supplied session artifacts.", "",
+             "Framework references do not establish complete framework coverage. "
+             "A successful process exit is not proof of full coverage or successful exploitation. "
+             "Scores without a recorded vector may be template defaults; unavailable scores are N/A.", ""]
+    if evidence["phases"]:
+        lines += ["Source: this session's phase_manifest.json.", "",
+                  "| Recorded phase | Status | Exit code |", "|---|---|---|"]
+        for row in evidence["phases"][:100]:
+            values = [row[key].replace("|", "\\|").replace("\n", " ") for key in ("phase", "status", "exit_code")]
+            lines.append("| " + " | ".join(values) + " |")
+        if len(evidence["phases"]) > 100:
+            lines.append(f"\n{len(evidence['phases']) - 100} additional records are retained in phase_manifest.json.")
+    else:
+        lines.append(f"Phase execution: {evidence['manifest_state']}.")
+    return "\n".join(lines)
+
+
 def render_html_report(findings: list, target: str, report_dir: str,
                        client: str, consultant: str, title: str) -> str:
     generated_date_str = datetime.now().strftime("%d %B %Y")
@@ -3412,6 +3558,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
     # v7.4.5 — gather scan diagnostics for the report footer so a 0-
     # findings report still explains what was actually scanned.
     diagnostics = _collect_scan_diagnostics(report_dir, target)
+    methodology = _methodology_evidence(report_dir)
 
     # Risk bar
     bar = ""
@@ -3433,11 +3580,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
         host  = re.search(r'https?://([^/]+)', f["url"])
         host  = host.group(1) if host else target
         vtitle = f.get("title") or tmpl["title"].format(host=host)
-        # Prefer the per-finding score (CVE rows carry the real CVSS inside
-        # their poc text) over the template default — mirrors the Markdown
-        # renderer so HTML/MD agree instead of hardcoding the cves template's 9.0.
-        m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
-        cvss = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
+        cvss = _finding_cvss(f, tmpl)
         caption = _severity_caption(f)
         sev_cell = _badge(f["severity"])
         if caption != str(f.get("severity") or "").lower():
@@ -3457,11 +3600,7 @@ def render_html_report(findings: list, target: str, report_dir: str,
         host   = host.group(1) if host else target
         vtitle = f.get("title") or tmpl["title"].format(host=host)
         sev    = f["severity"]
-        # Prefer the per-finding score (CVE rows carry the real CVSS inside
-        # their poc text) over the template default — mirrors the Markdown
-        # renderer so HTML/MD agree instead of hardcoding the cves template's 9.0.
-        m      = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
-        cvss   = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(sev, "N/A"))
+        cvss   = _finding_cvss(f, tmpl)
         refs   = "".join(f'<li><a href="{u}" target="_blank">{n}</a></li>'
                          for n, u in tmpl.get("references", []))
         _chain_row = _attack_chain_row_html(vtype)
@@ -3495,10 +3634,6 @@ def render_html_report(findings: list, target: str, report_dir: str,
     sev_counts_rows = "".join(
         f'<tr><td>{_badge(s)}</td><td><b>{counts[s]}</b></td></tr>'
         for s in ("critical", "high", "medium", "low", "info"))
-
-    tools = ("subfinder, assetfinder, amass, dnsx, httpx, katana, waybackurls, gau, "
-             "nmap, naabu, nuclei, dalfox, sqlmap, ffuf, Arjun, Kiterunner, "
-             "trufflehog, gitleaks, subzy, interactsh-client")
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -3566,20 +3701,14 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 <table class="tbl" style="max-width:580px;margin-bottom:16px">
   <tr><th>Item</th><th>Detail</th></tr>
   <tr><td>Target</td><td><code>{target}</code></td></tr>
-  <tr><td>Assessment Type</td><td>Black-box / Grey-box VAPT</td></tr>
-  <tr><td>Methodology</td><td>PTES, OWASP Testing Guide v4.2</td></tr>
+  <tr><td>Assessment record</td><td>Review of supplied session artifacts</td></tr>
+  <tr><td>Reference frameworks</td><td>PTES, OWASP Testing Guide v4.2</td></tr>
   <tr><td>Assessment session date</td><td>{session_date_str}</td></tr>
   <tr><td>Report generated</td><td>{generated_date_str}</td></tr>
   <tr><td>Consultant</td><td>{consultant or "—"}</td></tr>
 </table>
 <p style="color:#6c757d;font-size:.9em">The assessment session date comes from the session identifier. Report generation does not refresh the session evidence.</p>
-<ol>
-  <li><b>Reconnaissance</b> — Subdomain enumeration, port scanning, tech fingerprinting</li>
-  <li><b>Vulnerability Identification</b> — Automated and manual testing</li>
-  <li><b>Exploitation</b> — Controlled PoC to confirm impact</li>
-  <li><b>Analysis</b> — AI-assisted triage, CVSS v3.1 scoring</li>
-  <li><b>Reporting</b> — Structured findings with remediation guidance</li>
-</ol>
+{_methodology_html(methodology)}
 <div class="page-break"></div>
 
 <h2 id="vtable" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px">3. Vulnerability Summary</h2>
@@ -3601,8 +3730,8 @@ f'<b style="color:{SEVERITY_COLOR["high"]}">{counts["high"]} high</b> severity i
 
 {_render_scan_diagnostics_html(diagnostics)}
 
-<h2 id="appendix-a" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">Appendix A: Tools Used</h2>
-<p>{tools}</p>
+<h2 id="appendix-a" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:40px">Appendix A: Recorded Phase Execution</h2>
+{_execution_evidence_html(methodology)}
 
 <h2 id="appendix-b" style="border-bottom:2px solid #1a1a2e;padding-bottom:8px;margin-top:30px">Appendix B: Methodology Reference</h2>
 <ul>
@@ -3709,6 +3838,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
     _cov_md = _render_coverage_limitations_md(report_dir)
     if _cov_md:
         lines += ["", _cov_md]
+    lines += ["", _methodology_md(_methodology_evidence(report_dir))]
     lines += ["", "---", "", "## Vulnerability Summary", "",
               "| ID | Vulnerability | Severity | CVSS | Host |",
               "|----|---------------|----------|------|------|"]
@@ -3724,10 +3854,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         # CVE-DB rows already supply a useful "CVE-2017-7235 — cloudflare" title;
         # the generic template "Known CVE Vulnerability on {host}" is a fallback.
         title = f.get("title") or tmpl["title"].format(host=host)
-        # v9.1.2 — actual CVSS from finding (CVE rows carry per-CVE score) takes
-        # precedence over template default.
-        m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
-        cvss = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
+        cvss = _finding_cvss(f, tmpl)
         lines.append(f"| VN-{i:03d} | {title} | {_severity_caption(f)} | {cvss} | {host} |")
     lines += ["", "---", "", "## Detailed Findings", ""]
     for i, f in enumerate(findings, 1):
@@ -3737,8 +3864,7 @@ def render_markdown_report(findings: list, target: str, report_dir: str,
         if "nvd.nist.gov" in host or "cve.mitre.org" in host:
             host = target
         title = f.get("title") or tmpl["title"].format(host=host)
-        m = re.search(r"CVSS:\s*([\d.]+)", f.get("poc", ""))
-        cvss = m.group(1) if m else (f.get("cvss") or tmpl.get("cvss") or CVSS_DEFAULT.get(f["severity"], "N/A"))
+        cvss = _finding_cvss(f, tmpl)
         refs  = "\n".join(f"- [{n}]({u})" for n, u in tmpl.get("references", []))
         lines += [
             f"### VN-{i:03d} — {title}",

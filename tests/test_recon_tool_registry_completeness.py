@@ -57,7 +57,12 @@ def test_pip_recon_enrichment_tools_use_pip_hint():
     assert "xnLinkFinder" in hunt.AUTO_INSTALL_SYSTEM_TOOLS
 
 
-def test_projectdiscovery_runtime_prefers_go_bin():
-    assert os.environ["PATH"].split(os.pathsep)[0] == hunt.GOBIN
-    assert hunt._tool_bin("httpx") == os.path.join(hunt.GOBIN, "httpx")
-    assert hunt._tool_bin("nuclei") == os.path.join(hunt.GOBIN, "nuclei")
+def test_projectdiscovery_registry_uses_same_healthy_resolution_as_execution(monkeypatch):
+    # Go paths are preferences, not immutable install locations. Reporting an
+    # absent ~/go/bin/nuclei while a healthy keg binary exists loses CMS coverage.
+    selected = {name: f"/healthy/keg/{name}" for name in ("httpx", "nuclei")}
+    monkeypatch.setattr(hunt.tool_resolution, "resolve", lambda name, **kw: (selected.get(name), None))
+    assert hunt._tool_bin("httpx") == selected["httpx"]
+    assert hunt._tool_bin("nuclei") == selected["nuclei"]
+    assert hunt._which(os.path.join(hunt.GOBIN, "httpx"))
+    assert hunt._which(os.path.join(hunt.GOBIN, "nuclei"))

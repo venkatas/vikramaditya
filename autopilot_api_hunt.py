@@ -1463,12 +1463,22 @@ class InjectionTester:
                     # (Python httpx pip pkg shadows PD httpx; same risk for nuclei).
                     _gobin_nuclei = os.path.expanduser("~/go/bin/nuclei")
                     _nuclei_bin = _gobin_nuclei if os.path.isfile(_gobin_nuclei) and os.access(_gobin_nuclei, os.X_OK) else "nuclei"
+                    from nuclei_scope import nuclei_scope_flags, record_nuclei_coverage
+                    _nuclei_scope_flags = nuclei_scope_flags(
+                        saver.dir if saver else None, nuclei_out)
                     # posix_spawn launch — runs after in-process requests I/O.
                     result = procutil.run_capture(
                         [_nuclei_bin, "-l", urls_file.name,
                          "-severity", "critical,high,medium", "-silent",
-                         "-o", nuclei_out],
+                         "-o", nuclei_out] + _nuclei_scope_flags,
                         timeout=120, shell=False)
+                    record_nuclei_coverage(
+                        saver.dir if saver else None, nuclei_out,
+                        exit_code=-1 if result.get("timed_out") else result.get("returncode"))
+                    if result.get("timed_out") or result.get("returncode") not in (0, None):
+                        _record_coverage_gap(
+                            saver=saver, tool="nuclei",
+                            reason=f"scan failed or timed out (rc={result.get('returncode')}, timed_out={result.get('timed_out')})")
                     if result["returncode"] not in (0, None) and not result["timed_out"]:
                         log("warn", f"  nuclei exited rc={result['returncode']}")
                     if os.path.isfile(nuclei_out) and os.path.getsize(nuclei_out) > 0:

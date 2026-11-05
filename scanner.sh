@@ -16,7 +16,7 @@
 set -uo pipefail
 
 # macOS compatibility: 'timeout' is Linux-only; use gtimeout or passthrough
-export PATH="$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="$PATH:$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin"
 if ! command -v timeout &>/dev/null; then
     if command -v gtimeout &>/dev/null; then
         timeout() { gtimeout "$@"; }; export -f timeout
@@ -71,6 +71,7 @@ if [ -z "$RECON_DIR" ] || [ ! -d "$RECON_DIR" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/tool_runtime.sh"
 
 # ── P0: scope-lock boundary re-filter (fail-closed) ─────────────────────────────────────────────
 # recon.sh persists scope/allow.txt under scope-lock. scanner.sh has no host discovery of its own but
@@ -78,6 +79,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # OFF-SCOPE hosts to active curl/ffuf/nuclei. Re-filter the URL corpora through the EXACT-HOST allowlist
 # once, before any active check reads them. Presence of a non-empty allowlist == scope-lock active.
 _SCOPE_ALLOW="${SCOPE_ALLOW_FILE:-$RECON_DIR/scope/allow.txt}"
+if { [ "${SCOPE_LOCK:-0}" = "1" ] || [ -e "$_SCOPE_ALLOW" ] || [ -n "${SCOPE_ALLOW_FILE:-}" ]; } \
+    && [ ! -s "$_SCOPE_ALLOW" ]; then
+    log_err "Scope-lock allowlist missing/empty — scanner not started"
+    exit 2
+fi
 if [ -s "$_SCOPE_ALLOW" ]; then
     for _f in "$RECON_DIR/live/urls.txt" "$RECON_DIR/urls/all.txt" "$RECON_DIR/urls/with_params.txt" \
               "$RECON_DIR/urls/api_endpoints.txt" "$RECON_DIR/urls/js_files.txt"; do
@@ -100,7 +106,7 @@ else
 fi
 FINDINGS_DIR="${FINDINGS_OUT_DIR:-$BASE_DIR/findings/$TARGET/sessions/$SESSION_ID}"
 
-export PATH="$HOME/go/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+# Shared runtime resolution above preserves the invoking Python environment.
 export PRIORITY_DIR="$RECON_DIR/priority"
 export FINDINGS_DIR
 
@@ -115,7 +121,7 @@ mkdir -p "$FINDINGS_DIR"/{upload,xss,sqli,takeover,misconfig,exposure,cves,redir
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 file_lines()  { [ -f "${1:-}" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
-tool_ok()     { command -v "$1" &>/dev/null; }
+tool_ok()     { _vik_tool_ok "$1"; }
 count_vuln() { local file="$1"; [ -f "$file" ] && [ -s "$file" ] && wc -l < "$file" | tr -d ' ' || echo 0; }
 
 _has_skip() {
@@ -138,6 +144,16 @@ _mark_coverage() {
     # $1 = check/label, $2 = reason
     mkdir -p "$FINDINGS_DIR/manual_review" 2>/dev/null || true
     echo "[COVERAGE-GAP] ${1:-?}: ${2:-unspecified}" >> "$COVERAGE_MARKER_FILE"
+}
+
+_csp_headers() {
+    if [ -e "$_SCOPE_ALLOW" ] || [ -n "${SCOPE_ALLOW_FILE:-}" ] || [ "${SCOPE_LOCK:-0}" = "1" ]; then
+        python3 "$SCRIPT_DIR/scoped_http.py" --allow-file "$_SCOPE_ALLOW" \
+            --timeout 8 --headers-only \
+            --blocked-log "$FINDINGS_DIR/manual_review/off_scope_redirects.jsonl" "$1"
+    else
+        curl -sk -L --max-time 8 -o /dev/null -D - "$1"
+    fi
 }
 
 # P1 — record a genuine tool CRASH (hard signal / unexpected non-zero), distinct from an
@@ -744,7 +760,10 @@ PYEOF
         # no CSP — and flagged "Missing CSP" on hosts whose FINAL https page sets a full CSP
         # (a false positive on well-hardened sites). Following to the final hop and reading its
         # headers as a browser would (GET; some servers omit CSP on HEAD) fixes that.
-        HDR=$(curl -sk -L --max-time 8 -o /dev/null -D - "$host" 2>/dev/null | tr -d '\r')
+        if ! HDR=$(_csp_headers "$host" 2>/dev/null | tr -d '\r'); then
+            _mark_coverage "csp" "HTTP/redirect check failed for $host; see off_scope_redirects.jsonl"
+            continue
+        fi
         CSP=$(echo "$HDR" | grep -i "^content-security-policy:" | cut -d: -f2-)
         if [ -z "$CSP" ]; then
             log_warn "[CSP-MISSING] No CSP header: $host"

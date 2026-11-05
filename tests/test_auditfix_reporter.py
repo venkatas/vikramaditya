@@ -228,11 +228,14 @@ def test_coverage_limitations_graceful_when_absent(tmp_path):
     assert reporter._render_coverage_limitations_html(str(sess)) == ""
 
 
-def test_coverage_limitations_graceful_on_malformed(tmp_path):
+def test_coverage_limitations_fail_closed_on_malformed(tmp_path):
     sess = tmp_path / "findings" / "t.example" / "sessions" / "bad"
     sess.mkdir(parents=True)
     (sess / "coverage.json").write_text("{not valid json")
-    assert reporter._render_coverage_limitations_html(str(sess)) == ""
+    out = reporter._render_coverage_limitations_html(str(sess))
+    assert "INCONCLUSIVE" in out
+    assert "coverage_integrity" in out
+    assert "invalid JSON" in out
 
 
 def test_resolve_dirs_handles_relative_paths():

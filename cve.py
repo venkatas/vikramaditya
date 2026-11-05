@@ -20,6 +20,8 @@ import tempfile
 import urllib.parse
 from datetime import datetime
 
+import tool_resolution
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FINDINGS_DIR = os.path.join(BASE_DIR, "findings")
 
@@ -158,10 +160,63 @@ def _fetch_body_status(url, timeout=8):
     return out, "000"
 
 
+def _write_technology_gap(recon_dir, reason, findings_dir=None):
+    """Keep fallback-probe failures visible to file-only assessment reporting."""
+    from phase_manifest import resolve_session_dirs
+    directory = findings_dir or os.environ.get("FINDINGS_OUT_DIR", "").strip()
+    if not directory and recon_dir:
+        directory = resolve_session_dirs(str(recon_dir))[1]
+    if not directory:
+        return
+    path = os.path.join(directory, "manual_review", "coverage_gaps.txt")
+    line = f"[COVERAGE-GAP] httpx: {reason}\n"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, encoding="utf-8") as existing:
+                if line.strip() in existing.read().splitlines():
+                    return
+        except FileNotFoundError:
+            pass
+        with open(path, "a", encoding="utf-8") as output:
+            output.write(line)
+    except OSError as exc:
+        print(f"    [!] Could not persist technology-probe coverage: {exc}", file=sys.stderr)
+
+
+def _technology_target_allowed(domain, recon_dir):
+    """Gate the initial authority; the probe itself never follows redirects."""
+    from nuclei_scope import scope_locked
+    from scope_checker import _load_allow_file, scope_lock_allows
+    from urllib.parse import urlsplit
+    url = domain if "://" in domain else f"https://{domain}"
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or any(ord(char) <= 32 or char == "\\" for char in url)):
+            return False
+        _ = parsed.port
+    except (TypeError, ValueError):
+        return False
+    if not scope_locked(recon_dir):
+        return True
+    allow_file = os.environ.get("SCOPE_ALLOW_FILE")
+    if not allow_file and recon_dir:
+        allow_file = os.path.join(recon_dir, "scope", "allow.txt")
+    return bool(allow_file) and scope_lock_allows(url, _load_allow_file(allow_file))
+
+
 def detect_technologies(domain, recon_dir=None):
     """Detect technologies running on the target."""
     print(f"[*] Detecting technologies on {domain}...")
     techs = {}
+    detect_technologies.last_status = {"status": "ok", "tool": "httpx", "error": None}
+
+    def probe_gap(reason):
+        detect_technologies.last_status = {"status": "degraded", "tool": "httpx", "error": reason}
+        print(f"    [!] Technology coverage degraded: {reason}", file=sys.stderr)
+        _write_technology_gap(recon_dir, reason)
 
     # Method 1: Check httpx output from recon
     if recon_dir:
@@ -189,12 +244,29 @@ def detect_technologies(domain, recon_dir=None):
                     add_tech(techs, "drupal")
                     add_tech(techs, version.replace(" ", "/", 1))
 
-    # Method 2: Direct httpx probe
+    # Check the initial authority even when fingerprints were available: the
+    # following manual header/CMS probes must not widen an explicit allowlist.
+    if not _technology_target_allowed(domain, recon_dir):
+        probe_gap("technology probe target is outside or missing its authoritative exact scope; no requests issued")
+        return techs
+
+    # Method 2: Direct ProjectDiscovery probe. The active Python environment
+    # deliberately stays first on PATH, where its unrelated `httpx` CLI can
+    # shadow the scanner. Never use a bare executable name or shell fallback.
     if not techs:
-        success, output = run_cmd(
-            f'echo "{domain}" | httpx -silent -tech-detect -status-code 2>/dev/null',
-            timeout=30
-        )
+        httpx_bin, reason = tool_resolution.resolve("httpx")
+        if httpx_bin is None:
+            success, output = False, ""
+            probe_gap(reason or "healthy ProjectDiscovery HTTPX unavailable; fallback technology probing skipped")
+        else:
+            target = domain if "://" in domain else f"https://{domain}"
+            success, output = run_cmd(
+                [httpx_bin, "-u", target, "-silent", "-tech-detect", "-status-code",
+                 "-follow-redirects=false", "-follow-host-redirects=false"],
+                timeout=30,
+            )
+            if not success:
+                probe_gap("ProjectDiscovery HTTPX fallback probe failed or timed out; technology coverage incomplete")
         if success and output:
             tech_groups = re.findall(r'\[([^\]]+)\]', output)
             if tech_groups:
@@ -532,6 +604,10 @@ def run_nuclei_cve_scan(domain, recon_dir=None, out_file=None):
         f'nuclei -tags cve -severity medium,high,critical -silent '
         f'-rate-limit 30 -o "{out_file}"'
     )
+    from nuclei_scope import nuclei_scope_flags
+    scope_flags = nuclei_scope_flags(recon_dir, out_file)
+    if scope_flags:
+        nuclei_opts += " " + " ".join(scope_flags)
     if targets_file:
         cmd = f'cat "{targets_file}" | {nuclei_opts} {stderr_redirect}'
     else:
@@ -545,6 +621,8 @@ def run_nuclei_cve_scan(domain, recon_dir=None, out_file=None):
     except (TypeError, ValueError):
         cve_timeout = 300
     success, output = run_cmd(cmd, timeout=cve_timeout)
+    from nuclei_scope import record_nuclei_coverage
+    record_nuclei_coverage(recon_dir, out_file, exit_code=0 if success else 1)
     timed_out = (
         not success and isinstance(output, str) and output.startswith("timeout after")
     )
@@ -733,6 +811,12 @@ def hunt_cves(domain, recon_dir=None, findings_root=None):
 
     # Step 1: Detect technologies
     techs = detect_technologies(domain, recon_dir)
+    technology_status = getattr(detect_technologies, "last_status", {})
+    if technology_status.get("status") == "degraded":
+        # Standalone CVE runs may have no recon tree. Persist their failure in
+        # the findings root as well, not only in an in-memory function result.
+        _write_technology_gap(recon_dir, technology_status["error"],
+                              findings_dir=os.path.dirname(findings_dir))
 
     # Step 2: Search CVE databases for each technology
     all_cves = []
