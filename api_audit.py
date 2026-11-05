@@ -16,6 +16,7 @@ import os
 import re
 import ssl
 import sys
+from http.client import HTTPException
 from pathlib import Path
 
 # v9.x — Semgrep ERROR finding (python.lang.security.unverified-ssl-context):
@@ -26,7 +27,11 @@ VERIFY_TLS = os.environ.get("VAPT_INSECURE_SSL", "0") != "1"
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener, urlopen
+
+from scope_checker import _load_allow_file, scope_lock_allows
+from phase_manifest import api_completion_shortfall, write_coverage, write_coverage_summary
+from storage import atomic_write_json
 
 try:
     import yaml  # type: ignore
@@ -118,7 +123,64 @@ def safe_name(url: str) -> str:
     return f"{host}_{digest}"
 
 
-def fetch(url: str, timeout: int = 6) -> dict[str, Any]:
+def _scope_allows(url: str, exact_hosts) -> bool:
+    try:
+        parsed = urlparse(url)
+        return (parsed.scheme in ("http", "https") and bool(parsed.hostname)
+                and parsed.username is None and parsed.password is None
+                and not any(ord(c) <= 32 or ord(c) == 127 or c == "\\" for c in url)
+                and scope_lock_allows(url, exact_hosts))
+    except (ValueError, TypeError):
+        return False
+
+
+def _scope_for_recon(recon_dir: Path):
+    """None means unlocked; an unavailable explicit policy authorizes nothing."""
+    configured = os.environ.get("SCOPE_ALLOW_FILE")
+    if "SCOPE_ALLOW_FILE" in os.environ and not configured:
+        return frozenset()
+    scope_file = Path(configured) if configured else recon_dir / "scope" / "allow.txt"
+    locked = ("SCOPE_ALLOW_FILE" in os.environ or scope_file.exists()
+              or os.environ.get("SCOPE_LOCK") == "1")
+    return frozenset(_load_allow_file(scope_file)) if locked else None
+
+
+def _record_scope_block(events, url: str, phase: str) -> None:
+    if events is not None:
+        entry = {"url": url, "phase": phase, "reason": "outside exact HTTP scope"}
+        if entry not in events:
+            events.append(entry)
+
+
+class _ScopeBlocked(ValueError):
+    pass
+
+
+class _ScopedRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, exact_hosts):
+        super().__init__()
+        self.exact_hosts = exact_hosts
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        location = headers.get("location", headers.get("uri"))
+        if location is not None:
+            try:
+                destination = urljoin(req.full_url, location)
+            except ValueError:
+                fp.close()
+                raise _ScopeBlocked(location)
+            if not _scope_allows(destination, self.exact_hosts):
+                fp.close()
+                raise _ScopeBlocked(destination)
+        return super().http_error_302(req, fp, code, msg, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+def fetch(url: str, timeout: int = 6, *, exact_hosts=None) -> dict[str, Any]:
+    if exact_hosts is not None and not _scope_allows(url, exact_hosts):
+        return {"status": 0, "content_type": "", "body": "", "final_url": url,
+                "scope_blocked": url}
     req = Request(
         url,
         headers={
@@ -136,7 +198,12 @@ def fetch(url: str, timeout: int = 6) -> dict[str, Any]:
         _unverified = getattr(ssl, "_create_unverified_context")
         context = _unverified()
     try:
-        with urlopen(req, timeout=timeout, context=context) as resp:
+        # Keep urllib's verified TLS behavior. Only locked calls replace its
+        # automatic redirect handler, validating each Location before traffic.
+        response = (urlopen(req, timeout=timeout, context=context) if exact_hosts is None
+                    else build_opener(HTTPSHandler(context=context),
+                                      _ScopedRedirectHandler(exact_hosts)).open(req, timeout=timeout))
+        with response as resp:
             body = resp.read(1_000_000).decode("utf-8", errors="ignore")
             return {
                 "status": resp.getcode(),
@@ -144,6 +211,9 @@ def fetch(url: str, timeout: int = 6) -> dict[str, Any]:
                 "body": body,
                 "final_url": resp.geturl(),
             }
+    except _ScopeBlocked as exc:
+        return {"status": 0, "content_type": "", "body": "", "final_url": url,
+                "scope_blocked": str(exc)}
     except HTTPError as exc:
         try:
             body = exc.read(4096).decode("utf-8", errors="ignore")
@@ -155,13 +225,31 @@ def fetch(url: str, timeout: int = 6) -> dict[str, Any]:
             "body": body,
             "final_url": url,
         }
-    except (URLError, TimeoutError, OSError):
+    except (URLError, TimeoutError, OSError, HTTPException) as exc:
         return {
             "status": 0,
             "content_type": "",
             "body": "",
             "final_url": url,
+            "error": f"{type(exc).__name__}: {exc}",
         }
+
+
+def _fetch_for_scope(url: str, exact_hosts, events, phase: str,
+                     request_errors=None) -> dict[str, Any]:
+    try:
+        response = fetch(url) if exact_hosts is None else fetch(url, exact_hosts=exact_hosts)
+    except (URLError, TimeoutError, OSError, HTTPException) as exc:
+        response = {"status": 0, "content_type": "", "body": "", "final_url": url,
+                    "error": f"{type(exc).__name__}: {exc}"}
+    if response.get("scope_blocked"):
+        _record_scope_block(events, response["scope_blocked"], phase)
+    elif response.get("status") == 0 and request_errors is not None:
+        entry = {"url": url, "phase": phase,
+                 "reason": response.get("error") or "transport failed without an HTTP response"}
+        if entry not in request_errors:
+            request_errors.append(entry)
+    return response
 
 
 def looks_like_yaml_spec(text: str) -> bool:
@@ -298,7 +386,8 @@ def extract_operations(spec: dict[str, Any], source_url: str) -> tuple[dict[str,
     }, operations
 
 
-def collect_candidate_hosts(recon_dir: Path, max_hosts: int) -> tuple[list[str], int]:
+def collect_candidate_hosts(recon_dir: Path, max_hosts: int, *, exact_hosts=None,
+                            scope_events=None) -> tuple[list[str], int]:
     """Return (probed_hosts, total_candidate_count).
 
     ``total_candidate_count`` is the de-duplicated host count BEFORE the
@@ -313,10 +402,16 @@ def collect_candidate_hosts(recon_dir: Path, max_hosts: int) -> tuple[list[str],
     ):
         hosts.extend(read_lines(recon_dir / rel))
     deduped = dedupe(hosts)
+    if exact_hosts is not None:
+        for host in deduped:
+            if not _scope_allows(host, exact_hosts):
+                _record_scope_block(scope_events, host, "candidate host")
+        deduped = [host for host in deduped if _scope_allows(host, exact_hosts)]
     return deduped[:max_hosts], len(deduped)
 
 
-def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
+def discover_specs(recon_dir: Path, max_hosts: int, *, exact_hosts=None,
+                   scope_events=None, request_errors=None, probe_stats=None) -> tuple[
         list[dict[str, Any]], list[dict[str, Any]], list[str],
         list[tuple[str, dict[str, Any]]], int]:
     """Discover OpenAPI/Swagger specs from recon candidate hosts.
@@ -331,12 +426,19 @@ def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
     truncated the host surface — silently dropping hosts 21+ would hide whole
     specs (and all their operations) from the audit.
     """
-    candidates, total_candidates = collect_candidate_hosts(recon_dir, max_hosts)
+    if exact_hosts is None:
+        exact_hosts = _scope_for_recon(recon_dir)
+    if exact_hosts is None:
+        candidates, total_candidates = collect_candidate_hosts(recon_dir, max_hosts)
+    else:
+        candidates, total_candidates = collect_candidate_hosts(
+            recon_dir, max_hosts, exact_hosts=exact_hosts, scope_events=scope_events)
     discovered_specs = []
     operations = []
     raw_specs: list[tuple[str, dict[str, Any]]] = []
     visited = set()
     queued_links = []
+    failed_hosts = set()
 
     def probe(spec_url: str) -> bool:
         """Probe one candidate spec URL. Returns True if the host RESPONDED (any HTTP status),
@@ -345,14 +447,22 @@ def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
             return True
         visited.add(spec_url)
 
-        resp = fetch(spec_url)
+        resp = _fetch_for_scope(spec_url, exact_hosts, scope_events, "spec discovery", request_errors)
         connected = resp["status"] != 0          # 0 == connect/timeout failure (see fetch())
+        if not connected:
+            failed_hosts.add(urlparse(spec_url).netloc.lower())
         if resp["status"] != 200 or not resp["body"]:
             return connected
 
         parsed, fmt = parse_spec(resp["body"])
         if parsed is not None:
             spec_meta, ops = extract_operations(parsed, resp["final_url"])
+            if exact_hosts is not None:
+                for op in ops:
+                    if not _scope_allows(op["sample_url"], exact_hosts):
+                        _record_scope_block(scope_events, op["sample_url"], "spec operation")
+                ops = [op for op in ops if _scope_allows(op["sample_url"], exact_hosts)]
+                spec_meta["operations"] = len(ops)
             spec_meta["format"] = fmt
             spec_meta["content_type"] = resp["content_type"]
             saved_as = safe_name(resp["final_url"])
@@ -385,6 +495,10 @@ def discover_specs(recon_dir: Path, max_hosts: int) -> tuple[
     for extra in dedupe(queued_links):
         probe(extra)
 
+    if probe_stats is not None:
+        probe_stats.update({"attempted_hosts": len(candidates),
+                            "probed_hosts": sum(urlparse(host).netloc.lower() not in failed_hosts
+                                                for host in candidates)})
     return discovered_specs, operations, candidates, raw_specs, total_candidates
 
 
@@ -401,26 +515,35 @@ def count_probeable_public_ops(operations: list[dict[str, Any]]) -> int:
 
 
 def audit_public_operations(
-    operations: list[dict[str, Any]], max_ops: int
+    operations: list[dict[str, Any]], max_ops: int, *, exact_hosts=None,
+    scope_events=None, request_errors=None, probe_stats=None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Probe public, safe-method operations.
 
     Returns (findings, tested) where ``tested`` is the number of public ops
-    actually fetched — compare against count_probeable_public_ops() to detect
-    when ``max_ops`` left part of the public surface unprobed.
+    with an actual HTTP response. ``max_ops`` still bounds request attempts,
+    including transport failures, so failure accounting never expands the scan.
+    Optional ``probe_stats`` exposes attempted_ops separately from completion.
     """
     findings = []
     tested = 0
+    attempted = 0
     for op in operations:
-        if tested >= max_ops:
+        if attempted >= max_ops:
             break
         method = op["method"].lower()
         if op["requires_auth"] or method not in SAFE_PROBE_METHODS:
             continue
 
-        tested += 1
         url = op["sample_url"]
-        resp = fetch(url)
+        if exact_hosts is not None and not _scope_allows(url, exact_hosts):
+            _record_scope_block(scope_events, url, "public operation")
+            continue
+        attempted += 1
+        resp = _fetch_for_scope(url, exact_hosts, scope_events, "public operation", request_errors)
+        if resp["status"] == 0:
+            continue
+        tested += 1
         body = resp["body"]
         body_size = len(body.encode("utf-8", errors="ignore"))
         content_type = resp["content_type"].lower()
@@ -440,6 +563,8 @@ def audit_public_operations(
                     "summary": op.get("summary", ""),
                     "title": op.get("title", ""),
                 })
+    if probe_stats is not None:
+        probe_stats["attempted_ops"] = attempted
     return findings, tested
 
 
@@ -507,21 +632,31 @@ def write_outputs(
     probed_hosts = coverage.get("probed_hosts")
     total_hosts = coverage.get("total_hosts")
     max_hosts = coverage.get("max_hosts")
-    tested_ops = coverage.get("tested_ops")
-    total_probeable_ops = coverage.get("total_probeable_ops")
+    tested_ops = coverage.get("tested_public_operations", coverage.get("tested_ops"))
+    total_probeable_ops = coverage.get("total_probeable_public_operations", coverage.get("total_probeable_ops"))
     max_ops = coverage.get("max_ops")
     discover_only = coverage.get("discover_only", False)
+    scope_blocks = coverage.get("scope_blocks", [])
+    request_errors = coverage.get("request_errors", [])
+    attempted_hosts = coverage.get("attempted_hosts", probed_hosts)
+    attempted_ops = coverage.get("attempted_public_operations", coverage.get("attempted_ops", tested_ops))
 
     coverage_lines: list[str] = []
     degraded = False
 
     if total_hosts is not None and probed_hosts is not None:
-        if total_hosts > probed_hosts:
+        if total_hosts > attempted_hosts:
             degraded = True
             coverage_lines.append(
                 f"- Candidate hosts: {probed_hosts} of {total_hosts} probed "
-                f"(CAPPED by --max-hosts={max_hosts}, {total_hosts - probed_hosts} untested) "
+                f"(CAPPED by --max-hosts={max_hosts}, {total_hosts - attempted_hosts} "
+                f"{'untested' if attempted_hosts == probed_hosts else 'unattempted'}) "
                 f"— re-run with a higher --max-hosts to cover them"
+            )
+        elif probed_hosts < attempted_hosts:
+            coverage_lines.append(
+                f"- Candidate hosts: {probed_hosts} of {total_hosts} completed "
+                f"({attempted_hosts} attempted; failed requests leave incomplete coverage)"
             )
         else:
             coverage_lines.append(
@@ -529,36 +664,65 @@ def write_outputs(
             )
 
     if not discover_only and total_probeable_ops is not None and tested_ops is not None:
-        if total_probeable_ops > tested_ops:
+        if total_probeable_ops > attempted_ops:
             degraded = True
             coverage_lines.append(
                 f"- Public operations probed: {tested_ops} of {total_probeable_ops} "
                 f"(CAPPED by --max-ops={max_ops}, "
-                f"{total_probeable_ops - tested_ops} untested) "
+                f"{total_probeable_ops - attempted_ops} "
+                f"{'untested' if attempted_ops == tested_ops else 'unattempted'}) "
                 f"— re-run with a higher --max-ops to cover them"
+            )
+        elif tested_ops < attempted_ops:
+            coverage_lines.append(
+                f"- Public operations probed: {tested_ops} of {total_probeable_ops} "
+                f"({attempted_ops} attempted; failed requests leave incomplete coverage)"
             )
         else:
             coverage_lines.append(
                 f"- Public operations probed: {tested_ops} of {total_probeable_ops} (full)"
             )
 
+    capped = degraded
+    completion_reason = api_completion_shortfall({
+        **coverage, "attempted_hosts": attempted_hosts, "attempted_ops": attempted_ops})
+    if completion_reason:
+        degraded = True
+    if scope_blocks:
+        degraded = True
+        coverage_lines.append(
+            f"- Scope blocked: {len(scope_blocks)} destination(s) or policy failures; "
+            "coverage is partial (see scope_blocked.json)"
+        )
+        (output_dir / "scope_blocked.json").write_text(json.dumps(scope_blocks, indent=2))
+        (output_dir / "SCOPE_BLOCKED.marker").write_text(coverage_lines[-1] + "\n")
+    if request_errors:
+        degraded = True
+        coverage_lines.append(
+            f"- Transport failed: {len(request_errors)} request(s); partial coverage "
+            "(see request_errors.json)"
+        )
+        atomic_write_json(str(output_dir / "request_errors.json"), request_errors)
+
     # Rich api-audit-specific coverage record — kept in its OWN file so it never
     # collides with the canonical coverage.json list contract that hunt.py writes and
     # reporter.py renders (a dict here used to silently drop hunt's degraded list).
-    (output_dir / "api_coverage.json").write_text(
-        json.dumps(
-            {
-                "probed_hosts": probed_hosts,
-                "total_hosts": total_hosts,
-                "max_hosts": max_hosts,
-                "tested_public_operations": tested_ops,
-                "total_probeable_public_operations": total_probeable_ops,
-                "max_ops": max_ops,
-                "discover_only": discover_only,
-                "degraded": degraded,
-            },
-            indent=2,
-        )
+    rich_coverage = write_coverage_summary(
+        str(output_dir / "api_coverage.json"),
+        {
+            "probed_hosts": probed_hosts,
+            "attempted_hosts": attempted_hosts,
+            "total_hosts": total_hosts,
+            "max_hosts": max_hosts,
+            "tested_public_operations": tested_ops,
+            "attempted_public_operations": attempted_ops,
+            "total_probeable_public_operations": total_probeable_ops,
+            "max_ops": max_ops,
+            "discover_only": discover_only,
+            "degraded": degraded,
+            "scope_blocked": len(scope_blocks),
+            "transport_errors": len(request_errors),
+        },
     )
     # APPEND (never overwrite) the api-audit degradation into the canonical coverage.json
     # list so hunt.py's and api_audit's coverage entries coexist for the reporter.
@@ -567,20 +731,35 @@ def write_outputs(
         _existing = json.loads(_canon.read_text())
         if not isinstance(_existing, list):
             _existing = []
+        else:
+            _existing = [row for row in _existing if isinstance(row, dict)
+                         and isinstance(row.get("reason"), str) and row["reason"].strip()
+                         and isinstance(row.get("status", "degraded"), str)
+                         and row.get("status", "degraded") in {"ran", "skipped", "degraded", "failed", "aborted"}]
     except (OSError, ValueError):
         _existing = []
+    for row in rich_coverage.get("integrity_errors", []):
+        if row not in _existing:
+            _existing.append(row)
     if degraded:
+        reason = (f"surface capped — probed {probed_hosts} of {total_hosts} hosts, "
+                  f"{tested_ops} of {total_probeable_ops} public operations") if capped else ""
+        if scope_blocks:
+            reason += ("; " if reason else "") + f"scope blocked {len(scope_blocks)} destination(s) or policy failures; partial coverage"
+        if completion_reason:
+            reason += ("; " if reason else "") + completion_reason
+        if request_errors:
+            reason += ("; " if reason else "") + f"transport failed {len(request_errors)} request(s); partial coverage"
         _entry = {
             "source": "api_audit",
             "tool_or_phase": "api_audit",
-            "reason": (f"surface capped — probed {probed_hosts} of {total_hosts} hosts, "
-                       f"{tested_ops} of {total_probeable_ops} public operations"),
+            "reason": reason,
             "status": "degraded",
         }
         if _entry not in _existing:
             _existing.append(_entry)
-    _canon.write_text(json.dumps(_existing, indent=2))
-    if degraded:
+    write_coverage(str(output_dir), _existing)
+    if capped:
         (output_dir / "COVERAGE_CAPPED.marker").write_text("\n".join(coverage_lines) + "\n")
 
     lines = [
@@ -628,28 +807,49 @@ def main() -> int:
     output_dir = recon_dir / "api_specs"
     max_hosts = max(1, args.max_hosts)
     max_ops = max(1, args.max_ops)
+    exact_hosts = _scope_for_recon(recon_dir)
+    scope_events: list[dict[str, Any]] = []
+    request_errors: list[dict[str, Any]] = []
+    discovery_stats: dict[str, int] = {}
+    operation_stats: dict[str, int] = {}
+    if exact_hosts is not None and not exact_hosts:
+        scope_events.append({"phase": "scope policy", "url": "",
+                             "reason": "missing, unreadable, or empty explicit scope allowlist"})
     discovered_specs, operations, candidates, raw_specs, total_candidates = discover_specs(
-        recon_dir, max_hosts=max_hosts)
+        recon_dir, max_hosts=max_hosts, exact_hosts=exact_hosts, scope_events=scope_events,
+        request_errors=request_errors, probe_stats=discovery_stats)
 
     total_probeable_ops = count_probeable_public_ops(operations)
     if args.discover_only:
         findings, tested_ops = [], 0
     else:
-        findings, tested_ops = audit_public_operations(operations, max_ops=max_ops)
+        findings, tested_ops = audit_public_operations(
+            operations, max_ops=max_ops, exact_hosts=exact_hosts, scope_events=scope_events,
+            request_errors=request_errors, probe_stats=operation_stats)
 
     coverage = {
-        "probed_hosts": len(candidates),
+        "probed_hosts": discovery_stats.get("probed_hosts", len(candidates)),
+        "attempted_hosts": len(candidates),
         "total_hosts": total_candidates,
         "max_hosts": max_hosts,
         "tested_ops": tested_ops,
+        "attempted_ops": operation_stats.get("attempted_ops", 0),
         "total_probeable_ops": total_probeable_ops,
         "max_ops": max_ops,
         "discover_only": args.discover_only,
+        "scope_blocks": scope_events,
+        "request_errors": request_errors,
     }
     write_outputs(
         output_dir, discovered_specs, operations, findings,
         raw_specs=raw_specs, coverage=coverage,
     )
+    if scope_events:
+        print(f"[!] SCOPE BLOCKED: {len(scope_events)} destination(s) or policy failures; "
+              "OpenAPI coverage is partial (see api_specs/scope_blocked.json).", file=sys.stderr)
+    if request_errors:
+        print(f"[!] TRANSPORT FAILED: {len(request_errors)} request(s); "
+              "OpenAPI coverage is partial (see api_specs/request_errors.json).", file=sys.stderr)
 
     # Surface truncation on stderr so an operator running non-interactively
     # still sees that coverage was capped (never silently drop coverage).
@@ -661,7 +861,7 @@ def main() -> int:
             f"Re-run with a higher --max-hosts to cover them.",
             file=sys.stderr,
         )
-    if not args.discover_only and total_probeable_ops > tested_ops:
+    if not args.discover_only and total_probeable_ops > operation_stats.get("attempted_ops", tested_ops):
         print(
             f"[!] COVERAGE CAPPED: probed {tested_ops} of {total_probeable_ops} "
             f"public operations (--max-ops={max_ops}); "

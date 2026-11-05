@@ -238,12 +238,33 @@ class BrowserAgent:
         model_override: str | None = None,
         session_id: str | None = None,
         allow_unsafe: bool = False,
+        scope_lock: bool = False,
+        exact_hosts=None,
+        allow_file: str | None = None,
+        enable_ai: bool = True,
     ) -> None:
         self.target = target.rstrip("/")
         self.findings_dir = Path(findings_dir)
         self.headed = headed
         self.model_override = model_override
         self.session_id = session_id
+        self.enable_ai = enable_ai
+        from phase_manifest import resolve_session_dirs
+        from scope_checker import _load_allow_file
+        recon_dir, _ = resolve_session_dirs(str(self.findings_dir))
+        persisted = Path(allow_file or os.environ.get("SCOPE_ALLOW_FILE") or
+                         str(Path(recon_dir) / "scope" / "allow.txt"))
+        self.scope_lock = scope_lock or exact_hosts is not None or allow_file is not None or persisted.exists()
+        if exact_hosts is not None:
+            self.exact_hosts = set(exact_hosts)
+        elif persisted.exists() or allow_file is not None or os.environ.get("SCOPE_ALLOW_FILE"):
+            self.exact_hosts = _load_allow_file(str(persisted))
+            self.scope_lock = True
+        elif scope_lock:
+            parsed = urlsplit(self.target if "://" in self.target else f"https://{self.target}")
+            self.exact_hosts = {parsed.netloc.lower()}
+        else:
+            self.exact_hosts = None
         env_allow_unsafe = os.environ.get("ALLOW_UNSAFE_BROWSER_TASKS", "").lower()
         self.allow_unsafe = allow_unsafe or env_allow_unsafe in {"1", "true", "yes", "on"}
         self.method_policy = SafeMethodPolicy()
@@ -261,6 +282,8 @@ class BrowserAgent:
         (self.findings_dir / "browser" / "screenshots").mkdir(parents=True, exist_ok=True)
 
     def _init_llm(self) -> bool:
+        if not self.enable_ai:
+            return False
         self.llm = init_browser_llm(model_override=self.model_override)
         if self.llm is not None:
             self._resolve_use_vision()
@@ -445,6 +468,22 @@ class BrowserAgent:
 
     def run(self) -> dict[str, int]:
         """Run all configured browser tasks and return finding counts per task."""
+        if self.scope_lock:
+            return self._run_exact_scope()
+        if not self.enable_ai:
+            # --no-brain is an explicit caller policy, not merely the absence
+            # of hunt._brain. Never discover a separate browser LLM here.
+            self._partial = True
+            reason = ("[COVERAGE-GAP] browser: AI-driven browser validation disabled "
+                      "by tools-only policy; guarded rendering requires exact scope\n")
+            gaps = self.findings_dir / "manual_review" / "coverage_gaps.txt"
+            gaps.parent.mkdir(parents=True, exist_ok=True)
+            existing = gaps.read_text() if gaps.exists() else ""
+            if reason not in existing:
+                with gaps.open("a") as output:
+                    output.write(reason)
+            _log("info", "AI browser tasks disabled by tools-only policy")
+            return {}
         if not _browser_use_ok:
             _log(
                 "warn",
@@ -511,6 +550,38 @@ class BrowserAgent:
         _log("ok" if total else "info", f"Browser phase complete — {total} finding(s)")
         return results
 
+    def _run_exact_scope(self) -> dict[str, int]:
+        """Use a network-guarded renderer; browser-use cannot enforce this boundary.
+
+        Rendering/form discovery remains useful, but it is not a substitute for
+        LLM-driven vulnerability validation, so explicitly report partial coverage.
+        """
+        self._partial = True
+        gaps = self.findings_dir / "manual_review" / "coverage_gaps.txt"
+        gaps.parent.mkdir(parents=True, exist_ok=True)
+        with gaps.open("a", encoding="utf-8") as output:
+            output.write("[COVERAGE-GAP] browser: exact-scope guarded rendering/form discovery only; "
+                         "LLM-driven vulnerability validation unavailable without a network-enforced agent backend\n")
+        try:
+            from scoped_browser import render_pages
+            target_url = self.target if "://" in self.target else f"https://{self.target}"
+            result = asyncio.run(render_pages([target_url], self.exact_hosts,
+                self.findings_dir / "browser" / "screenshots", headed=self.headed,
+                timeout=TASK_TIMEOUT, allow_unsafe=self.allow_unsafe))
+            self._tasks_completed += result["completed"]
+            self._tasks_errored += result["failed"]
+            forms_file = self.findings_dir / "browser" / "form_discovery.txt"
+            with forms_file.open("a", encoding="utf-8") as output:
+                for page in result["pages"]:
+                    for form in page.get("forms", []):
+                        if form["scope_allowed"]:
+                            output.write(f"{page['final_url']} {form['action']}\n")
+            return {"GuardedRendering": 0} if result["completed"] else {}
+        except Exception as exc:
+            self._tasks_errored += 1
+            _log("err", f"Exact-scope browser failed closed: {exc}")
+            return {}
+
     @property
     def partial(self) -> bool:
         """True when the phase ran but at least one task errored.
@@ -543,7 +614,7 @@ class BrowserTask:
             f"Stay within the authorised target origin {origin}. "
             f"Begin at {self.target_url}. "
             "Do not substitute placeholder domains such as example.com or iana.org. "
-            "Only leave the target origin when the specific test explicitly requires following a redirect destination. "
+            "Never leave the target origin; record external redirect destinations without requesting them. "
         )
 
     def _scoped(self, instructions: str) -> str:
@@ -640,8 +711,8 @@ class OpenRedirectTask(BrowserTask):
             f"Navigate to {self.target_url}. "
             "Find all URL parameters that look like redirect targets: "
             "?url=, ?redirect=, ?next=, ?return=, ?goto=, ?dest=, ?target=. "
-            "For each one, replace the value with https://evil.example.com and follow the redirect. "
-            "If the browser ends up at evil.example.com (JS or HTTP redirect), it is vulnerable. "
+            "Inspect redirect destinations without following any destination outside the authorised origin. "
+            "Record external destinations as manual-review leads; do not claim a confirmed vulnerability from a URL alone. "
             "Report each open redirect in this EXACT format (no other text): "
             "URL [open_redirect] [medium] DESCRIPTION"
         )
@@ -682,6 +753,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", default=None, help="LLM model override")
     parser.add_argument("--allow-unsafe", action="store_true",
                         help="Allow browser tasks that may submit forms or use credentials")
+    parser.add_argument("--scope-lock", action="store_true", help="Enforce exact-host browser network scope")
+    parser.add_argument("--no-brain", action="store_true", help="Disable AI-driven browser validation")
+    parser.add_argument("--allow-file", help="Exact allowed hosts; missing/empty file fails closed")
     args = parser.parse_args()
 
     agent = BrowserAgent(
@@ -690,6 +764,9 @@ if __name__ == "__main__":
         headed=args.headed,
         model_override=args.model,
         allow_unsafe=args.allow_unsafe,
+        scope_lock=args.scope_lock,
+        allow_file=args.allow_file,
+        enable_ai=not args.no_brain,
     )
     results = agent.run()
     sys.exit(0 if results else 1)

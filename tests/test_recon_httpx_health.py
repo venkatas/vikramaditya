@@ -160,8 +160,9 @@ def test_per_batch_crash_accounting():
 def test_probe_done_marker_is_guarded():
     # the literal write must still exist (existing resume tests depend on it) ...
     assert '> "$RECON_DIR/live/.probe.done"' in RECON
-    # ... but only inside the all-crashed guard's else-branch
-    assert 'PROBE_CRASHES:-0}" -ge "${TOTAL_BATCHES' in RECON, "no all-crashed guard on the marker"
+    # ... but only when EVERY invocation (including partial-output failures) succeeded.
+    assert 'if [ "${PROBE_CRASHES:-0}" -gt 0 ]; then' in RECON
+    assert '_record_probe_exit "batch-$BATCH_NUM" "$BATCH_RC"' in RECON
 
 
 def test_distinct_failure_marker_written():

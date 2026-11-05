@@ -99,7 +99,7 @@ def test_single_pass_dnsx_captures_exit_and_fails_open():
     assert "DNSX_FAILED_CHUNKS=1" in t, "single-pass dnsx failure does not mark DNSX_FAILED_CHUNKS"
     # The single-pass dnsx must be guarded by an if (exit captured), not `|| true`
     assert re.search(
-        r'if timeout -k 30 300 dnsx -silent -a -l "\$DNSX_INPUT"',
+        r'if timeout -k 30 300 "\$VIK_DNSX_BIN" -silent -a -l "\$DNSX_INPUT"',
         t,
     ), "single-pass dnsx still swallows exit with `|| true` instead of capturing it"
     # On failure it must union the full candidate set back (fail-open)
@@ -115,7 +115,10 @@ def test_phase3_phase6_gate_on_completion_markers():
     assert '> "$RECON_DIR/live/.probe.done"' in t, ".probe.done marker is never written"
     assert 'phase_done "$RECON_DIR/urls/.urls.done"' in t, \
         "Phase-6 URL collection resume not gated on .urls.done completion marker"
-    assert '> "$RECON_DIR/urls/.urls.done"' in t, ".urls.done marker is never written"
+    assert "printf 'url_collection_v2\\n'" in t, "URL completion lacks a validated versioned success contract"
+    assert 'mv "$completion_tmp" "$RECON_DIR/urls/.urls.done"' in t, \
+        ".urls.done marker is not atomically published after successful collection"
+    assert "grep -qx 'url_collection_v2'" in t, "legacy false-success URL markers are still trusted"
     # The Phase-3 gate must NOT key on the partial-able httpx_full.txt data artefact
     assert 'phase_done "$RECON_DIR/live/httpx_full.txt"' not in t, \
         "Phase-3 still gates resume on the partial-able httpx_full.txt"

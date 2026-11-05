@@ -2675,12 +2675,18 @@ def main():
                         log("info", "  nuclei CVE scan...")
                         nuclei_dir = os.path.join(output_dir, "cves_custom")
                         os.makedirs(nuclei_dir, exist_ok=True)
+                        from nuclei_scope import nuclei_scope_flags, record_nuclei_coverage
+                        _nuclei_scope_flags = nuclei_scope_flags(
+                            output_dir, locked=cli.get("scope_lock") is True)
                         _r = run_capture(["nuclei", "-u", api_base,
                                           "-severity", "critical,high,medium", "-silent",
-                                          "-o", os.path.join(nuclei_dir, "nuclei_results.txt")],
+                                          "-o", os.path.join(nuclei_dir, "nuclei_results.txt")] + _nuclei_scope_flags,
                                          timeout=120, shell=False)
                         nuclei_rc = _r.get("returncode")
-                        if _r.get("timed_out") or (nuclei_rc is not None and nuclei_rc < 0):
+                        record_nuclei_coverage(
+                            output_dir, exit_code=-1 if _r.get("timed_out") else nuclei_rc,
+                            locked=cli.get("scope_lock") is True)
+                        if _r.get("timed_out") or nuclei_rc not in (0, None):
                             _mark_fallback_degraded(
                                 output_dir, "nuclei",
                                 f"exited abnormally (rc={nuclei_rc}, timed_out={_r.get('timed_out')})")

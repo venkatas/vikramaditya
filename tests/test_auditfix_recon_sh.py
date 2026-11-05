@@ -45,9 +45,10 @@ def test_bash_syntax_ok():
 # ── Fix 1: real DNS resolution + honest labelling + unconditional wildcard ────
 def test_fix1_dnsx_resolution_present():
     s = _src()
-    # dnsx is invoked with -a (A-record filter), fed </dev/null so it cannot block
-    assert "dnsx -silent -a -l" in s
-    assert "dnsx -silent -a -l" in s and "</dev/null" in s
+    # Both resolution paths use the health-checked absolute pin, not a bare
+    # PATH lookup. Keep A-record filtering and closed stdin on each invocation.
+    assert '"$VIK_DNSX_BIN" -silent -a -l "$DNSX_INPUT" </dev/null' in s
+    assert '"$VIK_DNSX_BIN" -silent -a -l "$_chunk" </dev/null' in s
     # The misleading unconditional "Resolved candidates: N" log for an unresolved
     # cp is gone; replaced by branch-accurate labelling.
     assert "Resolved hosts:" in s          # dnsx path
@@ -62,7 +63,7 @@ def test_hangprone_tools_use_timeout_hardkill():
     s = _src()
     assert "timeout -k 30 \"$AMASS_TIMEOUT\" amass enum -passive" in s
     assert "timeout 600 amass" not in s          # the old un-killable form is gone
-    assert "timeout -k 30 300 dnsx -silent -a -l" in s
+    assert s.count('timeout -k 30 300 "$VIK_DNSX_BIN" -silent -a -l') == 2
     assert "timeout 600 dnsx" not in s
 
 

@@ -71,7 +71,8 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 # returns 0 live hosts because its arg surface is different from
 # projectdiscovery/httpx). Brew's /opt/homebrew/bin/httpx is the Python one
 # on most macs, while ~/go/bin/httpx is the ProjectDiscovery one.
-export PATH="$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="$PATH:$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin"
+. "$SCRIPT_DIR/tool_runtime.sh"
 
 # Resolve an absolute path to the *ProjectDiscovery* httpx (its banner
 # contains "projectdiscovery" — Python httpx --help does not). Falls back
@@ -96,7 +97,10 @@ httpx_healthy() {
 _resolve_pd_httpx() {
     local cand
     for cand in \
+        "${VIK_HTTPX_BIN:-}" \
         "$HOME/go/bin/httpx" \
+        "/opt/homebrew/opt/httpx/bin/httpx" \
+        "/usr/local/opt/httpx/bin/httpx" \
         "/opt/homebrew/bin/httpx" \
         "/usr/local/bin/httpx" \
         "$(command -v httpx 2>/dev/null)"; do
@@ -257,7 +261,7 @@ file_lines() {
     [ -n "$path" ] && [ -f "$path" ] || { echo 0; return; }
     wc -l < "$path" 2>/dev/null | tr -d ' ' || echo 0
 }
-tool_ok()    { command -v "$1" &>/dev/null; }
+tool_ok()    { _vik_tool_ok "$1"; }
 
 # ── scope-lock EXACT-HOST allowlist shim (P0, fail-closed) ──────────────────────────────────────
 # SCOPE_ALLOW_FILE (set by hunt.py for domain / --targets-file scope-lock) holds the exact allowlist.
@@ -266,6 +270,11 @@ tool_ok()    { command -v "$1" &>/dev/null; }
 # _scope_filter_file: in-place filter a URL/host file. When an allowlist IS set under scope-lock,
 # BOTH FAIL CLOSED (treat as out-of-scope / drop) on empty allowlist, timeout, or any shim failure.
 SCOPE_ALLOW_FILE="${SCOPE_ALLOW_FILE:-}"
+if [ "$SCOPE_LOCK" = "1" ] && { [ "$TARGET_TYPE" = "domain" ] || [ -n "${TARGETS_FILE:-}" ]; } \
+    && [ ! -s "$SCOPE_ALLOW_FILE" ]; then
+    log_err "Scope-lock hostname allowlist missing/empty — recon not started"
+    exit 2
+fi
 _host_in_scope() {
     [ "$SCOPE_LOCK" = "1" ] || return 0
     [ -n "$SCOPE_ALLOW_FILE" ] || return 0          # no hostname allowlist (IP/CIDR) → not host-gated
@@ -295,6 +304,71 @@ phase_done() {
     [ -n "$RESUME_MODE" ] && [ -s "$f" ] && \
         log_warn "RESUME: skipping — $(basename "$f") already has $(file_lines "$f") lines" && \
         return 0
+    return 1
+}
+
+# Port discovery runs in a background shell while URL discovery runs in the
+# foreground. Serialize their updates so one producer cannot erase another's
+# coverage gap. Diagnostics stay outside URL corpora.
+_record_recon_gap() {
+    local tool="$1" reason="$2"
+    log_warn "Coverage gap: $tool — $reason"
+    python3 - "$SCRIPT_DIR" "$RECON_DIR" "$tool" "$reason" <<'PY'
+import fcntl
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from storage import atomic_write_json
+
+directory, tool, reason = Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+directory.mkdir(parents=True, exist_ok=True)
+path = directory / "coverage_degraded.json"
+with (directory / "coverage_degraded.json.lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    # Legacy GF/browser producers do not take this lock. Keep an append-only
+    # fallback so their concurrent JSON replacement cannot erase this gap.
+    fallback = directory / "manual_review" / "coverage_gaps.txt"
+    fallback.parent.mkdir(parents=True, exist_ok=True)
+    with fallback.open("a", encoding="utf-8") as output:
+        output.write(f"\n[COVERAGE-GAP] {tool}: {reason}\n")
+    try:
+        rows = json.loads(path.read_text())
+    except FileNotFoundError:
+        rows = []
+    except (OSError, ValueError):
+        # Preserve unreadable/malformed evidence; the fallback is sufficient.
+        sys.exit(0)
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        sys.exit(0)
+    row = {"source": "recon.sh", "tool": tool, "reason": reason}
+    if row not in rows:
+        rows.append(row)
+        atomic_write_json(str(path), rows)
+PY
+}
+
+_url_collection_gap() {
+    RECON_URLS_FAILED=1
+    _record_recon_gap "$1" "$2"
+}
+
+_finish_url_collection() {
+    if [ "${RECON_URLS_FAILED:-0}" -eq 0 ]; then
+        local completion_tmp="$RECON_DIR/urls/.urls.done.tmp.$$.$RANDOM"
+        if { printf 'url_collection_v2\n'; date '+%Y-%m-%d %H:%M:%S'; } > "$completion_tmp" \
+                && mv "$completion_tmp" "$RECON_DIR/urls/.urls.done"; then
+            rm -f "$RECON_DIR/urls/.urls.failed"
+            return 0
+        fi
+        rm -f "$completion_tmp"
+        _url_collection_gap urls "could not persist URL collection completion marker"
+    fi
+    rm -f "$RECON_DIR/urls/.urls.done"
+    printf 'URL collection incomplete; see diagnostics/ and coverage_degraded.json\n' \
+        > "$RECON_DIR/urls/.urls.failed"
+    log_warn "URL collection incomplete — partial corpus retained; resume will retry"
     return 1
 }
 
@@ -366,11 +440,27 @@ wait_async_phases() {
 }
 
 run_phase5_port_scanning() {
+    local port_failed=0 naabu_ok=1 rc=0
+    local done_file="$RECON_DIR/ports/.nmap.done"
+    local failed_file="$RECON_DIR/ports/.nmap.failed"
+    local diagnostics="$RECON_DIR/ports/diagnostics"
+    local port_attempt="$(date +%Y%m%d_%H%M%S).$$.$RANDOM"
     echo ""
     log_info "Phase 5: Port Scanning"
-    if phase_done "$RECON_DIR/ports/nmap_results.txt"; then
+    if [ ! -e "$failed_file" ] && phase_done "$done_file"; then
         return 0
     fi
+    mkdir -p "$diagnostics"
+    rm -f "$done_file"
+    # Keep partial/previous attempt evidence before tools truncate their output.
+    local previous
+    for previous in nmap_results.txt nmap_greppable.txt naabu_results.txt open_ports.txt open_host_ports.txt; do
+        if [ -f "$RECON_DIR/ports/$previous" ]; then
+            mv "$RECON_DIR/ports/$previous" "$diagnostics/$previous.previous.$port_attempt"
+        fi
+    done
+    printf '# port attempt %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$diagnostics/exit_codes.tsv"
+    : > "$RECON_DIR/ports/open_ports.txt"
 
     if tool_ok nmap; then
         PORT_TARGET_FILE="$RECON_DIR/ports/targets.txt"
@@ -386,7 +476,13 @@ run_phase5_port_scanning() {
         if tool_ok naabu; then
             log_step "naabu top-1000 on $PORT_TARGET_COUNT scoped target(s)..."
             naabu -list "$PORT_TARGET_FILE" -top-ports 1000 -silent \
-                -o "$RECON_DIR/ports/naabu_results.txt" 2>/dev/null || true
+                -o "$RECON_DIR/ports/naabu_results.txt" 2>>"$diagnostics/naabu.stderr.log"
+            rc=$?
+            printf 'naabu\t%s\n' "$rc" >> "$diagnostics/exit_codes.tsv"
+            if [ "$rc" -ne 0 ]; then
+                naabu_ok=0; port_failed=1
+                _record_recon_gap naabu "port discovery exited rc=$rc; partial output retained; Nmap fallback used"
+            fi
             cp "$RECON_DIR/ports/naabu_results.txt" \
                 "$RECON_DIR/ports/open_host_ports.txt" 2>/dev/null || true
             if [ -f "$RECON_DIR/ports/naabu_results.txt" ]; then
@@ -403,26 +499,40 @@ run_phase5_port_scanning() {
             if tool_ok fingerprintx && [ -s "$RECON_DIR/ports/naabu_results.txt" ]; then
                 log_step "fingerprintx service banners..."
                 fingerprintx -l "$RECON_DIR/ports/naabu_results.txt" \
-                    -json -o "$RECON_DIR/ports/fingerprintx.json" 2>/dev/null || true
+                    -json -o "$RECON_DIR/ports/fingerprintx.json" 2>>"$diagnostics/fingerprintx.stderr.log"
+                rc=$?
+                printf 'fingerprintx\t%s\n' "$rc" >> "$diagnostics/exit_codes.tsv"
+                if [ "$rc" -ne 0 ]; then
+                    port_failed=1
+                    _record_recon_gap fingerprintx "service fingerprinting exited rc=$rc; partial output retained"
+                fi
             fi
 
-            if [ -s "$RECON_DIR/ports/open_ports.txt" ]; then
+            if [ "$naabu_ok" -eq 1 ] && [ -s "$RECON_DIR/ports/open_ports.txt" ]; then
                 PORT_CSV="$(cut -d/ -f1 "$RECON_DIR/ports/open_ports.txt" | paste -sd, -)"
                 log_step "nmap service fingerprinting across $PORT_TARGET_COUNT target(s) on naabu-discovered ports: ${PORT_CSV:-none}"
                 nmap -Pn -sV -p "$PORT_CSV" -T4 --open -iL "$PORT_TARGET_FILE" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
-                    -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
+                    -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>>"$diagnostics/nmap.stderr.log"
+                rc=$?
             else
-                log_warn "naabu found no open ports — falling back to nmap top-1000"
+                log_warn "naabu empty/incomplete — falling back to nmap top-1000"
                 nmap -Pn -sV --top-ports 1000 -T4 --open -iL "$PORT_TARGET_FILE" \
                     -oN "$RECON_DIR/ports/nmap_results.txt" \
-                    -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
+                    -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>>"$diagnostics/nmap.stderr.log"
+                rc=$?
             fi
         else
             log_step "nmap top-1000 on $PORT_TARGET_COUNT scoped target(s)..."
             nmap -Pn -sV --top-ports 1000 -T4 --open -iL "$PORT_TARGET_FILE" \
                 -oN "$RECON_DIR/ports/nmap_results.txt" \
-                -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
+                -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>>"$diagnostics/nmap.stderr.log"
+            rc=$?
+        fi
+        printf 'nmap\t%s\n' "$rc" >> "$diagnostics/exit_codes.tsv"
+        if [ "$rc" -ne 0 ]; then
+            port_failed=1
+            _record_recon_gap nmap "service scan exited rc=$rc; partial output retained and resume will retry"
         fi
 
         # Re-derive open_ports.txt from the nmap greppable output. nmap -oG puts
@@ -440,7 +550,11 @@ run_phase5_port_scanning() {
                     && mv "$RECON_DIR/ports/open_ports.txt.new" "$RECON_DIR/ports/open_ports.txt"
             fi
         fi
-        log_done "Open ports: $(file_lines "$RECON_DIR/ports/open_ports.txt")"
+        if [ "$port_failed" -eq 0 ]; then
+            log_done "Open ports: $(file_lines "$RECON_DIR/ports/open_ports.txt")"
+        else
+            log_warn "Port discovery incomplete: $(file_lines "$RECON_DIR/ports/open_ports.txt") candidate port(s); see ports/diagnostics/"
+        fi
 
         if [ -s "$RECON_DIR/priority/critical_hosts.txt" ]; then
             log_step "nmap non-standard ports on CRITICAL hosts..."
@@ -452,12 +566,29 @@ run_phase5_port_scanning() {
                 HOSTNAME=$(echo "$host" | sed -E 's#https?://##; s#[/:].*##')
                 nmap -Pn -sV -p 8080,8443,8888,9090,9200,5601,6379,27017,3306,5432,2375,2376 \
                     --open -T4 "$HOSTNAME" \
-                    -oN "$RECON_DIR/ports/nmap_critical_${HOSTNAME}.txt" 2>/dev/null || true
+                    -oN "$RECON_DIR/ports/nmap_critical_${HOSTNAME}.txt" 2>>"$diagnostics/nmap.stderr.log"
+                rc=$?
+                printf 'nmap-critical:%s\t%s\n' "$HOSTNAME" "$rc" >> "$diagnostics/exit_codes.tsv"
+                if [ "$rc" -ne 0 ]; then
+                    port_failed=1
+                    _record_recon_gap nmap "critical-host service scan exited rc=$rc; partial output retained"
+                fi
             done < <(head -5 "$RECON_DIR/priority/critical_hosts.txt")
         fi
     else
         log_warn "nmap not installed — skipping"
+        port_failed=1
+        _record_recon_gap nmap "port scanning unavailable: Nmap not installed"
     fi
+    if [ "$port_failed" -eq 0 ]; then
+        if date '+%Y-%m-%d %H:%M:%S' > "$done_file"; then
+            rm -f "$failed_file"
+            return 0
+        fi
+        _record_recon_gap nmap "could not persist port-scan completion marker"
+    fi
+    printf 'port discovery incomplete; see diagnostics/exit_codes.tsv\n' > "$failed_file"
+    return 1
 }
 
 run_phase11_takeover_check() {
@@ -989,7 +1120,7 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
             # set dnsx flushed before dying; mirror the chunked branch: mark the pass
             # FAILED (so DNS_VALIDATED is NOT set and the wildcard dig-filter still
             # runs) and UNION the full candidate set back (fail-OPEN — httpx probes them).
-            if timeout -k 30 300 dnsx -silent -a -l "$DNSX_INPUT" </dev/null \
+            if timeout -k 30 300 "$VIK_DNSX_BIN" -silent -a -l "$DNSX_INPUT" </dev/null \
                 > "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null; then
                 :
             else
@@ -1027,7 +1158,7 @@ if phase_done "$RECON_DIR/subdomains/.dns.done"; then true; else
             : > "$DNSX_FAILED_LIST"
             for _chunk in "$CHUNK_DIR"/c_*; do
                 [ -f "$_chunk" ] || continue          # guard: empty glob if split produced nothing
-                if timeout -k 30 300 dnsx -silent -a -l "$_chunk" </dev/null \
+                if timeout -k 30 300 "$VIK_DNSX_BIN" -silent -a -l "$_chunk" </dev/null \
                     >> "$RECON_DIR/subdomains/resolved.txt" 2>/dev/null; then
                     :
                 else
@@ -1232,7 +1363,7 @@ if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
         HTTPX_TARGET_FILE="$_PROBE_WITH_APEX"
         # PROBED_COUNT tracks the actual probe-set size; RESOLVED_COUNT stays honest.
         PROBED_COUNT=$(file_lines "$HTTPX_TARGET_FILE")
-        log_step "Apex force-included in probe set ($TARGET, www.$TARGET) — $PROBED_COUNT hosts to probe"
+        log_step "Primary targets included after scope filtering — $PROBED_COUNT hosts to probe"
     fi
 fi
 
@@ -1246,7 +1377,29 @@ log_info "Phase 3: HTTP Probing in batches of $BATCH_SIZE (probing: $PROBED_COUN
 # batch at a time, so a kill mid-batch-loop previously left a non-empty PARTIAL
 # file that phase_done treated as "done", silently locking in an incomplete
 # live-host set on --resume (same fix already applied to Phases 1 and 2).
-if phase_done "$RECON_DIR/live/.probe.done"; then true; else
+if [ ! -e "$RECON_DIR/live/.probe.failed" ] && phase_done "$RECON_DIR/live/.probe.done"; then true; else
+
+# A new attempt invalidates the old completion marker before any child starts.
+# Keep a failure/in-progress marker until EVERY required invocation exits zero,
+# so interrupted or partially failed attempts cannot be trusted by --resume.
+mkdir -p "$RECON_DIR/live"
+rm -f "$RECON_DIR/live/.probe.done"
+RECON_PROBE_FAILED=1; export RECON_PROBE_FAILED
+echo "httpx probing incomplete (attempt in progress) — re-run/--resume required" \
+    > "$RECON_DIR/live/.probe.failed"
+printf '\n=== probe attempt %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+    >> "$RECON_DIR/live/httpx_stderr.log"
+printf '\n# probe attempt %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+    >> "$RECON_DIR/live/httpx_exit_codes.tsv"
+PROBE_CRASHES=0
+_record_probe_exit() {
+    local label="$1" rc="$2"
+    printf '%s\t%s\n' "$label" "$rc" >> "$RECON_DIR/live/httpx_exit_codes.tsv"
+    if [ "$rc" -ne 0 ]; then
+        PROBE_CRASHES=$(( PROBE_CRASHES + 1 ))
+        log_warn "httpx $label exited abnormally (rc=$rc) — probe coverage incomplete, even if output was produced"
+    fi
+}
 
 if [ "${HTTPX_HEALTHY:-0}" != 1 ]; then
     # P1 fail-closed: a missing / segfaulting / hanging / Python httpx must NOT
@@ -1278,12 +1431,14 @@ else
             | awk 'NF && !seen[$0]++' > "$_CORE_HOSTS" 2>/dev/null || true
         _scope_filter_file "$_CORE_HOSTS"
         if [ -s "$_CORE_HOSTS" ]; then
-            log_step "Core-hosts probe (apex/www, isolated + browser UA) — guarantees the primary site is tested"
+            log_step "Core-hosts probe (in-scope primary hosts, isolated + browser UA)"
             timeout 45 "$HTTPX_BIN" -l "$_CORE_HOSTS" \
                 -silent -status-code -title -tech-detect -content-length -ip -no-fallback -no-color \
                 -threads 2 -rate-limit 5 -timeout 12 -retries 1 \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
-                2>/dev/null >> "$RECON_DIR/live/httpx_full.txt" || true
+                2>> "$RECON_DIR/live/httpx_stderr.log" >> "$RECON_DIR/live/httpx_full.txt"
+            _CORE_RC=$?
+            _record_probe_exit "core-hosts" "$_CORE_RC"
             _CORE_N=$(file_lines "$RECON_DIR/live/httpx_full.txt")
             if [ "$_CORE_N" -eq 0 ]; then
                 # httpx intermittently trips Akamai/CDN bot-mitigation (TLS/JA3 or the
@@ -1316,10 +1471,8 @@ else
         fi
     fi
 
-    # P1 per-batch crash accounting: PROBE_CRASHES counts batches where httpx
-    # exited abnormally (124 timeout / 139 segfault / any nonzero) AND produced
-    # no new lines. If EVERY batch crashes we must not write a completion marker.
-    PROBE_CRASHES=0
+    # Every nonzero exit makes coverage incomplete, regardless of partial output
+    # or successful core/neighboring batches. PROBE_CRASHES includes core + retry.
     BATCH_NUM=0
     TOTAL_BATCHES=$(( (PROBED_COUNT + BATCH_SIZE - 1) / BATCH_SIZE ))
 
@@ -1333,6 +1486,9 @@ else
 
     for BATCH_FILE in "$RECON_DIR/subdomains/batch_"*; do
         [ -f "$BATCH_FILE" ] || continue
+        # A resumed directory can contain leftover batches from a wider scan.
+        _scope_filter_file "$BATCH_FILE"
+        [ -s "$BATCH_FILE" ] || continue
         BATCH_NUM=$((BATCH_NUM + 1))
         BATCH_NAME=$(basename "$BATCH_FILE")
 
@@ -1360,19 +1516,16 @@ else
             -rate-limit "$RATE_LIMIT" \
             -timeout 6 \
             -retries 1 \
-            2>/dev/null >> "$RECON_DIR/live/httpx_full.txt"
+            2>> "$RECON_DIR/live/httpx_stderr.log" >> "$RECON_DIR/live/httpx_full.txt"
         BATCH_RC=$?
 
         BATCH_END=$(date +%s)
         BATCH_ELAPSED=$(( BATCH_END - BATCH_START ))
         NEW_LIVE=$(file_lines "$RECON_DIR/live/httpx_full.txt")
         BATCH_FOUND=$(( NEW_LIVE - LIVE_SO_FAR ))
-        # A batch is a CRASH only when httpx exited abnormally AND added no lines
-        # (rc=0 with 0 new lines is a legitimately-empty batch, not a failure).
-        if [ "$BATCH_RC" -ne 0 ] && [ "$BATCH_FOUND" -eq 0 ]; then
-            PROBE_CRASHES=$(( PROBE_CRASHES + 1 ))
-            log_warn "  → Batch $BATCH_NUM httpx exited abnormally (rc=$BATCH_RC) with no output — counted as crashed batch"
-        fi
+        # Exit-zero with no lines is a valid empty result; nonzero with any
+        # number of lines is a failed invocation whose remaining hosts are unknown.
+        _record_probe_exit "batch-$BATCH_NUM" "$BATCH_RC"
         log_step "  → Batch $BATCH_NUM done in ${BATCH_ELAPSED}s | found $BATCH_FOUND live hosts this batch | total live: $NEW_LIVE"
 
         rm -f "$BATCH_FILE"
@@ -1408,14 +1561,20 @@ else
                 -threads "$THREADS" \
                 -rate-limit "$RATE_LIMIT" \
                 -timeout "$HTTP_PROBE_TIMEOUT" \
-                2>/dev/null >> "$RECON_DIR/live/httpx_full.txt" || true
+                2>> "$RECON_DIR/live/httpx_stderr.log" >> "$RECON_DIR/live/httpx_full.txt"
+            _RETRY_RC=$?
+            _record_probe_exit "scheme-retry" "$_RETRY_RC"
             sort -u "$RECON_DIR/live/httpx_full.txt" -o "$RECON_DIR/live/httpx_full.txt" 2>/dev/null || true
             LIVE_COUNT=$(file_lines "$RECON_DIR/live/httpx_full.txt")
         fi
         rm -f "$SCHEME_RETRY_FILE"
     fi
 
-    log_ok "HTTP probing complete — $LIVE_COUNT live hosts found"
+    if [ "$PROBE_CRASHES" -eq 0 ]; then
+        log_ok "HTTP probing complete — $LIVE_COUNT live hosts found"
+    else
+        log_warn "HTTP probing incomplete — $LIVE_COUNT live hosts found in partial output"
+    fi
 
     # Extract clean URL list
     awk '{print $1}' "$RECON_DIR/live/httpx_full.txt" \
@@ -1520,20 +1679,19 @@ else
     # full batch loop AND downstream URL/IP/status extraction complete; a kill
     # mid-loop leaves no marker, so --resume re-runs the probe instead of locking
     # in a partial live set. MUST stay outside the batch loop.
-    # P1 fail-closed guard: if EVERY batch crashed (0 live AND crashes == batches)
-    # the "0 live hosts" result is a tool failure, not a genuinely empty target —
-    # do NOT write the marker, so --resume re-probes; flag the failure instead.
-    if [ "${LIVE_COUNT:-0}" -eq 0 ] && [ "${TOTAL_BATCHES:-0}" -gt 0 ] \
-       && [ "${PROBE_CRASHES:-0}" -ge "${TOTAL_BATCHES:-0}" ]; then
+    # A failed core, batch, or retry invocation makes the entire inventory
+    # incomplete. Successful neighbors and partial stdout cannot certify it.
+    if [ "${PROBE_CRASHES:-0}" -gt 0 ]; then
         RECON_PROBE_FAILED=1; export RECON_PROBE_FAILED
-        echo "httpx crashed/timed out on all $TOTAL_BATCHES batch(es) — 0 live is a tool failure" \
+        rm -f "$RECON_DIR/live/.probe.done"
+        echo "httpx failed on $PROBE_CRASHES invocation(s) — live inventory is incomplete; see httpx_exit_codes.tsv and httpx_stderr.log" \
             > "$RECON_DIR/live/.probe.failed" 2>/dev/null || true
-        log_err "Phase-3 ABORTED — httpx crashed/timed out on all $TOTAL_BATCHES batch(es); '0 live hosts' is a tool failure, not an empty target."
+        log_err "Phase-3 ABORTED — $PROBE_CRASHES httpx invocation(s) failed; preserving partial output for diagnostics only."
         log_err "  .probe.done NOT written — re-run/--resume will re-probe. Do not trust this run's live set."
     else
-        [ "${PROBE_CRASHES:-0}" -gt 0 ] && log_warn "Phase-3 completed with $PROBE_CRASHES/$TOTAL_BATCHES crashed batch(es) — live set may be partial (degraded)."
-        rm -f "$RECON_DIR/live/.probe.failed" 2>/dev/null || true   # clear any stale failure marker from a prior run
         date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/live/.probe.done" 2>/dev/null || true
+        rm -f "$RECON_DIR/live/.probe.failed" 2>/dev/null || true   # all required invocations succeeded
+        RECON_PROBE_FAILED=0; export RECON_PROBE_FAILED
     fi
 fi
 fi  # end Phase 3 resume skip
@@ -1559,6 +1717,8 @@ if tool_ok tlsx && [ -s "$RECON_DIR/live/ips.txt" ]; then
 
     # Diff SANs vs known subs → in-scope new hosts + out-of-scope candidates.
     # Summary JSON keeps count+sample for reports (alterx-style; no SAN dump).
+    TLSX_SCOPE_FLAGS=()
+    [ "$SCOPE_LOCK" = "1" ] && TLSX_SCOPE_FLAGS=(--allow-file "$SCOPE_ALLOW_FILE")
     python3 "$SCRIPT_DIR/recon_enrichment.py" tlsx-feedback \
         --sans "$RECON_DIR/certs/sans.txt" \
         --known "$RECON_DIR/subdomains/all.txt" \
@@ -1567,7 +1727,14 @@ if tool_ok tlsx && [ -s "$RECON_DIR/live/ips.txt" ]; then
         --out-candidates "$RECON_DIR/certs/scope_candidates.txt" \
         --summary-out "$RECON_DIR/certs/summary.json" \
         --sample 20 \
+        ${TLSX_SCOPE_FLAGS[@]+"${TLSX_SCOPE_FLAGS[@]}"} \
         >/dev/null 2>&1 || true
+    # SANs are passive evidence, not authority to widen an exact-host scan.
+    # Keep the original candidate corpus while filtering the execution delta.
+    if [ "$SCOPE_LOCK" = "1" ]; then
+        cp "$RECON_DIR/certs/scope_candidates.txt" "$RECON_DIR/certs/san_candidates.txt" 2>/dev/null || true
+        _scope_filter_file "$RECON_DIR/certs/in_scope_new.txt"
+    fi
     NEW=$(file_lines "$RECON_DIR/certs/scope_candidates.txt")
     IN_NEW=$(file_lines "$RECON_DIR/certs/in_scope_new.txt")
     if [ "${NEW:-0}" -gt 0 ]; then
@@ -1583,6 +1750,7 @@ if tool_ok tlsx && [ -s "$RECON_DIR/live/ips.txt" ]; then
         cp "$RECON_DIR/certs/in_scope_new.txt" "$RECON_DIR/subdomains/tlsx_sans.txt" 2>/dev/null || true
         log_ok "tlsx feedback: $IN_NEW in-scope SAN host(s) merged into subdomains/all.txt"
     fi
+    _scope_filter_file "$RECON_DIR/subdomains/all.txt"
 else
     [ -s "$RECON_DIR/live/ips.txt" ] || log_warn "Phase 3.5 skipped — no live hosts"
     tool_ok tlsx || log_warn "Phase 3.5 skipped — tlsx not installed (go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest)"
@@ -1637,7 +1805,9 @@ fi
 fi  # end Phase 4 resume skip
 
 # ── Visual recon on priority web assets (XPFarm-style quick visibility) ─────
-if [ "$QUICK_MODE" != "--quick" ] && tool_ok gowitness && [ -s "$RECON_DIR/live/urls.txt" ]; then
+if [ "$SCOPE_LOCK" = "1" ]; then
+    log_info "Priority screenshots use the guarded Phase 4.5 renderer under scope-lock"
+elif [ -z "$SKIP_SCREENSHOTS" ] && [ "$QUICK_MODE" != "--quick" ] && tool_ok gowitness && [ -s "$RECON_DIR/live/urls.txt" ]; then
     if phase_done "$RECON_DIR/screenshots/.done"; then true; else
         SCREEN_TARGETS="$RECON_DIR/screenshots/targets.txt"
         {
@@ -1667,9 +1837,12 @@ fi
 # ── Deep fingerprint on CRITICAL/HIGH hosts ───────────────────────────────────
 if tool_ok whatweb && [ -s "$RECON_DIR/priority/critical_hosts.txt" ]; then
     log_step "whatweb deep fingerprint on CRITICAL hosts..."
+    WHATWEB_REDIRECT_FLAGS=()
+    [ "$SCOPE_LOCK" = "1" ] && WHATWEB_REDIRECT_FLAGS=(--follow-redirect=never)
     while IFS= read -r host; do
+        _host_in_scope "$host" || continue
         whatweb --log-brief="$RECON_DIR/priority/whatweb_${host//[:\/]/_}.txt" \
-            --no-errors -a 3 "$host" 2>/dev/null || true
+            --no-errors -a 3 ${WHATWEB_REDIRECT_FLAGS[@]+"${WHATWEB_REDIRECT_FLAGS[@]}"} "$host" 2>/dev/null || true
     done < <(head -20 "$RECON_DIR/priority/critical_hosts.txt")
     log_done "whatweb fingerprinting done"
 fi
@@ -1692,6 +1865,24 @@ mkdir -p "$RECON_DIR/screenshots"
 if [ -n "$SKIP_SCREENSHOTS" ]; then
     log_warn "Phase 4.5 skipped — SKIP_SCREENSHOTS set (visual recon disabled)"
     touch "$RECON_DIR/screenshots/.gowitness.done"
+elif [ "$SCOPE_LOCK" = "1" ]; then
+    # Gowitness has no per-request allowlist hook. Use one guarded context for
+    # redirects, subresources, popups and sockets; retain failures as coverage gaps.
+    if phase_done "$RECON_DIR/screenshots/.scoped.done"; then true; else
+        _scope_filter_file "$RECON_DIR/live/urls.txt"
+        _SCREENSHOT_ALLOW="${SCOPE_ALLOW_FILE:-}"
+        if [ -z "$_SCREENSHOT_ALLOW" ] && { [ "$TARGET_TYPE" = "ip" ] || [ "$TARGET_TYPE" = "cidr" ]; }; then
+            _SCREENSHOT_ALLOW="$RECON_DIR/subdomains/all.txt"
+        fi
+        if python3 "$SCRIPT_DIR/scoped_browser.py" --allow-file "$_SCREENSHOT_ALLOW" \
+            --urls-file "$RECON_DIR/live/urls.txt" --output-dir "$RECON_DIR/screenshots" \
+            --max-urls "$SCREENSHOT_MAX" --coverage-file "$RECON_DIR/coverage_degraded.json"; then
+            date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/screenshots/.scoped.done"
+        else
+            rm -f "$RECON_DIR/screenshots/.scoped.done"
+            log_warn "Guarded visual recon unavailable/incomplete — see coverage_degraded.json"
+        fi
+    fi
 elif phase_done "$RECON_DIR/screenshots/.gowitness.done"; then true; else
 if tool_ok gowitness && [ -s "$RECON_DIR/live/urls.txt" ]; then
     URL_COUNT=$(file_lines "$RECON_DIR/live/urls.txt")
@@ -1727,7 +1918,20 @@ log_info "Phase 6: URL Collection"
 # is written early in the phase while katana crawl, waymore, the all.txt merge and
 # the with_params/js/api subset extraction still follow; a kill after gau but
 # before the merge previously looked "done" to phase_done and skipped the rest.
-if phase_done "$RECON_DIR/urls/.urls.done"; then true; else
+# A legacy date-only marker could have been written after swallowed tool
+# failures. Re-run it once; only the new, atomically published success contract
+# is eligible for resume skipping.
+if [ ! -e "$RECON_DIR/urls/.urls.failed" ] && grep -qx 'url_collection_v2' "$RECON_DIR/urls/.urls.done" 2>/dev/null && phase_done "$RECON_DIR/urls/.urls.done"; then true; else
+RECON_URLS_FAILED=0
+rm -f "$RECON_DIR/urls/.urls.done"
+URL_DIAGNOSTICS="$RECON_DIR/urls/diagnostics/$(date +%Y%m%d_%H%M%S).$$.$RANDOM"
+mkdir -p "$URL_DIAGNOSTICS"
+for _previous_url_output in gau.txt wayback.txt waybackurls.txt waymore.txt waymore.raw.txt katana.txt; do
+    if [ -f "$RECON_DIR/urls/$_previous_url_output" ]; then
+        cp "$RECON_DIR/urls/$_previous_url_output" "$URL_DIAGNOSTICS/$_previous_url_output.previous"
+    fi
+done
+printf '# URL collection attempt %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$URL_DIAGNOSTICS/exit_codes.tsv"
 
 # Archive tools accept hostnames, not IP literals. Build the input from the
 # resolved scope so a --targets-file run does not silently query only $TARGET.
@@ -1776,30 +1980,56 @@ log_step "archive target list: $(file_lines "$ARCHIVE_TARGETS") hostname(s)"
 # gau — historical URLs from multiple sources
 if tool_ok gau; then
     log_step "gau (historical URLs)..."
+    : > "$URL_DIAGNOSTICS/gau_primary_urls.txt"
+    : > "$URL_DIAGNOSTICS/gau_fallback_urls.txt"
     timeout -k 15 "$GAU_TIMEOUT" gau --threads 5 \
         < "$ARCHIVE_TARGETS" \
-        --o "$RECON_DIR/urls/gau.txt" 2>/dev/null || \
-    timeout -k 15 "$GAU_TIMEOUT" gau \
-        < "$ARCHIVE_TARGETS" > "$RECON_DIR/urls/gau.txt" 2>/dev/null || true
-    log_done "gau: $(file_lines "$RECON_DIR/urls/gau.txt") URLs"
+        --o "$URL_DIAGNOSTICS/gau_primary_urls.txt" 2>>"$URL_DIAGNOSTICS/gau.stderr.log"
+    _gau_primary_rc=$?
+    printf 'gau-primary\t%s\n' "$_gau_primary_rc" >> "$URL_DIAGNOSTICS/exit_codes.tsv"
+    _gau_rc="$_gau_primary_rc"
+    if [ "$_gau_rc" -ne 0 ]; then
+        timeout -k 15 "$GAU_TIMEOUT" gau \
+            < "$ARCHIVE_TARGETS" > "$URL_DIAGNOSTICS/gau_fallback_urls.txt" 2>>"$URL_DIAGNOSTICS/gau.stderr.log"
+        _gau_rc=$?
+        printf 'gau-fallback\t%s\n' "$_gau_rc" >> "$URL_DIAGNOSTICS/exit_codes.tsv"
+    fi
+    cat "$URL_DIAGNOSTICS/gau_primary_urls.txt" "$URL_DIAGNOSTICS/gau_fallback_urls.txt" \
+        | sort -u > "$RECON_DIR/urls/gau.txt"
+    if [ "$_gau_rc" -eq 0 ]; then
+        log_done "gau: $(file_lines "$RECON_DIR/urls/gau.txt") URLs"
+    else
+        _url_collection_gap gau "archive requests failed (primary rc=$_gau_primary_rc, fallback rc=$_gau_rc); partial URLs retained"
+    fi
 else
     log_warn "gau not installed — using Wayback fallback"
     : > "$RECON_DIR/urls/wayback.txt"
     while IFS= read -r _archive_host; do
         [ -n "$_archive_host" ] || continue
-        curl -s --max-time 30 \
+        curl -fsS --max-time 30 \
             "https://web.archive.org/cdx/search/cdx?url=*.$_archive_host/*&output=text&fl=original&collapse=urlkey&limit=10000" \
-            >> "$RECON_DIR/urls/wayback.txt" 2>/dev/null || true
+            >> "$RECON_DIR/urls/wayback.txt" 2>>"$URL_DIAGNOSTICS/wayback.stderr.log"
+        _wayback_rc=$?
+        printf 'wayback:%s\t%s\n' "$_archive_host" "$_wayback_rc" >> "$URL_DIAGNOSTICS/exit_codes.tsv"
+        if [ "$_wayback_rc" -ne 0 ]; then
+            _url_collection_gap wayback "archive request failed for $_archive_host (rc=$_wayback_rc); partial URLs retained"
+        fi
     done < "$ARCHIVE_TARGETS"
-    log_done "wayback: $(file_lines "$RECON_DIR/urls/wayback.txt") URLs"
+    [ "${RECON_URLS_FAILED:-0}" -eq 0 ] && log_done "wayback: $(file_lines "$RECON_DIR/urls/wayback.txt") URLs"
 fi
 
 # waybackurls — extra coverage (timeout-bounded; the Wayback API can hang forever)
 if tool_ok waybackurls; then
     log_step "waybackurls..."
     timeout -k 15 "$WAYBACK_TIMEOUT" waybackurls < "$ARCHIVE_TARGETS" \
-        > "$RECON_DIR/urls/waybackurls.txt" 2>/dev/null || true
-    log_done "waybackurls: $(file_lines "$RECON_DIR/urls/waybackurls.txt") URLs"
+        > "$RECON_DIR/urls/waybackurls.txt" 2>>"$URL_DIAGNOSTICS/waybackurls.stderr.log"
+    _wayback_rc=$?
+    printf 'waybackurls\t%s\n' "$_wayback_rc" >> "$URL_DIAGNOSTICS/exit_codes.tsv"
+    if [ "$_wayback_rc" -eq 0 ]; then
+        log_done "waybackurls: $(file_lines "$RECON_DIR/urls/waybackurls.txt") URLs"
+    else
+        _url_collection_gap waybackurls "archive requests failed (rc=$_wayback_rc); partial URLs retained"
+    fi
 fi
 
 # waymore — richer archive coverage than gau+waybackurls combined
@@ -1810,7 +2040,12 @@ fi
 if tool_ok waymore && [ "$QUICK_MODE" != "--quick" ]; then
     log_step "waymore (multi-source archive URLs)..."
     timeout -k 15 "$WAYMORE_TIMEOUT" waymore -i "$TARGET" -mode U -oU "$RECON_DIR/urls/waymore.raw.txt" \
-        2>/dev/null || true
+        2>>"$URL_DIAGNOSTICS/waymore.stderr.log"
+    _waymore_rc=$?
+    printf 'waymore\t%s\n' "$_waymore_rc" >> "$URL_DIAGNOSTICS/exit_codes.tsv"
+    if [ "$_waymore_rc" -ne 0 ]; then
+        _url_collection_gap waymore "archive requests failed (rc=$_waymore_rc); partial URLs retained"
+    fi
     WAYMORE_MERGE_CAP="${WAYMORE_MERGE_CAP:-50000}"
     if [ -s "$RECON_DIR/urls/waymore.raw.txt" ]; then
         python3 "$SCRIPT_DIR/recon_enrichment.py" cap-merge \
@@ -1829,11 +2064,11 @@ if tool_ok waymore && [ "$QUICK_MODE" != "--quick" ]; then
             log_warn "waymore: $_wm_full URLs exceed merge cap $WAYMORE_MERGE_CAP — merging $_wm_n (full: urls/waymore.full.txt)"
         else
             rm -f "$RECON_DIR/urls/waymore.full.txt"
-            log_done "waymore: $_wm_n URLs"
+            [ "$_waymore_rc" -eq 0 ] && log_done "waymore: $_wm_n URLs"
         fi
     else
         : > "$RECON_DIR/urls/waymore.txt"
-        log_done "waymore: 0 URLs"
+        [ "$_waymore_rc" -eq 0 ] && log_done "waymore: 0 URLs"
     fi
 fi
 
@@ -1872,11 +2107,38 @@ if tool_ok katana && [ -s "$RECON_DIR/live/urls.txt" ]; then
     _KATANA_TGT_N=$(file_lines "$RECON_DIR/urls/katana_targets.txt")
     log_step "katana target list: $_KATANA_TGT_N hosts (cap=${KATANA_HOST_CAP}; 0=uncapped, priority-ordered)"
 
-    timeout 300 katana -list "$RECON_DIR/urls/katana_targets.txt" \
-        -d 3 -silent -jc \
-        -crawl-duration 300 \
-        -o "$RECON_DIR/urls/katana.txt" >/dev/null 2>&1 || true
-    log_done "katana: $(file_lines "$RECON_DIR/urls/katana.txt") URLs (5 min cap)"
+    # Constrain requests BEFORE crawling: post-filtering cannot undo off-scope
+    # requests made by Katana's default registered-domain/redirect behavior.
+    KATANA_SCOPE_FLAGS=()
+    KATANA_SCOPE_READY=1
+    if [ "$SCOPE_LOCK" = "1" ]; then
+        _KATANA_ALLOW="${SCOPE_ALLOW_FILE:-}"
+        if [ -z "$_KATANA_ALLOW" ] && { [ "$TARGET_TYPE" = "ip" ] || [ "$TARGET_TYPE" = "cidr" ]; }; then
+            _KATANA_ALLOW="$RECON_DIR/subdomains/all.txt"
+        fi
+        if _KATANA_SCOPE=$(python3 "$SCRIPT_DIR/scope_checker.py" --scope-lock-crawl-regex \
+                            --allow-file "$_KATANA_ALLOW" 2>/dev/null) && [ -n "$_KATANA_SCOPE" ]; then
+            KATANA_SCOPE_FLAGS=(-fs fqdn -cs "$_KATANA_SCOPE" -dr)
+        else
+            KATANA_SCOPE_READY=0
+            log_err "Katana not started — exact-host crawl allowlist is missing/invalid"
+            : > "$RECON_DIR/urls/katana.txt"
+            _url_collection_gap katana "exact-host crawl allowlist missing/invalid; no requests issued"
+        fi
+    fi
+    if [ "$KATANA_SCOPE_READY" = 1 ]; then
+        timeout -k 15 300 "$VIK_KATANA_BIN" -list "$RECON_DIR/urls/katana_targets.txt" \
+            -d 3 -silent -jc ${KATANA_SCOPE_FLAGS[@]+"${KATANA_SCOPE_FLAGS[@]}"} \
+            -crawl-duration 300 \
+            -o "$RECON_DIR/urls/katana.txt" >"$URL_DIAGNOSTICS/katana.stdout.log" 2>>"$URL_DIAGNOSTICS/katana.stderr.log"
+        _katana_rc=$?
+        printf 'katana\t%s\n' "$_katana_rc" >> "$URL_DIAGNOSTICS/exit_codes.tsv"
+        if [ "$_katana_rc" -eq 0 ]; then
+            log_done "katana: $(file_lines "$RECON_DIR/urls/katana.txt") URLs (5 min cap)"
+        else
+            _url_collection_gap katana "crawler exited rc=$_katana_rc; partial URLs retained"
+        fi
+    fi
 fi
 
 # Merge all URLs
@@ -2011,7 +2273,7 @@ fi
 # v10.6.0 — authoritative Phase-6 completion marker (resume gates on this). Written
 # only after the full collect+merge+filter pipeline finishes; a kill mid-phase
 # leaves no marker so --resume re-runs URL collection instead of skipping it.
-date '+%Y-%m-%d %H:%M:%S' > "$RECON_DIR/urls/.urls.done" 2>/dev/null || true
+_finish_url_collection || true
 fi  # end Phase 6 resume skip
 
 # Refresh prioritization once URL and JS artifacts exist.
@@ -2198,15 +2460,20 @@ if [ -n "$_XNLF_BIN" ] && [ "$QUICK_MODE" != "--quick" ] && [ -s "$RECON_DIR/liv
 fi
 
 # gf — pattern-match collected URLs for interesting params (xss, sqli, ssrf, lfi, redirect, rce)
-if tool_ok gf && [ -s "$RECON_DIR/urls/all.txt" ]; then
+if [ -s "$RECON_DIR/urls/all.txt" ]; then
     log_step "gf pattern matching on collected URLs..."
-    mkdir -p "$RECON_DIR/urls/gf"
-    for pattern in xss sqli ssrf lfi redirect rce idor cors; do
-        gf "$pattern" < "$RECON_DIR/urls/all.txt" \
-            > "$RECON_DIR/urls/gf/${pattern}.txt" 2>/dev/null || true
-        _cnt=$(file_lines "$RECON_DIR/urls/gf/${pattern}.txt")
-        [ "$_cnt" -gt 0 ] && log_warn "gf[$pattern]: $_cnt URLs — $RECON_DIR/urls/gf/${pattern}.txt"
-    done
+    # Homebrew gf may be GoFrame, not tomnomnom's pattern matcher. Resolve
+    # semantically, retain command diagnostics separately, and accept only exact
+    # validated input URLs. Missing tools/patterns/errors are coverage gaps.
+    _GF_SCOPE_ARGS=()
+    if [ "$SCOPE_LOCK" = "1" ] && [ -n "$SCOPE_ALLOW_FILE" ]; then
+        _GF_SCOPE_ARGS=(--allow-file "$SCOPE_ALLOW_FILE")
+    fi
+    if ! python3 "$SCRIPT_DIR/tool_resolution.py" --gf-match \
+            --urls-file "$RECON_DIR/urls/all.txt" --output-dir "$RECON_DIR/urls/gf" \
+            --coverage-file "$RECON_DIR/coverage_degraded.json" ${_GF_SCOPE_ARGS[@]+"${_GF_SCOPE_ARGS[@]}"}; then
+        log_warn "gf coverage unavailable/incomplete — see coverage_degraded.json and urls/gf/diagnostics/"
+    fi
 fi
 # Gxss — JS sink detection: find reflected parameters that land in JS contexts
 # Better signal than raw dalfox — narrows XSS surface to real sinks first.

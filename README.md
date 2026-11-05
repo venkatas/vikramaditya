@@ -1,858 +1,333 @@
-<div align="center">
+# Vikramaditya
 
-```
- ██╗   ██╗██╗██╗  ██╗██████╗  █████╗ ███╗   ███╗ █████╗ ██████╗ ██╗████████╗██╗   ██╗ █████╗
- ██║   ██║██║██║ ██╔╝██╔══██╗██╔══██╗████╗ ████║██╔══██╗██╔══██╗██║╚══██╔══╝╚██╗ ██╔╝██╔══██╗
- ██║   ██║██║█████╔╝ ██████╔╝███████║██╔████╔██║███████║██║  ██║██║   ██║    ╚████╔╝ ███████║
- ╚██╗ ██╔╝██║██╔═██╗ ██╔══██╗██╔══██║██║╚██╔╝██║██╔══██║██║  ██║██║   ██║     ╚██╔╝  ██╔══██║
-  ╚████╔╝ ██║██║  ██╗██║  ██║██║  ██║██║ ╚═╝ ██║██║  ██║██████╔╝██║   ██║      ██║   ██║  ██║
-   ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝
-```
+Evidence-first vulnerability assessment for authorized infrastructure, web, and API engagements.
 
-<h3 align="center">Autonomous VAPT platform — one target in, a submission-ready report out</h3>
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](requirements.txt)
+[![Tests](https://img.shields.io/badge/tests-pytest-blue.svg)](#testing)
+[![Changelog](https://img.shields.io/badge/releases-changelog-green.svg)](CHANGELOG.md)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![Version](https://img.shields.io/badge/version-10.0.0-success.svg?style=flat-square)](CHANGELOG.md)
+Run reconnaissance and vulnerability checks, optionally add AI-assisted analysis, and produce Burp-style HTML and Markdown reports. Session artifacts keep raw evidence, finding classifications, and recorded coverage limits available for review.
 
-[![Tests](https://img.shields.io/badge/tests-~700%20passing-2ea44f.svg?style=flat-square)](#core-architecture)
-[![CVSS](https://img.shields.io/badge/CVSS-3.1%20%7C%204.0-blue.svg?style=flat-square)](#reports)
-[![AI Powered](https://img.shields.io/badge/AI-5%20providers-blueviolet.svg?style=flat-square)](#ai-brain--models)
+> Test only with written authorization. An exact hostname does not authorize its subdomains, redirects, third-party services, or associated cloud accounts. A completed scan is not proof that a target is secure.
 
-**Autonomous VAPT you can actually sign off on.** Point Vikramaditya at a domain, IP, or CIDR and it runs recon → scan → AI triage → a Burp-style HTML report — one command, no flags required. Every finding is verified before it reaches the report: nothing fabricated gets in, nothing real gets dropped.
+[Quick start](#quick-start) · [Choose a workflow](#choose-your-workflow) · [Scope](#scope-and-coverage) · [Results](#reports-and-results) · [AI](#ai-configuration) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
-<sub>One target → auto-fingerprint → smart engine selection → AI writes exploit code → professional report.</sub>
+## Quick start
 
-[Quick Start](#quick-start) · [Why Vikramaditya](#why-vikramaditya) · [Usage](#usage--capabilities) · [Architecture](#core-architecture) · [Vulnerability Coverage](#vulnerability-coverage) · [Whitebox AWS](#whitebox-aws-integration) · [HAR Testing](#har-based-authenticated-testing) · [Reports](#reports) · [Changelog](CHANGELOG.md)
+Commands below run from the repository root with the project environment active. Replace `example.com` with an authorized target and `SESSION_ID` with a real session ID.
 
-</div>
+### 1. Install
 
----
-
-## What It Does
-
-Vikramaditya is an autonomous VAPT tool built for professional security consultants. Give it a target — a domain, a single IP, or an entire subnet — and it runs the full assessment pipeline and produces a submission-ready report.
-
-| Stage | What happens |
-|:------|:-------------|
-| 🔭 Recon | Subdomain enumeration, DNS resolution, live host discovery, URL crawling, JS analysis, secret extraction |
-| 🔬 Fingerprint | Tech-stack detection (httpx), CVE risk scoring, priority host ranking |
-| 🔍 Scan | SQLi, XSS, SSTI, RCE, file upload, CORS, JWT, cloud misconfigs, framework exposure |
-| 💥 Exploit | CMS exploit chains (Drupal, WordPress), Spring actuators, exposed admin panels |
-| 🧠 Analyze | AI triage drops fabricated / low-confidence findings — verified PoCs only, ranked by impact |
-| 📋 Report | Burp Suite-style HTML report — every finding lands at its confirmed severity: nothing real dropped, nothing fabricated added |
-| 🔐 HAR Testing | Browser-session analysis, authenticated vulnerability testing, real-world attack simulation |
-
-<details>
-<summary><b>Full table of contents</b></summary>
-
-- [What It Does](#what-it-does)
-- [Why Vikramaditya](#why-vikramaditya)
-- [Quick Start](#quick-start)
-- [Usage & Capabilities](#usage--capabilities)
-- [AI Brain & Models](#ai-brain--models)
-- [Core Architecture](#core-architecture)
-- [Vulnerability Coverage](#vulnerability-coverage)
-- [Whitebox AWS Integration](#whitebox-aws-integration)
-- [HAR-Based Authenticated Testing](#har-based-authenticated-testing)
-- [Engagement Privacy](#engagement-privacy)
-- [Reports](#reports)
-- [Professional Usage & Workflow](#professional-usage--workflow)
-- [Ethical Use & Legal Compliance](#ethical-use--legal-compliance)
-- [Contributing](#contributing)
-- [Changelog](#changelog)
-- [License & Support](#license--support)
-
-</details>
-
----
-
-## Why Vikramaditya
-
-Autonomous scanners are only useful if you can trust the report. The biggest objection a VAPT consultant has to autopilot tools is *"I'll spend more time disproving its false positives — and worrying about what it missed — than I saved."* Vikramaditya is built around two guarantees:
-
-- **Nothing fabricated reaches the report.** Detectors confirm before they claim — Drupalgeddon RCE needs a real `uid=` signature, time-based SQLi is anchored to a measured per-endpoint baseline, CORS detection is credential-aware, SSTI uses a distinctive arithmetic canary. A local-LLM triage gate (lowest-hallucination model, env-overridable) drops the rest.
-- **Nothing real gets dropped.** Every detector is wired to the report-ingestion contract — brain active-scanner output, confirmed RCE, and autopilot findings all land in `reporter.py` at their confirmed severity.
-
-The **v10.0.0 correctness audit** (60+ bugs across 12 files, independently reviewed by codex and grok) closed both failure classes.
-
-> **Evidence, not promises.** On the engagement that drove the audit, a clean-target run went from **25 findings (2 fabricated CVSS-10)** to **8 real ones** after the false-positive purge. The default triage model (`phi4:14b`) carries a measured **3.7 % hallucination rate** (Vectara leaderboard) — the lowest of any local model.
-
-This is a stated design contract backed by an audit — not a "100% accurate" claim. The operator still owns sign-off; Vikramaditya just makes the report worth signing.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-Tested on **macOS** (Apple Silicon / Intel). `setup.sh` provisions everything via **Homebrew** (auto-installed if missing), **Go**, and **pip** — it pulls ~30 external binaries onto your `PATH` (`subfinder`, `httpx`, `nuclei`, `ffuf`, `amass`, `sqlmap`, `naabu`, `katana`, `gau`, `dnsx`, `feroxbuster`, `gowitness`, `trufflehog`, `gitleaks`, … — see [`setup.sh`](setup.sh) for the full list. Opt-in Gitleaks SARIF / Syft SBOM / BagIt evidence packs: [`docs/gitleaks-syft-bagit.md`](docs/gitleaks-syft-bagit.md). On Linux, install [Homebrew/Linuxbrew](https://docs.brew.sh/Homebrew-on-Linux) first, or install the listed tools manually.
-
-### 1. Clone & install
-
-`setup.sh` installs all required tools, Python dependencies, and a virtual environment:
+The bundled installer targets **macOS** and uses Xcode Command Line Tools, Homebrew, Go, and pip. It creates `.venv`, installs the main Python requirements, and provisions isolated Prowler/PrincipalMapper environments. Optional tools and backends may need additional setup.
 
 ```bash
 git clone https://github.com/venkatas/vikramaditya.git
 cd vikramaditya
-chmod +x setup.sh && ./setup.sh
+bash setup.sh
 source .venv/bin/activate
 ```
 
-### 2. Verify the install
-
-Before pointing the tool at a real (authorized) target, confirm the install succeeded:
-
-```bash
-python3 vikramaditya.py --help                 # should print usage
-command -v subfinder httpx nuclei sqlmap        # core tools on PATH
-```
-
-### 3. First scan
-
-```bash
-python3 vikramaditya.py example.com            # auto-detect, interactive
-```
-
-**Two ways to run it:**
-
-- **Out of the box (no Ollama):** one command, then a few interactive prompts (proceed → credentials → enable brain → run active scanner). This is the ~30-second path.
-- **Fully autonomous (zero prompts):** install Ollama and pull the models in step 4 first (a multi-GB download — see sizing below). The brain then drives the whole assessment and only asks for credentials if a login is detected and `--creds` was not supplied.
-
-### 4. (Optional) Install the AI brain
-
-For autonomous operation, install [Ollama](https://ollama.com) and pull the per-role models the brain actually uses (see [AI Brain & Models](#ai-brain--models) for the rationale):
-
-```bash
-# Scanner / exploit code-gen — pullable from the Ollama library:
-ollama pull qwen3-coder:30b        # lands grounded PoCs (or qwen2.5-coder:14b for a lighter box)
-
-# Triage + narrator — the 2026-07-16 FP-discipline bench winner is OpenMythos-27B, a GGUF IMPORT
-# (NOT in the Ollama library). Build it once, or use a pullable faithful generic as fallback:
-#   download hf.co/jabbatheduck/OpenMythos-GGUF (Q4_K) → ollama create openmythos-27b -f Modelfile
-ollama pull qwen3:14b              # pullable faithful narrator/triage fallback if you skip the import
-```
-
-> **Minimum for autonomous mode:** one triage/narrator model — `openmythos-27b` (the bench winner, a
-> GGUF import) *or* the pullable `qwen3:14b` fallback — **plus one** coder (`qwen3-coder:30b` or
-> `qwen2.5-coder:14b`). See [AI Brain & Models](#ai-brain--models) and the benchmark record at
-> [`docs/benchmarks/2026-07-16-triage-fp-discipline.md`](docs/benchmarks/2026-07-16-triage-fp-discipline.md).
-> A pinned model that isn't installed now warns loudly (and fails under `BRAIN_REQUIRE_PIN=1`), so pin
-> only models you've actually pulled/built.
-
-Optionally create the security-tuned triage model (fully optional — triage defaults to `phi4:14b` without it):
-
-```bash
-wget -c 'https://huggingface.co/BugTraceAI/BugTraceAI-Apex-G4-26B-Q4/resolve/main/BugTraceAI-Apex-G4-26B-Q4.gguf' -O /tmp/BugTraceAI-Apex-G4-26B-Q4.gguf
-ollama create bugtraceai-apex -f Modelfiles/BugTraceAI-Modelfile
-```
-
----
-
-## Usage & Capabilities
-
-### The only command you need
-
-```bash
-# Fully autonomous — zero prompts when Ollama is installed
-python3 vikramaditya.py example.com
-python3 vikramaditya.py https://app.example.com --creds "user@domain.com:password"
-python3 vikramaditya.py 10.0.0.0/24
-
-# HAR-based authenticated testing (see HAR section below)
-python3 har_vapt.py admin_session.har
-
-# Combined infrastructure + authenticated testing
-python3 vapt_companion.py --full example.com
-
-# With fix verification — brain reads the "fixed" code and finds bypasses
-python3 vikramaditya.py https://app.example.com --creds "user:pass" \
-    --verify-fix "CSRF fixed via SameSite token"
-```
-
-When Ollama is installed the brain drives everything: auto-fingerprints, auto-selects
-the engine, enables the active scanner, and auto-generates the report when done. It
-only asks for credentials if a login is detected and `--creds` was not provided.
-Without Ollama it falls back to interactive mode.
-
-Useful flags (all confirmed in `vikramaditya.py`): `--creds` / `--creds-b`
-(primary + second account for IDOR / priv-esc), `--verify-fix`, `--passive-only`
-(generate the Phase-0 dork catalogue and exit), `--skip-passive`.
-
-> **Scope-lock note:** on the main entry point, scope-lock is offered as an
-> interactive prompt on the infrastructure/hunt path only — it is **not** a
-> `vikramaditya.py` CLI flag. For a true CLI flag, use `hunt.py --scope-lock`
-> directly (see the [Whitebox](#whitebox-aws-integration) / hunt examples).
-
-Sample run:
-
-```
-$ python3 vikramaditya.py app.example.com
-
-  ────────────────────────────────────────────────────────
-    TARGET SUMMARY
-  ────────────────────────────────────────────────────────
-    Target  : https://app.example.com
-    Status  : HTTP 200
-    Tech    : Vite, React
-    Login   : /auth/login
-    API     : https://app.example.com/v1
-    JS      : 52 bundles, 80+ API calls found
-    OpenAPI : found
-
-    Recommended: Authenticated API VAPT
-  ────────────────────────────────────────────────────────
-
-  Proceed? [Y/n]: y
-  Do you have credentials? [Y/n]: y
-  Username / email: admin@example.com
-  Password: ********
-  AI brain supervisor: enabled. Keep enabled? [Y/n]: y
-  Run brain active scanner? (LLM writes + executes exploit code) [y/N]: y
-
-  [launching 12-phase brain-supervised API VAPT...]
-  [then brain active scanner writes + runs exploit PoCs...]
-```
-
-### Authenticated / MFA login
-
-For API VAPT against MFA-protected applications, mint TOTP codes at login time
-or supply bearer tokens directly. Vikramaditya ships no per-target hardcoded
-fields — use `--login-extra-json` to pass any metadata the login body needs
-(workspace selector, tenant id, etc.). Token, password, and TOTP secret are
-never echoed to logs.
-
-```bash
-# Mint TOTP from the test-account secret at login time (primary + second account)
-python3 autopilot_api_hunt.py \
-    --base-url https://app.example.com/api \
-    --login-url auth/login \
-    --auth-creds   "vapt-admin@example.com:PasswordHere" \
-    --totp-secret  "$VAPT_MFA_ADMIN_TOTP_SECRET" \
-    --auth-creds-b "vapt-user@example.com:PasswordHere" \
-    --totp-secret-b "$VAPT_MFA_USER_TOTP_SECRET" \
-    --frontend-url https://app.example.com \
-    --output findings/example-vapt
-```
-
 <details>
-<summary><b>More auth modes</b> — extra login-body fields, token-only, IDOR second account, caller-supplied endpoint inventory</summary>
+<summary>Linux: manual setup</summary>
+
+`setup.sh` is not a Linux bootstrap script. Create a Python environment, then install the external tools required by your selected phases. Python dependencies alone do not provide full scan coverage.
 
 ```bash
-# Login endpoint expects extra body fields
-python3 autopilot_api_hunt.py \
-    --base-url https://app.example.com/api --login-url auth/login \
-    --auth-creds  "vapt-admin@example.com:Password" \
-    --totp-secret "$VAPT_MFA_ADMIN_TOTP_SECRET" \
-    --login-extra-json '{"loginSurface":"workspace"}'
-
-# Token-only mode (operator already minted bearers via the normal MFA flow)
-python3 autopilot_api_hunt.py \
-    --base-url https://app.example.com/api \
-    --auth-token   "$ORG_ADMIN_TOKEN" \
-    --auth-token-b "$ORG_USER_TOKEN" \
-    --frontend-url https://app.example.com \
-    --output findings/example-vapt
-
-# Second-account token for IDOR / priv-esc
-python3 api_idor_scanner.py \
-    --base-url https://app.example.com/api \
-    --token-a "$ORG_ADMIN_TOKEN" --token-b "$ORG_USER_TOKEN" \
-    --endpoints endpoints.json
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 ```
 
-Supply a caller-built endpoint inventory with `--endpoints-file` to merge known
-routes with what `EndpointDiscovery` finds (inventory wins on metadata, paths
-are normalised against `--base-url`):
-
-```bash
-python3 autopilot_api_hunt.py \
-    --base-url https://app.example.com/api \
-    --auth-token "$ADMIN_TOKEN" --auth-token-b "$USER_TOKEN" \
-    --endpoints-file path/to/endpoints.json
-```
+Use [requirements.txt](requirements.txt) and the external tool lists in [setup.sh](setup.sh) as references.
 
 </details>
 
-If the server replies `requiresTotp: true` and no secret/code was supplied, the
-autopilot fails loudly rather than silently retrying with a non-MFA fallback.
-
----
-
-## AI Brain & Models
-
-Vikramaditya runs a local LLM brain that supervises the assessment, triages
-findings, and (in active-scanner mode) writes and executes exploit code. Each
-role wants a different model — these are env-overridable with **no code change**.
-
-| Role | Model | Why | Env var |
-|:--|:--|:--|:--|
-| **Triage** (submit/drop) | `openmythos-27b:latest` | 2026-07-16 false-positive-discipline bench winner (73-judge panel, 5/5 clean runs, 0 invented confirmations). Triage's decisive axis is **FP discipline** — not fabricating a vuln that isn't there. ⚠ Provisional: the bench measured false-positives only, not sensitivity — see the benchmark record. | `TRIAGE_MODEL=openmythos-27b:latest` |
-| **Narration / analysis** | `openmythos-27b:latest` (pinned); code fallback `qwen3:14b` | Faithful, low-fabrication narration. Currently pinned to the triage winner; not separately narration-benched, so the code fallback stays a faithful generic. | `BRAIN_MODEL=openmythos-27b:latest` |
-| **Exploit code-gen** | `qwen3-coder:30b` (pinned) / `qwen2.5-coder:14b` (fast fallback) | A coder **lands grounded PoCs** where triage/analysis models flail in the write-and-run loop. | `BRAIN_SCANNER_MODEL=qwen3-coder:30b` |
-
-Model selection is layered: **`~/.config/vikramaditya/brain.env` file-WINS** (the
-canonical per-machine pin), and the `MODEL_PRIORITY` / `TRIAGE_MODEL_PRIORITY`
-lists in `brain.py` are the code-level **fallback** (first *installed* model wins).
-A pinned model that is **not installed** no longer silently substitutes — it warns
-loudly (and fails under `BRAIN_REQUIRE_PIN=1`), and the model actually used is
-recorded in `brain.MODEL_SELECTION_LOG`. The triage list is now ranked by FP
-discipline (`openmythos-27b` first, then clean alternates `nemesis` / `devstral` /
-`glm`; the offensive-tune `baron-llm` demoted). Full benchmark + caveats:
-[`docs/benchmarks/2026-07-16-triage-fp-discipline.md`](docs/benchmarks/2026-07-16-triage-fp-discipline.md).
-(Historical defaults `phi4` / `bugtraceai-apex` are retired — speed/JSON-optimized,
-not FP-discipline-validated, and were not installed.)
-
-> ⚠️ A `claude-*` tag in your local Ollama is **not** Claude (Claude weights are
-> not downloadable, so any such tag is a mislabeled local model). Always confirm
-> with `ollama show <tag>`.
-
-### Multi-provider support
-
-| Provider | Models (priority order) | Use case |
-|:---------|:------------------------|:---------|
-| **Ollama** (local) | `phi4:14b`, `devstral-small-2:24b`, `qwen2.5-coder:14b`, `bugtraceai-apex`, `gemma4:26b` | Primary brain, exploit generation, code analysis |
-| **MLX** (Apple Silicon) | Qwen2.5-32B, Qwen3-32B, DeepSeek-R1-Distill-Qwen-14B, Qwen2.5-14B, Mistral-7B | Fast inference on M-series Macs (SSD paging fits 32B on 16 GB) |
-| **OpenAI** | GPT-4o, GPT-4-Turbo | Premium analysis, complex reasoning |
-| **Anthropic** | Latest Claude Sonnet / Opus | Code understanding, vulnerability research |
-| **Google** | Gemini 1.5 Pro | Multimodal analysis, document processing |
-| **xAI** | Grok-2 | Alternative reasoning, real-time knowledge |
-
-Configure via environment variables or interactive setup.
-
-### Model benchmarking
-
-`brain_model_bench.py` replays `brain.py scan` against the same findings dir
-using each candidate Ollama model and ranks by hallucination rate (SUBMIT
-verdicts against sqlmap-flagged false-positive URLs) — deterministic
-ground-truth benching instead of swap-and-pray:
+### 2. Check readiness
 
 ```bash
-python3 vikramaditya.py --brain-model-bench \
-    --bmb-findings findings/<target>/sessions/<id> \
-    --bmb-recon    recon/<target>/sessions/<id>
+python3 -m pip check
+python3 hunt.py --status
+python3 hunt.py --help
 ```
 
----
+Review missing and unusable capabilities before scanning. A binary being installed does not mean its phase can run successfully; see [troubleshooting](#troubleshooting).
 
-## Core Architecture
-
-<div align="center">
-
-```mermaid
-graph TB
-    A[Target Input] --> B{Target Type}
-    B -->|Domain/IP/CIDR| C[vikramaditya.py]
-    B -->|HAR File| D[har_vapt.py]
-    B -->|Combined| E[vapt_companion.py]
-
-    C --> F[Auto-Fingerprint]
-    F --> G[Engine Selection]
-    G --> H[hunt.py Infrastructure]
-    G --> I[autopilot_api_hunt.py Web/API]
-
-    D --> J[HAR Analysis]
-    J --> K[Session Extraction]
-    K --> L[Vulnerability Testing]
-
-    E --> F
-    E --> J
-
-    H --> M[Report Generation]
-    I --> M
-    L --> M
-
-    classDef hub fill:#1f2937,stroke:#3b82f6,color:#fff,stroke-width:2px;
-    classDef har fill:#cce5ff,stroke:#3b82f6,color:#111;
-    class C hub;
-    class D,J,K,L har;
-```
-
-<sub><i>Blue path = HAR-based authenticated testing flow; <code>vikramaditya.py</code> is the orchestrator hub.</i></sub>
-
-</div>
-
-### File structure
-
-```
-vikramaditya/
-├── vikramaditya.py              # Main orchestrator
-├── hunt.py                      # Infrastructure VAPT
-├── autopilot_api_hunt.py        # Web/API VAPT (12-phase brain-supervised)
-├── api_idor_scanner.py          # Two-token IDOR / priv-esc tester
-├── har_analyzer.py              # HAR file analysis
-├── har_vapt_engine.py           # HAR-based vulnerability testing
-├── har_vapt.py                  # Complete HAR VAPT workflow
-├── vapt_companion.py            # Combined infrastructure + HAR
-├── vapt_suite.py                # Interactive unified interface
-├── brain.py / brain_scanner.py  # AI analysis + exploit generation
-├── brain_model_bench.py         # Hallucination-rate model bake-off
-├── agent.py                     # Autonomous ReAct agent
-├── reporter.py                  # HTML / Markdown (+ PDF) report generation
-├── saf_export.py                # Opt-in SARIF / HDF / ASFF export (MITRE SAF)
-├── session_tool_cache.py        # Opt-in session tool cache (VIK_SESSION_TOOL_CACHE=1)
-├── recon.sh / scanner.sh        # Recon + vuln-scanning pipelines
-├── recon_enrichment.py          # uncover/tlsx/waymore/xnLinkFinder glue (see docs/recon-enrichment.md)
-├── validate.py                  # Finding validation (CVSS 4.0)
-├── credential_store.py          # .env-backed auth store
-├── intel_engine.py              # CVE + HackerOne + hunt-memory intel
-├── eol_check.py                 # endoflife.date lifecycle / EOL lookup
-├── email_audit.py               # DMARC / MTA-STS / TLS-RPT / DNSSEC audit
-├── email_audit_adapter.py       # email-audit → reporter bridge
-├── token_scanner.py             # EVM + Solana meme-coin red flags
-├── sneaky_bits.py               # LLM prompt-injection encoder
-├── cicd_scanner.sh              # sisakulint GitHub Actions auditor
-│
-├── whitebox/cloud_hunt.py       # Whitebox AWS audit (Prowler + PMapper + secrets)
-│
-├── llm_anon/                    # Engagement-privacy anonymization proxy
-│   ├── proxy.py                 # FastAPI reverse proxy for Claude Code
-│   ├── regex_detector.py        # IP / hash / credential / FQDN / JWT patterns
-│   ├── surrogates.py            # RFC 5737 / .pentest.local generator
-│   ├── vault.py                 # SQLite per-engagement mapping store
-│   └── anonymizer.py            # anonymize() / deanonymize() facade
-│
-├── mcp/                         # HackerOne / Caido / Burp + opt-in Vik MCP facade
-├── memory/                      # Hunt journal, audit log, pattern DB
-├── skills/                      # bb-methodology, bug-bounty, meme-coin-audit, …
-├── agents/                      # recon-ranker, chain-builder, validator,
-│                                #   report-writer, email-auditor, autopilot, …
-├── commands/                    # /recon /hunt /validate /report /triage /chain
-│                                #   /intel /token-scan /email-audit /anon, …
-└── tests/                       # ~700 test functions across 69 modules (pytest,
-                                 #   incl. the whitebox unit/integration/smoke suite)
-```
-
----
-
-## Vulnerability Coverage
-
-### Infrastructure testing
-
-| Category | Tools | Techniques |
-|:---------|:------|:-----------|
-| **Recon** | subfinder, assetfinder, amass, httpx | Subdomain enumeration, live host discovery, tech fingerprinting |
-| **Scanning** | nuclei, sqlmap, naabu, feroxbuster | CVE detection, SQL injection, port scanning, directory bruteforce |
-| **Exploitation** | manual + brain-generated PoCs | CMS exploits, Spring Boot actuators, cloud misconfigs |
-
-### Authenticated testing (HAR-based)
-
-| Category | Vulnerability types | What it does |
-|:---------|:--------------------|:-------------|
-| **Injection** | SQL, NoSQL, Command injection | Auth bypass, parameter injection |
-| **Broken Auth** | Session management, auth bypass | Admin-panel access, invalid-session acceptance |
-| **Sensitive Data** | IDOR, information disclosure | User enumeration, unauthorized data access |
-| **File Upload** | RCE, path traversal, filter bypass | Malicious uploads, bypass techniques |
-| **XSS** | Reflected, stored, DOM-based | Parameter-based testing |
-| **Session** | Token security, hijacking | Bearer-token analysis, cookie security |
-
-### Web3 — meme-coin / SPL / DEX LP
-
-| Category | What `token_scanner.py` flags | Reference |
-|:---------|:-------------------------------|:----------|
-| **Mint abuse** | Unrestricted mint, `onlyOwner` mint without cap | `web3/10-meme-coin-bugs.md` |
-| **Fee traps** | Unbounded `setFee()`/`setTax()`, missing `MAX_FEE` | `web3/10` |
-| **Trading toggles** | Reversible `enableTrading`, pause / unpause loops | `web3/10` |
-| **Transfer hooks** | Hidden pre/post-transfer logic, fee-on-transfer accounting | `web3/10`, `web3/11` |
-| **Blacklists / freeze authority** | Owner can blacklist/freeze user funds | `web3/11` (Solana) |
-| **LP / AMM attacks** | Concentrated-liquidity, JIT sandwich, LP-share accounting | `web3/12` |
-
-### CI/CD, LLM red-team & lifecycle
-
-| Category | Tool | Detected / use case |
-|:---------|:-----|:--------------------|
-| **GitHub Actions** | `cicd_scanner.sh` (sisakulint) | `pwn_request`, script injection, unpinned actions, missing `permissions:`; org-wide via `"org:<name>" --recursive` |
-| **Invisible Unicode injection** | `sneaky_bits.py` | U+2062 / U+2064 / Variant-Selector encoding for indirect prompt-injection payloads |
-| **Chatbot IDOR replay** | `har_vapt_engine.py` | Replay authenticated LLM app sessions against injection, tool-call abuse, context leaks |
-| **Lifecycle / EOL** | `eol_check.py` | See below |
-
-### AI-powered analysis
-
-- **Exploit generation** — brain writes custom PoC code for found vulnerabilities
-- **Chain discovery** — identifies multi-step attack paths
-- **False-positive reduction** — AI triage drops fabricated / low-confidence findings before they reach the report
-- **Fix verification** — reads deployed code, finds logic-bypass opportunities
-- **Impact assessment** — business-risk scoring and prioritization
-
-### Lifecycle / EOL checks
-
-`eol_check.py` wraps the public [endoflife.date](https://endoflife.date/) metadata
-API and produces a per-engagement `recon/<target>/eol.md` flagging EOL'd /
-near-EOL / supported software for every detected tech (~80 fingerprint→slug
-mappings). It is auto-invoked from `intel.py`, so every `intel.md` leads with a
-"Lifecycle / End-of-Life Status" block — handy PCI-DSS 6.2 / ISO 27001 A.12.6.1
-evidence. Cached at `~/.cache/vikramaditya/eol/<slug>.json` (24h TTL); degrades
-to `status: no_data` on outage.
+### 3. Run an exact-host, tools-only assessment
 
 ```bash
-# Standalone — supply detected tech (versions optional, with =version)
-python3 eol_check.py --tech "asp.net,iis,dotnetfx=4.8,php=5.6" \
-                     --target client-portal.example.com \
-                     --json recon/<target>/eol.json
-# Show fingerprint→slug map / bust 24h cache
-python3 eol_check.py --list-products
-python3 eol_check.py --refresh --tech "ubuntu=20.04"
+python3 hunt.py --target example.com --full --scope-lock --no-brain
 ```
 
-**Credits.** Lifecycle data courtesy of [endoflife.date](https://endoflife.date/)
-([github.com/endoflife-date/endoflife.date](https://github.com/endoflife-date/endoflife.date),
-MIT-licensed). The credit string is embedded automatically in every `eol.md` and
-the lifecycle block of `intel.md` — please retain it when redistributing
-client-facing reports.
+This is an active assessment. It excludes `www.example.com` and other subdomains. `--full` selects the phase checklist, not unlimited or exhaustive coverage; `--no-brain` avoids model inference. Read the [scope limits](#scope-and-coverage), then review the final status and [session artifacts](#session-artifacts).
 
----
+To add AI, [configure a backend](docs/ai-configuration.md) and omit `--no-brain`.
 
-## Whitebox AWS Integration
+## Choose your workflow
 
-Run alongside a blackbox engagement to add cloud audit, IAM blast-radius graphs,
-secrets scanning, and exploit chaining. `whitebox/cloud_hunt.py` iterates
-account-wide inventory, runs the Prowler full-checks suite (~380 controls, OCSF
-JSON + CIS / SOC2 / HIPAA / FedRAMP / FFIEC compliance CSVs), builds the PMapper
-IAM privesc graph, scans secrets across Lambda env vars / SSM / SecretsManager /
-EC2 user-data / CloudWatch-Logs / S3, and emits a normalized correlator-ready
-dump. When `vikramaditya.py` runs it auto-detects whether the target domain is
-listed in `whitebox_config.yaml` and offers to run cloud whitebox alongside
-blackbox; the final report then includes a "Cloud Posture" chapter plus inline
-cloud context on each blackbox finding.
+| Your task | Entry point | Details |
+|:--|:--|:--|
+| Explicit infrastructure assessment: FQDN, IP, or CIDR | `hunt.py` | [Common commands](#common-commands) |
+| Fingerprint a target and select an engine | `vikramaditya.py` | [Launcher behavior](#launcher-behavior) |
+| Authenticated API assessment with tokens, credentials, or MFA | `autopilot_api_hunt.py` | [API/MFA guide](docs/specialist-workflows.md#api-and-mfa-authentication) |
+| Analyze and replay a captured browser session | `har_vapt.py` / `har_vapt_engine.py` | [HAR guide](docs/specialist-workflows.md#har-based-testing) |
+| Separately authorized AWS account assessment | `python3 -m whitebox.cloud_hunt` | [AWS guide](docs/specialist-workflows.md#aws-whitebox-assessments) |
+
+Scope and safety controls differ between entry points. The exact-host infrastructure controls below are not a general sandbox for every API, HAR, cloud, or AI-generated action.
+
+### Common commands
 
 ```bash
-# Auto-detected during a normal run (from whitebox_config.yaml)
-python3 vikramaditya.py example.com
+# Resume an existing session; recon completion markers can be reused
+python3 hunt.py --target example.com --resume SESSION_ID --full --scope-lock --no-brain
 
-# Standalone, single AWS profile
-python3 -m whitebox.cloud_hunt --profile client-erp \
-    --allowlist example.com \
-    --session-dir recon/example.com
+# Reuse recon without rerunning it
+python3 hunt.py --target example.com --resume SESSION_ID --scan-only --full --scope-lock --no-brain
+
+# Use a complete, explicitly authorized host list (implies scope lock)
+python3 hunt.py --target example.com --targets-file authorized-hosts.txt --full --no-brain
+
+# Assess an explicitly authorized subnet
+python3 hunt.py --target 192.168.1.0/24 --full --no-brain
 ```
 
-<details>
-<summary><b>More whitebox modes</b> — multi-account, timeout/region tuning, no-scope-lock</summary>
+`--resume` reuses session data; it does not automatically skip every completed non-recon phase. Use `--skip` only for work actually performed and retain its evidence. Hunt-memory journals and repository slash-command references are separate from `hunt.py` session-resume state.
+
+Failed archive/crawler and port-scan attempts retain diagnostics and partial evidence, but do not create clean completion markers. Resume retries those attempts rather than trusting a nonempty partial result file.
+
+### Launcher behavior
 
 ```bash
-# Multi-account, timeouts widened for a large IAM estate
-PROWLER_TIMEOUT=7200 PMAPPER_TIMEOUT=3600 \
-WHITEBOX_REGIONS=us-east-1,ap-south-1,eu-west-1 \
-python3 -m whitebox.cloud_hunt \
-    --profile client-erp --profile client-data \
-    --allowlist example.com --allowlist example-data.invalid \
-    --session-dir recon/example.com --refresh
-
-# Audit every public Route53 zone in the account (skip allowlist intersection)
-python3 -m whitebox.cloud_hunt --profile client-erp --no-scope-lock \
-    --session-dir recon/example.com
+python3 vikramaditya.py example.com --scope-lock
+python3 vikramaditya.py https://app.example.com --scope-lock --creds "user:password"
 ```
 
-</details>
+The launcher selects autonomous routing when the configured Ollama daemon is reachable and has an installed model. Applicable branches enable brain supervision and the active brain scanner. Without a usable Ollama inventory, the launcher uses interactive routing and disables launcher AI; configuring another provider alone does not change that decision.
 
-By default `cloud_hunt` filters `ec2 describe-regions` to enabled regions so
-boto3 never hangs in SYN_SENT against unenabled opt-in regions (`me-south-1`,
-`af-south-1`, …). Override with `WHITEBOX_REGIONS=...`. `--allowlist` is required
-unless `--no-scope-lock` is passed; Route53 zones are intersected with the
-allowlist before being treated as in-scope.
+In autonomous mode, missing `--creds` means an unauthenticated assessment, not a credentials prompt. The launcher accepts `--scope-lock` and `--no-scope-lock` and forwards the choice on its infrastructure/hunt path. **Do not assume a bare run is locked.**
 
-### Required external tools (one-time install)
+Use `python3 vikramaditya.py --help` for point tools and additional flags. Treat command-line credentials as sensitive: shell history and process listings can expose them.
 
-Both tools must live in isolated venvs — Prowler 4.5 hard-pins
-`pydantic==1.10.18`, which conflicts with `ollama` and most of the main venv.
+## Scope and coverage
+
+### Define the authorized surface
+
+With `--scope-lock`, `example.com` does **not** include `www.example.com`, any other subdomain, or a different host reached by a redirect. Non-default active web ports must be explicitly authorized.
+
+For an engagement covering several hosts, `authorized-hosts.txt` can contain:
+
+```text
+example.com
+www.example.com
+api.example.com:8443
+```
+
+With a host list, `--target` supplies the session label; it does not authorize hosts missing from that list. Certificate SANs and archive discoveries remain passive evidence rather than expanding execution scope. Missing or empty scope authority fails closed on the guarded scan-only/resume paths.
+
+### Understand the trade-offs
+
+| Path | Exact-host behavior and coverage limit |
+|:--|:--|
+| Crawling / HTTP probes | Destinations and redirects are checked before requests; discovered links cannot authorize another host. |
+| Nuclei | Locked runs append `-dr`, disabling **all** redirects, including same-authority redirects. Redirect-dependent templates have partial coverage; conflicting follow-redirect configuration fails closed. |
+| Browser work | Locked screenshots/forms use guarded Playwright, not unrestricted Gowitness or LLM navigation. Off-scope resources and unsupported transports are blocked. LLM-driven browser validation remains partial/unavailable. |
+| Form / parameter discovery | POST form fetching uses static scoped HTTP, not JavaScript rendering. GET and POST Arjun probes use the bundled small wordlist and disabled redirects when locked. POST uses one worker with a six-second delay and a five-URL default cap; `ARJUN_POST_MAX_URLS=0` removes that probe cap. Known POST actions are prioritized, and caps/failures remain explicit coverage gaps. |
+
+`--full` does not enable destructive, discovered-credential, or unsafe-browser opt-ins. Tool availability, phase caps, timeouts, and scope still limit coverage. Ctrl-C/timeouts tear down owned subprocess groups; interrupted artifacts are not a completed assessment.
+
+SQLmap does not repeat a POST discovery attempt already made in the same invocation.
+A later invocation can retry a failed attempt; failure never writes a successful
+completion marker. MIME-qualified extensionless HTML pages are eligible for form
+discovery. New query/API inputs invalidate autonomous core-scan completion, and
+unconsumed work remains visible when the step budget is exhausted.
+
+These controls are **not a general-purpose command sandbox**. The post-recon `brain/scan_plan.sh` is saved for manual review, not automatically run by that hook. Inspect its scope and actions before executing it.
+
+### Browser prerequisites
+
+The guarded backend needs context-level HTTP and WebSocket interception. If those controls are unavailable, it fails closed and records a coverage gap.
 
 ```bash
-# Prowler — pydantic-pinned, install in an isolated venv (use Python 3.11)
-python3 -m venv ~/.venvs/prowler
-~/.venvs/prowler/bin/pip install prowler-cloud==4.5.0
-
-# PMapper — patch the Python 3.10+ collections.abc import bug
-python3.11 -m venv ~/.venvs/pmapper
-~/.venvs/pmapper/bin/pip install principalmapper
-sed -i '' 's/from collections import Mapping/from collections.abc import Mapping/' \
-    ~/.venvs/pmapper/lib/python*/site-packages/principalmapper/util/case_insensitive_dict.py
+python3 -m pip install playwright
+python3 -m playwright install chromium
 ```
 
-> On Linux, drop the empty `''` argument after `-i` in the `sed` command.
+## Reports and results
 
-Binary discovery order for both: `<TOOL>_BIN` env var →
-`~/.venvs/<tool>/bin/<tool>` → `~/.local/share/<tool>/bin/<tool>` →
-`/opt/<tool>/bin/<tool>` → `$PATH`. If missing, the phase is skipped gracefully.
+Review evidence and coverage before delivering a report. HTML/Markdown can contain classified findings, configuration observations, and informational or unconfirmed context; these are not interchangeable.
 
-**Required IAM permissions** (audit user / role): `ReadOnlyAccess` +
-`SecurityAudit`. To enable full secret-value scanning add
-`secretsmanager:GetSecretValue`; without it the scanner falls back to
-metadata-only.
+### Session artifacts
 
-### Session output structure
+`hunt.py` keeps matching session IDs across three trees:
 
-```
-recon/<target>/cloud/<account_id>/
-├── inventory/                 # ~25+ AWS service inventories × N regions, raw boto3 JSON
-├── prowler/                   # OCSF JSON + compliance CSVs
-├── pmapper/                   # Graph storage copy + stdout/stderr logs
-├── secrets/                   # Per-finding redacted JSON (mode 0600 in 0700 dir)
-├── findings.json              # Consolidated normalized findings
-├── manifest.json              # Per-phase status + TTL cache key
-└── ../correlation/
-    ├── asset_feed_<account>.json
-    └── asset_feed.json        # Merged across accounts in this session
-```
+```text
+recon/<target>/sessions/<id>/
+├── scope/allow.txt          # Exact-host authority, when applicable
+├── live/                   # Probe results, exit records, completion markers
+├── urls/                   # URL corpus; GF diagnostics in urls/gf/diagnostics/
+├── screenshots/            # Guarded pages, screenshots, blocked-request records
+├── params/                 # Static forms and Arjun discovery
+└── brain/                  # Optional analysis and review-only scan plan
 
----
+findings/<target>/sessions/<id>/
+├── phase_manifest.json
+├── coverage.json
+├── coverage_degraded.json
+└── manual_review/coverage_gaps.txt
 
-## HAR-Based Authenticated Testing
-
-Comprehensive authenticated vulnerability testing driven by real browser-session
-data. Capture a session, then let Vikramaditya replay and attack it.
-
-### Capture real sessions
-
-```
-1. Open the target app in your browser
-2. Open DevTools (F12) → Network tab
-3. Login and navigate authenticated areas
-4. Right-click → Save as HAR file
+reports/<target>/sessions/<id>/
+├── vapt_report.html
+└── vapt_report.md
 ```
 
-### Run
+Artifact presence depends on the phases and backend used. Regenerating a report does not refresh evidence or prove that skipped phases ran.
+
+### Assessment status
+
+Synchronous `hunt.py` pipelines and bounded `--autonomous` runs fold the shared manifest/coverage assessment into their final result. Failed, aborted, or degraded coverage produces **INCONCLUSIVE**, including recorded gaps retained on resume or found in sibling recon artifacts. Autonomous sessions save that final status even when a resume executes no new steps. Report rendering uses the coverage available when it runs; a later report-generation failure also makes the final CLI result inconclusive.
+
+| Exit code | Meaning for a synchronous or bounded autonomous pipeline |
+|:--|:--|
+| `0` | No recorded assessment failure or coverage gap; not proof of a vulnerability-free target |
+| `2` | Inconclusive assessment; inspect the coverage artifacts |
+| `130` | Interrupted with SIGINT; partial artifacts are not completion |
+
+Other point-tool modes and usage errors can have different exit meanings. A report-rendering command can succeed while rendering an inconclusive assessment. A successfully completed zero-finding phase is not itself a failure. Failed coverage persistence is retained as an in-memory failure signal, even if a file-only report cannot show the unwritten limitation.
+
+Existing malformed or unreadable coverage is an integrity failure, not an empty
+result. Atomic repairs retain corrupt bytes in `.corrupt.<sha256>` backups when
+replacement is possible. API coverage distinguishes attempted requests from
+completed HTTP responses; transport failures remain visible even with zero findings.
+
+Reports use recorded session execution evidence rather than assuming that manual
+testing, AI analysis, exploitation, or every installed tool was used. Unavailable
+or incompatible finding scores display `N/A`; explicit recorded scores are retained.
+
+Counts use supported parsers and classification/proof gates, not raw lines, dictionary keys, file counts, or model prose. Exact duplicate observations are removed while distinct parameters, CVEs, and evidence remain separate. `classified_findings` can include configuration observations: it is **not** an exploitation-confirmed count.
+
+### Regenerate or export a report
 
 ```bash
-# All-in-one authenticated VAPT
-python3 har_vapt.py admin_session.har
+python3 reporter.py findings/example.com/sessions/SESSION_ID/ \
+    --client "Acme Corp" --consultant "Your Name"
 
-# Individual components
-python3 har_analyzer.py session.har               # extract endpoints & tokens
-python3 har_vapt_engine.py session_analysis.json  # run vulnerability tests
-
-# Combined infrastructure + authenticated
-python3 vapt_companion.py --full example.com
-
-# Interactive suite with all tools
-python3 vapt_suite.py
+# SARIF is the standalone exporter's default format
+python3 saf_export.py findings/example.com/sessions/SESSION_ID/ -o report.sarif
 ```
 
-HAR testing covers SQL injection (auth bypass, parameter injection), file-upload
-RCE, authentication bypass, IDOR, XSS, and session-management flaws. Sample
-output:
+Successful report generation emits HTML and Markdown. PDF conversion is attempted when `wkhtmltopdf` is available; check its outcome separately. HDF/ASFF exports require MITRE SAF; see [export formats and prerequisites](docs/saf-export.md).
 
-```
-$ python3 har_vapt.py admin_session.har
+## AI configuration
 
-  ────────────────────────────────────────────────────────
-    HAR ANALYSIS SUMMARY
-  ────────────────────────────────────────────────────────
-    Target Domain     : app.example.com
-    Total Endpoints   : 127
-    Admin Endpoints   : 18
-    File Uploads      : 3
-    High-Value Targets: 31
-    Authentication    : bearer_token
+AI is optional. The implemented backends are Ollama, MLX, MLX-VLM server, Anthropic, OpenAI, xAI, and Gemini. Provider availability, model selection, and launcher routing are separate concerns.
 
-    Recommended Tests : sql_injection, file_upload_rce, auth_bypass
-  ────────────────────────────────────────────────────────
+The per-machine `~/.config/vikramaditya/brain.env` file **overrides inherited environment values** for allowlisted keys. `BRAIN_ENV_FILE` selects another file; `BRAIN_ENV_NOLOAD=1` bypasses it. Inspect startup provider/model messages instead of assuming an environment assignment took effect.
 
-  [CRITICAL] SQL Injection: Authentication bypass confirmed
-  [CRITICAL] File Upload RCE: malicious files uploaded successfully
-  [HIGH]     Authentication Bypass: admin panels accessible without auth
-```
+The [AI configuration guide](docs/ai-configuration.md) covers backend connections, a local MLX-VLM example, Ollama role pins, strict pin failures, fallback behavior, and historical benchmark limitations. There is no repository-wide best-model or hardware-fit guarantee.
 
-> HAR files may contain live session tokens and PII — handle and store them
-> securely, and delete them post-engagement.
+Model output is not vulnerability evidence. Review generated actions and findings, and send engagement data only to approved providers. The optional privacy proxy is best-effort body redaction, **not** a confidentiality boundary; [read its limitations](docs/specialist-workflows.md#engagement-privacy-proxy).
 
----
+## Troubleshooting
 
-## Engagement Privacy
-
-When the NDA says "don't send client data to third-party AI services" but you
-still want Claude Code's reasoning on real `nmap` / `crackmapexec` / Burp output,
-the `llm_anon/` reverse proxy anonymizes everything in flight. Real IPs, hashes,
-credentials, and FQDNs are replaced with deterministic surrogates before any
-request leaves your host; responses are deanonymized in place (SSE-aware, so
-streaming stays live).
+| Symptom | What to check |
+|:--|:--|
+| Report says `INCONCLUSIVE`, or a synchronous scan exits `2` | Review `phase_manifest.json`, `coverage.json`, `coverage_degraded.json`, and `manual_review/coverage_gaps.txt`; fix the recorded limitation before relying on a negative result. |
+| Apex host redirects to `www` and coverage is partial | The hosts are separate scope entries. Add `www` only if it is explicitly authorized; otherwise keep the block and report the limitation. |
+| HTTPX / DNSX / Nuclei / Katana is installed but unusable | Check executable identity/readiness with `tool_resolution.py`; a shadowing or crashing binary is not operational coverage. |
+| GF output contains errors instead of URLs | Require tomnomnom's matcher and the requested patterns, not the unrelated GoFrame CLI. Inspect `urls/gf/diagnostics/`. |
+| Browser phase is unavailable | Install Playwright/Chromium in the active environment and confirm required interception support. |
+| AI is slow or uses an unexpected backend/model | Review `brain.env` file precedence and startup messages. For tools-only infrastructure work, use `--no-brain`. |
+| AWS checks fail despite a domain allowlist | Domain filtering is not account authorization. Check audit-role permissions, regions, isolated tools, and the [AWS guide](docs/specialist-workflows.md#aws-whitebox-assessments). |
 
 ```bash
-# Terminal 1 — start the anonymization proxy
-export ENGAGEMENT_ID=acme-2026-vapt
-export ANTHROPIC_API_KEY=sk-ant-...            # forwarded to upstream as-is
-python3 -m llm_anon.proxy                      # listens on 127.0.0.1:8080
-
-# Terminal 2 — run Claude Code through the proxy
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
-export ENGAGEMENT_ID=acme-2026-vapt            # must match Terminal 1
-claude
+python3 tool_resolution.py httpx
+python3 tool_resolution.py gf
 ```
 
-**What Claude sees:** `nmap scan of 203.0.113.47 on xkqpzt.pentest.local returned OpenSSH 8.2`
-**What your terminal shows:** `nmap scan of 10.20.0.10 on dc01.acmecorp.local returned OpenSSH 8.2`
+The shared resolver runs bounded identity probes for ProjectDiscovery HTTPX, DNSX, Nuclei, and Katana. A healthy Go install keeps precedence; a crashing/shadowed binary can fall back to a healthy Homebrew keg or later `PATH` entry. Shell execution pins these tools by absolute path and preserves the invoking Python environment.
 
-Mappings persist in `~/.vikramaditya/anon_vault.db`, scoped by `ENGAGEMENT_ID`
-so client A and client B never share surrogates. Run `/anon` for the command
-reference.
+## Architecture
 
-**Threat model:** prevents content-based correlation. Does **not** prevent
-query-pattern or timing correlation. Binds to `127.0.0.1` only. Not a compliance
-certification — review your contract.
+| Component | Responsibility |
+|:--|:--|
+| [hunt.py](hunt.py) | Infrastructure phase orchestration and session lifecycle |
+| [vikramaditya.py](vikramaditya.py) | Fingerprinting, engine routing, and point-tool CLI |
+| [recon.sh](recon.sh) / [scanner.sh](scanner.sh) | Reconnaissance and vulnerability-scanning pipelines |
+| [brain.py](brain.py) / [brain_scanner.py](brain_scanner.py) | Optional AI analysis and active code-generation workflow |
+| [scoped_http.py](scoped_http.py) / [scoped_browser.py](scoped_browser.py) / [nuclei_scope.py](nuclei_scope.py) | Guarded network paths and scope-related coverage recording |
+| [tool_resolution.py](tool_resolution.py) / [tool_runtime.sh](tool_runtime.sh) | Executable identity, health checks, and runtime pins |
+| [phase_manifest.py](phase_manifest.py) / [reporter.py](reporter.py) | Phase/coverage aggregation and report generation |
 
-Design credit: [zeroc00I/LLM-anonymization](https://github.com/zeroc00I/LLM-anonymization)
-(README-only spec — the implementation here is entirely original).
+Infrastructure checks include injection probes, CVE/template checks, exposure/configuration checks, and selected framework checks, subject to installed tools and phase selection. API/HAR probe families and their limits are documented in the [specialist guide](docs/specialist-workflows.md). Supported detector outputs still require operator validation.
 
----
+Successful scoped endpoint discoveries feed the canonical HTML, JavaScript, parameter, and API inputs before dependent checks run. Authentication/catchall responses, redirects, binary assets, and off-scope URLs are not promoted as application pages. Autonomous runs invalidate dependent completion state when new inputs arrive and report unfinished follow-up work if the step budget expires.
 
-## Reports
+## Documentation and integrations
 
-`reporter.py` produces professional, Burp Suite-style VAPT reports:
+| Guide | Contents |
+|:--|:--|
+| [AI configuration](docs/ai-configuration.md) | Providers, model pins, configuration precedence, benchmarking |
+| [Specialist workflows](docs/specialist-workflows.md) | API/MFA, HAR, AWS, and privacy proxy |
+| [Recon enrichment](docs/recon-enrichment.md) | uncover, tlsx, waymore, xnLinkFinder and opt-ins |
+| [CATS](docs/cats.md) / [Hadrian](templates/hadrian/README.md) | Optional OpenAPI fuzzing and role-based API authorization checks |
+| [Supply-chain and evidence helpers](docs/gitleaks-syft-bagit.md) | Gitleaks SARIF, Syft SBOM, BagIt evidence packs |
+| [SARIF / HDF / ASFF](docs/saf-export.md) | Machine-readable report exports |
+| [MCP facade and session cache](docs/hexstrike-patterns.md) | Narrow opt-in integrations and their limits |
+| [Web3 references](web3/README.md) | Manual audit material; `token_scanner.py` is source-regex heuristics, not bytecode/on-chain analysis |
+| [Changelog](CHANGELOG.md) | Release history and dated integration notes |
 
-- **Executive summary** — business impact, risk scores, remediation timeline
-- **Technical findings** — detailed vulnerability descriptions with PoC evidence
-- **CVSS scoring** — industry-standard risk assessment (3.1 and 4.0)
-- **Remediation guidance** — step-by-step fix instructions
-- **Compliance mapping** — OWASP Top 10, CWE references
+Additional helpers include [CI/CD checks](cicd_scanner.sh), [email posture checks](email_audit.py), and [lifecycle metadata](eol_check.py). Lifecycle `unknown`/`no_data` or a versionless inference does not establish support for a deployed version. Retain the embedded endoflife.date attribution when redistributing its metadata.
+
+Optional integrations have separate prerequisites; `--full` does not enable every module in this repository.
+
+## Development
+
+Keep documentation aligned with CLI/default changes. Add focused regressions for changed behavior, preserve user-local configuration, and never include engagement secrets or live client results in examples.
+
+### Testing
 
 ```bash
-python3 reporter.py findings/ --client "Acme Corp" --consultant "Your Name"
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt pytest
 ```
 
-Every run emits **HTML** (Burp-style) and **Markdown** (documentation-friendly).
-A **PDF** is generated automatically when `wkhtmltopdf` is on your `PATH`.
-Per-finding JSON is written under `findings/<target>/` for downstream tooling.
-
-### Opt-in SARIF / HDF / ASFF (MITRE SAF)
+Focused scope/runtime/reporting regressions:
 
 ```bash
-python3 saf_export.py findings/<target>/sessions/<id>/ --sarif
-python3 reporter.py findings/<target>/sessions/<id>/ --export-hdf
-python3 vikramaditya.py --export-sarif findings/<target>/sessions/<id>/
+PYTHONDONTWRITEBYTECODE=1 BRAIN_ENV_NOLOAD=1 python3 -m pytest -q -rs -p no:cacheprovider \
+    tests/test_scoped_http_redirects.py tests/test_recon_active_scope.py \
+    tests/test_scoped_browser.py tests/test_nuclei_scope_guard.py \
+    tests/test_tool_resolution.py tests/test_gf_resolution.py \
+    tests/test_scoped_form_discovery.py tests/test_arjun_runtime_contract.py \
+    tests/test_artifact_finding_count.py tests/test_reporter_exact_duplicates.py \
+    tests/test_assessment_status_consistency.py tests/test_phase_manifest_coverage.py \
+    tests/test_assessment_finalization.py tests/test_autonomous_assessment_status.py \
+    tests/test_watched_command_accounting.py tests/test_no_brain_browser_policy.py \
+    tests/test_discovery_feedback.py tests/test_hunt_discovery_feedback.py \
+    tests/test_recon_failure_completion.py tests/test_cve_fallback_and_nested_coverage.py \
+    tests/test_post_and_discovery_regressions.py tests/test_pipeline_and_phase_status.py \
+    tests/test_report_accuracy_regressions.py tests/test_coverage_integrity_regressions.py \
+    tests/test_secret_phase_activity.py \
+    tests/test_interrupt_cleanup.py
 ```
 
-Requires the MITRE SAF CLI on `PATH` for HDF/ASFF steps. See `docs/saf-export.md`.
+These checks use fixtures/local servers. Native controls require usable Nuclei and Playwright/Chromium installations; review skips with `-rs`. An installed but unusable backend may fail instead of skipping.
 
----
-
-## Professional Usage & Workflow
-
-### VAPT engagement workflow
-
-1. **Scoping** — define targets, obtain written authorization
-2. **Reconnaissance** — `python3 vikramaditya.py target.com`
-3. **Authenticated testing** — capture HAR files, run `python3 har_vapt.py session.har`
-4. **Analysis** — AI-powered triage and impact assessment
-5. **Reporting** — generate client-ready reports
-6. **Remediation support** — fix verification and retesting
-
-### Scan capabilities
-
-- **Multi-target scanning** — subnet, CIDR, and domain-range support (`hunt.py --target 10.0.0.0/24`)
-- **Authenticated testing** — HAR-based session analysis and JSON-API auth replay
-- **Structured output** — JSON findings under `findings/<target>/` for downstream tooling
-- **Hunt memory** — JSONL journal (`hunt-memory/journal.jsonl`) picked up by `/pickup <target>` on warm restart
-
-### Quality assurance
-
-- **False-positive reduction** — AI triage gate + regex dedup rules
-- **Reproducible testing** — sqlmap command log + per-phase watchdog traces saved per session
-- **Evidence collection** — request/response pairs, screenshots (via gowitness), scan logs
-
----
-
-## Ethical Use & Legal Compliance
-
-### Authorization requirements
-
-- ✅ Only test systems you own or have explicit **written permission** to test
-- ✅ Obtain proper documentation before starting any assessment
-- ✅ Stay within defined scope — use `hunt.py --scope-lock` (or accept the interactive scope-lock prompt) to restrict to the exact host with no subdomain expansion
-- ✅ Follow responsible disclosure for any findings
-
-### Methodology alignment
-
-The tool carries no certification on its own. The operator is responsible for
-conducting engagements under whatever framework the client requires:
-
-- **OWASP Testing Guide v4.2** — the recon → param-discovery → vuln-scan →
-  exploit-chain flow Vikramaditya implements follows the OTG structure.
-- **NIST CSF** — the scan → find → triage → report flow maps to
-  Identify-Protect-Detect-Respond-Recover at the engagement level.
-- **CERT-In VAPT format** — the operator maps findings to the required Indian
-  CERT-In template; `reporter.py` is the report generator.
-
-Claim alignment only where your configuration honestly supports it.
-
-### Data protection
-
-- HAR files contain session data — handle securely
-- Encrypt sensitive findings during storage and transmission
-- Follow data-retention policies for client information
-- Implement secure deletion procedures post-engagement
-
----
-
-## Contributing
-
-Contributions are welcome.
+Full suite, in a configured development environment:
 
 ```bash
-git clone https://github.com/venkatas/vikramaditya.git
-cd vikramaditya
-git checkout -b feature/new-testing-module
-# make changes, add tests, update docs, then open a PR
+env -u BRAIN_ENV_NOLOAD PYTHONDONTWRITEBYTECODE=1 BRAIN_ENV_FILE=/dev/null WHITEBOX_SMOKE=0 \
+    python3 -m pytest -q -rs -p no:cacheprovider tests/
 ```
 
-**Contribution areas:** new vulnerability-testing modules, additional AI-model
-integrations, enhanced reporting formats, performance optimizations,
-documentation improvements, HAR-analysis enhancements.
+Use the output for your current checkout/environment as the test result; this README does not publish a fixed passing-test count.
 
-**Code standards:** Python 3.10+ compatibility, type hints on new functions,
-comprehensive docstrings, unit tests for critical functionality, security-first
-design.
+## Responsible use and support
 
----
+Obtain written authorization, use dedicated test accounts where possible, follow the agreed scope and disclosure process, and protect HAR files, tokens, findings, and raw evidence. Apply the engagement's encryption and retention requirements.
 
-## Changelog
+This tool is not a certification of OWASP, NIST, or CERT-In coverage. The operator owns methodology selection, evidence validation, untested-control reporting, client sign-off, and remediation retesting.
 
-See **[CHANGELOG.md](CHANGELOG.md)** for the full v2.0 → v10.0.0 release history.
+MIT license: [LICENSE](LICENSE). Report bugs or contribute through [GitHub issues and pull requests](https://github.com/venkatas/vikramaditya/issues). Contact: [venkat.9099@gmail.com](mailto:venkat.9099@gmail.com). Authorized testing only; developers assume no liability for misuse.
 
-**Latest — v10.0.0 (full-tool correctness audit):** a multi-stage audit
-(automated fan-out → adversarial self-review → independent codex + grok review)
-found and fixed **60+ correctness bugs across 12 files** — false positives that
-fabricated findings (Drupalgeddon "RCE" on any output, time-based SQLi with no
-baseline, CORS `ACAO:*` flagged as a vuln, candidate/INFO lines inflated to
-HIGH/CRITICAL), false negatives where real findings never reached the report
-(brain active-scanner output, confirmed Drupalgeddon RCE, autopilot
-`finding_*.json`), and the report-ingestion contract that ties every detector to
-`reporter.py`. The headline theme: **findings now reach the report with the
-correct severity, and nothing fabricated does.**
-
-**v9.24.0 (engagement-driven hardening):** version-aware EOL detection
-(now flags end-of-life PHP 7.4 instead of reporting it "supported"), an
-`intel.py` version-less junk-CVE filter (no more "vue → HP-UX VUE 1994" or
-WordPress-1.2-era matches), an SSTI false-positive fix (skip static assets +
-distinctive-canary confirmation instead of grepping a coincidental `49`), the
-exploit code-gen model A/B finalized (`devstral-small-2:24b` validated as
-primary), and a full README cleanup.
-
-**v9.23.0 (detector/report/brain false-positive purge + model right-sizing):**
-a full-pipeline audit fixed several detectors that reported fabricated signal
-while real findings were dropped (jsluice flag, SecretFinder banner-counting,
-whatweb 0-byte crash, Drupal nginx-301 false positive, version-less keyword
-CVEs, `email_auth` surfacing, cvemap graceful skip). The AI brain was right-sized
-per role — `phi4:14b` narrator, `bugtraceai-apex` triage, `devstral-small-2:24b`
-/ `qwen2.5-coder:14b` code-gen — all overridable via `BRAIN_MODEL` /
-`TRIAGE_MODEL` / `BRAIN_SCANNER_MODEL`.
-
----
-
-## License & Support
-
-**License:** MIT — see [LICENSE](LICENSE).
-
-- 📧 Email: [venkat.9099@gmail.com](mailto:venkat.9099@gmail.com)
-- 🐛 Issues & PRs: [github.com/venkatas/vikramaditya/issues](https://github.com/venkatas/vikramaditya/issues)
-
-This tool is designed for **authorized security testing only**. The developers
-assume no liability for misuse. Always ensure you have explicit written
-permission before testing any systems.
-
-> **The Legend.** *Vikramaditya* — the legendary Indian emperor whose throne could only be ascended by one who sought truth fearlessly and judged without bias. His name means *"valour of the sun"*. This tool operates the same way: give it a target, walk away, and come back to a full VAPT report. It was inspired by and evolved from [**claude-bug-bounty**](https://github.com/shuvonsec/claude-bug-bounty) — the original AI-assisted bug-bounty automation platform that laid the recon pipeline, ReAct agent architecture, and AI analysis engine that power this tool today. *"He who seeks the truth must be ready to face the fire."*
-
-<div align="center">
-
-**Built for the cybersecurity community — fearless pursuit of truth.**
-
-**[⭐ Star this project](https://github.com/venkatas/vikramaditya)** if it helps secure your applications.
-
-</div>
+Inspired by [claude-bug-bounty](https://github.com/shuvonsec/claude-bug-bounty).

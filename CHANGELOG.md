@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased — scan follow-up correctness fixes
+
+- Avoid duplicate failed POST discovery inside one invocation. Use the small
+  wordlist, explicit serial pacing, and a documented POST probe cap without
+  increasing scan aggression; later invocations can still retry.
+- Classify phase activity from manifest and coverage evidence, including capped
+  parameters, explicit non-applicable RCE skips, and producer failures in watched
+  shell pipelines. A successful `tee` cannot hide a failed scanner.
+- Treat malformed or unreadable existing coverage as an integrity failure.
+  Publish manifests/coverage atomically and retain corrupt evidence in recoverable
+  backups rather than replacing it with an apparently clean result.
+- Record API transport failures and distinguish attempted from completed probes.
+- Consume known HTML form pages without extension guesses; reschedule autonomous
+  core scans for new query/API inputs while retaining scope, retry, and step limits.
+- Parse optional/structured HTTPX fields without shifting inventory columns.
+  Share HTML/Markdown CVSS display rules and derive methodology/tool-use claims
+  from recorded session evidence instead of an unconditional template.
+- Add offline regressions; no live scans, AI-model changes, or credential use.
+
+## Unreleased — discovery handoff and failure-path fixes
+
+- Feed fresh successful, scope-filtered Ferox HTML/JS/parameter/API discoveries
+  into downstream inputs before their consumers run; preserve bounded autonomous
+  reanalysis state and make surface caps explicit.
+- Record watched subprocess success, failure, timeout, spawn errors, and interrupts
+  in the session manifest; bind recon to its findings session before execution.
+  Failed report generation no longer counts stale reports as fresh completion.
+- Consolidate same-session nested API coverage and durable recon gap records.
+- Retain archive/crawler and port diagnostics; partial outputs cannot satisfy
+  successful resume markers. Genuine completed zero-result phases remain valid.
+- Resolve the CVE fallback through the healthy absolute ProjectDiscovery HTTPX
+  executable, with scope checks and redirect following disabled.
+- Propagate explicit tools-only policy into browser validation without changing
+  model configuration; reject contradictory `--agent --no-brain` requests.
+
+## Unreleased — assessment status reliability
+
+- Share coverage finalization between synchronous and bounded autonomous hunts.
+  Persisted scanner/recon gaps, failed phases, and in-memory limitations now
+  determine the autonomous dashboard, exit status, and saved final result.
+- Preserve unresolved coverage on no-op resumes and save the final result when
+  recon fails before planning. Consolidate before reports, then fold any late
+  report/authz failures into the final outcome.
+- Isolate per-target coverage without discarding the current invocation's
+  authentication/wordlist preflight failures. Coverage I/O failures cannot become
+  a clean success; genuine completed zero-finding phases remain successful.
+- Add local fixture regressions for outcome consistency, failed persistence,
+  preflight handoff, and session state. No scan-aggression or AI-model changes.
+
 ## HexStrike patterns only: MCP facade, session cache, coverage notes (2026-09-08)
 
 Clean-room ideas from HexStrike (MIT). **Not** a runtime. No fork, vendor,
